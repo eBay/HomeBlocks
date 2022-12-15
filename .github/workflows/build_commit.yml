@@ -1,0 +1,93 @@
+name: Build Commit
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      build-type:
+        required: true
+        type: string
+      malloc-impl:
+        required: true
+        type: string
+      prerelease:
+        required: true
+        type: string
+      tooling:
+        required: true
+        type: string
+
+jobs:
+  Sisl11Deps:
+    uses: eBay/sisl/.github/workflows/build_dependencies.yml@master
+    with:
+      branch: master
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
+  NuraftMesgDeps:
+    needs: Sisl11Deps
+    uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@main
+    with:
+      branch: main
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
+  IOMgrDeps:
+    needs: [Sisl11Deps]
+    uses: eBay/iomanager/.github/workflows/build_dependencies.yml@master
+    with:
+      branch: master
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
+  HomeStoreDeps:
+    needs: [IOMgrDeps, NuraftMesgDeps]
+    uses: eBay/homestore/.github/workflows/build_dependencies.yml@master
+    with:
+      branch: master
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
+  HomeBlocksDeps:
+    needs: [HomeStoreDeps]
+    uses: ./.github/workflows/build_dependencies.yml
+    with:
+      branch: ${{ github.ref }}
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: ${{ inputs.tooling }}
+      testing: 'True'
+    if: ${{ github.event_name != 'pull_request' }}
+
+  HomeBlocksBuild:
+    uses: ./.github/workflows/build_dependencies.yml
+    with:
+      branch: ${{ github.ref }}
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+      tooling: ${{ inputs.tooling }}
+      testing: 'True'
+    if: ${{ github.event_name == 'pull_request' }}
