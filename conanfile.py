@@ -41,6 +41,7 @@ class HomeReplicationConan(ConanFile):
         self.requires("sisl/[~=8, include_prerelease=True]@oss/master")
 
         self.requires("openssl/1.1.1s", override=True)
+        self.requires("zlib/1.2.12", override=True)
 
     def configure(self):
         if self.options.shared:
