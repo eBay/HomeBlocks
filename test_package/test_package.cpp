@@ -1,5 +1,5 @@
 #include <sisl/options/options.h>
-#include <home_replication.hpp>
+#include <home_replication.h>
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
@@ -10,6 +10,5 @@ int main(int argc, char** argv) {
    sisl::logging::SetLogger(std::string(argv[0]));
    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
    sisl::logging::SetModuleLogLevel("home_repl", spdlog::level::level_enum::trace);
-   home_replication::foo();
    return 0;
 }

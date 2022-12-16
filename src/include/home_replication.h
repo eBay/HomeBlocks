@@ -6,6 +6,4 @@
 
 namespace home_replication {
 
-extern void foo();
-
 }
