@@ -2,8 +2,6 @@
 
 #include <sisl/logging/logging.h>
 
-#include "home_replication.h"
-
 SISL_LOGGING_DECL(home_repl)
 
 namespace home_replication {
@@ -22,4 +20,4 @@ void hr_state_machine::create_snapshot(nuraft::snapshot& s, nuraft::async_result
     if (when_done) when_done(ret_val, null_except);
 }
 
-}
+} // namespace home_replication
