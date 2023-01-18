@@ -37,7 +37,10 @@ class HomeReplicationConan(ConanFile):
         self.build_requires("gtest/1.11.0")
 
     def requirements(self):
-        self.requires("nuraft/2.0.0")
+        self.requires("nuraft/nbi.2.1.0")
+        #self.requires("iomgr/[~=8, include_prerelease=True]@oss/master")
+        self.requires("homestore/[~=4, include_prerelease=True]@oss/develop")
+        #self.requires("homestore/4.0.2-2@oss/develop")
         self.requires("sisl/[~=8, include_prerelease=True]@oss/master")
 
         self.requires("openssl/1.1.1s", override=True)
