@@ -34,10 +34,11 @@ class HomeReplicationConan(ConanFile):
     exports_sources = ("CMakeLists.txt", "cmake/*", "src/*", "LICENSE")
 
     def build_requirements(self):
-        self.build_requires("gtest/1.11.0")
+        self.build_requires("gtest/1.12.1")
 
     def requirements(self):
-        self.requires("nuraft/2.0.0")
+        self.requires("nuraft_mesg/[~=0, include_prerelease=True]@oss/master")
+        self.requires("nuraft/2.1.0")
         self.requires("sisl/[~=8, include_prerelease=True]@oss/master")
 
         self.requires("openssl/1.1.1s", override=True)
@@ -87,11 +88,8 @@ class HomeReplicationConan(ConanFile):
     def package_info(self):
         self.cpp_info.libs = ["home_replication"]
 
-        if self.settings.compiler == "gcc":
-            self.cpp_info.cppflags.extend(["-fconcepts"])
-
         if self.settings.os == "Linux":
-            self.cpp_info.system_libs.extend(["dl", "pthread"])
+            self.cpp_info.system_libs.extend(["pthread"])
 
         if  self.options.sanitize:
             self.cpp_info.sharedlinkflags.append("-fsanitize=address")
