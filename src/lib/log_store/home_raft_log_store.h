@@ -156,5 +156,6 @@ public:
 private:
     homestore::logstore_id_t m_logstore_id;
     std::shared_ptr< homestore::HomeLogStore > m_log_store;
+    nuraft::ptr< nuraft::log_entry > m_dummy_log_entry;
 };
 } // namespace home_replication

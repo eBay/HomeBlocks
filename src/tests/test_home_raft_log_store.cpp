@@ -72,7 +72,7 @@ public:
             auto le = make_log(m_cur_term, lsn);
             int64_t const store_sn = m_rls->append(le);
 
-            ASSERT_EQ(lsn, store_sn + 1);
+            ASSERT_EQ(lsn, store_sn);
             ASSERT_EQ(m_rls->next_slot(), lsn + 1);
             validate_log(m_rls->last_entry(), lsn);
 
@@ -111,7 +111,7 @@ public:
     void pack_test(uint64_t from, int32_t cnt, pack_result_t& out_pack) {
         out_pack.actual_data = m_rls->pack(from, cnt);
         ASSERT_NE(out_pack.actual_data.get(), nullptr);
-        out_pack.exp_data.assign(m_shadow_log.begin() + from - 1, m_shadow_log.begin() + from + cnt);
+        out_pack.exp_data.assign(m_shadow_log.begin() + from - 1, m_shadow_log.begin() + from + cnt - 1);
     }
 
     pack_result_t pack_test() {
@@ -133,7 +133,8 @@ public:
         // Do Basic read validation
         ASSERT_EQ(m_rls->next_slot(), m_next_lsn);
         ASSERT_EQ(m_rls->start_index(), m_start_lsn);
-        validate_log(m_rls->last_entry(), m_next_lsn - 1);
+
+        if (m_next_lsn > m_start_lsn) { validate_log(m_rls->last_entry(), m_next_lsn - 1); }
 
         // Do invidivual get validation
         for (uint64_t lsn = m_start_lsn; lsn < uint64_cast(m_next_lsn); ++lsn) {
@@ -143,6 +144,7 @@ public:
         // Do bulk get validation as well.
         auto lsn = m_start_lsn;
         auto const entries = m_rls->log_entries(m_start_lsn, m_next_lsn);
+        ASSERT_EQ(entries->size(), uint64_cast(m_next_lsn - m_start_lsn));
         for (const auto& le : *entries) {
             validate_log(le, lsn++);
         }
