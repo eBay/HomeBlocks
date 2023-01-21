@@ -44,7 +44,6 @@ class HomeReplicationConan(ConanFile):
 
         self.requires("openssl/1.1.1s", override=True)
         self.requires("zlib/1.2.12", override=True)
-        self.requires("nlohmann_json/3.11.2", override=True)
 
     def configure(self):
         if self.options.shared:
@@ -58,8 +57,7 @@ class HomeReplicationConan(ConanFile):
     def build(self):
         cmake = CMake(self)
 
-        definitions = {'TEST_TARGET': 'ON',
-                       'CONAN_BUILD_COVERAGE': 'OFF',
+        definitions = {'CONAN_BUILD_COVERAGE': 'OFF',
                        'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
                        'MEMORY_SANITIZER_ON': 'OFF',
                        }
