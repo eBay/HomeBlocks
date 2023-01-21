@@ -5,19 +5,16 @@ add_flags("-Wall -Wextra -Werror -Wpedantic")
 
 find_package(nuraft REQUIRED)
 find_package(sisl REQUIRED)
-#find_package(iomgr REQUIRED)
 find_package(Threads REQUIRED)
 find_package(homestore REQUIRED)
 find_package(GTest REQUIRED)
 
 set (COMMON_DEPS
         homestore::homestore
-        #iomgr::iomgr
         sisl::sisl
         nuraft::nuraft
     )
 
-#message("spdk_LIBRARY_LIST = ${spdk_LIBRARY_LIST}")
 set(COMMON_TEST_DEPS
         ${COMMON_DEPS}
         ${spdk_LIBRARY_LIST}

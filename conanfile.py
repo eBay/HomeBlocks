@@ -44,6 +44,7 @@ class HomeReplicationConan(ConanFile):
 
         self.requires("openssl/1.1.1s", override=True)
         self.requires("zlib/1.2.12", override=True)
+        self.requires("nlohmann_json/3.11.2", override=True)
 
     def configure(self):
         if self.options.shared:
@@ -57,7 +58,8 @@ class HomeReplicationConan(ConanFile):
     def build(self):
         cmake = CMake(self)
 
-        definitions = {'CONAN_BUILD_COVERAGE': 'OFF',
+        definitions = {'TEST_TARGET': 'ON',
+                       'CONAN_BUILD_COVERAGE': 'OFF',
                        'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
                        'MEMORY_SANITIZER_ON': 'OFF',
                        }
@@ -72,7 +74,7 @@ class HomeReplicationConan(ConanFile):
 
         cmake.configure(defs=definitions)
         cmake.build()
-        #cmake.test(target=test_target, output_on_failure=True)
+        cmake.test(target=test_target, output_on_failure=True)
 
     def package(self):
         lib_dir = join(self.package_folder, "lib")
