@@ -69,6 +69,12 @@ void HomeRaftLogStore::create_store() {
     REPL_STORE_LOG(DEBUG, "New logstore created");
 }
 
+void HomeRaftLogStore::remove_store() {
+    REPL_STORE_LOG(DEBUG, "Logstore is being physically removed");
+    logstore_service().remove_log_store(homestore::LogStoreService::DATA_LOG_FAMILY_IDX, m_logstore_id);
+    m_log_store.reset();
+}
+
 void HomeRaftLogStore::on_store_created(std::shared_ptr< HomeLogStore > log_store) {
     m_log_store = log_store;
     m_logstore_id = m_log_store->get_store_id();

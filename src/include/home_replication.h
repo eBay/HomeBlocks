@@ -3,7 +3,6 @@
 #include <sisl/logging/logging.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <string>
-#include <home_replication/engine.h>
 
 #define HOMEREPL_LOG_MODS home_repl
 
@@ -15,6 +14,8 @@ struct fully_qualified_pba {
     pba_t pba;
 };
 
+typedef uint64_t pba_t;
+typedef folly::small_vector< pba_t, 4 > pba_list_t;
 typedef folly::small_vector< std::pair< pba_t, int64_t >, 4 > pba_lsn_list_t;
 
 enum class log_store_impl_t : uint8_t { homestore, jungle };
@@ -132,7 +133,6 @@ private:
     std::shared_ptr< ReplicaStateMachine > m_state_machine;
     std::unique_ptr< ReplicaSetListener > m_listener;
     std::shared_ptr< nuraft::log_store > m_data_journal;
-    std::shared_ptr< Journal > m_free_pba_journal;
     log_store_impl_t m_log_store_impl;
     folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
 };
@@ -150,6 +150,7 @@ public:
     uint64_t last_commit_index() override;
 
 private:
+    std::shared_ptr< StateMachineStore > m_state_store;
 };
 
 class ReplicationService {

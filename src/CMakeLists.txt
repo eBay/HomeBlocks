@@ -26,12 +26,14 @@ include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_subdirectory(lib/state_machine)
 add_subdirectory(lib/log_store)
+add_subdirectory(lib/local_journal)
 add_subdirectory(tests)
 
 add_library(${PROJECT_NAME})
 target_sources(${PROJECT_NAME} PRIVATE
             $<TARGET_OBJECTS:state_machine>
             $<TARGET_OBJECTS:log_store>
+            $<TARGET_OBJECTS:local_journal>
         )
 target_link_libraries(${PROJECT_NAME}
             ${COMMON_DEPS}
