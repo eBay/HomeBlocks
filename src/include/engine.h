@@ -8,9 +8,9 @@
 
 namespace home_replication {
 
-typedef std::function< void(int status, void* cookie) > io_completion_cb_t;
-typedef uint64_t pba_t;
-typedef folly::small_vector< pba_t, 4 > pba_list_t;
+using io_completion_cb_t = std::function< void(int status, void* cookie) >;
+using pba_t = uint64_t;
+using pba_list_t = folly::small_vector< pba_t, 4 >;
 
 class StorageEngine {
     virtual pba_list_t alloc_pbas(uint32_t size) = 0;

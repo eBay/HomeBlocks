@@ -1,9 +1,12 @@
 #pragma once
 
-#include <sisl/logging/logging.h>
-#include <folly/concurrency/ConcurrentHashMap.h>
 #include <string>
-#include <home_replication/engine.h>
+
+#include <folly/concurrency/ConcurrentHashMap.h>
+#include <nuraft_mesg/messaging_if.hpp>
+#include <sisl/logging/logging.h>
+
+#include "engine.h"
 
 #define HOMEREPL_LOG_MODS home_repl
 
@@ -82,7 +85,7 @@ public:
 };
 
 class ReplicaStateMachine;
-class ReplicaSet : public sds::messaging::mesg_state_mgr {
+class ReplicaSet : public nuraft_mesg::mesg_state_mgr {
 public:
     ReplicaSet(const std::string& group_id, const std::vector< std::string >& peer_ids, log_store_impl_t log_store_impl,
                std::unique_ptr< ReplicaSetListener > listener);
