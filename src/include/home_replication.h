@@ -12,6 +12,8 @@
 
 namespace home_replication {
 
+class Journal;
+
 // Fully qualified domain pba, unique pba id across replica set
 struct fully_qualified_pba {
     std::string& srv_id;
@@ -109,7 +111,7 @@ public:
     /// tracking this seperately to support consistent read use cases
     /// @param value - vector of io buffers that contain value for the key
     /// @param user_ctx - User supplied opaque context which will be passed to listener callbacks
-    virtual void write(const sisl::blob& header, const sisl::blob& key, const sg_list& value, void* user_ctx);
+    virtual void write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx);
 
     /// @brief Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
     /// immediately available, it reaches out to the remote replica and then fetch the data, write to the local storage
@@ -124,7 +126,7 @@ public:
     void save_state(const nuraft::srv_state& state) override;
     nuraft::ptr< nuraft::srv_state > read_state() override;
     nuraft::ptr< nuraft::log_store > load_log_store() override;
-    int32 server_id() override;
+    int32_t server_id() override;
     void system_exit(const int exit_code) override;
 
     std::shared_ptr< ReplicaStateMachine > state_machine();
