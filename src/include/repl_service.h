@@ -85,9 +85,10 @@ public:
 };
 
 class ReplicaStateMachine;
-class ReplicaSet : public sds::messaging::mesg_state_mgr {
+class ReplicaStateManager;
+class ReplicaSet {
 public:
-    ReplicaSet(const std::string& group_id, const std::vector< std::string >& peer_ids, log_store_impl_t log_store_impl,
+    ReplicaSet(const std::string& group_id, log_store_impl_t log_store_impl,
                std::unique_ptr< ReplicaSetListener > listener);
 
     virtual ~ReplicaSet() = default;
@@ -119,44 +120,37 @@ public:
     /// @return Returns Returns the local_pba
     virtual pba_t map_pba(fully_qualified_pba fq_pba);
 
-    nuraft::ptr< nuraft::cluster_config > load_config() override;
-    void save_config(const nuraft::cluster_config& config) override;
-    void save_state(const nuraft::srv_state& state) override;
-    nuraft::ptr< nuraft::srv_state > read_state() override;
-    nuraft::ptr< nuraft::log_store > load_log_store() override;
-    int32 server_id() override;
-    void system_exit(const int exit_code) override;
-
-    std::shared_ptr< ReplicaStateMachine > state_machine();
+    void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
+    std::shared_ptr< ReplicaStateManager > state_mgr() { return m_state_mgr; }
+    std::shared_ptr< ReplicaStateManager > state_machine() { return m_state_machine; }
+    std::shared_ptr< nuraft::log_store > data_journal() { return m_data_journal; }
 
 private:
+    std::shared_ptr< ReplicaStateManager > m_state_mgr;
     std::shared_ptr< ReplicaStateMachine > m_state_machine;
     std::unique_ptr< ReplicaSetListener > m_listener;
     std::shared_ptr< nuraft::log_store > m_data_journal;
-    log_store_impl_t m_log_store_impl;
     folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
 };
+typedef std::shared_ptr< ReplicaSet > rs_ptr_t;
 
-class ReplicaStateMachine : public nuraft::state_machine {
-public:
-    nuraft::ptr< nuraft::buffer > commit(uint64_t lsn, nuraft::buffer& data) override;
-    nuraft::ptr< nuraft::buffer > pre_commit(uint64_t lsn, nuraft::buffer& data) override;
-    void rollback(uint64_t lsn, nuraft::buffer& data) override;
-
-    bool apply_snapshot(nuraft::snapshot&) override { return false; }
-    void create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) override;
-    nuraft::ptr< nuraft::snapshot > last_snapshot() override { return nullptr; }
-
-    uint64_t last_commit_index() override;
-
-private:
-    std::shared_ptr< StateMachineStore > m_state_store;
-};
+class ReplicationServiceImpl;
+typedef std::function< std::shared_ptr< ReplicaSetListener >(const rs_ptr_t& rs) > on_replica_set_identified_t;
 
 class ReplicationService {
 public:
-    ReplicationService(engine_impl_t engine_impl);
+    ReplicationService(engine_impl_t engine_impl, log_store_impl_t log_store_impl, on_replica_set_identified_t cb);
+    rs_ptr_t create_replica_set(uuid_t uuid);
+    rs_ptr_t lookup_replica_set(uuid_t uuid);
+    void iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb);
 
 private:
+    std::unique_ptr< ReplicationServiceImpl > m_impl;
+    std::mutex m_rs_map_mtx;
+    std::unordered_map< uuid_t, std::shared_ptr< ReplicaSet > > m_rs_map;
+    on_replica_set_identified_t m_rs_found_cb;
+
+    engine_impl_t m_engine_impl;
+    log_store_impl_t m_log_store_impl;
 };
 } // namespace home_replication

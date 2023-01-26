@@ -4,7 +4,7 @@
 #include <vector>
 #include <functional>
 #include <sisl/fds/buffer.hpp>
-#include <home_replication/home_replication.h>
+#include <home_replication/repl_service.h>
 
 namespace home_replication {
 

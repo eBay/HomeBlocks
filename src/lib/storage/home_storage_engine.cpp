@@ -15,54 +15,6 @@
 SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
-///////////////////////////// HomeReplicationServiceImpl Section ////////////////////////////
-HomeReplicationServiceImpl::HomeReplicationServiceImpl() : {
-    homestore::meta_service().register_handler(
-        "replica_set",
-        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            rs_super_blk_found(std::move(buf), voidptr_cast(mblk));
-        },
-        nullptr);
-}
-
-void HomeReplicationServiceImpl::rs_super_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
-    homestore::superblk< home_rs_superblk > rs_sb;
-    rs_sb.load(buf, meta_cookie);
-    HS_REL_ASSERT_EQ(m_sb->get_magic(), rs_superblk::REPLICA_SET_SB_MAGIC, "Invalid rs metablk, magic mismatch");
-    HS_REL_ASSERT_EQ(m_sb->get_version(), rs_superblk::REPLICA_SET_SB_MAGIC, "Invalid version of rs metablk");
-
-    auto sms = std::make_shared< HomeStateMachineStore >(rs_sb);
-    {
-        std::unique_lock lg(m_sm_store_map_mtx);
-        m_sm_store_map.insert(std::make_pair(rs_sb->uuid, sms));
-    }
-}
-
-sm_store_ptr_t HomeReplicationServiceImpl::lookup_state_store(uuid_t uuid) {
-    std::unique_lock lg(m_sm_store_map_mtx);
-    auto it = m_sm_store_map.find(uuid);
-    return (it == m_sm_store_map.end() ? nullptr : it->second);
-}
-
-sm_store_ptr_t HomeReplicationServiceImpl::create_state_store(uuid_t uuid) {
-    if (look_state_store(uuid) != nullptr) {
-        assert(0);
-        LOGDEBUGMOD(home_replication, "Attempting to create a state machine with already existing uuid={}", uuid);
-    }
-
-    auto sms = std::make_shared< HomeStateMachineStore >(uuid);
-    std::unique_lock lg(m_sm_store_map_mtx);
-    m_sm_store_map.insert(std::make_pair(rs_sb->uuid, sms));
-    return sms;
-}
-
-void HomeReplicationServiceImpl::iterate_state_stores(const std::function< void(const sm_store_ptr_t&) >& cb) {
-    std::unique_lock lg(m_sm_store_map_mtx);
-    for (const auto& [uuid, sms] : m_sm_store_map) {
-        cb(sms);
-    }
-}
-
 ///////////////////////////// HomeStateMachineStore Section ////////////////////////////
 void HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) {
     LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for uuid={}", rs_uuid);
@@ -123,19 +75,22 @@ void HomeStateMachineStore::add_free_pba_record(DirtySession* ds, int64_t lsn, c
                                   [](int64_t, sisl::io_blob& b, logdev_key, void*) { b.buf_free(); });
 }
 
-pba_list_t HomeStateMachineStore::get_free_pba_record(int64_t lsn) {
-    pba_list_t plist;
-
-    auto bview = m_free_pba_store->read_sync(lsn - 1);
-    uint32_t num_pbas = *(r_cast< uint32_t* >(bview.bytes()));
-    pba_t* raw_ptr = r_cast< pba_t* >(bview.bytes() + sizeof(uint32_t));
-
-    for (uint32_t i{0}; i < num_pbas; ++i) {
-        plist.push_back(*raw_ptr);
-        ++raw_ptr;
-    }
-
-    return plist;
+void HomeStateMachineStore::get_free_pba_records(int64_t from_lsn, int64_t to_lsn,
+                                                 const std::function< void(int64_t lsn, const pba_list_t& pba) >& cb) {
+    m_free_pba_store->foreach (from_lsn - 1, [to_lsn, &cb](int64_t lsn, const homestore::log_buffer& entry) -> bool {
+        bool ret = (lsn < int64_cast(to_lsn - 2));
+        if (lsn < int64_cast(to_lsn - 1)) {
+            pba_list_t plist;
+            uint32_t num_pbas = *(r_cast< uint32_t* >(entry.bytes()));
+            pba_t* raw_ptr = r_cast< pba_t* >(entry.bytes() + sizeof(uint32_t));
+            for (uint32_t i{0}; i < num_pbas; ++i) {
+                plist.push_back(*raw_ptr);
+                ++raw_ptr;
+            }
+            cb(lsn, plist);
+        }
+        return ret;
+    });
 }
 
 void HomeStateMachineStore::remove_free_pba_records_upto(DirtySession* ds, int64_t lsn) {
