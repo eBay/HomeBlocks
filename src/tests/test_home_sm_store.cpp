@@ -1,42 +1,20 @@
-#include "local_journal/home_journal.h"
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
-
+#include <boost/uuid/uuid_generators.hpp>
+#include "storage/home_storage_engine.h"
 using namespace home_replication;
 
 SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, home_replication)
 
-static constexpr uint32_t g_max_logsize{512};
 static std::random_device g_rd{};
 static std::default_random_engine g_re{g_rd()};
-static std::uniform_int_distribution< uint32_t > g_randlogsize_generator{2, g_max_logsize};
+static std::uniform_int_distribution< uint32_t > g_num_pbas_generator{2, 10};
 
-static constexpr std::array< const char, 62 > alphanum{
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K',
-    'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
-    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'};
-
-static std::string gen_random_string(size_t len, uint64_t preamble = std::numeric_limits< uint32_t >::max()) {
-    std::string str;
-    if (preamble != std::numeric_limits< uint64_t >::max()) {
-        std::stringstream ss;
-        ss << std::setw(8) << std::setfill('0') << std::hex << preamble;
-        str += ss.str();
-    }
-
-    std::uniform_int_distribution< size_t > rand_char{0, alphanum.size() - 1};
-    for (size_t i{0}; i < len; ++i) {
-        str += alphanum[rand_char(g_re)];
-    }
-    str += '\0';
-    return str;
-}
-
-static const std::string s_fpath_root{"/tmp/log_store_dev_"};
+static const std::string s_fpath_root{"/tmp/home_sm_store"};
 
 static void remove_files(uint32_t ndevices) {
     for (uint32_t i{0}; i < ndevices; ++i) {
@@ -54,8 +32,13 @@ static void init_files(uint32_t ndevices, uint64_t dev_size) {
     }
 }
 
-class TestHomeJournal : public ::testing::Test {
+class TestHomeStateMachineStore : public ::testing::Test {
 public:
+    void SetUp() {
+        boost::uuids::random_generator gen;
+        m_uuid = gen();
+    }
+
     void start_homestore(bool restart = false) {
         auto const ndevices = SISL_OPTIONS["num_devs"].as< uint32_t >();
         auto const dev_size = SISL_OPTIONS["dev_size_mb"].as< uint64_t >() * 1024 * 1024;
@@ -104,21 +87,20 @@ public:
             .with_meta_service(5.0)
             .with_log_service(80.0, 5.0)
             .before_init_devices([this]() {
-                m_hj = std::make_unique< HomeLocalJournal >(bind_this(TestHomeJournal::entry_found, 2), m_store_id);
+                homestore::meta_service().register_handler(
+                    "replica_set",
+                    [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t) {
+                        rs_super_blk_found(std::move(buf), voidptr_cast(mblk));
+                    },
+                    nullptr);
             })
             .init(true /* wait_for_init */);
 
-        if (!restart) {
-            m_hj->create_store();
-        } else {
-            ASSERT_EQ(m_restart_log, m_shadow_log) << "All entries expected not found after restart";
-            m_restart_log.clear();
-        }
-        m_store_id = m_hj->logstore_id();
+        if (!restart) { m_hsm = std::make_unique< HomeStateMachineStore >(m_uuid); }
     }
 
     void shutdown(bool cleanup = true) {
-        if (cleanup) { m_hj->remove_store(); }
+        if (cleanup) { m_hsm->destroy(); }
 
         homestore::HomeStore::instance()->shutdown();
         homestore::HomeStore::reset_instance();
@@ -127,78 +109,81 @@ public:
         if (cleanup) { remove_files(SISL_OPTIONS["num_devs"].as< uint32_t >()); }
     }
 
-    void insert(int64_t lsn) {
-        m_shadow_log[lsn - 1] = gen_random_string(g_randlogsize_generator(g_re));
-        auto& s = m_shadow_log[lsn - 1];
-        m_hj->insert_async(lsn, sisl::io_blob::from_string(s));
+    void rs_super_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
+        homestore::superblk< home_rs_superblk > rs_sb;
+        rs_sb.load(buf, meta_cookie);
+        m_hsm = std::make_unique< HomeStateMachineStore >(rs_sb);
+        m_uuid = rs_sb->uuid;
     }
 
-    void validate_all() {
-        size_t lsn{1};
-        for (const auto& s : m_shadow_log) {
-            if (!s.empty()) {
-                auto b = m_hj->read_sync(lsn);
-                ASSERT_EQ(b.get_string(), s) << "Mismatch data for lsn=" << lsn;
-            }
-            ++lsn;
+    void add(int64_t lsn) {
+        pba_list_t pbas;
+        auto num_pbas = g_num_pbas_generator(g_re);
+        for (size_t i{0}; i < num_pbas; ++i) {
+            pbas.push_back(m_cur_pba.fetch_add(1));
         }
+        m_shadow_log[lsn - 1] = pbas;
+        m_hsm->add_free_pba_record(lsn, pbas);
     }
 
-    void truncate(int64_t lsn) {
-        m_hj->truncate(lsn);
-        m_shadow_log.erase(m_shadow_log.begin(), m_shadow_log.begin() + lsn);
+    void validate_all(int64_t from_lsn, int64_t to_lsn) {
+        m_hsm->flush_free_pba_records();
+        m_hsm->get_free_pba_records(from_lsn, to_lsn, [this](int64_t lsn, const pba_list_t& pbas) {
+            if (pbas != m_shadow_log[lsn - 1]) {
+                ASSERT_TRUE(false) << " Free pba record and shadow log pba list mismatch for lsn=" << lsn;
+            }
+        });
     }
 
-private:
-    void entry_found(int64_t lsn, const sisl::byte_view& data) {
-        ASSERT_EQ(m_shadow_log[lsn - 1].empty(), false)
-            << "Restart found lsn=" << lsn << " which was not never inserted";
-        ASSERT_EQ(data.get_string(), m_shadow_log[lsn - 1]) << "Restart data mismatch for lsn=" << lsn;
-        m_restart_log[lsn - 1] = m_shadow_log[lsn - 1];
+    void remove_upto(int64_t lsn) {
+        m_hsm->remove_free_pba_records_upto(lsn - 1);
+        // m_shadow_log.erase(m_shadow_log.begin(), m_shadow_log.begin() + lsn);
     }
 
 protected:
-    std::unique_ptr< HomeLocalJournal > m_hj;
+    std::unique_ptr< HomeStateMachineStore > m_hsm;
     homestore::logstore_id_t m_store_id{UINT32_MAX};
-    sisl::sparse_vector< std::string > m_shadow_log;
-    sisl::sparse_vector< std::string > m_restart_log;
+    sisl::sparse_vector< pba_list_t > m_shadow_log;
+    std::atomic< uint64_t > m_cur_pba{0};
+    boost::uuids::uuid m_uuid;
 };
 
-TEST_F(TestHomeJournal, lifecycle_test) {
+TEST_F(TestHomeStateMachineStore, free_pba_record_maintanence) {
     LOGINFO("Step 1: Start HomeStore");
     this->start_homestore();
 
     LOGINFO("Step 2: Insert with gaps and validate insertions");
-    this->insert(10);
-    this->insert(20);
-    this->insert(30);
-    this->insert(90);
-    this->insert(100);
-    this->insert(110);
-    this->validate_all();
+    this->add(10);
+    this->add(20);
+    this->add(30);
+    this->add(90);
+    this->add(100);
+    this->add(110);
+    this->validate_all(1, 110);
 
     LOGINFO("Step 3: Truncate in-between");
-    this->truncate(92);
-    this->validate_all();
+    this->remove_upto(92);
+    this->validate_all(1, 110);
 
     LOGINFO("Step 4: Truncate empty set");
-    this->truncate(98);
-    this->validate_all();
+    this->remove_upto(98);
+    this->validate_all(1, 110);
 
     LOGINFO("Step 5: Restart homestore and validate recovery");
     this->start_homestore(true /* restart */);
-    this->validate_all();
+    this->validate_all(1, 110);
 
     LOGINFO("Step 6: Post restart insert after truncated lsn");
-    this->insert(99);
-    this->insert(101);
-    this->insert(105);
+    this->add(105);
+    this->add(99);
+    this->add(101);
+    this->validate_all(1, 110);
 
     this->shutdown();
 }
 
-SISL_OPTIONS_ENABLE(logging, test_home_local_journal)
-SISL_OPTION_GROUP(test_home_local_journal,
+SISL_OPTIONS_ENABLE(logging, test_home_sm_store)
+SISL_OPTION_GROUP(test_home_sm_store,
                   (num_threads, "", "num_threads", "number of threads",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
                   (num_devs, "", "num_devs", "number of devices to create",
@@ -215,7 +200,7 @@ SISL_OPTION_GROUP(test_home_local_journal,
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_home_local_journal);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_home_sm_store);
     sisl::logging::SetLogger("test_home_local_journal");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 

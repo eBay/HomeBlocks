@@ -28,6 +28,9 @@
 
 namespace home_replication {
 
+using store_lsn_t = int64_t;
+using repl_lsn_t = int64_t;
+
 class HomeRaftLogStore : public nuraft::log_store {
 public:
     explicit HomeRaftLogStore(homestore::logstore_id_t logstore_id = UINT32_MAX);

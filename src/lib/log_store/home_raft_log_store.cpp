@@ -34,6 +34,10 @@ SISL_LOGGING_DECL(home_replication)
                         msg, ##__VA_ARGS__);
 
 namespace home_replication {
+static constexpr store_lsn_t to_store_lsn(uint64_t raft_lsn) { return s_cast< store_lsn_t >(raft_lsn) - 1; }
+static constexpr store_lsn_t to_store_lsn(repl_lsn_t repl_lsn) { return repl_lsn - 1; }
+static constexpr repl_lsn_t to_repl_lsn(store_lsn_t store_lsn) { return store_lsn + 1; }
+
 static nuraft::ptr< nuraft::log_entry > to_nuraft_log_entry(const homestore::log_buffer& log_bytes) {
     uint8_t* raw_ptr = log_bytes.bytes();
     uint64_t term = *r_cast< uint64_t* >(raw_ptr);
@@ -82,23 +86,22 @@ void HomeRaftLogStore::on_store_created(std::shared_ptr< HomeLogStore > log_stor
 }
 
 ulong HomeRaftLogStore::next_slot() const {
-    // Since logstore tracks from 0, raft logstore tracks from 1, we need to increment by 2
-    uint64_t next_slot = m_log_store->get_contiguous_issued_seq_num(-1) + 2;
+    uint64_t next_slot = to_repl_lsn(m_log_store->get_contiguous_issued_seq_num(-1)) + 1;
     REPL_STORE_LOG(DEBUG, "next_slot()={}", next_slot);
     return next_slot;
 }
 
 ulong HomeRaftLogStore::start_index() const {
     // start_index starts from 1.
-    ulong start_index = std::max((int64_t)1, m_log_store->truncated_upto() + 2);
+    ulong start_index = std::max((repl_lsn_t)1, to_repl_lsn(m_log_store->truncated_upto()) + 1);
     REPL_STORE_LOG(DEBUG, "start_index()={}", start_index);
     return start_index;
 }
 
 nuraft::ptr< nuraft::log_entry > HomeRaftLogStore::last_entry() const {
-    int64_t max_seq = m_log_store->get_contiguous_issued_seq_num(-1);
-    REPL_STORE_LOG(DEBUG, "last_entry() seqnum={}", max_seq);
-    if (max_seq == -1) { return m_dummy_log_entry; }
+    store_lsn_t max_seq = m_log_store->get_contiguous_issued_seq_num(-1);
+    REPL_STORE_LOG(DEBUG, "last_entry() store seqnum={}", max_seq);
+    if (max_seq < 0) { return m_dummy_log_entry; }
 
     nuraft::ptr< nuraft::log_entry > nle;
     try {
@@ -120,11 +123,11 @@ ulong HomeRaftLogStore::append(nuraft::ptr< nuraft::log_entry >& entry) {
     auto next_seq = m_log_store->append_async(
         sisl::io_blob{entry_buf->data_begin(), uint32_cast(entry_buf->size()), false /* is_aligned */},
         nullptr /* cookie */, [entry_buf](int64_t, sisl::io_blob&, homestore::logdev_key, void*) {});
-    return next_seq + 1;
+    return to_repl_lsn(next_seq);
 }
 
 void HomeRaftLogStore::write_at(ulong index, nuraft::ptr< nuraft::log_entry >& entry) {
-    m_log_store->rollback_async(index - 2, nullptr);
+    m_log_store->rollback_async(to_store_lsn(index) - 1, nullptr);
     append(entry);
 }
 
@@ -134,18 +137,19 @@ void HomeRaftLogStore::end_of_append_batch([[maybe_unused]] ulong start, [[maybe
 
 nuraft::ptr< std::vector< nuraft::ptr< nuraft::log_entry > > > HomeRaftLogStore::log_entries(ulong start, ulong end) {
     auto out_vec = std::make_shared< std::vector< nuraft::ptr< nuraft::log_entry > > >();
-    m_log_store->foreach (start - 1, [end, &out_vec](int64_t cur, const homestore::log_buffer& entry) -> bool {
-        bool ret = (cur < int64_cast(end - 2));
-        if (cur < int64_cast(end - 1)) { out_vec->emplace_back(to_nuraft_log_entry(entry)); }
-        return ret;
-    });
+    m_log_store->foreach (to_store_lsn(start),
+                          [end, &out_vec](store_lsn_t cur, const homestore::log_buffer& entry) -> bool {
+                              bool ret = (cur < to_store_lsn(end) - 1);
+                              if (cur < to_store_lsn(end)) { out_vec->emplace_back(to_nuraft_log_entry(entry)); }
+                              return ret;
+                          });
     return out_vec;
 }
 
 nuraft::ptr< nuraft::log_entry > HomeRaftLogStore::entry_at(ulong index) {
     nuraft::ptr< nuraft::log_entry > nle;
     try {
-        auto log_bytes = m_log_store->read_sync(index - 1);
+        auto log_bytes = m_log_store->read_sync(to_store_lsn(index));
         nle = to_nuraft_log_entry(log_bytes);
     } catch (const std::exception& e) {
         REPL_STORE_LOG(ERROR, "entry_at({}) index out_of_range", index);
@@ -157,7 +161,7 @@ nuraft::ptr< nuraft::log_entry > HomeRaftLogStore::entry_at(ulong index) {
 ulong HomeRaftLogStore::term_at(ulong index) {
     ulong term;
     try {
-        auto log_bytes = m_log_store->read_sync(index - 1);
+        auto log_bytes = m_log_store->read_sync(to_store_lsn(index));
         term = extract_term(log_bytes);
     } catch (const std::exception& e) {
         REPL_STORE_LOG(ERROR, "term_at({}) index out_of_range", index);
@@ -180,8 +184,8 @@ nuraft::ptr< nuraft::buffer > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
     out_buf->put(cnt);
 
     int32_t remain_cnt = cnt;
-    m_log_store->foreach (int64_cast(index - 1),
-                          [this, &out_buf, &remain_cnt]([[maybe_unused]] int64_t cur,
+    m_log_store->foreach (to_store_lsn(index),
+                          [this, &out_buf, &remain_cnt]([[maybe_unused]] store_lsn_t cur,
                                                         const homestore::log_buffer& entry) mutable -> bool {
                               if (remain_cnt-- > 0) {
                                   size_t avail_size = out_buf->size() - out_buf->pos();
@@ -189,8 +193,8 @@ nuraft::ptr< nuraft::buffer > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
                                       avail_size += std::max(out_buf->size() * 2, (size_t)entry.size());
                                       out_buf = nuraft::buffer::expand(*out_buf, avail_size);
                                   }
-                                  REPL_STORE_LOG(TRACE, "packing lsn={} of size={}, avail_size in buffer={}", cur + 1,
-                                                 entry.size(), avail_size);
+                                  REPL_STORE_LOG(TRACE, "packing lsn={} of size={}, avail_size in buffer={}",
+                                                 to_repl_lsn(cur), entry.size(), avail_size);
                                   out_buf->put(entry.bytes(), entry.size());
                               }
                               return (remain_cnt > 0);
@@ -205,14 +209,14 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
     auto slot = next_slot();
     if (index < slot) {
         // We are asked to apply/insert data behind next slot, so we must rollback before index and then append
-        m_log_store->rollback_async(index - 2, nullptr);
+        m_log_store->rollback_async(to_store_lsn(index) - 1, nullptr);
     } else if (index > slot) {
         // We are asked to apply/insert data after next slot, so we need to fill in with dummy entries upto the slot
         // before append the entries
         REPL_STORE_LOG(WARN,
                        "RaftLogStore is asked to apply pack on lsn={}, but current lsn={} is behind, will be filling "
                        "with dummy data to make it functional, however, this could result in inconsistent data",
-                       index, slot - 1);
+                       index, to_store_lsn(slot));
         while (index++ < slot) {
             append(m_dummy_log_entry);
         }
@@ -223,21 +227,21 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
         auto* entry = const_cast< nuraft::byte* >(pack.get_bytes(entry_len));
         [[maybe_unused]] auto store_sn =
             m_log_store->append_async(sisl::io_blob{entry, uint32_cast(entry_len), false}, nullptr, nullptr);
-        REPL_STORE_LOG(TRACE, "unpacking nth_entry={} of size={}, lsn={}", i + 1, entry_len, store_sn + 1);
+        REPL_STORE_LOG(TRACE, "unpacking nth_entry={} of size={}, lsn={}", i + 1, entry_len, to_repl_lsn(store_sn));
     }
-    m_log_store->flush_sync(index + num_entries - 2);
+    m_log_store->flush_sync(to_store_lsn(index) + num_entries - 1);
 }
 
 bool HomeRaftLogStore::compact(ulong compact_lsn) {
     auto cur_max_lsn = m_log_store->get_contiguous_issued_seq_num(-1);
-    if (cur_max_lsn < int64_cast(compact_lsn - 1)) {
+    if (cur_max_lsn < to_store_lsn(compact_lsn)) {
         // We need to fill the remaining entries with dummy data.
-        for (auto lsn{cur_max_lsn + 1}; lsn <= int64_cast(compact_lsn - 1); ++lsn) {
+        for (auto lsn{cur_max_lsn + 1}; lsn <= to_store_lsn(compact_lsn); ++lsn) {
             append(m_dummy_log_entry);
         }
     }
-    m_log_store->flush_sync(compact_lsn - 1);
-    m_log_store->truncate(compact_lsn - 1);
+    m_log_store->flush_sync(to_store_lsn(compact_lsn));
+    m_log_store->truncate(to_store_lsn(compact_lsn));
     return true;
 }
 

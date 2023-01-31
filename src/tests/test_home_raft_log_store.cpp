@@ -36,7 +36,7 @@ static std::string gen_random_string(size_t len, uint64_t preamble = std::numeri
     return str;
 }
 
-static const std::string s_fpath_root{"/tmp/log_store_dev_"};
+static const std::string s_fpath_root{"/tmp/home_raft_log_store"};
 
 static void remove_files(uint32_t ndevices) {
     for (uint32_t i{0}; i < ndevices; ++i) {

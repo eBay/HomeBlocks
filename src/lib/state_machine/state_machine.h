@@ -1,19 +1,31 @@
 #pragma once
 
-#include <home_replication/repl_service.h>
 #include <libnuraft/nuraft.hxx>
-#include "storage/storage_engine.h"
 
 namespace home_replication {
+class ReplicaSet;
+class StateMachineStore;
 
-typedef std::shared_ptr< ReplicaStateMachine > rs_sm_ptr_t;
+#define RS_LOG(level, msg, ...) _RS_LOG(level, m_group_id, msg, ##__VA_ARGS__)
+#define SM_LOG(level, msg, ...) _RS_LOG(level, m_rs->m_group_id, msg, ##__VA_ARGS__)
+#define _RS_LOG(level, group_id, msg, ...)                                                                             \
+    LOG##level##MOD_FMT(home_replication, ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {   \
+                            fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                          \
+                                            fmt::make_format_args(file_name(__FILE__), __LINE__));                     \
+                            fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                          \
+                                            fmt::make_format_args("rs", group_id));                                    \
+                            fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                               \
+                                            fmt::make_format_args(std::forward< decltype(args) >(args)...));           \
+                            return true;                                                                               \
+                        }),                                                                                            \
+                        msg, ##__VA_ARGS__);
 
 class ReplicaStateMachine : public nuraft::state_machine {
 public:
-    ReplicaStateMachine(const rs_sm_ptr_t& state_store);
+    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs);
     ~ReplicaStateMachine() override = default;
-    ReplicaStateMachine(hr_state_machine const&) = delete;
-    ReplicaStateMachine& operator=(hr_state_machine const&) = delete;
+    ReplicaStateMachine(ReplicaStateMachine const&) = delete;
+    ReplicaStateMachine& operator=(ReplicaStateMachine const&) = delete;
 
     /// NuRaft overrides
     uint64_t last_commit_index() override;
@@ -27,6 +39,7 @@ public:
 
 private:
     std::shared_ptr< StateMachineStore > m_state_store;
+    ReplicaSet* m_rs;
 };
 
 } // namespace home_replication
