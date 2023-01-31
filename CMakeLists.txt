@@ -29,6 +29,8 @@ if (CCACHE_FOUND)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif ()
 
+enable_testing()
+
 # add conan information 
 add_flags("-DPACKAGE_NAME=${PROJECT_NAME}")
 if (DEFINED CONAN_PACKAGE_VERSION)
