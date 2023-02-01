@@ -2,16 +2,7 @@
 #include <boost/uuid/uuid.hpp>
 #include <sisl/utility/enum.hpp>
 #include <sisl/fds/buffer.hpp>
-
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#endif
-#include <libnuraft/nuraft.hxx>
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic pop
-#endif
-#undef auto_lock
+#include <home_replication/repl_decls.h>
 
 namespace home_replication {
 VENUM(journal_type_t, uint16_t, DATA = 0);
@@ -44,7 +35,9 @@ struct repl_req {
     sisl::sg_list value;
     void* user_ctx;
     int64_t lsn{0};
-    nuraft::ptr< nuraft::buffer > journal_entry; // This should be the last in the entry as data is followed by this
+    raft_buf_ptr_t journal_entry;
+    bool is_data_written{false};
+    bool is_data_replicated{false};
 };
 
 } // namespace home_replication

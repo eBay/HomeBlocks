@@ -58,6 +58,7 @@ private:
     mutable folly::SharedMutexWritePriority m_sb_lock;           // Lock to protect staged sb and persisting sb
     home_rs_superblk m_sb_in_mem;                                // Cached version which is used to read and for staging
     std::atomic< repl_lsn_t > m_last_write_lsn{0};               // LSN which was lastly written, to track flushes
+    repl_lsn_t m_last_flushed_commit_lsn{0};
 };
 
 } // namespace home_replication

@@ -119,7 +119,7 @@ ulong HomeRaftLogStore::append(nuraft::ptr< nuraft::log_entry >& entry) {
     REPL_STORE_LOG(TRACE, "append entry term={}, log_val_type={} size={}", entry->get_term(), entry->get_val_type(),
                    entry->get_buf().size());
 
-    nuraft::ptr< nuraft::buffer > entry_buf = entry->serialize();
+    raft_buf_ptr_t entry_buf = entry->serialize();
     auto next_seq = m_log_store->append_async(
         sisl::io_blob{entry_buf->data_begin(), uint32_cast(entry_buf->size()), false /* is_aligned */},
         nullptr /* cookie */, [entry_buf](int64_t, sisl::io_blob&, homestore::logdev_key, void*) {});
@@ -170,7 +170,7 @@ ulong HomeRaftLogStore::term_at(ulong index) {
     return term;
 }
 
-nuraft::ptr< nuraft::buffer > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
+raft_buf_ptr_t HomeRaftLogStore::pack(ulong index, int32_t cnt) {
     static constexpr size_t estimated_record_size = 128;
     size_t estimated_size = cnt * estimated_record_size + sizeof(uint32_t);
 
@@ -180,7 +180,7 @@ nuraft::ptr< nuraft::buffer > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
     // | log length (X)     4 bytes
     // | log data           X bytes
     // +--- repeat N
-    nuraft::ptr< nuraft::buffer > out_buf = nuraft::buffer::alloc(estimated_size);
+    raft_buf_ptr_t out_buf = nuraft::buffer::alloc(estimated_size);
     out_buf->put(cnt);
 
     int32_t remain_cnt = cnt;

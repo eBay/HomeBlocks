@@ -14,16 +14,7 @@
  *********************************************************************************/
 #pragma once
 
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#endif
-#include <libnuraft/nuraft.hxx>
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic pop
-#endif
-#undef auto_lock
-
+#include <home_replication/repl_decls.h>
 #include <homestore/logstore_service.hpp>
 
 namespace home_replication {
@@ -123,7 +114,7 @@ public:
      * @param cnt The number of logs to pack.
      * @return log pack
      */
-    virtual nuraft::ptr< nuraft::buffer > pack(ulong index, int32_t cnt) override;
+    virtual raft_buf_ptr_t pack(ulong index, int32_t cnt) override;
 
     /**
      * Apply the log pack to current log store, starting from index.

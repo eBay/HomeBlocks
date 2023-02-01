@@ -36,6 +36,8 @@ HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set
     m_sb.write();
     m_sb_in_mem = *m_sb;
     SM_STORE_LOG(DEBUG, "New free pba record logstore={} created", m_sb->free_pba_store_id);
+
+    start_sb_flush_timer();
 }
 
 HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb) :
@@ -47,7 +49,11 @@ HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_
     homestore::logstore_service().open_log_store(homestore::LogStoreService::CTRL_LOG_FAMILY_IDX,
                                                  m_sb->free_pba_store_id, true,
                                                  bind_this(HomeStateMachineStore::on_store_created, 1));
+
+    start_sb_flush_timer();
 }
+
+HomeStateMachineStore::~HomeStateMachineStore() { stop_sb_flush_timer(); }
 
 void HomeStateMachineStore::on_store_created(std::shared_ptr< homestore::HomeLogStore > free_pba_store) {
     assert(m_sb->free_pba_store_id == free_pba_store->get_store_id());
@@ -62,6 +68,7 @@ void HomeStateMachineStore::destroy() {
     homestore::logstore_service().remove_log_store(homestore::LogStoreService::CTRL_LOG_FAMILY_IDX,
                                                    m_sb->free_pba_store_id);
     m_free_pba_store.reset();
+    stop_sb_flush_timer();
 }
 
 pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t) {
@@ -79,6 +86,7 @@ void HomeStateMachineStore::free_pba(pba_t) {
     // TODO: Implementation pending
 }
 
+//////////////// StateMachine Superblock/commit update section /////////////////////////////
 void HomeStateMachineStore::commit_lsn(repl_lsn_t lsn) {
     folly::SharedMutexWritePriority::ReadHolder holder(m_sb_lock);
     m_sb_in_mem.commit_lsn = lsn;
@@ -89,6 +97,35 @@ repl_lsn_t HomeStateMachineStore::get_last_commit_lsn() const {
     return m_sb_in_mem.commit_lsn;
 }
 
+void HomeStateMachineStore::start_sb_flush_timer() {
+    iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
+        m_sb_flush_timer_hdl =
+            iomanager.schedule_thread_timer(RS_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring */,
+                                            nullptr, [this](void* cookie) { flush_super_block(); });
+    });
+}
+
+void HomeStateMachineStore::stop_sb_flush_timer() {
+    if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(m_sb_flush_timer_hdl);
+        m_sb_flush_timer_hdl = iomanagr.null_timer_handle;
+    }
+}
+
+void HomeStateMachineStore::flush_super_block() {
+    bool do_flush{false};
+    {
+        folly::SharedMutexWritePriority::WriteHolder holder(m_sb_lock);
+        if (m_sb_in_mem.commit_lsn > m_last_flushed_commit_lsn) {
+            *m_sb = m_sb_in_mem;
+            do_flush = true;
+        }
+    }
+
+    if (do_flush) { m_sb.write(); }
+}
+
+//////////////// Free PBA Record section /////////////////////////////
 void HomeStateMachineStore::add_free_pba_record(repl_lsn_t lsn, const pba_list_t& pbas) {
     // Serialize it as
     // # num pbas (N)       4 bytes

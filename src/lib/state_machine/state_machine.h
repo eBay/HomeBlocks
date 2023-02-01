@@ -1,6 +1,6 @@
 #pragma once
 
-#include <libnuraft/nuraft.hxx>
+#include <home_replication/repl_decls.h>
 
 namespace home_replication {
 class ReplicaSet;
@@ -29,8 +29,8 @@ public:
 
     /// NuRaft overrides
     uint64_t last_commit_index() override;
-    nuraft::ptr< nuraft::buffer > commit(uint64_t lsn, nuraft::buffer& data) override;
-    nuraft::ptr< nuraft::buffer > pre_commit(uint64_t lsn, nuraft::buffer& data) override;
+    raft_buf_ptr_t commit_ext(const nuraft::ext_op_params& params) override;
+    raft_buf_ptr_t pre_commit_ext(const nuraft::ext_op_params& params) override;
     void rollback(uint64_t lsn, nuraft::buffer& data) override;
 
     bool apply_snapshot(nuraft::snapshot&) override { return false; }

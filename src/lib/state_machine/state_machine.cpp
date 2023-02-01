@@ -13,9 +13,22 @@ ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStor
 
 uint64_t ReplicaStateMachine::last_commit_index() { return uint64_cast(m_state_store->get_last_commit_lsn()); }
 
-nuraft::ptr< nuraft::buffer > ReplicaStateMachine::commit(uint64_t log_idx, nuraft::buffer& data) {
-    SM_LOG(DEBUG, "apply_commit: {}, size: {}", log_idx, data.size());
-    // m_rs->m_listener->on_commit();
+raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::ext_op_params& params) {
+    int64_t lsn = s_cast< int64_t >(params.log_idx);
+    raft_buf_ptr_t data = params.data;
+
+    SM_LOG(DEBUG, "apply_commit: {}, size: {}", lsn, data->size());
+
+    // Pull the req from the lsn
+    auto const it = m_lsn_req_map(log_idx);
+    HS_DBG_ASSERT(it != m_lsn_req_map.cend(), "lsn req map missing lsn={}", log_idx);
+
+    const repl_req* req = it->second;
+    HS_DBG_ASSERT_EQ(log_idx, uint64_cast(req - lsn), "lsn req map mismatch");
+
+    req->is_data_replicated = true;
+    m_rs->handle_completion_activity(req);
+
     return nullptr;
 }
 
