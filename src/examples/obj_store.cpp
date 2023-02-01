@@ -9,7 +9,7 @@
 ///
 
 #include <sisl/options/options.h>
-#include "home_replication.h"
+#include "home_replication/repl_service.h"
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 

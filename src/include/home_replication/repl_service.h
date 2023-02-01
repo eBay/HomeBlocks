@@ -1,12 +1,13 @@
 #pragma once
 
 #include <string>
-
+#include <map>
 #include <folly/concurrency/ConcurrentHashMap.h>
-#include <nuraft_mesg/messaging_if.hpp>
 #include <sisl/logging/logging.h>
-
-#include "engine.h"
+#include <sisl/fds/buffer.hpp>
+#include <nuraft_mesg/messaging_if.hpp>
+#include <home_replication/repl_decls.h>
+#include <libnuraft/nuraft.hxx>
 
 #define HOMEREPL_LOG_MODS home_repl
 
@@ -16,15 +17,11 @@ class Journal;
 
 // Fully qualified domain pba, unique pba id across replica set
 struct fully_qualified_pba {
-    std::string& srv_id;
+    uint32_t server_id;
     pba_t pba;
 };
 
-typedef folly::small_vector< std::pair< pba_t, int64_t >, 4 > pba_lsn_list_t;
-
-enum class log_store_impl_t : uint8_t { homestore, jungle };
-enum class engine_impl_t : uint8_t { homestore, jungle, file };
-
+enum class backend_impl_t : uint8_t { homestore, jungle };
 //
 // Callbacks to be implemented by ReplicaSet users.
 //
@@ -43,11 +40,8 @@ public:
     /// @param pbas - List of pbas where data is written to the storage engine.
     /// @param ctx - User contenxt passed as part of the replica_set::write() api
     ///
-    /// @return The implementation needs to return the current list of <pba, lsn> pair that are being released as part
-    /// of the commit of the key. The life cycle of these pbas are controlled by the replica set and no longer should be
-    /// owned by the consumer/listener.
-    virtual pba_lsn_list_t on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
-                                     const pba_list_t& pbas, void* ctx) = 0;
+    virtual void on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key, const pba_list_t& pbas,
+                           void* ctx) = 0;
 
     /// @brief Called when the log entry has been received by the replica set.
     ///
@@ -89,16 +83,17 @@ public:
 };
 
 class ReplicaStateMachine;
+class StateMachineStore;
+struct repl_req;
 class ReplicaSet : public nuraft_mesg::mesg_state_mgr {
 public:
-    ReplicaSet(const std::string& group_id, const std::vector< std::string >& peer_ids, log_store_impl_t log_store_impl,
-               std::unique_ptr< ReplicaSetListener > listener);
+    friend class ReplicaStateMachine;
+    friend class ReplicationService;
+
+    ReplicaSet(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,
+               const std::shared_ptr< nuraft::log_store >& log_store);
 
     virtual ~ReplicaSet() = default;
-
-    /// @brief Add new member to the replica set, by adding to the raft group
-    /// @param to_dst_srv_id
-    virtual void add_new_member(const std::string& to_dst_srv_id);
 
     /// @brief Replicate the data to the replica set. This method goes through the following steps
     /// Step 1: Allocates pba from the storage engine to write the value into. Storage engine returns a pba_list in
@@ -115,6 +110,14 @@ public:
     /// @param user_ctx - User supplied opaque context which will be passed to listener callbacks
     virtual void write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx);
 
+    /// @brief After data is replicated and on_commit to the listener is called. the pbas are implicityly transferred to
+    /// listener. This call will transfer the ownership of pba back to the replication service. This listener should
+    /// never free the pbas on its own and should always transfer the ownership after it is no longer useful.
+    /// @param lsn - LSN of the old pba that is being transferred
+    /// @param pbas - PBAs to be transferred.
+    virtual void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas);
+
+protected:
     /// @brief Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
     /// immediately available, it reaches out to the remote replica and then fetch the data, write to the local storage
     /// engine and updates the map and then returns the local pba.
@@ -123,6 +126,19 @@ public:
     /// @return Returns Returns the local_pba
     virtual pba_t map_pba(fully_qualified_pba fq_pba);
 
+    std::shared_ptr< nuraft::state_machine > get_state_machine() override;
+
+    uint32_t get_logstore_id() const override;
+
+    void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
+
+    std::shared_ptr< nuraft::log_store > data_journal() { return m_data_journal; }
+
+    void permanent_destroy() override;
+
+    void leave() override;
+
+private:
     nuraft::ptr< nuraft::cluster_config > load_config() override;
     void save_config(const nuraft::cluster_config& config) override;
     void save_state(const nuraft::srv_state& state) override;
@@ -131,36 +147,39 @@ public:
     int32_t server_id() override;
     void system_exit(const int exit_code) override;
 
-    std::shared_ptr< ReplicaStateMachine > state_machine();
+    void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& cb_params);
 
 private:
     std::shared_ptr< ReplicaStateMachine > m_state_machine;
+    std::shared_ptr< StateMachineStore > m_state_store;
     std::unique_ptr< ReplicaSetListener > m_listener;
     std::shared_ptr< nuraft::log_store > m_data_journal;
-    std::shared_ptr< Journal > m_free_pba_journal;
-    log_store_impl_t m_log_store_impl;
     folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
+    folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
+    std::string m_group_id;
 };
+typedef std::shared_ptr< ReplicaSet > rs_ptr_t;
 
-class ReplicaStateMachine : public nuraft::state_machine {
-public:
-    nuraft::ptr< nuraft::buffer > commit(uint64_t lsn, nuraft::buffer& data) override;
-    nuraft::ptr< nuraft::buffer > pre_commit(uint64_t lsn, nuraft::buffer& data) override;
-    void rollback(uint64_t lsn, nuraft::buffer& data) override;
-
-    bool apply_snapshot(nuraft::snapshot&) override { return false; }
-    void create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) override;
-    nuraft::ptr< nuraft::snapshot > last_snapshot() override { return nullptr; }
-
-    uint64_t last_commit_index() override;
-
-private:
-};
+class ReplicationServiceBackend;
+typedef std::function< std::unique_ptr< ReplicaSetListener >(const rs_ptr_t& rs) > on_replica_set_init_t;
 
 class ReplicationService {
+    friend class HomeReplicationBackend;
+
 public:
-    ReplicationService(engine_impl_t engine_impl);
+    ReplicationService(backend_impl_t engine_impl, on_replica_set_init_t cb);
+    rs_ptr_t create_replica_set(uuid_t uuid);
+    rs_ptr_t lookup_replica_set(uuid_t uuid);
+    void iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb);
 
 private:
+    void on_replica_store_found(uuid_t uuid, const std::shared_ptr< StateMachineStore >& sm_store,
+                                const std::shared_ptr< nuraft::log_store >& log_store);
+
+private:
+    std::unique_ptr< ReplicationServiceBackend > m_backend;
+    std::mutex m_rs_map_mtx;
+    std::map< uuid_t, std::shared_ptr< ReplicaSet > > m_rs_map;
+    on_replica_set_init_t m_on_rs_init_cb;
 };
 } // namespace home_replication

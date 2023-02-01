@@ -15,6 +15,8 @@ set(COMMON_TEST_DEPS
         ${dpdk_LIBRARY_LIST}
     )
 
+include_directories (BEFORE lib/)
+include_directories (BEFORE include/)
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_subdirectory(lib)
