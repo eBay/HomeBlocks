@@ -13,8 +13,6 @@
 
 namespace home_replication {
 
-class Journal;
-
 // Fully qualified domain pba, unique pba id across replica set
 struct fully_qualified_pba {
     uint32_t server_id;
