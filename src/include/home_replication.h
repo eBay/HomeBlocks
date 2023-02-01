@@ -20,6 +20,8 @@ struct fully_qualified_pba {
     pba_t pba;
 };
 
+typedef folly::small_vector< std::pair< pba_t, int64_t >, 4 > pba_lsn_list_t;
+
 enum class log_store_impl_t : uint8_t { homestore, jungle };
 enum class engine_impl_t : uint8_t { homestore, jungle, file };
 
@@ -41,11 +43,11 @@ public:
     /// @param pbas - List of pbas where data is written to the storage engine.
     /// @param ctx - User contenxt passed as part of the replica_set::write() api
     ///
-    /// @return The implementation needs to return the current list of pbas that are being released as part of the
-    /// commit of the key. The life cycle of these pbas are controlled by the replica set and no longer should be owned
-    /// by the consumer/listener.
-    virtual pba_list_t on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key, const pba_list_t& pbas,
-                                 void* ctx) = 0;
+    /// @return The implementation needs to return the current list of <pba, lsn> pair that are being released as part
+    /// of the commit of the key. The life cycle of these pbas are controlled by the replica set and no longer should be
+    /// owned by the consumer/listener.
+    virtual pba_lsn_list_t on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                                     const pba_list_t& pbas, void* ctx) = 0;
 
     /// @brief Called when the log entry has been received by the replica set.
     ///

@@ -33,7 +33,10 @@ public:
     static void removeLogStore(homestore::logstore_id_t logstore_id);
 
     explicit HomeRaftLogStore(homestore::logstore_id_t logstore_id = UINT32_MAX);
-    virtual ~HomeRaftLogStore();
+    virtual ~HomeRaftLogStore() = default;
+
+    void create_store();
+    void on_store_created(std::shared_ptr< homestore::HomeLogStore > log_store);
 
     /**
      * The first available slot of the store, starts with 1.
@@ -57,7 +60,7 @@ public:
      * @return If no log entry exists: a dummy constant entry with
      *         value set to null and term set to zero.
      */
-    virtual ptr< nuraft::log_entry > last_entry() const override;
+    virtual nuraft::ptr< nuraft::log_entry > last_entry() const override;
 
     /**
      * Append a log entry to store
@@ -65,7 +68,7 @@ public:
      * @param entry Log entry
      * @return Log index number.
      */
-    virtual ulong append(ptr< nuraft::log_entry >& entry) override;
+    virtual ulong append(nuraft::ptr< nuraft::log_entry >& entry) override;
 
     /**
      * Overwrite a log entry at the given `index`.
@@ -73,7 +76,7 @@ public:
      * @param index Log index number to overwrite.
      * @param entry New log entry to overwrite.
      */
-    virtual void write_at(ulong index, ptr< nuraft::log_entry >& entry) override;
+    virtual void write_at(ulong index, nuraft::ptr< nuraft::log_entry >& entry) override;
 
     /**
      * Invoked after a batch of logs is written as a part of
@@ -91,7 +94,7 @@ public:
      * @param end The end log index number (exclusive).
      * @return The log entries between [start, end).
      */
-    virtual ptr< std::vector< ptr< nuraft::log_entry > > > log_entries(ulong start, ulong end) override;
+    virtual nuraft::ptr< std::vector< nuraft::ptr< nuraft::log_entry > > > log_entries(ulong start, ulong end) override;
 
     /**
      * Get the log entry at the specified log index number.
@@ -99,7 +102,7 @@ public:
      * @param index Should be equal to or greater than 1.
      * @return The log entry or null if index >= this->next_slot().
      */
-    virtual ptr< nuraft::log_entry > entry_at(ulong index) override;
+    virtual nuraft::ptr< nuraft::log_entry > entry_at(ulong index) override;
 
     /**
      * Get the term for the log entry at the specified index
@@ -118,7 +121,7 @@ public:
      * @param cnt The number of logs to pack.
      * @return log pack
      */
-    virtual ptr< buffer > pack(ulong index, int32 cnt) override;
+    virtual nuraft::ptr< nuraft::buffer > pack(ulong index, int32_t cnt) override;
 
     /**
      * Apply the log pack to current log store, starting from index.
@@ -126,7 +129,7 @@ public:
      * @param index The start log index number (inclusive).
      * @param pack
      */
-    virtual void apply_pack(ulong index, buffer& pack);
+    virtual void apply_pack(ulong index, nuraft::buffer& pack);
 
     /**
      * Compact the log store by purging all log entries,
@@ -148,8 +151,11 @@ public:
      */
     virtual bool flush() override;
 
+    homestore::logstore_id_t logstore_id() const { return m_logstore_id; }
+
 private:
     homestore::logstore_id_t m_logstore_id;
-    std::shared_ptr< homestore::HomeLogStore > m_home_log_store;
+    std::shared_ptr< homestore::HomeLogStore > m_log_store;
+    nuraft::ptr< nuraft::log_entry > m_dummy_log_entry;
 };
 } // namespace home_replication
