@@ -28,14 +28,16 @@
 
 namespace home_replication {
 
+using store_lsn_t = int64_t;
+using repl_lsn_t = int64_t;
+
 class HomeRaftLogStore : public nuraft::log_store {
 public:
-    static void removeLogStore(homestore::logstore_id_t logstore_id);
-
     explicit HomeRaftLogStore(homestore::logstore_id_t logstore_id = UINT32_MAX);
     virtual ~HomeRaftLogStore() = default;
 
     void create_store();
+    void remove_store();
     void on_store_created(std::shared_ptr< homestore::HomeLogStore > log_store);
 
     /**
