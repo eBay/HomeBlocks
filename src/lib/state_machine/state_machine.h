@@ -29,8 +29,13 @@ public:
 
     /// NuRaft overrides
     uint64_t last_commit_index() override;
+<<<<<<< HEAD
     raft_buf_ptr_t commit_ext(const nuraft::ext_op_params& params) override;
     raft_buf_ptr_t pre_commit_ext(const nuraft::ext_op_params& params) override;
+=======
+    nuraft::ptr< nuraft::buffer > commit(uint64_t lsn, nuraft::buffer& data) override;
+    nuraft::ptr< nuraft::buffer > pre_commit(uint64_t lsn, nuraft::buffer& data) override;
+>>>>>>> 0deca066d3fee8b074f5a58de265b893a3f523c1
     void rollback(uint64_t lsn, nuraft::buffer& data) override;
 
     bool apply_snapshot(nuraft::snapshot&) override { return false; }

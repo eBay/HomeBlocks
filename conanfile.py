@@ -40,7 +40,7 @@ class HomeReplicationConan(ConanFile):
         self.requires("nuraft_mesg/[~=0, include_prerelease=True]@oss/master")
         self.requires("nuraft/2.1.0")
         self.requires("homestore/[~=4, include_prerelease=True]@oss/develop")
-        self.requires("sisl/[~=8, include_prerelease=True]@oss/master")
+        self.requires("sisl/[~=9, include_prerelease=True]@oss/master")
 
         self.requires("openssl/1.1.1s", override=True)
         self.requires("zlib/1.2.12", override=True)
@@ -51,8 +51,6 @@ class HomeReplicationConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            if self.options.coverage or self.options.sanitize:
-                self.options.malloc_impl = 'libc'
 
     def build(self):
         cmake = CMake(self)
