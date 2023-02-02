@@ -18,7 +18,7 @@ struct repl_journal_entry {
 
     journal_type_t code;
     uint16_t n_pbas;
-    boost::uuids::uuid replica_id;
+    uint32_t replica_id;
     uint32_t user_header_size;
     uint32_t key_size;
     // Followed by user_header, then key, then pbas
@@ -30,14 +30,15 @@ public:
 };
 
 struct repl_req {
-    sisl::blob header;
-    sisl::blob key;
-    sisl::sg_list value;
-    void* user_ctx;
-    int64_t lsn{0};
-    raft_buf_ptr_t journal_entry;
-    bool is_data_written{false};
-    bool is_data_replicated{false};
+    sisl::blob header;                           // User header
+    sisl::blob key;                              // Key to replicate
+    sisl::sg_list value;                         // Raw value - applicable only to leader req
+    pba_list_t pbas;                             // List of pbas the value is written to
+    void* user_ctx{nullptr};                     // User context passed with replica_set::write, valie for leader only
+    int64_t lsn{0};                              // Lsn for this replication req
+    raft_buf_ptr_t journal_entry;                // Journal entry info
+    std::atomic< uint32_t > num_pbas_written{0}; // Total pbas persisted in store
+    bool is_raft_written{false};                 // Has data to raft is flushed
 };
 
 } // namespace home_replication

@@ -31,8 +31,8 @@ void ReplicaSet::write(const sisl::blob& header, const sisl::blob& key, const si
 
     // Step 4: Write the data to underlying store
     m_state_store->async_write(value, pbas, [this, req](int status, void*) {
-        req->is_data_written = true;
-        handle_completion_activity(req);
+        ++req->num_pbas_written;
+        check_and_commit(req);
     });
 
     // Step 5: Allocate and populate the journal entry
@@ -59,7 +59,7 @@ void ReplicaSet::write(const sisl::blob& header, const sisl::blob& key, const si
     param.after_precommit_ = bind_this(ReplicaSet::after_precommit_in_leader, 1);
     param.expected_term_ = 0;
     param.context_ = voidptr_cast(req);
-    // m_raft_server->append_entries_ext(*vec, param)
+    // m_raft_server->append_entries_ext(*vec, param);
     sisl::VectorPool< raft_buf_ptr_t >::free(vec);
 }
 
@@ -67,15 +67,23 @@ void ReplicaSet::after_precommit_in_leader(const nuraft::raft_server::req_ext_cb
     repl_req* req = r_cast< repl_req* >(params.context);
     auto r = m_lsn_req_map.insert(params.log_idx, req);
     HS_DBG_ASSERT_EQ(r.second, true, "lsn={} already in precommit list", params.log_idx);
+    handle_pre_commit(req);
+}
+
+void ReplicaSet::on_data_received() {}
+
+void ReplicaSet::handle_pre_commit(repl_req* req) {
+    m_listener->on_pre_commit(req->lsn, req->header, req->key, req->pbas, req->user_ctx);
+}
+
+void ReplicaSet::check_and_commit(repl_req* req) {
+    if ((req->num_pbas_written.load() == req->pbas.size()) && req->is_raft_written) {
+        m_listener->on_commit(req->lsn, req->header, req->key, req->pbas, req->user_ctx);
+    }
 }
 
 std::shared_ptr< nuraft::state_machine > ReplicaSet::get_state_machine() {
     return std::dynamic_pointer_cast< nuraft::state_machine >(m_state_machine);
 }
 
-void ReplicaSet::handle_replication_completion(repl_req* req) {
-    if (req->is_data_written && req->is_data_replicated) {
-        m_listener->on_commit(req->lsn, req->header, req->key, req->pbas, req->ctx);
-    }
-}
 } // namespace home_replication

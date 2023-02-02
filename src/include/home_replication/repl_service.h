@@ -15,6 +15,7 @@ namespace home_replication {
 
 // Fully qualified domain pba, unique pba id across replica set
 struct fully_qualified_pba {
+    fully_qualified_pba(uint32_t s, pba_t p) : server_id{s}, pba{p} {}
     uint32_t server_id;
     pba_t pba;
 };
@@ -122,7 +123,7 @@ protected:
     ///
     /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
     /// @return Returns Returns the local_pba
-    virtual pba_t map_pba(fully_qualified_pba fq_pba);
+    virtual std::pair< pba_t, bool > map_pba(fully_qualified_pba fq_pba);
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
