@@ -9,7 +9,7 @@
 #include <home_replication/repl_decls.h>
 #include <libnuraft/nuraft.hxx>
 
-#define HOMEREPL_LOG_MODS home_repl
+SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
@@ -166,6 +166,8 @@ class ReplicationService {
 
 public:
     ReplicationService(backend_impl_t engine_impl, on_replica_set_init_t cb);
+    ~ReplicationService();
+
     rs_ptr_t create_replica_set(uuid_t uuid);
     rs_ptr_t lookup_replica_set(uuid_t uuid);
     void iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb);
