@@ -4,8 +4,6 @@
 #include "service/repl_backend.h"
 #include "service/home_repl_backend.h"
 
-SISL_LOGGING_DECL(home_replication)
-
 namespace home_replication {
 ReplicationService::ReplicationService(backend_impl_t backend, on_replica_set_init_t cb) :
         m_on_rs_init_cb{std::move(cb)} {
@@ -19,6 +17,8 @@ ReplicationService::ReplicationService(backend_impl_t backend, on_replica_set_in
         throw std::runtime_error("Repl Services with jungleDB backend is unsupported yet");
     }
 }
+
+ReplicationService::~ReplicationService() = default;
 
 rs_ptr_t ReplicationService::lookup_replica_set(uuid_t uuid) {
     std::unique_lock lg(m_rs_map_mtx);
