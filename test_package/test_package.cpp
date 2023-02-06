@@ -1,5 +1,5 @@
 #include <sisl/options/options.h>
-#include <repl_service.h>
+#include <home_replication/repl_service.h>
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
