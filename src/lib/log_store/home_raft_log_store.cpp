@@ -52,7 +52,8 @@ static nuraft::ptr< nuraft::log_entry > to_nuraft_log_entry(const homestore::log
 }
 
 static uint64_t extract_term(const homestore::log_buffer& log_bytes) {
-    SEBufSerializer ss(SEBuf{log_bytes.size(), log_bytes.bytes()});
+    auto const se_buf = SEBuf{log_bytes.size(), log_bytes.bytes()};
+    SEBufSerializer ss(se_buf);
     return ss.getU64();
 }
 
