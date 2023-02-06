@@ -1,6 +1,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/fds/utils.hpp>
 #include <home_replication/repl_service.h>
+#include <home_replication/repl_set.h>
 #include "state_machine.h"
 #include "storage/storage_engine.h"
 
