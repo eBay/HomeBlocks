@@ -6,6 +6,7 @@
 
 namespace home_replication {
 VENUM(journal_type_t, uint16_t, DATA = 0);
+using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
 
 static constexpr uint16_t JOURNAL_ENTRY_MAJOR{1};
 static constexpr uint16_t JOURNAL_ENTRY_MINOR{0};
@@ -33,12 +34,13 @@ struct repl_req {
     sisl::blob header;                           // User header
     sisl::blob key;                              // Key to replicate
     sisl::sg_list value;                         // Raw value - applicable only to leader req
-    pba_list_t pbas;                             // List of pbas the value is written to
+    fq_pba_list_t remote_fq_pbas;                // List of remote pbas for the value
+    pba_list_t local_pbas;                       // List of corresponding local pbas for the value
     void* user_ctx{nullptr};                     // User context passed with replica_set::write, valie for leader only
     int64_t lsn{0};                              // Lsn for this replication req
     raft_buf_ptr_t journal_entry;                // Journal entry info
     std::atomic< uint32_t > num_pbas_written{0}; // Total pbas persisted in store
-    bool is_raft_written{false};                 // Has data to raft is flushed
+    std::atomic< bool > is_raft_written{false};  // Has data to raft is flushed
 };
 
 } // namespace home_replication

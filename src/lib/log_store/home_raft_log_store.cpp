@@ -87,7 +87,7 @@ void HomeRaftLogStore::on_store_created(std::shared_ptr< HomeLogStore > log_stor
 }
 
 ulong HomeRaftLogStore::next_slot() const {
-    uint64_t next_slot = to_repl_lsn(m_log_store->get_contiguous_issued_seq_num(-1)) + 1;
+    uint64_t next_slot = to_repl_lsn(m_log_store->get_contiguous_issued_seq_num(m_last_durable_lsn)) + 1;
     REPL_STORE_LOG(DEBUG, "next_slot()={}", next_slot);
     return next_slot;
 }
@@ -100,7 +100,7 @@ ulong HomeRaftLogStore::start_index() const {
 }
 
 nuraft::ptr< nuraft::log_entry > HomeRaftLogStore::last_entry() const {
-    store_lsn_t max_seq = m_log_store->get_contiguous_issued_seq_num(-1);
+    store_lsn_t max_seq = m_log_store->get_contiguous_issued_seq_num(m_last_durable_lsn);
     REPL_STORE_LOG(DEBUG, "last_entry() store seqnum={}", max_seq);
     if (max_seq < 0) { return m_dummy_log_entry; }
 
@@ -129,11 +129,16 @@ ulong HomeRaftLogStore::append(nuraft::ptr< nuraft::log_entry >& entry) {
 
 void HomeRaftLogStore::write_at(ulong index, nuraft::ptr< nuraft::log_entry >& entry) {
     m_log_store->rollback_async(to_store_lsn(index) - 1, nullptr);
+    // we need to reset the durable lsn, because its ok to set to lower number as it will be updated on next flush
+    // calls, but it is dangerous to set higher number.
+    m_last_durable_lsn = -1;
     append(entry);
 }
 
-void HomeRaftLogStore::end_of_append_batch([[maybe_unused]] ulong start, [[maybe_unused]] ulong cnt) {
-    // TODO: Check if we need to trigger a device flush
+void HomeRaftLogStore::end_of_append_batch(ulong start, ulong cnt) {
+    store_lsn_t end_lsn = to_store_lsn(start + cnt);
+    m_log_store->flush_sync(end_lsn);
+    m_last_durable_lsn = end_lsn;
 }
 
 nuraft::ptr< std::vector< nuraft::ptr< nuraft::log_entry > > > HomeRaftLogStore::log_entries(ulong start, ulong end) {
@@ -234,7 +239,7 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
 }
 
 bool HomeRaftLogStore::compact(ulong compact_lsn) {
-    auto cur_max_lsn = m_log_store->get_contiguous_issued_seq_num(-1);
+    auto cur_max_lsn = m_log_store->get_contiguous_issued_seq_num(m_last_durable_lsn);
     if (cur_max_lsn < to_store_lsn(compact_lsn)) {
         // We need to fill the remaining entries with dummy data.
         for (auto lsn{cur_max_lsn + 1}; lsn <= to_store_lsn(compact_lsn); ++lsn) {
@@ -251,4 +256,8 @@ bool HomeRaftLogStore::flush() {
     return true;
 }
 
+ulong HomeRaftLogStore::last_durable_index() {
+    m_last_durable_lsn = m_log_store->get_contiguous_completed_seq_num(m_last_durable_lsn);
+    return to_repl_lsn(m_last_durable_lsn);
+}
 } // namespace home_replication

@@ -1,6 +1,8 @@
 #include "home_storage_engine.h"
 #include <sisl/fds/utils.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <iomgr/iomgr_timer.hpp>
+#include "service/repl_config.h"
 
 #define SM_STORE_LOG(level, msg, ...)                                                                                  \
     LOG##level##MOD_FMT(home_replication, ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {   \
@@ -49,8 +51,6 @@ HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_
     homestore::logstore_service().open_log_store(homestore::LogStoreService::CTRL_LOG_FAMILY_IDX,
                                                  m_sb->free_pba_store_id, true,
                                                  bind_this(HomeStateMachineStore::on_store_created, 1));
-
-    start_sb_flush_timer();
 }
 
 HomeStateMachineStore::~HomeStateMachineStore() { stop_sb_flush_timer(); }
@@ -61,6 +61,8 @@ void HomeStateMachineStore::on_store_created(std::shared_ptr< homestore::HomeLog
     // m_free_pba_store->register_log_found_cb(
     //     [this](int64_t lsn, homestore::log_buffer buf, [[maybe_unused]] void* ctx) { m_entry_found_cb(lsn, buf); });
     SM_STORE_LOG(DEBUG, "Successfully opened free pba record logstore={}", m_sb->free_pba_store_id);
+
+    start_sb_flush_timer();
 }
 
 void HomeStateMachineStore::destroy() {
@@ -68,6 +70,7 @@ void HomeStateMachineStore::destroy() {
     homestore::logstore_service().remove_log_store(homestore::LogStoreService::CTRL_LOG_FAMILY_IDX,
                                                    m_sb->free_pba_store_id);
     m_free_pba_store.reset();
+    m_sb.destroy();
     stop_sb_flush_timer();
 }
 
@@ -100,15 +103,20 @@ repl_lsn_t HomeStateMachineStore::get_last_commit_lsn() const {
 void HomeStateMachineStore::start_sb_flush_timer() {
     iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
         m_sb_flush_timer_hdl =
-            iomanager.schedule_thread_timer(RS_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring */,
-                                            nullptr, [this](void* cookie) { flush_super_block(); });
+            iomanager.schedule_thread_timer(HR_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring */,
+                                            nullptr, [this](void*) { flush_super_block(); });
     });
 }
 
 void HomeStateMachineStore::stop_sb_flush_timer() {
     if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
-        iomanager.cancel_timer(m_sb_flush_timer_hdl);
-        m_sb_flush_timer_hdl = iomanagr.null_timer_handle;
+        iomanager.run_on(
+            homestore::logstore_service().truncate_thread(),
+            [this](iomgr::io_thread_addr_t) {
+                iomanager.cancel_timer(m_sb_flush_timer_hdl);
+                m_sb_flush_timer_hdl = iomgr::null_timer_handle;
+            },
+            iomgr::wait_type_t::spin);
     }
 }
 

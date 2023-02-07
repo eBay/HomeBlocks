@@ -7,20 +7,23 @@
 #include <sisl/fds/buffer.hpp>
 #include <nuraft_mesg/messaging_if.hpp>
 #include <home_replication/repl_decls.h>
+
+#if defined __clang__ or defined __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
 #include <libnuraft/nuraft.hxx>
+#if defined __clang__ or defined __GNUC__
+#pragma GCC diagnostic pop
+#endif
+#undef auto_lock
 
 SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
-// Fully qualified domain pba, unique pba id across replica set
-struct fully_qualified_pba {
-    fully_qualified_pba(uint32_t s, pba_t p) : server_id{s}, pba{p} {}
-    uint32_t server_id;
-    pba_t pba;
-};
-
 enum class backend_impl_t : uint8_t { homestore, jungle };
+
 //
 // Callbacks to be implemented by ReplicaSet users.
 //
@@ -116,17 +119,11 @@ public:
     /// @param pbas - PBAs to be transferred.
     virtual void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas);
 
-protected:
-    /// @brief Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
-    /// immediately available, it reaches out to the remote replica and then fetch the data, write to the local storage
-    /// engine and updates the map and then returns the local pba.
-    ///
-    /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
-    /// @return Returns Returns the local_pba
-    virtual std::pair< pba_t, bool > map_pba(fully_qualified_pba fq_pba);
+    bool is_leader();
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
+protected:
     uint32_t get_logstore_id() const override;
 
     void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
@@ -153,8 +150,6 @@ private:
     std::shared_ptr< StateMachineStore > m_state_store;
     std::unique_ptr< ReplicaSetListener > m_listener;
     std::shared_ptr< nuraft::log_store > m_data_journal;
-    folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
-    folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
     std::string m_group_id;
 };
 typedef std::shared_ptr< ReplicaSet > rs_ptr_t;
