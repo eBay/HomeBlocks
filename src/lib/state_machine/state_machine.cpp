@@ -3,6 +3,7 @@
 #include <sisl/fds/obj_allocator.hpp>
 #include <sisl/fds/vector_pool.hpp>
 #include <home_replication/repl_service.h>
+#include <home_replication/repl_set.h>
 #include "state_machine.h"
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
