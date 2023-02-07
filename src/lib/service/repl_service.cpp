@@ -1,6 +1,9 @@
 #include <home_replication/repl_service.h>
-#include <sisl/logging/logging.h>
+
 #include <boost/uuid/uuid_io.hpp>
+#include <sisl/logging/logging.h>
+
+#include <home_replication/repl_set.h>
 #include "service/repl_backend.h"
 #include "service/home_repl_backend.h"
 
