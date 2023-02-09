@@ -33,9 +33,9 @@ public:
 
     ////////////// Storage Writes of Data Blocks ///////////////////////
     pba_list_t alloc_pbas(uint32_t size) override;
-    void async_write(const sisl::sg_list& sgs, const pba_list_t& in_pbas, const io_completion_cb_t& cb) override;
+    void async_write(const sisl::sg_list& sgs, pba_list_t& in_pbas, const io_completion_cb_t& cb) override;
     void async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) override;
-    void free_pba(pba_t pba) override;
+    void free_pba(pba_t pba, const io_completion_cb_t& cb) override;
 
     //////////////////// Control operations ///////////////////////////////
     void destroy() override;

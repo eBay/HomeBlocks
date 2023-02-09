@@ -1,6 +1,7 @@
 #include "home_storage_engine.h"
 #include <sisl/fds/utils.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <homestore/blkdata_service.hpp>
 
 #define SM_STORE_LOG(level, msg, ...)                                                                                  \
     LOG##level##MOD_FMT(home_replication, ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {   \
@@ -64,19 +65,23 @@ void HomeStateMachineStore::destroy() {
     m_free_pba_store.reset();
 }
 
-pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t) {
-    // TODO: Implementation pending
-    return pba_list_t{};
+pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t size) { return homestore::data_service().alloc_blks(size); }
+
+void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, pba_list_t& pba_list, const io_completion_cb_t& cb) {
+    homestore::blk_alloc_hints hints;
+    std::vector< homestore::BlkId > out_blkids;
+    homestore::data_service().async_write(sgs, hints, out_blkids, cb);
+    for (auto i = 0ul; i < out_blkids.size(); ++i) {
+        pba_list.emplace_back(out_blkids[i].to_integer());
+    }
 }
 
-void HomeStateMachineStore::async_write(const sisl::sg_list&, const pba_list_t&, const io_completion_cb_t&) {
-    // TODO: Implementation pending
+void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
+    homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
 }
-void HomeStateMachineStore::async_read(pba_t, sisl::sg_list&, uint32_t, const io_completion_cb_t&) {
-    // TODO: Implementation pending
-}
-void HomeStateMachineStore::free_pba(pba_t) {
-    // TODO: Implementation pending
+
+void HomeStateMachineStore::free_pba(pba_t pba, const io_completion_cb_t& cb) {
+    homestore::data_service().async_free_blk(homestore::BlkId{pba}, cb);
 }
 
 void HomeStateMachineStore::commit_lsn(repl_lsn_t lsn) {
