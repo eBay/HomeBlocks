@@ -103,6 +103,7 @@ public:
     void shutdown(bool cleanup = true) {
         if (cleanup) { m_hsm->destroy(); }
 
+        m_hsm.reset();
         homestore::HomeStore::instance()->shutdown();
         homestore::HomeStore::reset_instance();
         iomanager.stop();

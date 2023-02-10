@@ -2,6 +2,7 @@
 
 #include <homestore/logstore_service.hpp>
 #include <homestore/superblk_handler.hpp>
+#include <iomgr/iomgr.hpp>
 #include "storage_engine.h"
 
 namespace home_replication {
@@ -29,7 +30,7 @@ class HomeStateMachineStore : public StateMachineStore {
 public:
     HomeStateMachineStore(uuid_t rs_uuid);
     HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb);
-    virtual ~HomeStateMachineStore() = default;
+    virtual ~HomeStateMachineStore();
 
     ////////////// Storage Writes of Data Blocks ///////////////////////
     pba_list_t alloc_pbas(uint32_t size) override;
@@ -51,6 +52,9 @@ public:
 
 private:
     void on_store_created(std::shared_ptr< homestore::HomeLogStore > log_store);
+    void start_sb_flush_timer();
+    void stop_sb_flush_timer();
+    void flush_super_block();
 
 private:
     std::shared_ptr< homestore::HomeLogStore > m_free_pba_store; // Logstore for storing free pba records
@@ -58,6 +62,8 @@ private:
     mutable folly::SharedMutexWritePriority m_sb_lock;           // Lock to protect staged sb and persisting sb
     home_rs_superblk m_sb_in_mem;                                // Cached version which is used to read and for staging
     std::atomic< repl_lsn_t > m_last_write_lsn{0};               // LSN which was lastly written, to track flushes
+    repl_lsn_t m_last_flushed_commit_lsn{0};
+    iomgr::timer_handle_t m_sb_flush_timer_hdl;
 };
 
 } // namespace home_replication

@@ -10,16 +10,14 @@
 
 namespace home_replication {
 
-// Fully qualified domain pba, unique pba id across replica set
-struct fully_qualified_pba {
-    uint32_t server_id;
-    pba_t pba;
-};
-
 struct repl_req;
 class ReplicaSetListener;
 class ReplicaStateMachine;
 class StateMachineStore;
+
+class ReplicaStateMachine;
+class StateMachineStore;
+struct repl_req;
 
 class ReplicaSet : public nuraft_mesg::mesg_state_mgr {
 public:
@@ -53,17 +51,13 @@ public:
     /// @param pbas - PBAs to be transferred.
     virtual void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas);
 
-protected:
-    /// @brief Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
-    /// immediately available, it reaches out to the remote replica and then fetch the data, write to the local storage
-    /// engine and updates the map and then returns the local pba.
-    ///
-    /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
-    /// @return Returns Returns the local_pba
-    virtual pba_t map_pba(fully_qualified_pba fq_pba);
+    /// @brief Checks if this replica is the leader in this replica set
+    /// @return true or false
+    bool is_leader();
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
+protected:
     uint32_t get_logstore_id() const override;
 
     void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
@@ -90,8 +84,6 @@ private:
     std::shared_ptr< StateMachineStore > m_state_store;
     std::unique_ptr< ReplicaSetListener > m_listener;
     std::shared_ptr< nuraft::log_store > m_data_journal;
-    folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
-    folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
     std::string m_group_id;
 };
 

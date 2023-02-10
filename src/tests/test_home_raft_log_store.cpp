@@ -56,7 +56,7 @@ static void init_files(uint32_t ndevices, uint64_t dev_size) {
 }
 
 struct pack_result_t {
-    nuraft::ptr< nuraft::buffer > actual_data;
+    raft_buf_ptr_t actual_data;
     std::vector< std::string > exp_data;
 };
 
@@ -154,7 +154,7 @@ public:
 private:
     nuraft::ptr< nuraft::log_entry > make_log(uint64_t term, uint64_t lsn) {
         auto val = gen_random_string(g_randlogsize_generator(g_re), term);
-        nuraft::ptr< nuraft::buffer > buf = nuraft::buffer::alloc(val.size() + 1);
+        raft_buf_ptr_t buf = nuraft::buffer::alloc(val.size() + 1);
         buf->put(val);
         m_shadow_log[lsn - 1] = std::move(val);
         return nuraft::cs_new< nuraft::log_entry >(term, buf);

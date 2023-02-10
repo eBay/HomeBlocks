@@ -1,0 +1,10 @@
+native_include "sisl/utility/non_null_ptr.hpp";
+
+attribute "hotswap";
+attribute "deprecated";
+
+table HomeReplicationSettings {
+    commit_lsn_flush_ms: uint32 = 100 (hotswap);
+}
+
+root_type HomeReplicationSettings;

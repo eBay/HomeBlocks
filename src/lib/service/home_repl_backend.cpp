@@ -35,4 +35,8 @@ std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(
 std::shared_ptr< nuraft::log_store > HomeReplicationBackend::create_log_store() {
     return std::make_shared< ReplicaLogStore< HomeRaftLogStore > >();
 }
+
+void HomeReplicationBackend::link_log_store_to_replica_set(nuraft::log_store* ls, ReplicaSet* rs) {
+    r_cast< ReplicaLogStore< HomeRaftLogStore >* >(ls)->attach_replica_set(rs);
+}
 } // namespace home_replication
