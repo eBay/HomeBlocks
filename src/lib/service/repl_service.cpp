@@ -53,36 +53,41 @@ rs_ptr_t ReplicationService::lookup_replica_set(uuid_t uuid) {
     return (it == m_rs_map.end() ? nullptr : it->second);
 }
 
-rs_ptr_t ReplicationService::create_replica_set(uuid_t uuid) {
-    if (auto rs = lookup_replica_set(uuid); rs != nullptr) { return rs; }
+rs_ptr_t ReplicationService::create_replica_set(uuid_t const uuid) {
+    auto it = m_rs_map.end();
+    bool happened = false;
+
+    {
+        std::unique_lock lg(m_rs_map_mtx);
+        std::tie(it, happened) = m_rs_map.emplace(std::make_pair(uuid, nullptr));
+    }
+    DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
+    if (!happened) return it->second;
 
     auto log_store = m_backend->create_log_store();
-    auto rs =
+    it->second =
         std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), m_backend->create_state_store(uuid), log_store);
-    {
-        std::unique_lock lg(m_rs_map_mtx);
-        m_rs_map.insert(std::make_pair(uuid, rs));
-    }
-    rs->attach_listener(std::move(m_on_rs_init_cb(rs)));
-    m_backend->link_log_store_to_replica_set(log_store.get(), rs.get());
-    return rs;
+    it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
+    m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
+    return it->second;
 }
 
-void ReplicationService::on_replica_store_found(uuid_t uuid, const std::shared_ptr< StateMachineStore >& sm_store,
+void ReplicationService::on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
                                                 const std::shared_ptr< nuraft::log_store >& log_store) {
-    if (lookup_replica_set(uuid) != nullptr) {
-        assert(0);
-        LOGDEBUG("Attempting to create replica set instance with already existing uuid={}",
-                 boost::uuids::to_string(uuid));
-    }
+    auto it = m_rs_map.end();
+    bool happened = false;
 
-    auto rs = std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
     {
         std::unique_lock lg(m_rs_map_mtx);
-        m_rs_map.insert(std::make_pair(uuid, rs));
+        std::tie(it, happened) = m_rs_map.emplace(std::make_pair(uuid, nullptr));
     }
-    rs->attach_listener(std::move(m_on_rs_init_cb(rs)));
-    m_backend->link_log_store_to_replica_set(log_store.get(), rs.get());
+    DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
+    if (!happened) return;
+
+    it->second =
+        std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
+    it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
+    m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
 }
 
 void ReplicationService::iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb) {
