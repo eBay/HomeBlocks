@@ -72,11 +72,11 @@ public:
     void free_pba(pba_t pba) override;
 
     /**
-     * @brief
+     * @brief : get the size of this pba;
      *
-     * @param pba
+     * @param pba : pba of which to map size with;
      *
-     * @return
+     * @return : size of the pba;
      */
     uint32_t pba_to_size(pba_t pba) const override;
 
