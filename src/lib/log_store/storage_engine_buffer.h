@@ -16,7 +16,7 @@ struct SEBuf {
     /**
      * Empty buffer.
      */
-    SEBuf() : len(0), buf(nullptr) {}
+    SEBuf() = default;
 
     /**
      * Reference to given address.
@@ -96,8 +96,8 @@ struct SEBuf {
         if (len) { memcpy(dst.buf, buf, len); }
     }
 
-    size_t len;
-    void* buf;
+    size_t len {0};
+    void* buf {nullptr};
 
     /**
      * To easily free buffer (to avoid memory leak by mistake),

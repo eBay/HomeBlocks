@@ -14,6 +14,9 @@
  *********************************************************************************/
 #pragma once
 
+#include <home_replication/repl_decls.h>
+#include <homestore/logstore_service.hpp>
+
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -24,12 +27,11 @@
 #endif
 #undef auto_lock
 
-#include <homestore/logstore_service.hpp>
-
 namespace home_replication {
 
 using store_lsn_t = int64_t;
 using repl_lsn_t = int64_t;
+using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
 
 class HomeRaftLogStore : public nuraft::log_store {
 public:
@@ -123,7 +125,7 @@ public:
      * @param cnt The number of logs to pack.
      * @return log pack
      */
-    virtual nuraft::ptr< nuraft::buffer > pack(ulong index, int32_t cnt) override;
+    virtual raft_buf_ptr_t pack(ulong index, int32_t cnt) override;
 
     /**
      * Apply the log pack to current log store, starting from index.
@@ -153,11 +155,22 @@ public:
      */
     virtual bool flush() override;
 
+    /**
+     * This API is used only when `raft_params::parallel_log_appending_` flag is set.
+     * Please refer to the comment of the flag.
+     *
+     * NOTE: In home_replication use cases, we use this even without parallel_log_appending_ flag is not set
+     *
+     * @return The last durable log index.
+     */
+    virtual ulong last_durable_index() override;
+
     homestore::logstore_id_t logstore_id() const { return m_logstore_id; }
 
 private:
     homestore::logstore_id_t m_logstore_id;
     std::shared_ptr< homestore::HomeLogStore > m_log_store;
     nuraft::ptr< nuraft::log_entry > m_dummy_log_entry;
+    store_lsn_t m_last_durable_lsn{-1};
 };
 } // namespace home_replication

@@ -11,4 +11,5 @@ target_sources(example_obj_store PRIVATE
         )
 target_link_libraries(example_obj_store
             home_replication
+            ${COMMON_TEST_DEPS}
         )

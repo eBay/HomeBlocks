@@ -18,7 +18,8 @@ set(COMMON_TEST_DEPS
 include_directories (BEFORE lib/)
 include_directories (BEFORE include/)
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
 add_subdirectory(lib)
-add_subdirectory(examples)
+#add_subdirectory(examples)
 add_subdirectory(tests)
