@@ -14,6 +14,7 @@ namespace home_replication {
 class ReplicationServiceBackend;
 
 enum class backend_impl_t : uint8_t { homestore, jungle };
+
 //
 // Callbacks to be implemented by ReplicaSet users.
 //
