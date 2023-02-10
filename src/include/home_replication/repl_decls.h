@@ -8,7 +8,7 @@
 
 SISL_LOGGING_DECL(home_replication)
 
-#define HOMEREPL_LOG_MODS HOMESTORE_LOG_MODS, home_replication
+#define HOMEREPL_LOG_MODS grpc_server, HOMESTORE_LOG_MODS, nuraft_mesg, nuraft, home_replication
 
 namespace home_replication {
 using pba_t = uint64_t;
