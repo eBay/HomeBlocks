@@ -67,21 +67,29 @@ void HomeStateMachineStore::destroy() {
 
 pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t size) { return homestore::data_service().alloc_blks(size); }
 
-void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, pba_list_t& pba_list, const io_completion_cb_t& cb) {
+void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list_t& in_pba_list,
+                                        const io_completion_cb_t& cb) {
     homestore::blk_alloc_hints hints;
-    std::vector< homestore::BlkId > out_blkids;
-    homestore::data_service().async_write(sgs, hints, out_blkids, cb);
-    for (auto i = 0ul; i < out_blkids.size(); ++i) {
-        pba_list.emplace_back(out_blkids[i].to_integer());
+    static thread_local std::vector< homestore::BlkId > out_blkids;
+    out_blkids.clear();
+
+    for (const auto& pba : in_pba_list) {
+        out_blkids.emplace_back(homestore::BlkId{pba});
     }
+
+    homestore::data_service().async_write_ahead(sgs, hints, out_blkids, cb);
 }
 
 void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
     homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
 }
 
-void HomeStateMachineStore::free_pba(pba_t pba, const io_completion_cb_t& cb) {
-    homestore::data_service().async_free_blk(homestore::BlkId{pba}, cb);
+uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
+    return homestore::BlkId{pba}.get_nblks() * homestore::data_service().get_page_size();
+}
+
+void HomeStateMachineStore::free_pba(pba_t pba) {
+    homestore::data_service().async_free_blk(homestore::BlkId{pba}, [](std::error_condition err) { assert(!err); });
 }
 
 void HomeStateMachineStore::commit_lsn(repl_lsn_t lsn) {

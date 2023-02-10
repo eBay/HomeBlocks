@@ -216,6 +216,19 @@ public:
                                            free_sg_buf(sg_read);
 
                                            LOGINFO("Step 4: started async_free_blk: {}", free_bid.to_string());
+#if 1
+                                           m_hsm->free_pba(free_bid.to_integer());
+
+                                           // it is fine to declair job done here as we know there is no read pending on
+                                           // this free blk and free should be done in sync mode;
+                                           {
+                                               std::lock_guard lk(this->m_mtx);
+                                               this->m_io_job_done = true;
+                                           }
+
+                                           this->m_cv.notify_one();
+#endif
+#if 0
                                            m_hsm->free_pba(
                                                free_bid.to_integer(), [this, free_bid](std::error_condition err) {
                                                    LOGINFO("completed async_free_blk: {}", free_bid.to_string());
@@ -227,6 +240,7 @@ public:
 
                                                    this->m_cv.notify_one();
                                                });
+#endif
                                        });
                  });
     }
@@ -254,6 +268,10 @@ private:
         }
 
         std::shared_ptr< pba_list_t > out_bids_ptr = std::make_shared< pba_list_t >();
+        const auto pba_list = m_hsm->alloc_pbas(io_size);
+        for (const auto& p : pba_list) {
+            out_bids_ptr->emplace_back(p);
+        }
 
         m_hsm->async_write(*(sg.get()), *(out_bids_ptr.get()),
                            [sg, this, after_write_cb, out_bids_ptr](std::error_condition err) {

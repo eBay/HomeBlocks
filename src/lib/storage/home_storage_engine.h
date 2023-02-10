@@ -32,10 +32,53 @@ public:
     virtual ~HomeStateMachineStore() = default;
 
     ////////////// Storage Writes of Data Blocks ///////////////////////
+
+    /**
+     * @brief : API to allocate physical block address(pba) based on input size
+     *
+     * @param size : io size that is required for allocation
+     *
+     * @return : a list of pbas that can fullfill the input size;
+     *
+     * Note: each pba represents a physical block address that can be used to do write.
+     * API "pba_to_size" can be called to know what is the total size that this pba represents;
+     */
     pba_list_t alloc_pbas(uint32_t size) override;
-    void async_write(const sisl::sg_list& sgs, pba_list_t& in_pbas, const io_completion_cb_t& cb) override;
+
+    /**
+     * @brief : asynchronouswrite API
+     *
+     * @param sgs : the list that contains the data content to be written
+     * @param in_pba_list : the preallocated pba list that should be used to issue write with
+     * @param cb : callback that will be called after async write completes;
+     */
+    void async_write(const sisl::sg_list& sgs, const pba_list_t& in_pba_list, const io_completion_cb_t& cb) override;
+
+    /**
+     * @brief : asynchronous read API
+     *
+     * @param pba : the pha to issue read to
+     * @param sgs : the result saved in this data buffer
+     * @param size : size to be read
+     * @param cb : callback that will be called after read completes;
+     */
     void async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) override;
-    void free_pba(pba_t pba, const io_completion_cb_t& cb) override;
+
+    /**
+     * @brief : free the pba
+     *
+     * @param pba : pba to be freed;
+     */
+    void free_pba(pba_t pba) override;
+
+    /**
+     * @brief
+     *
+     * @param pba
+     *
+     * @return
+     */
+    uint32_t pba_to_size(pba_t pba) const override;
 
     //////////////////// Control operations ///////////////////////////////
     void destroy() override;
