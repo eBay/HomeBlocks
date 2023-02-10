@@ -6,9 +6,10 @@
 #include <homestore/homestore.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include "storage/home_storage_engine.h"
+#include <home_replication/repl_decls.h>
 using namespace home_replication;
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, home_replication)
+SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
 static std::random_device g_rd{};
 static std::default_random_engine g_re{g_rd()};
