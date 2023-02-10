@@ -9,6 +9,10 @@ namespace nuraft {
 struct log_store;
 }
 
+namespace nuraft_mesg {
+class consensus_component;
+}
+
 namespace home_replication {
 
 class ReplicationServiceBackend;
@@ -82,7 +86,8 @@ class ReplicationService {
     friend class HomeReplicationBackend;
 
 public:
-    ReplicationService(backend_impl_t engine_impl, on_replica_set_init_t cb);
+    ReplicationService(backend_impl_t engine_impl, std::shared_ptr< nuraft_mesg::consensus_component > messaging,
+                       on_replica_set_init_t cb);
     ~ReplicationService();
 
     rs_ptr_t create_replica_set(uuid_t uuid);
@@ -98,5 +103,7 @@ private:
     std::mutex m_rs_map_mtx;
     std::map< uuid_t, rs_ptr_t > m_rs_map;
     on_replica_set_init_t m_on_rs_init_cb;
+
+    std::shared_ptr< nuraft_mesg::consensus_component > m_messaging;
 };
 } // namespace home_replication

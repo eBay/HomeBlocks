@@ -30,11 +30,10 @@ std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replica
 int main(int argc, char** argv) {
     SISL_OPTIONS_LOAD(argc, argv, logging, obj_store);
     sisl::logging::SetLogger(std::string(argv[0]));
-    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 
     // Configure the gRPC service parameters for this instance (TCP port, svc UUID etc.)
     auto const svc_id = to_string(boost::uuids::random_generator()());
-    LOGINFO("Setting service_id to: [{}]", svc_id);
+    LOGINFO("[{}] starting messaging service...", svc_id);
 
     auto const listen_port = SISL_OPTIONS["tcp_port"].as< uint32_t >();
     if (UINT16_MAX < listen_port) {
@@ -42,14 +41,17 @@ int main(int argc, char** argv) {
         exit(-1);
     }
 
-
     auto consensus_params = nuraft_mesg::consensus_component::params{
         svc_id, listen_port, [](std::string const& client) -> std::string { return client; }, "home_replication"};
     consensus_params.enable_data_service = true;
 
     auto consensus_instance = std::make_shared< nuraft_mesg::service >();
+    consensus_instance->start(consensus_params);
 
-    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::jungle, &on_set_init);
+    LOGINFO("Initializing replication backend...");
+    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::jungle, consensus_instance,
+                                                         &on_set_init);
 
+    LOGINFO("Exiting.");
     return 0;
 }
