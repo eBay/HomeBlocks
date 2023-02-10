@@ -232,13 +232,11 @@ public:
         params.data_devices = device_info;
         homestore::HomeStore::instance()
             ->with_params(params)
-            .with_meta_service(5.0)
-            .with_log_service(80.0, 5.0)
             .before_init_devices([this]() {
                 m_leader_store.m_rls = std::make_unique< HomeRaftLogStore >(m_leader_store.m_store_id);
                 m_follower_store.m_rls = std::make_unique< HomeRaftLogStore >(m_follower_store.m_store_id);
             })
-            .init(true /* wait_for_init */);
+            .init(true /* wait_for_init */, 5.0 /* meta_service */, 80.0 /* log_data */, 5.0 /* log_ctrl */);
 
         if (!restart) {
             m_leader_store.m_rls->create_store();

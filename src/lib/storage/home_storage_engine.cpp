@@ -70,14 +70,15 @@ pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t size) { return homestore::
 void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list_t& in_pba_list,
                                         const io_completion_cb_t& cb) {
     homestore::blk_alloc_hints hints;
-    static thread_local std::vector< homestore::BlkId > out_blkids;
-    out_blkids.clear();
+    static thread_local std::vector< homestore::BlkId > in_blkids;
+    in_blkids.clear();
 
     for (const auto& pba : in_pba_list) {
-        out_blkids.emplace_back(homestore::BlkId{pba});
+        in_blkids.emplace_back(homestore::BlkId{pba});
     }
 
-    homestore::data_service().async_write_ahead(sgs, hints, out_blkids, cb);
+    // async write with input block ids;
+    homestore::data_service().async_write(sgs, hints, in_blkids, cb);
 }
 
 void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {

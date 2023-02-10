@@ -92,9 +92,6 @@ public:
         if (ds_test) {
             homestore::HomeStore::instance()
                 ->with_params(params)
-                .with_meta_service(5.0)
-                .with_data_service(40.0)
-                .with_log_service(40.0, 5.0)
                 .before_init_devices([this]() {
                     homestore::meta_service().register_handler(
                         "replica_set",
@@ -103,13 +100,12 @@ public:
                         },
                         nullptr);
                 })
-                .init(true /* wait_for_init */);
+                .init(true /* wait_for_init */, 5.0 /* meta_service */, 40.0 /* log_data */, 5.0 /* log_ctrl */,
+                      40.0 /* data_service */);
 
         } else {
             homestore::HomeStore::instance()
                 ->with_params(params)
-                .with_meta_service(5.0)
-                .with_log_service(80.0, 5.0)
                 .before_init_devices([this]() {
                     homestore::meta_service().register_handler(
                         "replica_set",
@@ -118,7 +114,7 @@ public:
                         },
                         nullptr);
                 })
-                .init(true /* wait_for_init */);
+                .init(true /* wait_for_init */, 5.0 /* meta_service */, 80.0 /* log_data */, 5.0 /* log_ctrl */);
         }
 
         if (!restart) { m_hsm = std::make_unique< HomeStateMachineStore >(m_uuid); }
@@ -216,7 +212,7 @@ public:
                                            free_sg_buf(sg_read);
 
                                            LOGINFO("Step 4: started async_free_blk: {}", free_bid.to_string());
-#if 1
+
                                            m_hsm->free_pba(free_bid.to_integer());
 
                                            // it is fine to declair job done here as we know there is no read pending on
@@ -227,20 +223,6 @@ public:
                                            }
 
                                            this->m_cv.notify_one();
-#endif
-#if 0
-                                           m_hsm->free_pba(
-                                               free_bid.to_integer(), [this, free_bid](std::error_condition err) {
-                                                   LOGINFO("completed async_free_blk: {}", free_bid.to_string());
-                                                   assert(!err);
-                                                   {
-                                                       std::lock_guard lk(this->m_mtx);
-                                                       this->m_io_job_done = true;
-                                                   }
-
-                                                   this->m_cv.notify_one();
-                                               });
-#endif
                                        });
                  });
     }
