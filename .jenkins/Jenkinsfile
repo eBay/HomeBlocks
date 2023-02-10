@@ -94,8 +94,10 @@ pipeline {
 
         stage("Compile") {
             steps {
+/* Need some additional variants from homestore and iomgr to build this.
                 sh "conan create ${BUILD_MISSING} -o sisl:prerelease=False -o ${PROJECT}:sanitize=True -pr debug . ${PROJECT}/${TAG}"
                 sh "conan remove -f ${PROJECT}/${TAG}"
+*/
                 sh "conan create ${BUILD_MISSING} -o sisl:prerelease=True -pr debug . ${PROJECT}/${TAG}"
                 sh "conan create ${BUILD_MISSING} -o sisl:prerelease=True -pr test . ${PROJECT}/${TAG}"
                 sh "conan create ${BUILD_MISSING} -o sisl:prerelease=False -pr test . ${PROJECT}/${TAG}"
