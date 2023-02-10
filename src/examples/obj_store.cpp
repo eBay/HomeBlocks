@@ -10,11 +10,9 @@
 
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <iomgr/reactor.hpp>
-#include <homestore/homestore_decl.hpp>
 #include <home_replication/repl_service.h>
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, home_replication)
+SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
 SISL_OPTIONS_ENABLE(logging)
 

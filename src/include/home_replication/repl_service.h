@@ -2,11 +2,8 @@
 
 #include <map>
 #include <sisl/fds/buffer.hpp>
-#include <sisl/logging/logging.h>
 
 #include <home_replication/repl_set.h>
-
-SISL_LOGGING_DECL(home_replication)
 
 namespace nuraft {
 struct log_store;

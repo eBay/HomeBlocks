@@ -5,10 +5,11 @@
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
+#include <home_replication/repl_decls.h>
 
 using namespace home_replication;
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, home_replication)
+SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
 static constexpr uint32_t g_max_logsize{512};
 static std::random_device g_rd{};
