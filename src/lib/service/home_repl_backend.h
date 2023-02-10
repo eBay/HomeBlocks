@@ -11,7 +11,7 @@ class StateMachineStore;
 class HomeReplicationBackend : public ReplicationServiceBackend {
 public:
     HomeReplicationBackend(ReplicationService* svc);
-    virtual ~HomeReplicationBackend() = default;
+    ~HomeReplicationBackend() override = default;
 
     std::shared_ptr< StateMachineStore > create_state_store(uuid_t uuid) override;
     std::shared_ptr< nuraft::log_store > create_log_store() override;

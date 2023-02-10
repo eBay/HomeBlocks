@@ -58,24 +58,24 @@ public:
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
 protected:
-    uint32_t get_logstore_id() const override;
+    uint32_t get_logstore_id() const override { return 0; }
 
     void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
 
     std::shared_ptr< nuraft::log_store > data_journal() { return m_data_journal; }
 
-    void permanent_destroy() override;
+    void permanent_destroy() override {}
 
-    void leave() override;
+    void leave() override {}
 
 private:
-    nuraft::ptr< nuraft::cluster_config > load_config() override;
-    void save_config(const nuraft::cluster_config& config) override;
-    void save_state(const nuraft::srv_state& state) override;
-    nuraft::ptr< nuraft::srv_state > read_state() override;
-    nuraft::ptr< nuraft::log_store > load_log_store() override;
-    int32_t server_id() override;
-    void system_exit(const int exit_code) override;
+    nuraft::ptr< nuraft::cluster_config > load_config() override { return nullptr; }
+    void save_config(const nuraft::cluster_config& ) override {}
+    void save_state(const nuraft::srv_state& ) override {}
+    nuraft::ptr< nuraft::srv_state > read_state() override { return nullptr; }
+    nuraft::ptr< nuraft::log_store > load_log_store() override { return nullptr; }
+    int32_t server_id() override { return 0; }
+    void system_exit(const int ) override {}
 
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& cb_params);
 
