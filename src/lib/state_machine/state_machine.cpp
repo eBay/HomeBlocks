@@ -14,7 +14,9 @@ SISL_LOGGING_DECL(home_replication)
 namespace home_replication {
 
 ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
-        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
+        m_state_store{state_store},
+        m_rs{rs},
+        m_group_id{rs->m_group_id} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -36,7 +38,8 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     req->user_ctx = user_ctx;
 
     // Step 4: Write the data to underlying store
-    m_state_store->async_write(value, pbas, [this, req](int, void*) {
+    m_state_store->async_write(value, pbas, [this, req](std::error_condition err) {
+        assert(!err);
         ++req->num_pbas_written;
         check_and_commit(req);
     });

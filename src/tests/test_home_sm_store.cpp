@@ -93,6 +93,9 @@ public:
         if (ds_test) {
             homestore::HomeStore::instance()
                 ->with_params(params)
+                .with_meta_service(5.0)
+                .with_log_service(40.0, 5.0)
+                .with_data_service(40.0)
                 .before_init_devices([this]() {
                     homestore::meta_service().register_handler(
                         "replica_set",
@@ -101,12 +104,13 @@ public:
                         },
                         nullptr);
                 })
-                .init(true /* wait_for_init */, 5.0 /* meta_service */, 40.0 /* log_data */, 5.0 /* log_ctrl */,
-                      40.0 /* data_service */);
+                .init(true /* wait_for_init */);
 
         } else {
             homestore::HomeStore::instance()
                 ->with_params(params)
+                .with_meta_service(5.0)
+                .with_log_service(80.0, 5.0)
                 .before_init_devices([this]() {
                     homestore::meta_service().register_handler(
                         "replica_set",
@@ -115,7 +119,7 @@ public:
                         },
                         nullptr);
                 })
-                .init(true /* wait_for_init */, 5.0 /* meta_service */, 80.0 /* log_data */, 5.0 /* log_ctrl */);
+                .init(true /* wait_for_init */);
         }
 
         if (!restart) { m_hsm = std::make_unique< HomeStateMachineStore >(m_uuid); }
