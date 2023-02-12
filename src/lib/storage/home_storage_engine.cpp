@@ -1,6 +1,7 @@
 #include "home_storage_engine.h"
 #include <sisl/fds/utils.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <homestore/blkdata_service.hpp>
 #include <iomgr/iomgr_timer.hpp>
 #include "service/repl_config.h"
 
@@ -74,19 +75,32 @@ void HomeStateMachineStore::destroy() {
     stop_sb_flush_timer();
 }
 
-pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t) {
-    // TODO: Implementation pending
-    return pba_list_t{};
+pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t size) { return homestore::data_service().alloc_blks(size); }
+
+void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list_t& in_pba_list,
+                                        const io_completion_cb_t& cb) {
+    homestore::blk_alloc_hints hints;
+    static thread_local std::vector< homestore::BlkId > in_blkids;
+    in_blkids.clear();
+
+    for (const auto& pba : in_pba_list) {
+        in_blkids.emplace_back(homestore::BlkId{pba});
+    }
+
+    // async write with input block ids;
+    homestore::data_service().async_write(sgs, hints, in_blkids, cb);
 }
 
-void HomeStateMachineStore::async_write(const sisl::sg_list&, const pba_list_t&, const io_completion_cb_t&) {
-    // TODO: Implementation pending
+void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
+    homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
 }
-void HomeStateMachineStore::async_read(pba_t, sisl::sg_list&, uint32_t, const io_completion_cb_t&) {
-    // TODO: Implementation pending
+
+uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
+    return homestore::BlkId{pba}.get_nblks() * homestore::data_service().get_page_size();
 }
-void HomeStateMachineStore::free_pba(pba_t) {
-    // TODO: Implementation pending
+
+void HomeStateMachineStore::free_pba(pba_t pba) {
+    homestore::data_service().async_free_blk(homestore::BlkId{pba}, [](std::error_condition err) { assert(!err); });
 }
 
 //////////////// StateMachine Superblock/commit update section /////////////////////////////
