@@ -1,6 +1,8 @@
 #pragma once
 
 #include <map>
+#include <memory>
+#include <mutex>
 #include <sisl/fds/buffer.hpp>
 
 #include <home_replication/repl_set.h>
@@ -16,8 +18,36 @@ class consensus_component;
 namespace home_replication {
 
 class ReplicationServiceBackend;
+class ReplicaSetListener;
 
 enum class backend_impl_t : uint8_t { homestore, jungle };
+
+using rs_ptr_t = std::shared_ptr< ReplicaSet >;
+using on_replica_set_init_t = std::function< std::unique_ptr< ReplicaSetListener >(const rs_ptr_t& rs) >;
+
+class ReplicationService {
+    friend class HomeReplicationBackend;
+
+    std::unique_ptr< ReplicationServiceBackend > m_backend;
+    std::mutex m_rs_map_mtx;
+    std::map< uuid_t, rs_ptr_t > m_rs_map;
+    on_replica_set_init_t m_on_rs_init_cb;
+
+    std::shared_ptr< nuraft_mesg::consensus_component > m_messaging;
+
+public:
+    ReplicationService(backend_impl_t engine_impl, std::shared_ptr< nuraft_mesg::consensus_component > messaging,
+                       on_replica_set_init_t cb);
+    ~ReplicationService();
+
+    rs_ptr_t lookup_replica_set(uuid_t uuid);
+    void iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb);
+
+private:
+    rs_ptr_t create_replica_set(uuid_t const uuid);
+    void on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
+                                const std::shared_ptr< nuraft::log_store >& log_store);
+};
 
 //
 // Callbacks to be implemented by ReplicaSet users.
@@ -79,31 +109,4 @@ public:
     virtual void on_replica_stop() = 0;
 };
 
-typedef std::shared_ptr< ReplicaSet > rs_ptr_t;
-typedef std::function< std::unique_ptr< ReplicaSetListener >(const rs_ptr_t& rs) > on_replica_set_init_t;
-
-class ReplicationService {
-    friend class HomeReplicationBackend;
-
-public:
-    ReplicationService(backend_impl_t engine_impl, std::shared_ptr< nuraft_mesg::consensus_component > messaging,
-                       on_replica_set_init_t cb);
-    ~ReplicationService();
-
-    rs_ptr_t lookup_replica_set(uuid_t uuid);
-    void iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb);
-
-private:
-    rs_ptr_t create_replica_set(uuid_t const uuid);
-    void on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
-                                const std::shared_ptr< nuraft::log_store >& log_store);
-
-private:
-    std::unique_ptr< ReplicationServiceBackend > m_backend;
-    std::mutex m_rs_map_mtx;
-    std::map< uuid_t, rs_ptr_t > m_rs_map;
-    on_replica_set_init_t m_on_rs_init_cb;
-
-    std::shared_ptr< nuraft_mesg::consensus_component > m_messaging;
-};
 } // namespace home_replication

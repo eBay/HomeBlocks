@@ -1,7 +1,7 @@
 cmake_minimum_required (VERSION 3.11)
 
 # add warning options
-add_flags("-Wall -Wextra -Werror -Wpedantic")
+add_flags("-Wall -Wextra -Werror -Wno-unused-parameter")
 
 link_directories(${spdk_LIB_DIRS} ${dpdk_LIB_DIRS})
 
