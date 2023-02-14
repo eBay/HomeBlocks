@@ -8,7 +8,9 @@
 //   - REST service allows PUT/GET of simple objects to bucket-less endpoint (No-multipart, hierchy, iteration etc...)
 ///
 
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 
 #include <boost/uuid/random_generator.hpp>
 #include <iomgr/io_environment.hpp>
@@ -18,8 +20,6 @@
 #include <sisl/options/options.h>
 
 #include <home_replication/repl_service.h>
-
-static const std::string s_fpath_root{"/tmp/example_obj_store"};
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
@@ -37,23 +37,80 @@ SISL_OPTION_GROUP(obj_store,
 
 SISL_OPTIONS_ENABLE(logging, obj_store)
 
-class SetListener : public home_replication::ReplicaSetListener {
-public:
-    using home_replication::ReplicaSetListener::ReplicaSetListener;
-    ~SetListener() override = default;
+static bool s_stop_signal;
+static std::condition_variable s_stop_signal_condition;
+static std::mutex s_stop_signal_condition_lck;
 
-    void on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
-                   const home_replication::pba_list_t& pbas, void* ctx) override {}
+static const std::string s_fpath_root{"/tmp/example_obj_store"};
 
-    void on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key, void* ctx) override {}
+static void handle(int signal);
+static void start_homestore(std::string const& svc_id);
+static void stop_homestore(std::string const& svc_id);
+static std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replication::rs_ptr_t const&);
 
-    void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key, void* ctx) override {}
+int main(int argc, char** argv) {
+    SISL_OPTIONS_LOAD(argc, argv, logging, obj_store);
+    sisl::logging::SetLogger(std::string(argv[0]));
+    sisl::logging::install_crash_handler();
 
-    void on_replica_stop() override {}
-};
+    auto const listen_port = SISL_OPTIONS["tcp_port"].as< uint32_t >();
+    if (UINT16_MAX < listen_port) {
+        LOGCRITICAL("Invalid TCP port: {}", listen_port);
+        exit(-1);
+    }
 
-std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replication::rs_ptr_t const&) {
-    return std::make_unique< SetListener >();
+    s_stop_signal = false;
+    signal(SIGINT, handle);
+    signal(SIGTERM, handle);
+
+    // Start the Homestore service on some devices configured via the CLI parameters
+    auto const svc_id = to_string(boost::uuids::random_generator()());
+    LOGINFO("[{}] starting homestore service...", svc_id);
+    start_homestore(svc_id);
+
+    // Configure the gRPC service parameters for this instance (TCP port, svc UUID etc.)
+    LOGINFO("[{}] starting messaging service...", svc_id);
+    auto consensus_params = nuraft_mesg::consensus_component::params{
+        svc_id, listen_port, [](std::string const& client) -> std::string { return client; }, "home_replication"};
+    consensus_params.enable_data_service = true;
+
+    // Start the NuRaft gRPC service.
+    auto consensus_instance = std::make_shared< nuraft_mesg::service >();
+    consensus_instance->start(consensus_params);
+
+    LOGINFO("Initializing replication backend...");
+    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
+                                                         consensus_instance, &on_set_init);
+
+    // Now we wait until we are asked to terminate
+    {
+        auto lk = std::unique_lock< std::mutex >(s_stop_signal_condition_lck);
+        s_stop_signal_condition.wait(lk, [] { return s_stop_signal; });
+    }
+
+    LOGWARN("Shutting down!");
+    stop_homestore(svc_id);
+    LOGINFO("Exiting.");
+    return 0;
+}
+
+void handle(int signal) {
+    switch (signal) {
+    case SIGINT:
+        [[fallthrough]];
+    case SIGTERM: {
+        LOGWARN("SIGNAL: {}", strsignal(signal));
+        {
+            auto lk = std::lock_guard< std::mutex >(s_stop_signal_condition_lck);
+            s_stop_signal = true;
+        }
+        s_stop_signal_condition.notify_all();
+    } break;
+        ;
+    default:
+        LOGERROR("Unhandled SIGNAL: {}", strsignal(signal));
+        break;
+    }
 }
 
 void start_homestore(std::string const& svc_id) {
@@ -61,13 +118,9 @@ void start_homestore(std::string const& svc_id) {
     auto const dev_size = SISL_OPTIONS["dev_size_mb"].as< uint64_t >() * 1024 * 1024;
     auto nthreads = SISL_OPTIONS["num_threads"].as< uint32_t >();
 
-    //    if (restart) {
-    //        shutdown(false);
-    //        std::this_thread::sleep_for(std::chrono::seconds{5});
-    //    }
-
     std::vector< homestore::dev_info > device_info;
     if (SISL_OPTIONS.count("device_list")) {
+        /* if user customized file/disk names */
         auto dev_names = SISL_OPTIONS["device_list"].as< std::vector< std::string > >();
         std::string dev_list_str;
         for (const auto& d : dev_names) {
@@ -75,9 +128,7 @@ void start_homestore(std::string const& svc_id) {
         }
         LOGINFO("Taking input dev_list: {}", dev_list_str);
 
-        /* if user customized file/disk names */
         for (uint32_t i{0}; i < dev_names.size(); ++i) {
-            // const std::filesystem::path fpath{m_dev_names[i]};
             device_info.emplace_back(dev_names[i], homestore::HSDevType::Data);
         }
     } else {
@@ -106,18 +157,8 @@ void start_homestore(std::string const& svc_id) {
         ->with_params(params)
         .with_meta_service(5.0)
         .with_log_service(80.0, 5.0)
-        //        .before_init_devices([this]() {
-        //            m_leader_store.m_rls = std::make_unique< HomeRaftLogStore >(m_leader_store.m_store_id);
-        //            m_follower_store.m_rls = std::make_unique< HomeRaftLogStore >(m_follower_store.m_store_id);
-        //        })
+        // .before_init_devices([this]() { })
         .init(true /* wait_for_init */);
-
-    //    if (!restart) {
-    //        m_leader_store.m_rls->create_store();
-    //        m_follower_store.m_rls->create_store();
-    //    }
-    //    m_leader_store.m_store_id = m_leader_store.m_rls->logstore_id();
-    //    m_follower_store.m_store_id = m_follower_store.m_rls->logstore_id();
 }
 
 void stop_homestore(std::string const& svc_id) {
@@ -132,36 +173,21 @@ void stop_homestore(std::string const& svc_id) {
     }
 }
 
-int main(int argc, char** argv) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, obj_store);
-    sisl::logging::SetLogger(std::string(argv[0]));
+class SetListener : public home_replication::ReplicaSetListener {
+public:
+    using home_replication::ReplicaSetListener::ReplicaSetListener;
+    ~SetListener() override = default;
 
-    // Start the Homestore service on some devices configured via the CLI parameters
-    auto const svc_id = to_string(boost::uuids::random_generator()());
-    LOGINFO("[{}] starting homestore service...", svc_id);
-    start_homestore(svc_id);
+    void on_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                   const home_replication::pba_list_t& pbas, void* ctx) override {}
 
-    // Configure the gRPC service parameters for this instance (TCP port, svc UUID etc.)
-    LOGINFO("[{}] starting messaging service...", svc_id);
-    auto const listen_port = SISL_OPTIONS["tcp_port"].as< uint32_t >();
-    if (UINT16_MAX < listen_port) {
-        LOGCRITICAL("Invalid TCP port: {}", listen_port);
-        exit(-1);
-    }
+    void on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key, void* ctx) override {}
 
-    auto consensus_params = nuraft_mesg::consensus_component::params{
-        svc_id, listen_port, [](std::string const& client) -> std::string { return client; }, "home_replication"};
-    consensus_params.enable_data_service = true;
+    void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key, void* ctx) override {}
 
-    auto consensus_instance = std::make_shared< nuraft_mesg::service >();
-    consensus_instance->start(consensus_params);
+    void on_replica_stop() override {}
+};
 
-    LOGINFO("Initializing replication backend...");
-    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
-                                                         consensus_instance, &on_set_init);
-
-    LOGWARN("Shutting down!");
-    stop_homestore(svc_id);
-    LOGINFO("Exiting.");
-    return 0;
+std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replication::rs_ptr_t const&) {
+    return std::make_unique< SetListener >();
 }

@@ -84,8 +84,7 @@ void ReplicationService::on_replica_store_found(uuid_t const uuid, const std::sh
     DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
     if (!happened) return;
 
-    it->second =
-        std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
+    it->second = std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
     it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
     m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
 }
