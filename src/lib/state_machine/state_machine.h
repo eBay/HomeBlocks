@@ -2,6 +2,8 @@
 
 #include <vector>
 #include <functional>
+
+#include <sisl/utility/enum.hpp>
 #include <home_replication/repl_decls.h>
 
 #if defined __clang__ or defined __GNUC__
@@ -32,17 +34,17 @@ class StateMachineStore;
 
 #define RS_ASSERT_CMP(assert_type, val1, cmp, val2, ...)                                                               \
     {                                                                                                                  \
-        assert_type##_ASSERT_CMP(                                                                                      \
-            val1, cmp, val2,                                                                                           \
-            [&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                            \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
-                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
-                sisl::logging::default_cmp_assert_formatter(buf, msgcb, std::forward< decltype(args) >(args)...);      \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                                      \
-                                fmt::make_format_args("rs", m_group_id));                                              \
-                return true;                                                                                           \
-            },                                                                                                         \
-            ##__VA_ARGS__);                                                                                            \
+        assert_type##_ASSERT_CMP(val1, cmp, val2,                                                                      \
+                                 [&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {       \
+                                     fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                 \
+                                                     fmt::make_format_args(file_name(__FILE__), __LINE__));            \
+                                     sisl::logging::default_cmp_assert_formatter(                                      \
+                                         buf, msgcb, std::forward< decltype(args) >(args)...);                         \
+                                     fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                 \
+                                                     fmt::make_format_args("rs", m_group_id));                         \
+                                     return true;                                                                      \
+                                 },                                                                                    \
+                                 ##__VA_ARGS__);                                                                       \
     }
 #define RS_ASSERT(assert_type, cond, ...)                                                                              \
     {                                                                                                                  \
@@ -76,10 +78,37 @@ class StateMachineStore;
 struct repl_req;
 using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
 
+ENUM(pba_state_t, uint32_t, unknown, allocated, written, completed);
+
+using batch_completion_cb_t = std::function< void(void) >;
+
+struct pba_waiter {
+    pba_waiter(batch_completion_cb_t&& cb) : m_cb{std::move(cb)} {}
+    ~pba_waiter() { m_cb(); }
+    batch_completion_cb_t m_cb;
+};
+
+using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
+
+//
+// Requirements:
+//
+// 1. Same waiter can wait on multiple pbas,
+// 2. On pba completion (state change to "pba_state_t::cmopleted"), it deref
+// waiter by 1; and the waiter will be called when the last pba finishes its write
+// 3. Only one waiter can wait on same pba.
+// 4. Waiter can be nullptr, meaning no waiter is waiting on this pba to complete its write;
+//
+struct local_pba_info {
+    pba_t pba;
+    pba_state_t state;
+    pba_waiter_ptr waiter;
+};
+
+using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
+
 class ReplicaStateMachine : public nuraft::state_machine {
 public:
-    using batch_completion_cb_t = std::function< void(void) >;
-
     ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs);
     ~ReplicaStateMachine() override = default;
     ReplicaStateMachine(ReplicaStateMachine const&) = delete;
@@ -89,7 +118,7 @@ public:
     uint64_t last_commit_index() override;
     raft_buf_ptr_t pre_commit_ext(const nuraft::state_machine::ext_op_params& params) override;
     raft_buf_ptr_t commit_ext(const nuraft::state_machine::ext_op_params& params) override;
-    void rollback(uint64_t lsn, nuraft::buffer& ) override { LOGCRITICAL("Unimplemented rollback on: [{}]", lsn); }
+    void rollback(uint64_t lsn, nuraft::buffer&) override { LOGCRITICAL("Unimplemented rollback on: [{}]", lsn); }
 
     bool apply_snapshot(nuraft::snapshot&) override { return false; }
     void create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) override;
@@ -127,7 +156,7 @@ private:
 
 private:
     std::shared_ptr< StateMachineStore > m_state_store;
-    folly::ConcurrentHashMap< fully_qualified_pba, pba_t > m_pba_map;
+    folly::ConcurrentHashMap< fully_qualified_pba, local_pba_info_ptr > m_pba_map;
     folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
     ReplicaSet* m_rs;
     std::string m_group_id;
