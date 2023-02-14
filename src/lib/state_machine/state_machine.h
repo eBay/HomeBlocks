@@ -95,15 +95,16 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // 1. Same waiter can wait on multiple pbas,
 // 2. A pba can't be waited on multiple waiters (no waiter or one waiter);
 // 3. On each pba completion (state change to "pba_state_t::cmopleted"), it deref
-// waiter by 1 (if there is a waiter); and the waiter's cb will be called when the last pba finishes its write
+// waiter by 1 (if there is a waiter) by removing the waiter; and the waiter's cb will be called when the last pba
+// finishes its write
 // 4. Waiter can be nullptr, meaning no waiter is waiting on this pba to complete its write;
 //
 // async_fetch_write_pbas:
-// 1. if all fq_pbas are found in map (most common cases), apply waiter to all the local pbas whose state is not
-// completed, if all states are completed, trigger callback, otherwise just return, callback will be triggered after
-// last pba is completed;
-// 2. if none or part of fq_pbas can be found, wait for certain mount (MAP_PBA_WAITER_TIMER) of time to see if all of
-// the pbas can be found in map,
+// 1. if all fq_pbas are found in map (most common cases for non-resync-mode), apply waiter to all the local pbas whose
+// state is not completed, if all states are completed, trigger callback, otherwise just return, callback will be
+// triggered after last pba is completed;
+// 2. if none (resync-mode) or part of fq_pbas can be found, wait for certain mount (MAP_PBA_WAITER_TIMER) of time to
+// see if all of the pbas can be found in map,
 //     2.a if yes, go to step 1;
 //     2.b if no, apply waiters to those pbas that are not completed yet, and mark those fq_pbas that are not found in
 //     map, trigger fetch pba from remote (by calling try_map_pba, which will create entry in map with local_pba),
@@ -116,7 +117,7 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // last pba write is completd;
 //
 // try_map_pba:
-// 1. if fq_pba is found, return local_pba and true in std::pir;
+// 1. if fq_pba is found, return local_pba and true in std::pair;
 // 2. if fq_pba is not found, allocate local pbas and return to caller with false in std::pair, meaning data is not
 // filled yet, it is caller's responsibility to fill the data (via "fetch_pba_data_from_leader");
 //
