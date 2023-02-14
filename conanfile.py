@@ -65,6 +65,7 @@ class HomeReplicationConan(ConanFile):
         cmake = CMake(self)
         cmake.configure(defs=definitions)
         cmake.build()
+        cmake.test(target=test_target, output_on_failure=True)
 
     def package(self):
         lib_dir = join(self.package_folder, "lib")
