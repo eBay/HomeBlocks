@@ -92,17 +92,44 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 
 //
 // Requirements:
-//
 // 1. Same waiter can wait on multiple pbas,
-// 2. On pba completion (state change to "pba_state_t::cmopleted"), it deref
-// waiter by 1; and the waiter will be called when the last pba finishes its write
-// 3. Only one waiter can wait on same pba.
+// 2. A pba can't be waited on multiple waiters (no waiter or one waiter);
+// 3. On each pba completion (state change to "pba_state_t::cmopleted"), it deref
+// waiter by 1 (if there is a waiter); and the waiter's cb will be called when the last pba finishes its write
 // 4. Waiter can be nullptr, meaning no waiter is waiting on this pba to complete its write;
+//
+// async_fetch_write_pbas:
+// 1. if all fq_pbas are found in map (most common cases), apply waiter to all the local pbas whose state is not
+// completed, if all states are completed, trigger callback, otherwise just return, callback will be triggered after
+// last pba is completed;
+// 2. if none or part of fq_pbas can be found, wait for certain mount (MAP_PBA_WAITER_TIMER) of time to see if all of
+// the pbas can be found in map,
+//     2.a if yes, go to step 1;
+//     2.b if no, apply waiters to those pbas that are not completed yet, and mark those fq_pbas that are not found in
+//     map, trigger fetch pba from remote (by calling try_map_pba, which will create entry in map with local_pba),
+//          2.b.1 if it returns true, meaning fq_pba is found (data channel received this fq_pba after
+//          MAP_PBA_WAITER_TIMER), apply waiter to it;
+//          2.b.2 if it returns false, the local pba is newly allocated, we should call new api
+//          "fetch_pba_data_from_leader" (TODO) to fill this data to this local_pba and apply waiter on it;
+//
+// 3. at this point, local_pba for every fq_pba is created in the map, and callback should be called already or after
+// last pba write is completd;
+//
+// try_map_pba:
+// 1. if fq_pba is found, return local_pba and true in std::pir;
+// 2. if fq_pba is not found, allocate local pbas and return to caller with false in std::pair, meaning data is not
+// filled yet, it is caller's responsibility to fill the data (via "fetch_pba_data_from_leader");
+//
+// Corner case:
+// TODO: if data channel comes in to fill this fq_pba at this point, we can choose to either
+// 1. skip write and just return success or
+// 2. go ahead to fill the data on existing local_lba that was already there this operation is idomponent
+// even though data is already started to fetch from leader;
 //
 struct local_pba_info {
     pba_t pba;
     pba_state_t state;
-    pba_waiter_ptr waiter;
+    pba_waiter_ptr waiter; // only one waiter can wait on same pba; TODO: is there a case for multiple waiter?
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -134,7 +161,8 @@ public:
     /// repl_req instance. The local_pba will be immediately returned.
     ///
     /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
-    /// @return Returns Returns the local_pba
+    /// @return Returns true if local_pba is already there and state is not unknown,
+    ///         Returns false if local_pba is created and data with unknown state;
     std::pair< pba_t, bool > try_map_pba(const fully_qualified_pba& fq_pba);
 
     /// @brief First try to map the pbas if available. If not available in local map, wait for some time (based on if
