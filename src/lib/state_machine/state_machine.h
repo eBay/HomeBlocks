@@ -92,6 +92,7 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 
 //
 // Requirements:
+// 0. waiter can only be called after all the pbas are completed on write;
 // 1. Same waiter can wait on multiple pbas,
 // 2. A pba can't be waited on multiple waiters (no waiter or one waiter);
 // 3. On each pba completion (state change to "pba_state_t::cmopleted"), it deref
@@ -101,8 +102,8 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 //
 // async_fetch_write_pbas:
 // 1. if all fq_pbas are found in map (most common cases for non-resync-mode), apply waiter to all the local pbas whose
-// state is not completed, if all states are completed, trigger callback, otherwise just return, callback will be
-// triggered after last pba is completed;
+// state is not completed, if all states are completed, return false (false means no-wait, no need to trigger callback),
+// otherwise just return true (means caller needs to wait), callback will be triggered after last pba is completed;
 // 2. if none (resync-mode) or part of fq_pbas can be found, wait for certain mount (MAP_PBA_WAITER_TIMER) of time to
 // see if all of the pbas can be found in map,
 //     2.a if yes, go to step 1;
@@ -112,6 +113,8 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 //          MAP_PBA_WAITER_TIMER), apply waiter to it;
 //          2.b.2 if it returns false, the local pba is newly allocated, we should call new api
 //          "fetch_pba_data_from_leader" (TODO) to fill this data to this local_pba and apply waiter on it;
+//          - In phase 1 we can do it in current thread;
+//          - In phase 2 we might need to move it to a dedicated thread (or pool of threads) to fetch data from remote;
 //
 // 3. at this point, local_pba for every fq_pba is created in the map, and callback should be called already or after
 // last pba write is completd;
@@ -122,7 +125,8 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // filled yet, it is caller's responsibility to fill the data (via "fetch_pba_data_from_leader");
 //
 // Corner case:
-// TODO: if data channel comes in to fill this fq_pba at this point, we can choose to either
+// If data channel comes in to fill this fq_pba at this point (try_map_pba returned false - not found to caller), we can
+// choose to either:
 // 1. skip write and just return success or
 // 2. go ahead to fill the data on existing local_lba that was already there this operation is idomponent
 // even though data is already started to fetch from leader;
