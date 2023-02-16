@@ -119,6 +119,13 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // 3. at this point, local_pba for every fq_pba is created in the map, and callback should be called already or after
 // last pba write is completd;
 //
+// Assumption for try_map_pba and update_map_pba:
+// 0. two callers will call try_map_pba
+//    - async_fetch_write_pbas
+//    - data channel on data received api;
+// 1. the caller who got return value as false in std::pair should take the responsibility to call update_map_pba;
+// 2. caller who got return true in std::pair of try_map_pba should not call update_map_pba;
+//
 // try_map_pba:
 // 1. if fq_pba is found, return local_pba and true in std::pair;
 // 2. if fq_pba is not found, allocate local pbas and return to caller with false in std::pair, meaning data is not
@@ -130,6 +137,13 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // 1. skip write and just return success or
 // 2. go ahead to fill the data on existing local_lba that was already there this operation is idomponent
 // even though data is already started to fetch from leader;
+//
+// update_map_pba:
+// 1. will update from allocated to written state when write is sent;
+// 2. will update frmo written to completed state when write is completed;
+//
+// remove_map_pba:
+// 1. when truncation happens, it should remove the fq_pba from the map
 //
 struct local_pba_info {
     pba_t pba;
@@ -169,6 +183,24 @@ public:
     /// @return Returns true if local_pba is already there and state is not unknown,
     ///         Returns false if local_pba is created and data with unknown state;
     std::pair< pba_t, bool > try_map_pba(const fully_qualified_pba& fq_pba);
+
+    ///
+    /// @brief : update a fq_pba's state to the state specified by this API;
+    ///
+    /// @param pba : The fq_pba that this api wants to update its state
+    /// @param to_state : The state that will be updated to
+    ///
+    /// @return : current state before this api is called;
+    ///
+    pba_state_t update_map_pba(const fully_qualified_pba& pba, pba_state_t& to_state);
+
+    ///
+    /// @brief : remove fq_pba entry from map
+    ///
+    /// @param pba : pba that is going to be removed;
+    /// It should be called when truncation happens;
+    ///
+    void remove_map_pba(const fully_qualified_pba& pba);
 
     /// @brief First try to map the pbas if available. If not available in local map, wait for some time (based on if
     /// it is in resync mode or not) and then reach out to remote replica and fetch the actual data, write to the local
