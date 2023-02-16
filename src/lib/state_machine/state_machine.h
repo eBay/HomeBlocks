@@ -143,7 +143,7 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // 2. will update frmo written to completed state when write is completed;
 //
 // remove_map_pba:
-// 1. when truncation happens, it should remove the fq_pba from the map
+// 1. when commit is about to finish, it should remove the fq_pba from the map via this api;
 //
 struct local_pba_info {
     pba_t pba;
@@ -198,7 +198,6 @@ public:
     /// @brief : remove fq_pba entry from map
     ///
     /// @param pba : pba that is going to be removed;
-    /// It should be called when truncation happens;
     ///
     void remove_map_pba(const fully_qualified_pba& pba);
 
