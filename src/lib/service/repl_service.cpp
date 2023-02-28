@@ -54,6 +54,14 @@ rs_ptr_t ReplicationService::lookup_replica_set(uuid_t uuid) {
 }
 
 rs_ptr_t ReplicationService::create_replica_set(uuid_t const uuid) {
+    auto log_store = m_backend->create_log_store();
+    auto sm_store = m_backend->create_state_store(uuid);
+    return on_replica_store_found(uuid, sm_store, log_store);
+}
+
+rs_ptr_t ReplicationService::on_replica_store_found(uuid_t const uuid,
+                                                    const std::shared_ptr< StateMachineStore >& sm_store,
+                                                    const std::shared_ptr< nuraft::log_store >& log_store) {
     auto it = m_rs_map.end();
     bool happened = false;
 
@@ -64,29 +72,13 @@ rs_ptr_t ReplicationService::create_replica_set(uuid_t const uuid) {
     DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
     if (!happened) return it->second;
 
-    auto log_store = m_backend->create_log_store();
-    it->second =
-        std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), m_backend->create_state_store(uuid), log_store);
-    it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
-    m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
-    return it->second;
-}
-
-void ReplicationService::on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
-                                                const std::shared_ptr< nuraft::log_store >& log_store) {
-    auto it = m_rs_map.end();
-    bool happened = false;
-
-    {
-        std::unique_lock lg(m_rs_map_mtx);
-        std::tie(it, happened) = m_rs_map.emplace(std::make_pair(uuid, nullptr));
-    }
-    DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
-    if (!happened) return;
-
     it->second = std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
     it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
     m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
+    if (!it->second->register_data_service_apis(m_messaging)) {
+        // TODO: log error message
+    }
+    return it->second;
 }
 
 void ReplicationService::iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb) {

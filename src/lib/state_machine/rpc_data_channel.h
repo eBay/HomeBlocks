@@ -4,7 +4,7 @@
 
 namespace home_replication {
 
-VENUM(data_rpc_name_t, uint16_t, SEND_PBAS = 0, FETCH_PBAS = 1)
+class StateMachineStore;
 
 #pragma pack(1)
 struct data_channel_rpc_hdr {
@@ -12,12 +12,10 @@ struct data_channel_rpc_hdr {
     static constexpr uint16_t MINOR_VERSION{1};
     static constexpr uint32_t max_hdr_size{512};
 
-    uint16_t major_version{MAJOR_VERSION};
-    uint16_t minor_version{MINOR_VERSION};
-    uint32_t total_size{0};     // Total size of RPC including this rpc header
     uuid_t group_id;            // UUID of the replica set
     uint32_t issuer_replica_id; // Server ID it is initiated from
-    data_rpc_name_t rpc;        // Name of the RPC
+    uint16_t major_version{MAJOR_VERSION};
+    uint16_t minor_version{MINOR_VERSION};
 };
 #pragma pack()
 
@@ -33,45 +31,28 @@ public:
     _pba_info pinfo[0];
 
 public:
-    static pbas_serialized* serialize(const pba_list_t& pbas, uint8_t* raw_ptr) {
-        pbas_serialized* pthis = new (raw_ptr) pbas_serialized();
-        pthis->n_pbas = pbas.size();
-        for (uint16_t i{0}; i < pthis->n_pbas; ++i) {
-            pthis->pinfo[i].pba = pbas[i];
-        }
-        return pthis;
-    }
+    static pbas_serialized* serialize(const pba_list_t& pbas, StateMachineStore* store_ptr, uint8_t* raw_ptr);
 };
 #pragma pack()
 
 #pragma pack(1)
-struct send_pbas_rpc {
+struct data_rpc {
 public:
     data_channel_rpc_hdr common_hdr;
     pbas_serialized pba_area[0];
 
 public:
-    send_pbas_rpc() : common_hdr.rpc{data_rpc_name_t::SEND_PBAS} {}
-
-    sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), data_channel_rpc_hdr::max_hdr_size}; }
+    data_rpc() = default;
 
     static constexpr uint16_t max_pbas() {
-        return (data_channel_rpc_hdr::max_hdr_size - sizeof(send_pbas_rpc)) / sizeof(pbas_serialized);
+        return (data_channel_rpc_hdr::max_hdr_size - sizeof(data_rpc) - sizeof(pbas_serialized)) /
+            sizeof(pbas_serialized::_pba_info);
     }
 
-    static send_pbas_rpc* create(const pba_list_t& pbas) {
-        if (pbas.size() > max_pbas()) {
-            LOGERROR("Exceeds max number of pbas that can be sent in this rpc");
-            return nullptr;
-        }
-
-        auto* bytes = new uint8_t[data_channel_rpc_hdr::max_hdr_size];
-        send_pbas_rpc* rpc = new (bytes) send_pbas_rpc();
-        pbas_serialized::serialize(pbas, r_cast< uint8_t* >(pba_area));
-
-        return rpc;
-    }
-}
+    static sisl::io_blob_list_t serialize(const data_channel_rpc_hdr& common_header, const pba_list_t& pbas,
+                                          StateMachineStore* store_ptr, const sisl::sg_list& value);
+    static void deserialize(sisl::io_blob const& incoming_buf, fq_pba_list_t& fq_pbas, sisl::sg_list& value);
+};
 #pragma pack()
 
 } // namespace home_replication

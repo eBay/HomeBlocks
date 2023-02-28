@@ -35,8 +35,9 @@ class ReplicationService {
 
     std::shared_ptr< nuraft_mesg::consensus_component > m_messaging;
 
-    void on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
-                                const std::shared_ptr< nuraft::log_store >& log_store);
+    rs_ptr_t on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
+                                    const std::shared_ptr< nuraft::log_store >& log_store);
+
 public:
     ReplicationService(backend_impl_t engine_impl, std::shared_ptr< nuraft_mesg::consensus_component > messaging,
                        on_replica_set_init_t cb);

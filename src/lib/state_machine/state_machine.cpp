@@ -10,6 +10,15 @@
 #include "log_store/journal_entry.h"
 #include "service/repl_config.h"
 
+#if defined __clang__ or defined __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+#include "rpc_data_channel.h"
+#if defined __clang__ or defined __GNUC__
+#pragma GCC diagnostic pop
+#endif
+
 SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
@@ -33,7 +42,7 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     auto pbas = m_state_store->alloc_pbas(uint32_cast(value.size));
 
     // Step 2: Send the data to all replicas
-    // m_rs->send_in_data_channel(pbas, value);
+    m_rs->send_in_data_channel(pbas, value);
 
     // Step 3: Create the request structure containing all details essential for callback
     repl_req* req = sisl::ObjectAllocator< repl_req >::make_object();
@@ -322,5 +331,59 @@ void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_res
     auto ret_val{false};
     if (when_done) when_done(ret_val, null_except);
 }
+
+void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, void* rpc_data) {
+    sisl::sg_list value;
+    fq_pba_list_t fq_pbas;
+
+    // deserialize incoming buf and get fq pba list and the data to be written
+    data_rpc::deserialize(incoming_buf, fq_pbas, value);
+    fq_pba_list_t fq_pbas_allocated;
+    pba_list_t pbas_final;
+    sisl::sg_iterator sg_itr(value.iovs);
+    sisl::sg_list value_final;
+
+    // pbas which are in allocated state after try_map_pba are pushed in the final lists to be written.
+    // All other states are ignored.
+    for (auto const& fq_pba : fq_pbas) {
+        auto const [pba_list, pba_state] = try_map_pba(fq_pba);
+        switch (pba_state) {
+        case pba_state_t::allocated: {
+            pbas_final.insert(pbas_final.cend(), pba_list.cbegin(), pba_list.cend());
+            value_final.size += fq_pba.size;
+            auto temp_sg = sg_itr.next_iovs(fq_pba.size);
+            value_final.iovs.insert(value_final.iovs.cend(), temp_sg.cbegin(), temp_sg.cend());
+            fq_pbas_allocated.emplace_back(fq_pba);
+            break;
+        }
+        case pba_state_t::written: // fall-through
+        case pba_state_t::completed: {
+            sg_itr.move_offset(fq_pba.size);
+            break;
+        }
+        case pba_state_t::unknown:
+        default:
+            break;
+        }
+    }
+
+    // issue async write and update the state.
+    if (!pbas_final.empty()) {
+        m_state_store->async_write(
+            value_final, pbas_final,
+            [this, fqs = fq_pbas_allocated, rpc_data]([[maybe_unused]] std::error_condition err) {
+                assert(!err);
+                for (auto const& fq_p : fqs) {
+                    update_map_pba(fq_p, pba_state_t::completed);
+                }
+                m_rs->send_data_service_response({}, rpc_data);
+            });
+        for (auto const& fq_p : fq_pbas_allocated) {
+            update_map_pba(fq_p, pba_state_t::written);
+        }
+    }
+}
+
+// void ReplicaStateMachine::on_fetch_data_request( sisl::io_blob const& incoming_buf, void* rpc_data) {}
 
 } // namespace home_replication

@@ -55,6 +55,21 @@ public:
     /// @return true or false
     bool is_leader();
 
+    /// @brief Register server side implimentation callbacks to data service apis
+    /// @param messaging - messaging service pointer
+    /// @return false indicates error in the data service registration
+    bool register_data_service_apis(std::shared_ptr< nuraft_mesg::consensus_component >& messaging);
+
+    /// @brief Send data to followers
+    /// @param pbas - PBAs to be sent
+    /// @param value - data to be sent
+    void send_in_data_channel(const pba_list_t& pbas, const sisl::sg_list& value);
+
+    /// @brief Send the final responce to the rpc client
+    /// @param outgoing_buf - response buf to client
+    /// @param rpc_data - context provided by the rpc server
+    void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf, void* rpc_data);
+
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
 protected:
