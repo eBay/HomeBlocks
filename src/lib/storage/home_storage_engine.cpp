@@ -100,7 +100,8 @@ uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
 }
 
 void HomeStateMachineStore::free_pba(pba_t pba) {
-    homestore::data_service().async_free_blk(homestore::BlkId{pba}, [](std::error_condition err) { assert(!err); });
+    homestore::data_service().async_free_blk(homestore::BlkId{pba},
+                                             []([[maybe_unused]] std::error_condition err) { assert(!err); });
 }
 
 //////////////// StateMachine Superblock/commit update section /////////////////////////////
