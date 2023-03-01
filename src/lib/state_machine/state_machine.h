@@ -34,17 +34,17 @@ class StateMachineStore;
 
 #define RS_ASSERT_CMP(assert_type, val1, cmp, val2, ...)                                                               \
     {                                                                                                                  \
-        assert_type##_ASSERT_CMP(val1, cmp, val2,                                                                      \
-                                 [&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {       \
-                                     fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                 \
-                                                     fmt::make_format_args(file_name(__FILE__), __LINE__));            \
-                                     sisl::logging::default_cmp_assert_formatter(                                      \
-                                         buf, msgcb, std::forward< decltype(args) >(args)...);                         \
-                                     fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                 \
-                                                     fmt::make_format_args("rs", m_group_id));                         \
-                                     return true;                                                                      \
-                                 },                                                                                    \
-                                 ##__VA_ARGS__);                                                                       \
+        assert_type##_ASSERT_CMP(                                                                                      \
+            val1, cmp, val2,                                                                                           \
+            [&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                            \
+                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
+                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
+                sisl::logging::default_cmp_assert_formatter(buf, msgcb, std::forward< decltype(args) >(args)...);      \
+                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                                      \
+                                fmt::make_format_args("rs", m_group_id));                                              \
+                return true;                                                                                           \
+            },                                                                                                         \
+            ##__VA_ARGS__);                                                                                            \
     }
 #define RS_ASSERT(assert_type, cond, ...)                                                                              \
     {                                                                                                                  \
@@ -115,6 +115,7 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 //          "fetch_pba_data_from_leader" (TODO) to fill this data to this local_pba and apply waiter on it;
 //          - In phase 1 we can do it in current thread;
 //          - In phase 2 we might need to move it to a dedicated thread (or pool of threads) to fetch data from remote;
+//                       use boost::intrusive_ptr;
 //
 // 3. at this point, local_pba for every fq_pba is created in the map, and callback should be called already or after
 // last pba write is completd;
@@ -148,7 +149,7 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 struct local_pba_info {
     pba_t pba;
     pba_state_t state;
-    pba_waiter_ptr waiter; // only one waiter can wait on same pba; TODO: is there a case for multiple waiter?
+    pba_waiter_ptr waiter; // only one waiter can wait on same pba;
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -180,9 +181,8 @@ public:
     /// repl_req instance. The local_pba will be immediately returned.
     ///
     /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
-    /// @return Returns true if local_pba is already there and state is not unknown,
-    ///         Returns false if local_pba is created and data with unknown state;
-    std::pair< pba_t, bool > try_map_pba(const fully_qualified_pba& fq_pba);
+    /// @return Returns the state of the local_pba.
+    std::pair< pba_t, pba_state_t > try_map_pba(const fully_qualified_pba& fq_pba);
 
     ///
     /// @brief : update a fq_pba's state to the state specified by this API;
