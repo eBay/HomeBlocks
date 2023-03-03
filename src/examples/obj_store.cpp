@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     sisl::logging::SetLogger(std::string(argv[0]));
     sisl::logging::install_crash_handler();
 
+    // Configure the gRPC service parameters for this instance (TCP port, svc UUID etc.)
     auto const listen_port = SISL_OPTIONS["tcp_port"].as< uint32_t >();
     if (UINT16_MAX < listen_port) {
         LOGCRITICAL("Invalid TCP port: {}", listen_port);
@@ -68,7 +69,6 @@ int main(int argc, char** argv) {
     LOGINFO("[{}] starting homestore service...", svc_id);
     start_homestore(svc_id);
 
-    // Configure the gRPC service parameters for this instance (TCP port, svc UUID etc.)
     LOGINFO("[{}] starting messaging service...", svc_id);
     auto consensus_params = nuraft_mesg::consensus_component::params{
         svc_id, listen_port, [](std::string const& client) -> std::string { return client; }, "home_replication"};

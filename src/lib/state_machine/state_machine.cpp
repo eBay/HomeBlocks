@@ -14,9 +14,7 @@ SISL_LOGGING_DECL(home_replication)
 namespace home_replication {
 
 ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
-        m_state_store{state_store},
-        m_rs{rs},
-        m_group_id{rs->m_group_id} {
+        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -38,7 +36,7 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     req->user_ctx = user_ctx;
 
     // Step 4: Write the data to underlying store
-    m_state_store->async_write(value, pbas, [this, req](std::error_condition err) {
+    m_state_store->async_write(value, pbas, [this, req]([[maybe_unused]] std::error_condition err) {
         assert(!err);
         ++req->num_pbas_written;
         check_and_commit(req);
@@ -170,14 +168,24 @@ repl_req* ReplicaStateMachine::lsn_to_req(int64_t lsn) {
     return req;
 }
 
-std::pair< pba_t, bool > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
+std::pair< pba_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
     // TODO: Implement them
-    return std::make_pair(fq_pba.pba, true);
+    return std::make_pair(fq_pba.pba, pba_state_t::unknown);
 }
 
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >&, batch_completion_cb_t) {
     // TODO: Implement them
     return false;
+}
+
+pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba&, pba_state_t&) {
+    // TODO: Implement them
+    return pba_state_t::unknown;
+}
+
+void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba&) {
+    // TODO: Implement them
+    return;
 }
 
 void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
