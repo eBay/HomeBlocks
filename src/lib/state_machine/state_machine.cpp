@@ -138,9 +138,11 @@ repl_req* ReplicaStateMachine::transform_journal_entry(const raft_buf_ptr_t& raf
         auto const remote_pba = fully_qualified_pba{entry->replica_id, raw_pba_list[i]};
         remote_pbas.push_back(remote_pba);
 
-        auto const [local_pba, written] = try_map_pba(remote_pba);
-        raw_pba_list[i] = local_pba;
-        local_pbas.push_back(local_pba);
+        auto const [local_pba_list, state] = try_map_pba(remote_pba);
+        // TODO: remove this assert after buf re-alloc is resolved;
+        assert(local_pba_list.size() == 1);
+        raw_pba_list[i] = local_pba_list[0];
+        local_pbas.push_back(local_pba_list[0]);
     }
     // TODO: Should we leave this on senders id in journal or better to write local id?
     entry->replica_id = m_server_id;
@@ -168,9 +170,25 @@ repl_req* ReplicaStateMachine::lsn_to_req(int64_t lsn) {
     return req;
 }
 
-std::pair< pba_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
-    // TODO: Implement them
-    return std::make_pair(fq_pba.pba, pba_state_t::unknown);
+std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
+#if 0
+    const auto it = m_pba_map.find(fq_pba);
+    local_pba_info_ptr local_pbas_ptr{nullptr};
+    if (it != m_pba_map.end()) {
+        local_pbas_ptr = it->second;
+    } else {
+        const auto local_pbas = m_state_store->alloc_pbas(fq_pba.size);
+        assert(local_pbas);
+
+        local_pbas_ptr = std::make_shared< local_pba_info >(local_pbas, pba_state_t::allocated,
+                                                            local_pbas.size() /* ref_cnt */, nullptr /*waiter*/);
+
+        // insert to concurrent hash map
+        m_pba_map.insert(fq_pba, local_pbas_ptr);
+    }
+    return std::make_pair(local_pbas_ptr->pbas, local_pbas_ptr->state);
+#endif
+    return std::make_pair(pba_list_t{fq_pba.pba}, pba_state_t::unknown);
 }
 
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >&, batch_completion_cb_t) {
@@ -184,7 +202,7 @@ pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba&, pba_
 }
 
 void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba&) {
-    // TODO: Implement them
+    // m_pba_map.erase(fq_pba);
     return;
 }
 

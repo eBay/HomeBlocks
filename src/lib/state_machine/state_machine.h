@@ -146,10 +146,24 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // remove_map_pba:
 // 1. when commit is about to finish, it should remove the fq_pba from the map via this api;
 //
+#if 0
+// relies on storage to provide "alloc_contingous_pbas" api, which already there in homestore;
+// for object-storage, it seems we should go with this way??? 
 struct local_pba_info {
-    pba_t pba;
+    pba_t pba;   // a remote pba can only map to one local pba;
     pba_state_t state;
     pba_waiter_ptr waiter; // only one waiter can wait on same pba;
+};
+#endif
+
+// if ref_cnt drops to zero, remove this waiter;
+// The last one who remove the waiter will trigger callback to caller, because same waiter can be associated with
+// multiple fq_pbas (hence wait on multiple sets of local pbas;);
+struct local_pba_info {
+    pba_list_t pbas;                    // a remote pba can map to multiple local pbas
+    pba_state_t state;                  // state applies to all of the local pbas
+    std::atomic< uint32_t > ref_cnt{0}; // init: pbas.size(); every pba completion will dec ref_cnt by 1;
+    pba_waiter_ptr waiter;              // only one waiter can wait on same pba;
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -180,9 +194,9 @@ public:
     /// available it will allocate a local pba and create a map entry for remote_pba to local_pba and its associated
     /// repl_req instance. The local_pba will be immediately returned.
     ///
-    /// @param fq_pba Fully qualified pba to be fetched and mapped to local pba
+    /// @param fq_pba:  Fully qualified pba to be fetched and mapped to local pba_t
     /// @return Returns the state of the local_pba.
-    std::pair< pba_t, pba_state_t > try_map_pba(const fully_qualified_pba& fq_pba);
+    std::pair< pba_list_t, pba_state_t > try_map_pba(const fully_qualified_pba& fq_pba);
 
     ///
     /// @brief : update a fq_pba's state to the state specified by this API;
