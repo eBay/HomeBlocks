@@ -146,15 +146,6 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // remove_map_pba:
 // 1. when commit is about to finish, it should remove the fq_pba from the map via this api;
 //
-#if 0
-// relies on storage to provide "alloc_contingous_pbas" api, which already there in homestore;
-// for object-storage, it seems we should go with this way??? 
-struct local_pba_info {
-    pba_t pba;   // a remote pba can only map to one local pba;
-    pba_state_t state;
-    pba_waiter_ptr waiter; // only one waiter can wait on same pba;
-};
-#endif
 
 // if ref_cnt drops to zero, remove this waiter;
 // The last one who remove the waiter will trigger callback to caller, because same waiter can be associated with
