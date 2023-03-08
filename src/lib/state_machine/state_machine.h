@@ -151,10 +151,15 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // The last one who remove the waiter will trigger callback to caller, because same waiter can be associated with
 // multiple fq_pbas (hence wait on multiple sets of local pbas;);
 struct local_pba_info {
-    pba_list_t pbas;                    // a remote pba can map to multiple local pbas
-    pba_state_t state;                  // state applies to all of the local pbas
-    std::atomic< uint32_t > ref_cnt{0}; // init: pbas.size(); every pba completion will dec ref_cnt by 1;
-    pba_waiter_ptr waiter;              // only one waiter can wait on same pba;
+    local_pba_info(const pba_list_t& l, pba_state_t s, const pba_waiter_ptr w) :
+            m_pbas{std::move(l)}, m_state{s}, m_waiter{w} {
+        m_ref_cnt = m_pbas.size();
+    }
+
+    pba_list_t m_pbas;                 // a remote pba can map to multiple local pbas
+    pba_state_t m_state;               // state applies to all of the local pbas
+    std::atomic< uint32_t > m_ref_cnt; // init: pbas.size(); every pba completion will dec ref_cnt by 1;
+    pba_waiter_ptr m_waiter;           // only one waiter can wait on same pba;
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -225,7 +230,7 @@ private:
 
 private:
     std::shared_ptr< StateMachineStore > m_state_store;
-    folly::ConcurrentHashMap< fully_qualified_pba, local_pba_info_ptr > m_pba_map;
+    folly::ConcurrentHashMap< std::string, local_pba_info_ptr > m_pba_map; // fully_qualified_pba to local pba mapping;
     folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
     ReplicaSet* m_rs;
     std::string m_group_id;

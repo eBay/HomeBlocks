@@ -1,7 +1,9 @@
 #pragma once
+#include <iostream>
+#include <string>
+
 #include <boost/uuid/uuid.hpp>
 #include <folly/small_vector.h>
-
 #include <sisl/logging/logging.h>
 #include <iomgr/reactor.hpp>
 #include <homestore/homestore_decl.hpp>
@@ -21,6 +23,7 @@ struct fully_qualified_pba {
     uint32_t server_id;
     pba_t pba;
     uint32_t size; // corresponding size of this pba;
+    std::string to_key_string() const { return fmt::format("{}_{}", std::to_string(server_id), std::to_string(pba)); }
 };
 using fq_pba_list_t = folly::small_vector< fully_qualified_pba, 4 >;
 } // namespace home_replication
