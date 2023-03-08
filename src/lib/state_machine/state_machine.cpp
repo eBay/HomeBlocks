@@ -185,24 +185,21 @@ repl_req* ReplicaStateMachine::lsn_to_req(int64_t lsn) {
 }
 
 std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
-#if 0
-    const auto it = m_pba_map.find(fq_pba);
+    const auto it = m_pba_map.find(fq_pba.to_key_string());
     local_pba_info_ptr local_pbas_ptr{nullptr};
     if (it != m_pba_map.end()) {
         local_pbas_ptr = it->second;
     } else {
         const auto local_pbas = m_state_store->alloc_pbas(fq_pba.size);
-        assert(local_pbas);
+        assert(local_pbas.size());
 
-        local_pbas_ptr = std::make_shared< local_pba_info >(local_pbas, pba_state_t::allocated,
-                                                            local_pbas.size() /* ref_cnt */, nullptr /*waiter*/);
+        local_pbas_ptr = std::make_shared< local_pba_info >(local_pbas, pba_state_t::allocated, nullptr /*waiter*/);
 
         // insert to concurrent hash map
-        m_pba_map.insert(fq_pba, local_pbas_ptr);
+        m_pba_map.insert(fq_pba.to_key_string(), local_pbas_ptr);
     }
-    return std::make_pair(local_pbas_ptr->pbas, local_pbas_ptr->state);
-#endif
-    return std::make_pair(pba_list_t{fq_pba.pba}, pba_state_t::unknown);
+
+    return std::make_pair(local_pbas_ptr->m_pbas, local_pbas_ptr->m_state);
 }
 
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >&, batch_completion_cb_t) {
@@ -210,13 +207,19 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
     return false;
 }
 
-pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba&, pba_state_t&) {
-    // TODO: Implement them
-    return pba_state_t::unknown;
+pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t& state) {
+    RS_DBG_ASSERT(state != pba_state_t::unknown && state != pba_state_t::allocated,
+                  "invalid state, not expecting update to state: {}", state);
+    auto it = m_pba_map.find(fq_pba.to_key_string());
+    const auto old_state = state;
+    it->second->state = state;
+
+    if ((state == pba_state_t::completed) && (it->second->waiter != nullptr)) { it->second->m_waiter.reset(); }
+    return old_state;
 }
 
-void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba&) {
-    // m_pba_map.erase(fq_pba);
+void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba& fq_pba) {
+    m_pba_map.erase(fq_pba.to_key_string());
     return;
 }
 
