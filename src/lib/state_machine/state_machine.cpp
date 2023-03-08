@@ -43,7 +43,8 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     });
 
     // Step 5: Allocate and populate the journal entry
-    auto const entry_size = sizeof(repl_journal_entry) + (pbas.size() * sizeof(pba_t)) + header.size + key.size;
+    auto const entry_size = sizeof(repl_journal_entry) +
+        (pbas.size() * (sizeof(pba_t) + sizeof(uint32_t) /* pba size*/)) + header.size + key.size;
     raft_buf_ptr_t buf = nuraft::buffer::alloc(entry_size);
 
     auto* entry = r_cast< repl_journal_entry* >(buf->data_begin());
@@ -57,6 +58,16 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     std::memcpy(raw_ptr, header.bytes, header.size);
     raw_ptr += header.size;
     std::memcpy(raw_ptr, key.bytes, key.size);
+
+    raw_ptr += key.size;
+    // now raw_ptr is pointing to pba list portion, layout: {pba-1, size-1}, {pba-2, size-2}, ..., {pba-n, size-n}
+    for (const auto& p : pbas) {
+        // fill in the pba and its size;
+        *(r_cast< pba_t* >(raw_ptr)) = p;
+        raw_ptr += sizeof(pba_t);
+        *(r_cast< uint32_t* >(raw_ptr)) = m_state_store->pba_to_size(p);
+        raw_ptr += sizeof(uint32_t);
+    }
 
     // Step 7: Append the entry to the raft group
     auto* vec = sisl::VectorPool< raft_buf_ptr_t >::alloc();
@@ -131,16 +142,21 @@ repl_req* ReplicaStateMachine::transform_journal_entry(const raft_buf_ptr_t& raf
     req->header =
         sisl::blob{uintptr_cast(raft_buf->data_begin()) + sizeof(repl_journal_entry), entry->user_header_size};
     req->key = sisl::blob{req->header.bytes + req->header.size, req->key.size};
-    pba_t* raw_pba_list = r_cast< pba_t* >(req->key.bytes + req->key.size);
+    uint8_t* raw_pba_list = r_cast< uint8_t* >(req->key.bytes + req->key.size);
 
     // Transform log_entry and also populate the pbas in a list
     for (uint16_t i{0}; i < entry->n_pbas; ++i) {
-        auto const remote_pba = fully_qualified_pba{entry->replica_id, raw_pba_list[i]};
+        raw_pba_list += (i * (sizeof(pba_t) + sizeof(uint32_t) /* pba size*/));
+        auto const remote_pba = fully_qualified_pba{entry->replica_id, *r_cast< pba_t* >(raw_pba_list),
+                                                    *r_cast< uint32_t* >(raw_pba_list + sizeof(pba_t)) /* pba size */};
         remote_pbas.push_back(remote_pba);
 
-        auto const [local_pba, written] = try_map_pba(remote_pba);
-        raw_pba_list[i] = local_pba;
-        local_pbas.push_back(local_pba);
+        auto const [local_pba_list, state] = try_map_pba(remote_pba);
+        // TODO: remove this assert after buf re-alloc is resolved;
+        assert(local_pba_list.size() == 1);
+        *r_cast< pba_t* >(raw_pba_list) = local_pba_list[0];
+        *r_cast< uint32_t* >(raw_pba_list + sizeof(pba_t)) = m_state_store->pba_to_size(local_pba_list[0]);
+        local_pbas.push_back(local_pba_list[0]);
     }
     // TODO: Should we leave this on senders id in journal or better to write local id?
     entry->replica_id = m_server_id;
@@ -168,9 +184,25 @@ repl_req* ReplicaStateMachine::lsn_to_req(int64_t lsn) {
     return req;
 }
 
-std::pair< pba_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
-    // TODO: Implement them
-    return std::make_pair(fq_pba.pba, pba_state_t::unknown);
+std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
+#if 0
+    const auto it = m_pba_map.find(fq_pba);
+    local_pba_info_ptr local_pbas_ptr{nullptr};
+    if (it != m_pba_map.end()) {
+        local_pbas_ptr = it->second;
+    } else {
+        const auto local_pbas = m_state_store->alloc_pbas(fq_pba.size);
+        assert(local_pbas);
+
+        local_pbas_ptr = std::make_shared< local_pba_info >(local_pbas, pba_state_t::allocated,
+                                                            local_pbas.size() /* ref_cnt */, nullptr /*waiter*/);
+
+        // insert to concurrent hash map
+        m_pba_map.insert(fq_pba, local_pbas_ptr);
+    }
+    return std::make_pair(local_pbas_ptr->pbas, local_pbas_ptr->state);
+#endif
+    return std::make_pair(pba_list_t{fq_pba.pba}, pba_state_t::unknown);
 }
 
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >&, batch_completion_cb_t) {
@@ -184,7 +216,7 @@ pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba&, pba_
 }
 
 void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba&) {
-    // TODO: Implement them
+    // m_pba_map.erase(fq_pba);
     return;
 }
 
