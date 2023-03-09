@@ -4,6 +4,7 @@
 #include <sisl/fds/vector_pool.hpp>
 #include <home_replication/repl_service.h>
 #include <home_replication/repl_set.h>
+#include <iomgr/iomgr_timer.hpp>
 #include "state_machine.h"
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
@@ -202,19 +203,91 @@ std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const full
     return std::make_pair(local_pbas_ptr->m_pbas, local_pbas_ptr->m_state);
 }
 
-bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >&, batch_completion_cb_t) {
-    // TODO: Implement them
-    return false;
+//
+// if return false /* no need to wait */, no cb will be triggered;
+// if return true /* need to wait */ , cb will be triggered after all local pbas completed writting;
+//
+bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >& fq_pba_list,
+                                                 batch_completion_cb_t cb) {
+    auto wait_to_fill_fq_pbas = std::make_shared< std::vector< fully_qualified_pba > >();
+    std::shared_ptr< pba_waiter > waiter = nullptr;
+
+    for (const auto& fq_pba : fq_pba_list) {
+        auto it = m_pba_map.find(fq_pba.to_key_string());
+
+        if (it == m_pba_map.end()) {
+            auto const [local_pba_list, state] = try_map_pba(fq_pba);
+            it = m_pba_map.find(fq_pba.to_key_string());
+
+            // add this fq_pba to wait list;
+            wait_to_fill_fq_pbas->emplace_back(fq_pba);
+
+            // fall through;
+        }
+
+        // now "it" points to either newly created map entry or already existed entry;
+        if (it->second->m_state != pba_state_t::completed) {
+            // only create waiter when there is at least one fq_pba that needs to be waited on;
+            if (waiter == nullptr) { waiter = std::make_shared< pba_waiter >(std::move(cb)); }
+
+            // same waiter can wait on multiple fq_pbas;
+            RS_DBG_ASSERT_EQ(it->second->m_waiter, nullptr, "not expecting to apply waiter on already waited entry.");
+            it->second->m_waiter = waiter;
+        }
+    }
+
+    if (wait_to_fill_fq_pbas->size()) {
+        // some pbas are not in completed state, let's schedule a timer to check it again;
+        // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
+        // remote;
+        m_wait_pba_write_timer_hdl = iomanager.schedule_thread_timer(
+            HR_DYNAMIC_CONFIG(wait_pba_write_timer_sec) * 1000 * 1000 * 1000, false /* recurring */,
+            nullptr /* cookie */, [this, wait_to_fill_fq_pbas]([[maybe_unused]] void* cookie) {
+                // check input fq_pbas to see if they completed write, if there is
+                // still any fq_pba not completed yet, trigger a remote fetch
+                check_and_fetch_remote_pbas(wait_to_fill_fq_pbas);
+            });
+    }
+
+    // if size is not zero, it means caller needs to wait;
+    return wait_to_fill_fq_pbas->size() != 0;
 }
 
+void ReplicaStateMachine::check_and_fetch_remote_pbas(
+    std::shared_ptr< std::vector< fully_qualified_pba > > fq_pba_list) {
+    auto remote_fetch_pbas = std::make_unique< std::vector< fully_qualified_pba > >();
+    for (auto fq_it = fq_pba_list->begin(); fq_it != fq_pba_list->end(); ++fq_it) {
+        auto it = m_pba_map.find(fq_it->to_key_string());
+        if (it->second->m_state != pba_state_t::completed) {
+            // found some pba not completed yet, save to the remote list;
+            remote_fetch_pbas->emplace_back(*fq_it);
+        }
+    }
+
+    if (remote_fetch_pbas->size()) {
+        // we've got some pbas not completed yet, let's fetch from remote;
+        fetch_pba_data_from_leader(std::move(remote_fetch_pbas));
+    }
+}
+
+void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {}
+
+//
+// if caller calls this api concurrently with different state, result is undetermined;
+//
 pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t& state) {
     RS_DBG_ASSERT(state != pba_state_t::unknown && state != pba_state_t::allocated,
                   "invalid state, not expecting update to state: {}", state);
     auto it = m_pba_map.find(fq_pba.to_key_string());
-    const auto old_state = state;
-    it->second->state = state;
+    const auto old_state = it->second->m_state;
+    it->second->m_state = state;
 
-    if ((state == pba_state_t::completed) && (it->second->waiter != nullptr)) { it->second->m_waiter.reset(); }
+    if ((state == pba_state_t::completed) && (it->second->m_waiter != nullptr)) {
+        // waiter on this fq_pba can be released.
+        // if this is the last fq_pba that this waiter is waiting on, cb will be triggered automatically;
+        it->second->m_waiter.reset();
+    }
+
     return old_state;
 }
 

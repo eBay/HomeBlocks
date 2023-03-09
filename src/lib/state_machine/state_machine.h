@@ -2,7 +2,7 @@
 
 #include <vector>
 #include <functional>
-
+#include <iomgr/iomgr.hpp>
 #include <sisl/utility/enum.hpp>
 #include <home_replication/repl_decls.h>
 
@@ -152,14 +152,11 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // multiple fq_pbas (hence wait on multiple sets of local pbas;);
 struct local_pba_info {
     local_pba_info(const pba_list_t& l, pba_state_t s, const pba_waiter_ptr w) :
-            m_pbas{std::move(l)}, m_state{s}, m_waiter{w} {
-        m_ref_cnt = m_pbas.size();
-    }
+            m_pbas{std::move(l)}, m_state{s}, m_waiter{w} {}
 
-    pba_list_t m_pbas;                 // a remote pba can map to multiple local pbas
-    pba_state_t m_state;               // state applies to all of the local pbas
-    std::atomic< uint32_t > m_ref_cnt; // init: pbas.size(); every pba completion will dec ref_cnt by 1;
-    pba_waiter_ptr m_waiter;           // only one waiter can wait on same pba;
+    pba_list_t m_pbas;       // a remote pba can map to multiple local pbas
+    pba_state_t m_state;     // state applies to all of the local pbas
+    pba_waiter_ptr m_waiter; // only one waiter can wait on same pba;
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -221,6 +218,10 @@ public:
     /// completion callback will not be called.
     bool async_fetch_write_pbas(const std::vector< fully_qualified_pba >& fq_pbas, batch_completion_cb_t cb);
 
+    void check_and_fetch_remote_pbas(std::shared_ptr< std::vector< fully_qualified_pba > > fq_pba_list);
+
+    void fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > > fq_pba_list);
+
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);
 
@@ -236,6 +237,7 @@ private:
     std::string m_group_id;
     uint32_t m_server_id;                        // TODO: Populate the value from replica set/RAFT
     nuraft::ptr< nuraft::buffer > m_success_ptr; // Preallocate the success return to raft
+    iomgr::timer_handle_t m_wait_pba_write_timer_hdl{iomgr::null_timer_handle};
 };
 
 } // namespace home_replication
