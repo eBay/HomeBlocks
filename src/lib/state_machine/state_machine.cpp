@@ -275,12 +275,8 @@ void ReplicaStateMachine::check_and_fetch_remote_pbas(
     }
 }
 
-void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {
-    // TODO: to be implemented;
-}
-
 //
-// if caller calls this api concurrently with different state, result is undetermined;
+// for the same fq_pba, if caller calls it concurrently with different state, result is undetermined;
 //
 pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t& state) {
     RS_DBG_ASSERT(state != pba_state_t::unknown && state != pba_state_t::allocated,
@@ -292,6 +288,7 @@ pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pb
     if ((state == pba_state_t::completed) && (it->second->m_waiter != nullptr)) {
         // waiter on this fq_pba can be released.
         // if this is the last fq_pba that this waiter is waiting on, cb will be triggered automatically;
+        RS_DBG_ASSERT_EQ(old_state, pba_state_t::written, "invalid state, not expecting state to be: {}", state);
         it->second->m_waiter.reset();
     }
 
@@ -301,6 +298,10 @@ pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pb
 void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba& fq_pba) {
     m_pba_map.erase(fq_pba.to_key_string());
     return;
+}
+
+void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {
+    // TODO: to be implemented;
 }
 
 void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
