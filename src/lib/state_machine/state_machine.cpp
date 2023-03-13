@@ -62,6 +62,7 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
 
     raw_ptr += key.size;
     // now raw_ptr is pointing to pba list portion, layout: {pba-1, size-1}, {pba-2, size-2}, ..., {pba-n, size-n}
+    // Step 7: Copy pba and its size into the buffer;
     for (const auto& p : pbas) {
         // fill in the pba and its size;
         *(r_cast< pba_t* >(raw_ptr)) = p;
@@ -70,7 +71,7 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
         raw_ptr += sizeof(uint32_t);
     }
 
-    // Step 7: Append the entry to the raft group
+    // Step 8: Append the entry to the raft group
     auto* vec = sisl::VectorPool< raft_buf_ptr_t >::alloc();
     vec->push_back(buf);
 
@@ -236,11 +237,15 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
         }
     }
 
-    if (wait_to_fill_fq_pbas->size()) {
+    [[unlikely]] if (resync_mode) {
+        // if in resync mode, fetch data from remote immediately;
+        check_and_fetch_remote_pbas(wait_to_fill_fq_pbas);
+    }
+    else if (wait_to_fill_fq_pbas->size()) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;
-        m_wait_pba_write_timer_hdl = iomanager.schedule_thread_timer(
+        m_wait_pba_write_timer_hdl = iomanager.schedule_thread_timer( // timer wakes up in current thread;
             HR_DYNAMIC_CONFIG(wait_pba_write_timer_sec) * 1000 * 1000 * 1000, false /* recurring */,
             nullptr /* cookie */, [this, wait_to_fill_fq_pbas]([[maybe_unused]] void* cookie) {
                 // check input fq_pbas to see if they completed write, if there is
@@ -270,7 +275,9 @@ void ReplicaStateMachine::check_and_fetch_remote_pbas(
     }
 }
 
-void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {}
+void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {
+    // TODO: to be implemented;
+}
 
 //
 // if caller calls this api concurrently with different state, result is undetermined;
