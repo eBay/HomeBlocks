@@ -236,8 +236,11 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
             it->second->m_waiter = waiter;
         }
     }
-
+#if __cplusplus > 201703L
     [[unlikely]] if (resync_mode) {
+#else
+    if (sisl_unlikely(resync_mode)) {
+#endif
         // if in resync mode, fetch data from remote immediately;
         check_and_fetch_remote_pbas(wait_to_fill_fq_pbas);
     }
