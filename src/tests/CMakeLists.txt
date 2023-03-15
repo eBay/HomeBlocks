@@ -24,3 +24,12 @@ target_link_libraries(test_home_sm_store
             ${COMMON_TEST_DEPS} 
             GTest::gmock)
 add_test(NAME HomeStateStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_sm_store)
+
+add_executable(test_repl_state_machine)
+target_sources(test_repl_state_machine PRIVATE test_repl_state_machine.cpp)
+target_link_libraries(test_repl_state_machine 
+            home_replication 
+            ${COMMON_TEST_DEPS} 
+            GTest::gmock)
+add_test(NAME ReplStateMachine COMMAND ${CMAKE_BINARY_DIR}/bin/test_repl_state_machine)
+

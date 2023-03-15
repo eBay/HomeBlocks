@@ -281,7 +281,7 @@ void ReplicaStateMachine::check_and_fetch_remote_pbas(
 //
 // for the same fq_pba, if caller calls it concurrently with different state, result is undetermined;
 //
-pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t& state) {
+pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t state) {
     RS_DBG_ASSERT(state != pba_state_t::unknown && state != pba_state_t::allocated,
                   "invalid state, not expecting update to state: {}", state);
     auto it = m_pba_map.find(fq_pba.to_key_string());

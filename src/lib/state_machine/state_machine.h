@@ -3,6 +3,7 @@
 #include <vector>
 #include <functional>
 #include <iomgr/iomgr.hpp>
+#include <folly/concurrency/ConcurrentHashMap.h>
 #include <sisl/utility/enum.hpp>
 #include <home_replication/repl_decls.h>
 
@@ -201,7 +202,7 @@ public:
     ///
     /// @return : current state before this api is called;
     ///
-    pba_state_t update_map_pba(const fully_qualified_pba& pba, pba_state_t& to_state);
+    pba_state_t update_map_pba(const fully_qualified_pba& pba, pba_state_t to_state);
 
     ///
     /// @brief : remove fq_pba entry from map
