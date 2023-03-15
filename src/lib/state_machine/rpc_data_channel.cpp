@@ -40,9 +40,11 @@ sisl::io_blob_list_t data_rpc::serialize(const data_channel_rpc_hdr& common_head
     return io_list;
 }
 
-void data_rpc::deserialize(sisl::io_blob const& incoming_buf, fq_pba_list_t& fq_pbas, sisl::sg_list& value) {
+void data_rpc::deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_hdr& common_header,
+                           fq_pba_list_t& fq_pbas, sisl::sg_list& value) {
     // assert buf.size >= max header size
     data_rpc* rpc = r_cast< data_rpc* >(incoming_buf.bytes);
+    common_header = rpc->common_hdr;
     for (uint16_t i{0}; i < rpc->pba_area[0].n_pbas; ++i) {
         fq_pbas.emplace_back(rpc->common_hdr.issuer_replica_id, rpc->pba_area[0].pinfo[i].pba,
                              rpc->pba_area[0].pinfo[i].data_size);

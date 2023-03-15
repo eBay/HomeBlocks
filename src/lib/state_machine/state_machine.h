@@ -249,8 +249,8 @@ public:
     repl_req* lsn_to_req(int64_t lsn);
 
     // data service apis
-    void on_data_received(sisl::io_blob const&, void*);
-    // void on_fetch_data_request(sisl::io_blob const&, void*);
+    void on_data_received(sisl::io_blob const&, void* rpc_data);
+    // void on_fetch_data_request(sisl::io_blob const&, void* rpc_data);
 
 private:
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& params);

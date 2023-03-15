@@ -333,11 +333,15 @@ void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_res
 }
 
 void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, void* rpc_data) {
+    data_channel_rpc_hdr common_header;
     sisl::sg_list value;
     fq_pba_list_t fq_pbas;
 
     // deserialize incoming buf and get fq pba list and the data to be written
-    data_rpc::deserialize(incoming_buf, fq_pbas, value);
+    data_rpc::deserialize(incoming_buf, common_header, fq_pbas, value);
+
+    // TODO: sanity checks around common_header
+
     fq_pba_list_t fq_pbas_allocated;
     pba_list_t pbas_final;
     sisl::sg_iterator sg_itr(value.iovs);
@@ -384,6 +388,15 @@ void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, vo
     }
 }
 
-// void ReplicaStateMachine::on_fetch_data_request( sisl::io_blob const& incoming_buf, void* rpc_data) {}
+/*
+void ReplicaStateMachine::on_fetch_data_request(sisl::io_blob const& incoming_buf, void* rpc_data) {
+    // get the pbas for which we need to send the data
+    pba_list_t pbas;
+    data_rpc::deserialize(incoming_buf, pbas);
+    for(auto const& pba : pbas) {
+
+    }
+}
+*/
 
 } // namespace home_replication

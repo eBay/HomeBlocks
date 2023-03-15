@@ -1,3 +1,4 @@
+#include <gmock/gmock.h>
 #include "storage/storage_engine.h"
 
 using namespace home_replication;

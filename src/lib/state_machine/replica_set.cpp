@@ -55,7 +55,7 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
         // LOG ERROR
         return false;
     }
-    /*
+    /* TODO add fetch data API
     if (auto resp = messaging->bind_data_service_request(FETCH_DATA, m_group_id,
                                                          [this](sisl::io_blob const& incoming_buf, void* rpc_data) {
                                                              m_state_machine->on_fetch_data_request(incoming_buf,
@@ -70,7 +70,6 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
 }
 
 void ReplicaSet::send_in_data_channel(const pba_list_t& pbas, const sisl::sg_list& value) {
-    data_channel_rpc_hdr common_header;
     m_repl_svc_ctx->data_service_request(
         SEND_DATA,
         data_rpc::serialize(
