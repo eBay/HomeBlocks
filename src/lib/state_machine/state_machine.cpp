@@ -20,6 +20,13 @@ ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStor
     m_success_ptr->put(0);
 }
 
+void ReplicaStateMachine::stop_write_wait_timer() {
+    if (m_wait_pba_write_timer_hdl != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(m_wait_pba_write_timer_hdl);
+        m_wait_pba_write_timer_hdl = iomgr::null_timer_handle;
+    }
+}
+
 void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value,
                                   void* user_ctx) {
     // Step 1: Alloc PBAs
@@ -281,7 +288,7 @@ void ReplicaStateMachine::check_and_fetch_remote_pbas(
 //
 // for the same fq_pba, if caller calls it concurrently with different state, result is undetermined;
 //
-pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, pba_state_t state) {
+pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pba, const pba_state_t& state) {
     RS_DBG_ASSERT(state != pba_state_t::unknown && state != pba_state_t::allocated,
                   "invalid state, not expecting update to state: {}", state);
     auto it = m_pba_map.find(fq_pba.to_key_string());
@@ -298,9 +305,8 @@ pba_state_t ReplicaStateMachine::update_map_pba(const fully_qualified_pba& fq_pb
     return old_state;
 }
 
-void ReplicaStateMachine::remove_map_pba(const fully_qualified_pba& fq_pba) {
-    m_pba_map.erase(fq_pba.to_key_string());
-    return;
+std::size_t ReplicaStateMachine::remove_map_pba(const fully_qualified_pba& fq_pba) {
+    return m_pba_map.erase(fq_pba.to_key_string());
 }
 
 void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {

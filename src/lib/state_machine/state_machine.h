@@ -202,14 +202,16 @@ public:
     ///
     /// @return : current state before this api is called;
     ///
-    pba_state_t update_map_pba(const fully_qualified_pba& pba, pba_state_t to_state);
+    pba_state_t update_map_pba(const fully_qualified_pba& pba, const pba_state_t& to_state);
 
     ///
     /// @brief : remove fq_pba entry from map
     ///
     /// @param pba : pba that is going to be removed;
     ///
-    void remove_map_pba(const fully_qualified_pba& pba);
+    /// @return: number of elements removed;
+    ///
+    std::size_t remove_map_pba(const fully_qualified_pba& pba);
 
     ///
     /// @brief : First try to map the pbas if available. If not available in local map, wait for some time (based on if
@@ -240,6 +242,8 @@ public:
     /// @param fq_pba_list : the fq_pba list that should be fetched from remote leader;
     ///
     void fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > > fq_pba_list);
+
+    void stop_write_wait_timer();
 
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);

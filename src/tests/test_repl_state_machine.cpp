@@ -99,22 +99,23 @@ public:
             .init(true /* wait_for_init */);
 
         if (!restart) {
-            m_rs = new home_replication::ReplicaSet("Test_Group_Id", nullptr /*sm store*/, nullptr /*log store*/);
             m_hsm = std::make_shared< HomeStateMachineStore >(m_uuid);
-            m_sm = std::make_shared< ReplicaStateMachine >(m_hsm, m_rs);
+            //  m_rs = std::make_shared< home_replication::ReplicaSet >("Test_Group_Id", m_hsm, nullptr /*log store*/);
+            m_rs = new home_replication::ReplicaSet("Test_Group_Id", m_hsm, nullptr /*log store*/);
+            m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
         }
     }
 
     void shutdown(bool cleanup = true) {
         if (cleanup) { m_hsm->destroy(); }
 
+        delete m_rs;
         m_hsm.reset();
         homestore::HomeStore::instance()->shutdown();
         homestore::HomeStore::reset_instance();
         iomanager.stop();
 
         if (cleanup) { remove_files(SISL_OPTIONS["num_devs"].as< uint32_t >()); }
-        delete m_rs;
     }
 
     void rs_super_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
@@ -129,21 +130,99 @@ public:
 
 private:
     home_replication::ReplicaSet* m_rs{nullptr}; // dummy replica set, it is just initialized for unit test purpose;
+#if 0
+    std::shared_ptr< home_replication::ReplicaSet > m_rs{nullptr};
+#endif
     std::shared_ptr< HomeStateMachineStore > m_hsm{nullptr}; // Home SM Store
     boost::uuids::uuid m_uuid;
 };
 
-TEST_F(TestReplStateMachine, try_map_pba_test) {
+TEST_F(TestReplStateMachine, map_pba_basic_test) {
+    LOGINFO("Step 1: Start HomeStore");
     this->start_homestore();
+
+    LOGINFO("Step 2: try_map_pba");
     fully_qualified_pba fq_pba{1 /* server_id */, 100 /* remote_pba */, 4096 /* size */};
     auto const [local_pba_list, state] = m_sm->try_map_pba(fq_pba);
 
     ASSERT_EQ(state, pba_state_t::allocated);
     ASSERT_EQ(local_pba_list.size(), 1);
+
+    LOGINFO("Step 3: updaet_map_pba state written");
     m_sm->update_map_pba(fq_pba, pba_state_t::written);
+
+    LOGINFO("Step 4: updaet_map_pba state completed");
     m_sm->update_map_pba(fq_pba, pba_state_t::completed);
-    m_sm->remove_map_pba(fq_pba);
+
+    LOGINFO("Step 5: remove_map_pba");
+    const auto num_removed = m_sm->remove_map_pba(fq_pba);
+    ASSERT_EQ(num_removed, 1);
+
+    LOGINFO("Step 6: shutdown");
     this->shutdown();
+}
+#if 0 // TODO: disable for now because of known issue not related to this test;
+TEST_F(TestReplStateMachine, async_fetch_pba_test_wait_no_timeout) {
+    LOGINFO("Step 1: Start HomeStore");
+    this->start_homestore();
+
+    LOGINFO("Step 2: try_map_pba");
+    fully_qualified_pba fq_pba{1 /* server_id */, 100 /* remote_pba */, 4096 /* size */};
+    auto const [local_pba_list, state] = m_sm->try_map_pba(fq_pba);
+
+    LOGINFO("Step 3: updaet_map_pba state written");
+    m_sm->update_map_pba(fq_pba, pba_state_t::written);
+
+    LOGINFO("Step 4: async_fetch_write_pbas");
+    std::vector< fully_qualified_pba > fq_pbas{fq_pba};
+    bool called{false};
+    const auto need_to_wait = m_sm->async_fetch_write_pbas(fq_pbas, [&called]() {
+        called = true;
+        LOGINFO("callback called");
+    });
+
+    ASSERT_EQ(need_to_wait, true);
+    ASSERT_EQ(called, false);
+
+    LOGINFO("Step 5: updaet_map_pba state written");
+    m_sm->update_map_pba(fq_pba, pba_state_t::completed);
+
+    ASSERT_EQ(called, true);
+
+    LOGINFO("Step 6: shutdown");
+    this->shutdown();
+}
+
+TEST_F(TestReplStateMachine, async_fetch_pba_test_no_wait) {
+    LOGINFO("Step 1: Start HomeStore");
+    this->start_homestore();
+
+    LOGINFO("Step 2: try_map_pba");
+    fully_qualified_pba fq_pba{1 /* server_id */, 100 /* remote_pba */, 4096 /* size */};
+    auto const [local_pba_list, state] = m_sm->try_map_pba(fq_pba);
+
+    LOGINFO("Step 3: updaet_map_pba state written");
+    m_sm->update_map_pba(fq_pba, pba_state_t::written);
+
+    LOGINFO("Step 4: updaet_map_pba state completed");
+    m_sm->update_map_pba(fq_pba, pba_state_t::completed);
+
+    LOGINFO("Step 5: async_fetch_write_pbas");
+    std::vector< fully_qualified_pba > fq_pbas{fq_pba};
+    const auto need_to_wait =
+        m_sm->async_fetch_write_pbas(fq_pbas, []() { ASSERT_TRUE(false) << "Should not be called. "; });
+
+    ASSERT_EQ(need_to_wait, false);
+
+    m_sm->stop_write_wait_timer();
+
+    LOGINFO("Step 6: shutdown");
+    this->shutdown();
+}
+#endif
+
+TEST_F(TestReplStateMachine, async_fetch_pba_test_wait_timeout_fetch_remote) {
+    // To be implemented;
 }
 
 SISL_OPTIONS_ENABLE(logging, test_repl_state_machine)
