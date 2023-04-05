@@ -218,7 +218,7 @@ std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const full
 //
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >& fq_pba_list,
                                                  batch_completion_cb_t cb) {
-    auto wait_to_fill_fq_pbas = std::make_shared< std::vector< fully_qualified_pba > >();
+    std::vector< fully_qualified_pba > wait_to_fill_fq_pbas;
     std::shared_ptr< pba_waiter > waiter = nullptr;
 
     for (const auto& fq_pba : fq_pba_list) {
@@ -230,7 +230,7 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
             it = m_pba_map.find(key_string);
 
             // add this fq_pba to wait list;
-            wait_to_fill_fq_pbas->emplace_back(fq_pba);
+            wait_to_fill_fq_pbas.emplace_back(fq_pba);
 
             // fall through;
         }
@@ -245,35 +245,36 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
             it->second->m_waiter = waiter;
         }
     }
+
+    const auto wait_size = wait_to_fill_fq_pbas.size();
 #if __cplusplus > 201703L
     [[unlikely]] if (resync_mode) {
 #else
     if (sisl_unlikely(resync_mode)) {
 #endif
         // if in resync mode, fetch data from remote immediately;
-        check_and_fetch_remote_pbas(wait_to_fill_fq_pbas);
+        check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
     }
-    else if (wait_to_fill_fq_pbas->size()) {
+    else if (wait_size) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;
         m_wait_pba_write_timer_hdl = iomanager.schedule_thread_timer( // timer wakes up in current thread;
             HR_DYNAMIC_CONFIG(wait_pba_write_timer_sec) * 1000 * 1000 * 1000, false /* recurring */,
-            nullptr /* cookie */, [this, wait_to_fill_fq_pbas]([[maybe_unused]] void* cookie) {
+            nullptr /* cookie */, [this, &wait_to_fill_fq_pbas]([[maybe_unused]] void* cookie) {
                 // check input fq_pbas to see if they completed write, if there is
                 // still any fq_pba not completed yet, trigger a remote fetch
-                check_and_fetch_remote_pbas(wait_to_fill_fq_pbas);
+                check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
             });
     }
 
     // if size is not zero, it means caller needs to wait;
-    return wait_to_fill_fq_pbas->size() != 0;
+    return wait_size != 0;
 }
 
-void ReplicaStateMachine::check_and_fetch_remote_pbas(
-    std::shared_ptr< std::vector< fully_qualified_pba > > fq_pba_list) {
+void ReplicaStateMachine::check_and_fetch_remote_pbas(std::vector< fully_qualified_pba > fq_pba_list) {
     auto remote_fetch_pbas = std::make_unique< std::vector< fully_qualified_pba > >();
-    for (auto fq_it = fq_pba_list->begin(); fq_it != fq_pba_list->end(); ++fq_it) {
+    for (auto fq_it = fq_pba_list.begin(); fq_it != fq_pba_list.end(); ++fq_it) {
         auto it = m_pba_map.find(fq_it->to_key_string());
         if (it->second->m_state != pba_state_t::completed) {
             // found some pba not completed yet, save to the remote list;

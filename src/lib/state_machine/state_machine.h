@@ -234,7 +234,7 @@ public:
     ///
     /// @param fq_pba_list : the input fq pba list that needs to be checked for completion;
     ///
-    void check_and_fetch_remote_pbas(std::shared_ptr< std::vector< fully_qualified_pba > > fq_pba_list);
+    void check_and_fetch_remote_pbas(std::vector< fully_qualified_pba > fq_pba_list);
 
     ///
     /// @brief : fetch data specified by the fq_pba_list from remote leader;
