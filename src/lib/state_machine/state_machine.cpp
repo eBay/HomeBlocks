@@ -194,18 +194,19 @@ repl_req* ReplicaStateMachine::lsn_to_req(int64_t lsn) {
 }
 
 std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const fully_qualified_pba& fq_pba) {
-    const auto it = m_pba_map.find(fq_pba.to_key_string());
+    const auto key_string = fq_pba.to_key_string();
+    const auto it = m_pba_map.find(key_string);
     local_pba_info_ptr local_pbas_ptr{nullptr};
     if (it != m_pba_map.end()) {
         local_pbas_ptr = it->second;
     } else {
         const auto local_pbas = m_state_store->alloc_pbas(fq_pba.size);
-        assert(local_pbas.size());
+        RS_DBG_ASSERT(local_pbas.size() > 0, "alloca_pbas returned null, no space left!");
 
         local_pbas_ptr = std::make_shared< local_pba_info >(local_pbas, pba_state_t::allocated, nullptr /*waiter*/);
 
         // insert to concurrent hash map
-        m_pba_map.insert(fq_pba.to_key_string(), local_pbas_ptr);
+        m_pba_map.insert(key_string, local_pbas_ptr);
     }
 
     return std::make_pair(local_pbas_ptr->m_pbas, local_pbas_ptr->m_state);
@@ -221,11 +222,12 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
     std::shared_ptr< pba_waiter > waiter = nullptr;
 
     for (const auto& fq_pba : fq_pba_list) {
-        auto it = m_pba_map.find(fq_pba.to_key_string());
+        const auto key_string = fq_pba.to_key_string();
+        auto it = m_pba_map.find(key_string);
 
         if (it == m_pba_map.end()) {
             auto const [local_pba_list, state] = try_map_pba(fq_pba);
-            it = m_pba_map.find(fq_pba.to_key_string());
+            it = m_pba_map.find(key_string);
 
             // add this fq_pba to wait list;
             wait_to_fill_fq_pbas->emplace_back(fq_pba);
