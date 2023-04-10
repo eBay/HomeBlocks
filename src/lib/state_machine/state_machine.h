@@ -2,7 +2,8 @@
 
 #include <vector>
 #include <functional>
-
+#include <iomgr/iomgr.hpp>
+#include <folly/concurrency/ConcurrentHashMap.h>
 #include <sisl/utility/enum.hpp>
 #include <home_replication/repl_decls.h>
 
@@ -151,10 +152,12 @@ using pba_waiter_ptr = std::shared_ptr< pba_waiter >;
 // The last one who remove the waiter will trigger callback to caller, because same waiter can be associated with
 // multiple fq_pbas (hence wait on multiple sets of local pbas;);
 struct local_pba_info {
-    pba_list_t pbas;                    // a remote pba can map to multiple local pbas
-    pba_state_t state;                  // state applies to all of the local pbas
-    std::atomic< uint32_t > ref_cnt{0}; // init: pbas.size(); every pba completion will dec ref_cnt by 1;
-    pba_waiter_ptr waiter;              // only one waiter can wait on same pba;
+    local_pba_info(const pba_list_t& l, pba_state_t s, const pba_waiter_ptr w) :
+            m_pbas{std::move(l)}, m_state{s}, m_waiter{w} {}
+
+    pba_list_t m_pbas;       // a remote pba can map to multiple local pbas
+    pba_state_t m_state;     // state applies to all of the local pbas
+    pba_waiter_ptr m_waiter; // only one waiter can wait on same pba;
 };
 
 using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
@@ -181,12 +184,14 @@ public:
 
     repl_req* transform_journal_entry(const raft_buf_ptr_t& raft_buf);
 
-    /// @brief Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
+    ///
+    /// @brief : Map the fully qualified pba (possibly remote pba) and get the local pba if available. If its not
     /// available it will allocate a local pba and create a map entry for remote_pba to local_pba and its associated
     /// repl_req instance. The local_pba will be immediately returned.
     ///
     /// @param fq_pba:  Fully qualified pba to be fetched and mapped to local pba_t
-    /// @return Returns the state of the local_pba.
+    /// @return : Returns the state of the local_pba.
+    ///
     std::pair< pba_list_t, pba_state_t > try_map_pba(const fully_qualified_pba& fq_pba);
 
     ///
@@ -197,24 +202,48 @@ public:
     ///
     /// @return : current state before this api is called;
     ///
-    pba_state_t update_map_pba(const fully_qualified_pba& pba, pba_state_t& to_state);
+    pba_state_t update_map_pba(const fully_qualified_pba& pba, const pba_state_t& to_state);
 
     ///
     /// @brief : remove fq_pba entry from map
     ///
     /// @param pba : pba that is going to be removed;
     ///
-    void remove_map_pba(const fully_qualified_pba& pba);
+    /// @return: number of elements removed;
+    ///
+    std::size_t remove_map_pba(const fully_qualified_pba& pba);
 
-    /// @brief First try to map the pbas if available. If not available in local map, wait for some time (based on if
+    ///
+    /// @brief : First try to map the pbas if available. If not available in local map, wait for some time (based on if
     /// it is in resync mode or not) and then reach out to remote replica and fetch the actual data, write to the local
     /// storage engine and update the map. It then calls callback after all pbas in the list are fetched.
     ///
-    /// @param fq_pbas Vector of fq_pbas that needs to mapped
-    /// @param completion callback called after all pbas are fetched if that is needed.
-    /// @return Returns if all fq_pbas have their corresponding map is readily available. If the return is true, the
-    /// completion callback will not be called.
+    /// @param fq_pbas : Vector of fq_pbas that needs to mapped
+    /// @param cb : completion callback called after all pbas are fetched if that is needed.
+    /// @return : Returns if all fq_pbas have their corresponding map is readily available.
+    /// if return false /* no need to wait */, no cb will be triggered;
+    /// if return true /* need to wait */ , cb will be triggered after all local pbas completed writting;
+    ///
     bool async_fetch_write_pbas(const std::vector< fully_qualified_pba >& fq_pbas, batch_completion_cb_t cb);
+
+    ///
+    /// @brief : check the input fq_pba_list that if anyone is still not completed its write.
+    /// if yes, save all of the fq_pbas that in not-completed state to a list and fetch them from remote leader;
+    /// if no, nothing needs to be done, it means data channel arrived and completed writing data before wait-timer
+    /// timeout;
+    ///
+    /// @param fq_pba_list : the input fq pba list that needs to be checked for completion;
+    ///
+    void check_and_fetch_remote_pbas(std::vector< fully_qualified_pba > fq_pba_list);
+
+    ///
+    /// @brief : fetch data specified by the fq_pba_list from remote leader;
+    ///
+    /// @param fq_pba_list : the fq_pba list that should be fetched from remote leader;
+    ///
+    void fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > > fq_pba_list);
+
+    void stop_write_wait_timer();
 
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);
@@ -225,12 +254,14 @@ private:
 
 private:
     std::shared_ptr< StateMachineStore > m_state_store;
-    folly::ConcurrentHashMap< fully_qualified_pba, local_pba_info_ptr > m_pba_map;
+    folly::ConcurrentHashMap< std::string, local_pba_info_ptr > m_pba_map; // fully_qualified_pba to local pba mapping;
     folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
     ReplicaSet* m_rs;
     std::string m_group_id;
     uint32_t m_server_id;                        // TODO: Populate the value from replica set/RAFT
     nuraft::ptr< nuraft::buffer > m_success_ptr; // Preallocate the success return to raft
+    iomgr::timer_handle_t m_wait_pba_write_timer_hdl{iomgr::null_timer_handle};
+    bool resync_mode{false};
 };
 
 } // namespace home_replication

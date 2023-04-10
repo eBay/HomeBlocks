@@ -5,6 +5,7 @@ attribute "deprecated";
 
 table HomeReplicationSettings {
     commit_lsn_flush_ms: uint32 = 100 (hotswap);
+    wait_pba_write_timer_sec: uint32 =  30 (hotswap);
 }
 
 root_type HomeReplicationSettings;
