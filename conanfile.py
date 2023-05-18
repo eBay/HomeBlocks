@@ -9,7 +9,7 @@ required_conan_version = ">=1.50.0"
 
 class HomeReplicationConan(ConanFile):
     name = "home_replication"
-    version = "0.0.6"
+    version = "0.0.7"
     homepage = "https://github.com/eBay/HomeReplication"
     description = "Fast Storage Replication using NuRaft"
     topics = ("ebay")
@@ -37,7 +37,7 @@ class HomeReplicationConan(ConanFile):
 
     def requirements(self):
         self.requires("nuraft_mesg/[~=0,    include_prerelease=True]@oss/master")
-        self.requires("homestore/[~=4,      include_prerelease=True]@oss/develop")
+        self.requires("homestore/[~=4,      include_prerelease=True]@oss/master")
         self.requires("sisl/[~=9,           include_prerelease=True]@oss/master")
 
         self.requires("nuraft/2.1.0", override=True)
