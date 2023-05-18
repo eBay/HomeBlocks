@@ -70,6 +70,10 @@ public:
     /// @param rpc_data - context provided by the rpc server
     void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf, void* rpc_data);
 
+    /// @brief Fetch pba data from the leader
+    /// @param remote_pbas - list of remote pbas for which data is needed from the leader
+    void fetch_pba_data_from_leader(const pba_list_t& remote_pbas);
+
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
 protected:

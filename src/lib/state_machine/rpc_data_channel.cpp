@@ -54,4 +54,13 @@ void data_rpc::deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_h
         iovec{r_cast< void* >(incoming_buf.bytes + data_channel_rpc_hdr::max_hdr_size), value.size});
 }
 
+void data_rpc::deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_hdr& common_header, pba_list_t& pbas) {
+    // assert buf.size >= max header size
+    data_rpc* rpc = r_cast< data_rpc* >(incoming_buf.bytes);
+    common_header = rpc->common_hdr;
+    for (uint16_t i{0}; i < rpc->pba_area[0].n_pbas; ++i) {
+        pbas.emplace_back(rpc->pba_area[0].pinfo[i].pba);
+    }
+}
+
 } // namespace home_replication

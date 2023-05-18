@@ -55,7 +55,7 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
         // LOG ERROR
         return false;
     }
-    /* TODO add fetch data API
+
     if (auto resp = messaging->bind_data_service_request(FETCH_DATA, m_group_id,
                                                          [this](sisl::io_blob const& incoming_buf, void* rpc_data) {
                                                              m_state_machine->on_fetch_data_request(incoming_buf,
@@ -65,7 +65,7 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
         // LOG ERROR
         return false;
     }
-    */
+
     return true;
 }
 
@@ -76,6 +76,15 @@ void ReplicaSet::send_in_data_channel(const pba_list_t& pbas, const sisl::sg_lis
             data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), 0 /*replace with replica id*/}, pbas,
             m_state_store.get(), value),
         nullptr); // response callback is null as this is fire and forget
+}
+
+void ReplicaSet::fetch_pba_data_from_leader(const pba_list_t& remote_pbas) {
+    m_repl_svc_ctx->data_service_request(
+        FETCH_DATA,
+        data_rpc::serialize(
+            data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), 0 /*replace with replica id*/},
+            remote_pbas, m_state_store.get(), {}),
+        [this](sisl::io_blob const& incoming_buf) { m_state_machine->on_data_received(incoming_buf, nullptr); });
 }
 
 } // namespace home_replication

@@ -51,8 +51,11 @@ public:
 
     static sisl::io_blob_list_t serialize(const data_channel_rpc_hdr& common_header, const pba_list_t& pbas,
                                           StateMachineStore* store_ptr, const sisl::sg_list& value);
+
     static void deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_hdr& common_header,
                             fq_pba_list_t& fq_pbas, sisl::sg_list& value);
+
+    static void deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_hdr& common_header, pba_list_t& pbas);
 };
 #pragma pack()
 
