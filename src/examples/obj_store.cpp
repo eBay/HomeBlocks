@@ -13,9 +13,12 @@
 #include <mutex>
 
 #include <boost/uuid/random_generator.hpp>
+#include <iomgr/io_environment.hpp>
+#include <iomgr/http_server.hpp>
 #include <nuraft_mesg/messaging.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
+#include <sisl/version.hpp>
 
 #include "home_replication/repl_service.h"
 
@@ -42,6 +45,22 @@ static void handle(int signal);
 ///
 
 static std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replication::rs_ptr_t const&);
+
+static auto read_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+    LOGINFO("Read Object: [{}]", request.resource());
+    auto vers{sisl::VersionMgr::getVersions()};
+    std::string ver_str{""};
+    for (auto v : vers) {
+        ver_str += fmt::format("{0}: {1}; ", v.first, v.second);
+    }
+    response.send(Pistache::Http::Code::Ok, ver_str);
+    return Pistache::Rest::Route::Result::Ok;
+}
+
+static auto write_object([[maybe_unused]] auto& svc, auto const request, [[maybe_unused]] auto response) {
+    LOGINFO("Read Object: [{}]", request.resource());
+    return Pistache::Rest::Route::Result::Ok;
+}
 
 int main(int argc, char** argv) {
     SISL_OPTIONS_LOAD(argc, argv, logging, obj_store, example_lib);
@@ -77,11 +96,25 @@ int main(int argc, char** argv) {
     auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
                                                          consensus_instance, &on_set_init);
 
+    auto http_server = ioenvironment.with_http_server().get_http_server();
+    http_server->setup_route(Pistache::Http::Method::Get, "/api/v1/objects/*",
+                             [&repl_svc](const auto& request, auto response) {
+                                 return read_object(repl_svc, request, std::move(response));
+                             });
+    http_server->setup_route(Pistache::Http::Method::Put, "/api/v1/objects/*",
+                             [&repl_svc](const auto& request, auto response) {
+                                 return write_object(repl_svc, request, std::move(response));
+                             });
+
+    // start the server
+    http_server->start();
+
     // Now we wait until we are asked to terminate
     {
         auto lk = std::unique_lock< std::mutex >(s_stop_signal_condition_lck);
         s_stop_signal_condition.wait(lk, [] { return s_stop_signal; });
     }
+    http_server->stop();
 
     LOGWARN("Shutting down!");
     stop_homestore(svc_id);
