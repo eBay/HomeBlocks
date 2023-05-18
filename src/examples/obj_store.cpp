@@ -46,19 +46,30 @@ static void handle(int signal);
 
 static std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_replication::rs_ptr_t const&);
 
-static auto read_object([[maybe_unused]] auto& svc, auto const request, auto response) {
-    LOGINFO("Read Object: [{}]", request.resource());
+static auto ver_str() {
     auto vers{sisl::VersionMgr::getVersions()};
-    std::string ver_str{""};
+    auto ver_str = std::string();
     for (auto v : vers) {
         ver_str += fmt::format("{0}: {1}; ", v.first, v.second);
     }
-    response.send(Pistache::Http::Code::Ok, ver_str);
+    return ver_str;
+}
+
+static auto get_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+    LOGINFO("Get Object: [{}]", request.resource());
+    response.send(Pistache::Http::Code::Ok, ver_str());
     return Pistache::Rest::Route::Result::Ok;
 }
 
-static auto write_object([[maybe_unused]] auto& svc, auto const request, [[maybe_unused]] auto response) {
-    LOGINFO("Read Object: [{}]", request.resource());
+static auto put_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+    LOGINFO("Put Object: [{}]", request.resource());
+    response.send(Pistache::Http::Code::Ok, ver_str());
+    return Pistache::Rest::Route::Result::Ok;
+}
+
+static auto delete_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+    LOGINFO("Delete Object: [{}]", request.resource());
+    response.send(Pistache::Http::Code::Ok, ver_str());
     return Pistache::Rest::Route::Result::Ok;
 }
 
@@ -97,13 +108,15 @@ int main(int argc, char** argv) {
                                                          consensus_instance, &on_set_init);
 
     auto http_server = ioenvironment.with_http_server().get_http_server();
-    http_server->setup_route(Pistache::Http::Method::Get, "/api/v1/objects/*",
+    http_server->setup_route(
+        Pistache::Http::Method::Get, "/api/v1/objects/*",
+        [&repl_svc](const auto& request, auto response) { return get_object(repl_svc, request, std::move(response)); });
+    http_server->setup_route(
+        Pistache::Http::Method::Put, "/api/v1/objects/*",
+        [&repl_svc](const auto& request, auto response) { return put_object(repl_svc, request, std::move(response)); });
+    http_server->setup_route(Pistache::Http::Method::Delete, "/api/v1/objects/*",
                              [&repl_svc](const auto& request, auto response) {
-                                 return read_object(repl_svc, request, std::move(response));
-                             });
-    http_server->setup_route(Pistache::Http::Method::Put, "/api/v1/objects/*",
-                             [&repl_svc](const auto& request, auto response) {
-                                 return write_object(repl_svc, request, std::move(response));
+                                 return delete_object(repl_svc, request, std::move(response));
                              });
 
     // start the server
