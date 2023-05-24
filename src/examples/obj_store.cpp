@@ -63,24 +63,29 @@ static auto get_object([[maybe_unused]] auto& set, auto const request, auto resp
 }
 
 static auto put_object([[maybe_unused]] auto& set, auto const request, auto response) {
-    auto const sz = request.body().size();
     auto const& resource = request.resource();
+    auto const sz = request.body().size();
 
-    if (4096u < sz) {
+    if (4096u >= sz) {
+        LOGINFO("Put Object: [{}]:[{}]B", resource, sz);
+        iomanager.run_on(
+            iomgr::thread_regex::random_worker,
+            [&set, &request, &resource](iomgr::io_thread_addr_t a) {
+                auto iovs = sisl::sg_iovs_t();
+                iovs.push_back(iovec{const_cast< char* >(request.body().data()), 4096});
+                auto sg = sisl::sg_list{4096, iovs};
+                auto blob_header = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+                                              static_cast< uint32_t >(resource.size())};
+                auto blob_key = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+                                           static_cast< uint32_t >(resource.size())};
+                set->write(blob_header, blob_key, sg, nullptr);
+            },
+            iomgr::wait_type_t::spin);
+        response.send(Pistache::Http::Code::Ok);
+    } else {
         LOGWARN("Put Object too big!: [{}]:[{}]", resource, sz);
         response.send(Pistache::Http::Code::Request_Entity_Too_Large);
-        return Pistache::Rest::Route::Result::Ok;
     }
-    LOGINFO("Put Object: [{}]:[{}]", resource, request.body());
-    auto iovs = sisl::sg_iovs_t();
-    iovs.push_back(iovec{const_cast< char* >(request.body().data()), 4096});
-    auto sg = sisl::sg_list{4096, iovs};
-    auto blob_header = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
-                                  static_cast< uint32_t >(resource.size())};
-    auto blob_key = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
-                               static_cast< uint32_t >(resource.size())};
-    set->write(blob_header, blob_key, sg, nullptr);
-    response.send(Pistache::Http::Code::Ok);
     return Pistache::Rest::Route::Result::Ok;
 }
 
