@@ -13,6 +13,7 @@
 #include <mutex>
 
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/string_generator.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
 #include <nuraft_mesg/messaging.hpp>
@@ -55,19 +56,35 @@ static auto ver_str() {
     return ver_str;
 }
 
-static auto get_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+static auto get_object([[maybe_unused]] auto& set, auto const request, auto response) {
     LOGINFO("Get Object: [{}]", request.resource());
     response.send(Pistache::Http::Code::Ok, ver_str());
     return Pistache::Rest::Route::Result::Ok;
 }
 
-static auto put_object([[maybe_unused]] auto& svc, auto const request, auto response) {
-    LOGINFO("Put Object: [{}]", request.resource());
-    response.send(Pistache::Http::Code::Ok, ver_str());
+static auto put_object([[maybe_unused]] auto& set, auto const request, auto response) {
+    auto const sz = request.body().size();
+    auto const& resource = request.resource();
+
+    if (4096u < sz) {
+        LOGWARN("Put Object too big!: [{}]:[{}]", resource, sz);
+        response.send(Pistache::Http::Code::Request_Entity_Too_Large);
+        return Pistache::Rest::Route::Result::Ok;
+    }
+    LOGINFO("Put Object: [{}]:[{}]", resource, request.body());
+    auto iovs = sisl::sg_iovs_t();
+    iovs.push_back(iovec{const_cast< char* >(request.body().data()), 4096});
+    auto sg = sisl::sg_list{4096, iovs};
+    auto blob_header = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+                                  static_cast< uint32_t >(resource.size())};
+    auto blob_key = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+                               static_cast< uint32_t >(resource.size())};
+    set->write(blob_header, blob_key, sg, nullptr);
+    response.send(Pistache::Http::Code::Ok);
     return Pistache::Rest::Route::Result::Ok;
 }
 
-static auto delete_object([[maybe_unused]] auto& svc, auto const request, auto response) {
+static auto delete_object([[maybe_unused]] auto& set, auto const request, auto response) {
     LOGINFO("Delete Object: [{}]", request.resource());
     response.send(Pistache::Http::Code::Ok, ver_str());
     return Pistache::Rest::Route::Result::Ok;
@@ -107,16 +124,20 @@ int main(int argc, char** argv) {
     auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
                                                          consensus_instance, &on_set_init);
 
+    // Create a replication group
+    auto const set_id = boost::uuids::string_generator()("f0d3ec17-9075-429b-afa7-68d7542f7403");
+    auto repl_set = repl_svc.create_replica_set(set_id);
+
     auto http_server = ioenvironment.with_http_server().get_http_server();
     http_server->setup_route(
         Pistache::Http::Method::Get, "/api/v1/objects/*",
-        [&repl_svc](const auto& request, auto response) { return get_object(repl_svc, request, std::move(response)); });
+        [&repl_set](const auto& request, auto response) { return get_object(repl_set, request, std::move(response)); });
     http_server->setup_route(
         Pistache::Http::Method::Put, "/api/v1/objects/*",
-        [&repl_svc](const auto& request, auto response) { return put_object(repl_svc, request, std::move(response)); });
+        [&repl_set](const auto& request, auto response) { return put_object(repl_set, request, std::move(response)); });
     http_server->setup_route(Pistache::Http::Method::Delete, "/api/v1/objects/*",
-                             [&repl_svc](const auto& request, auto response) {
-                                 return delete_object(repl_svc, request, std::move(response));
+                             [&repl_set](const auto& request, auto response) {
+                                 return delete_object(repl_set, request, std::move(response));
                              });
 
     // start the server
@@ -127,6 +148,7 @@ int main(int argc, char** argv) {
         auto lk = std::unique_lock< std::mutex >(s_stop_signal_condition_lck);
         s_stop_signal_condition.wait(lk, [] { return s_stop_signal; });
     }
+    repl_set.reset();
     http_server->stop();
 
     LOGWARN("Shutting down!");
