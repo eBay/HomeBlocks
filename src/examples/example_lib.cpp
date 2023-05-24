@@ -14,7 +14,7 @@ SISL_OPTION_GROUP(example_lib,
                   (num_devs, "", "num_devs", "number of devices to create",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
                   (dev_size_mb, "", "dev_size_mb", "size of each device in MB",
-                   ::cxxopts::value< uint64_t >()->default_value("1024"), "number"),
+                   ::cxxopts::value< uint64_t >()->default_value("2048"), "number"),
                   (device_list, "", "device_list", "Device List instead of default created",
                    ::cxxopts::value< std::vector< std::string > >(), "path [...]"));
 
@@ -63,7 +63,8 @@ void start_homestore(std::string const& svc_id) {
     homestore::HomeStore::instance()
         ->with_params(params)
         .with_meta_service(5.0)
-        .with_log_service(80.0, 5.0)
+        .with_log_service(20.0, 5.0)
+        .with_data_service(30.0)
         // .before_init_devices([this]() { })
         .init(true /* wait_for_init */);
 }
