@@ -40,7 +40,6 @@ class HomeReplicationConan(ConanFile):
         self.requires("homestore/[~=4,      include_prerelease=True]@oss/master")
         self.requires("sisl/[~=9,           include_prerelease=True]@oss/master")
 
-        self.requires("nuraft/2.1.0", override=True)
         self.requires("openssl/1.1.1s", override=True)
         self.requires("zlib/1.2.12", override=True)
 
