@@ -36,7 +36,7 @@ class HomeReplicationConan(ConanFile):
         self.build_requires("gtest/1.12.1")
 
     def requirements(self):
-        self.requires("nuraft_mesg/[~=0,    include_prerelease=True]@oss/master")
+        self.requires("nuraft_mesg/[~=0,    include_prerelease=True]@oss/main")
         self.requires("homestore/[~=4,      include_prerelease=True]@oss/master")
         self.requires("sisl/[~=9,           include_prerelease=True]@oss/master")
 
