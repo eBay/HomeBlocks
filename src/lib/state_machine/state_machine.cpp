@@ -2,6 +2,7 @@
 #include <sisl/fds/utils.hpp>
 #include <sisl/fds/obj_allocator.hpp>
 #include <sisl/fds/vector_pool.hpp>
+#include <sisl/grpc/generic_service.hpp>
 #include <home_replication/repl_service.h>
 #include <home_replication/repl_set.h>
 #include <iomgr/iomgr_timer.hpp>
@@ -24,8 +25,9 @@ SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
-ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
-        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
+ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs,
+                                         const std::string& group_id) :
+        m_state_store{state_store}, m_rs{rs}, m_group_id{group_id} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -338,7 +340,14 @@ void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_res
     if (when_done) when_done(ret_val, null_except);
 }
 
-void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, void* rpc_data) {
+pba_state_t ReplicaStateMachine::get_pba_state(fully_qualified_pba const& fq_pba) const {
+    const auto key_string = fq_pba.to_key_string();
+    const auto it = m_pba_map.find(key_string);
+    return (it != m_pba_map.end()) ? it->second->m_state : pba_state_t::unknown;
+}
+
+void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf,
+                                           boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
     data_channel_rpc_hdr common_header;
     sisl::sg_list value;
     fq_pba_list_t fq_pbas;
@@ -348,10 +357,20 @@ void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, vo
 
     // TODO: sanity checks around common_header
 
-    fq_pba_list_t fq_pbas_allocated;
+    // Prepare context to add to the rpc data
+    class DataReceivedContext : public sisl::GenericRpcContextBase {
+    public:
+        ReplicaStateMachine* sm_ptr;
+        fq_pba_list_t fq_list;
+        bool rpc_data{true};
+        DataReceivedContext(ReplicaStateMachine* sm) : sm_ptr(sm) {}
+    };
+
+    auto rpc_ctx = std::make_unique< DataReceivedContext >(this);
+    auto& fq_pbas_allocated = rpc_ctx->fq_list;
     pba_list_t pbas_final;
     sisl::sg_iterator sg_itr(value.iovs);
-    sisl::sg_list value_final;
+    sisl::sg_list value_final{0, {}};
 
     // pbas which are in allocated state after try_map_pba are pushed in the final lists to be written.
     // All other states are ignored.
@@ -377,71 +396,110 @@ void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf, vo
         }
     }
 
+    if (!rpc_data) {
+        rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+        rpc_ctx->rpc_data = false;
+    }
+    rpc_data->set_context(std::move(rpc_ctx));
+
     // issue async write and update the state.
     if (!pbas_final.empty()) {
-        m_state_store->async_write(
-            value_final, pbas_final,
-            [this, fqs = fq_pbas_allocated, rpc_data]([[maybe_unused]] std::error_condition err) {
-                assert(!err);
-                for (auto const& fq_p : fqs) {
-                    update_map_pba(fq_p, pba_state_t::completed);
-                }
-                if (rpc_data) { m_rs->send_data_service_response({}, rpc_data); }
-            });
-        for (auto const& fq_p : fq_pbas_allocated) {
-            update_map_pba(fq_p, pba_state_t::written);
-        }
+        m_state_store->async_write(value_final, pbas_final,
+                                   [rpc_data]([[maybe_unused]] std::error_condition err) mutable {
+                                       assert(!err);
+                                       auto rpc_ctx = dynamic_cast< DataReceivedContext* >(rpc_data->get_context());
+                                       assert(rpc_ctx != nullptr);
+                                       for (auto const& fq_p : rpc_ctx->fq_list) {
+                                           rpc_ctx->sm_ptr->update_map_pba(fq_p, pba_state_t::completed);
+                                       }
+                                       if (rpc_ctx->rpc_data) {
+                                           rpc_ctx->sm_ptr->m_rs->send_data_service_response({}, rpc_data);
+                                       }
+                                   });
     }
 }
 
-void ReplicaStateMachine::on_fetch_data_request(sisl::io_blob const& incoming_buf, void* rpc_data) {
+sisl::io_blob_list_t ReplicaStateMachine::serialize_data_rpc_buf(pba_list_t const& pbas,
+                                                                 sisl::sg_list const& value) const {
+    return data_rpc::serialize(data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), m_server_id}, pbas,
+                               m_state_store.get(), value);
+}
+
+class FetchDataContext : public sisl::GenericRpcContextBase {
+public:
+    ReplicaStateMachine* sm_ptr;
+    std::atomic< size_t > counter;
+    sisl::sg_list sg_final;
+    pba_list_t const pbas;
+    std::vector< sisl::sg_list > sg_cur;
+    sisl::io_blob hdr_blob;
+    std::atomic< bool > success{true};
+    bool rpc_data{true};
+    FetchDataContext(ReplicaStateMachine* sm, pba_list_t const& pba_list) : sm_ptr(sm), pbas(pba_list) {
+        sg_final.iovs.resize(pba_list.size());
+        sg_cur.resize(pba_list.size());
+        sg_final.size = 0;
+    }
+};
+
+void ReplicaStateMachine::on_fetch_data_request(sisl::io_blob const& incoming_buf,
+                                                boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
     // get the pbas for which we need to send the data
     data_channel_rpc_hdr common_header;
     pba_list_t pbas;
     data_rpc::deserialize(incoming_buf, common_header, pbas);
     // TODO: sanity checks around common_header
 
-    struct read_context {
-        std::atomic< size_t > counter;
-        sisl::sg_list sg_final;
-        pba_list_t pbas;
-        std::vector< sisl::sg_list > sg_cur;
-        std::atomic< bool > success{true};
-        read_context(pba_list_t const& pba_list) : pbas(pba_list) {
-            sg_final.iovs.resize(pba_list.size());
-            sg_final.size = 0;
-        }
-    };
-
-    auto ctx = std::make_shared< read_context >(pbas);
+    auto rpc_ctx = std::make_unique< FetchDataContext >(this, pbas);
+    if (!rpc_data) {
+        rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+        rpc_ctx->rpc_data = false;
+    }
     auto const num_pbas = pbas.size();
-    ctx->counter = num_pbas;
+    rpc_ctx->counter = num_pbas;
+    rpc_data->set_context(std::move(rpc_ctx));
 
+    auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
     for (size_t i = 0; i < num_pbas; i++) {
         auto const sz = m_state_store->pba_to_size(pbas[i]);
-        ctx->sg_cur[i].iovs.push_back(iovec{iomanager.iobuf_alloc(512, sz), sz});
-        ctx->sg_cur[i].size = sz;
-        m_state_store->async_read(pbas[i], ctx->sg_cur[i], sz, [this, ctx, i, rpc_data](std::error_condition err) {
+        ctx->sg_cur[i] = sisl::sg_list{sz, {iovec{iomanager.iobuf_alloc(512, sz), sz}}};
+        m_state_store->async_read(pbas[i], ctx->sg_cur[i], sz, [i, rpc_data](std::error_condition err) mutable {
+            auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
+            assert(ctx != nullptr);
             if (!err) {
                 ctx->sg_final.iovs[i] = ctx->sg_cur[i].iovs.back();
             } else {
                 (ctx->success = false);
             }
-            if (ctx->counter.fetch_sub(1, std::memory_order_seq_cst) == 1) {
-                for (auto const& iov : ctx->sg_final.iovs) {
-                    ctx->sg_final.size += iov.iov_len;
-                }
-                if (rpc_data) {
-                    sisl::io_blob_list_t response_blobs = (ctx->success)
-                        ? data_rpc::serialize(
-                              data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), m_server_id},
-                              ctx->pbas, m_state_store.get(), ctx->sg_final)
-                        : sisl::io_blob_list_t();
-                    m_rs->send_data_service_response(response_blobs, rpc_data);
+            if (ctx->rpc_data) {
+                if (ctx->counter.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                    for (auto const& iov : ctx->sg_final.iovs) {
+                        ctx->sg_final.size += iov.iov_len;
+                    }
+                    sisl::io_blob_list_t response_blobs;
+                    if (ctx->success) {
+                        response_blobs = ctx->sm_ptr->serialize_data_rpc_buf(ctx->pbas, ctx->sg_final);
+                        ctx->hdr_blob = response_blobs[0];
+                    }
+                    ctx->sm_ptr->m_rs->send_data_service_response(response_blobs, rpc_data);
                 }
             }
         });
     }
+}
+
+void ReplicaStateMachine::on_fetch_data_completed(boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+    auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
+    assert(ctx != nullptr);
+    for (auto& sgl : ctx->sg_cur) {
+        for (auto iov : sgl.iovs) {
+            iomanager.iobuf_free(s_cast< uint8_t* >(iov.iov_base));
+            iov.iov_base = nullptr;
+            iov.iov_len = 0;
+        }
+        sgl.size = 0;
+    }
+    delete[] ctx->hdr_blob.bytes;
 }
 
 } // namespace home_replication

@@ -164,7 +164,8 @@ using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
 
 class ReplicaStateMachine : public nuraft::state_machine {
 public:
-    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs);
+    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs,
+                        const std::string& group_id);
     ~ReplicaStateMachine() override = default;
     ReplicaStateMachine(ReplicaStateMachine const&) = delete;
     ReplicaStateMachine& operator=(ReplicaStateMachine const&) = delete;
@@ -248,9 +249,12 @@ public:
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);
 
-    // data service apis
-    void on_data_received(sisl::io_blob const&, void* rpc_data);
-    void on_fetch_data_request(sisl::io_blob const&, void* rpc_data);
+    // data service apis and helpers
+    void on_data_received(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_request(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_completed(boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    sisl::io_blob_list_t serialize_data_rpc_buf(pba_list_t const& pbas, sisl::sg_list const& value) const;
+    pba_state_t get_pba_state(fully_qualified_pba const& fq_pba) const;
 
 private:
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& params);

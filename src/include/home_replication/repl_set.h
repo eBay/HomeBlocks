@@ -65,10 +65,11 @@ public:
     /// @param value - data to be sent
     void send_in_data_channel(const pba_list_t& pbas, const sisl::sg_list& value);
 
-    /// @brief Send the final responce to the rpc client
+    /// @brief Send the final responce to the rpc client. This method is defined virtual for mocking in the gtest
     /// @param outgoing_buf - response buf to client
     /// @param rpc_data - context provided by the rpc server
-    void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf, void* rpc_data);
+    virtual void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
+                                            boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
 
     /// @brief Fetch pba data from the leader
     /// @param remote_pbas - list of remote pbas for which data is needed from the leader

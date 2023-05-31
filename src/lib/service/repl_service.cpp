@@ -40,7 +40,15 @@ ReplicationService::ReplicationService(backend_impl_t backend,
     auto group_type_params = nuraft_mesg::consensus_component::register_params{
         r_params,
         [this](int32_t const, std::string const& group_id) mutable -> std::shared_ptr< nuraft_mesg::mesg_state_mgr > {
-            return create_replica_set(boost::uuids::string_generator()(group_id));
+            // boost::uuids can throw
+            uuid_t sanitized_group_id;
+            try {
+                sanitized_group_id = boost::uuids::string_generator()(group_id);
+            } catch (std::runtime_error const&) {
+                LOGERROR("invalid uuid format, {}", group_id);
+                return nullptr;
+            }
+            return create_replica_set(sanitized_group_id);
         }};
     m_messaging->register_mgr_type("home_replication", group_type_params);
 }

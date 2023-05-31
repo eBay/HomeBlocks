@@ -9,10 +9,14 @@
 #include <home_replication/repl_service.h> // includes repl_set.h
 #include <gtest/gtest.h>
 
+#include <sisl/grpc/generic_service.hpp>
 #include <home_replication/repl_decls.h>
 #include "state_machine/state_machine.h"
+#include "mock_storage_engine.h"
+#include "test_common.h"
 
 using namespace home_replication;
+using namespace testing;
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 
@@ -223,6 +227,194 @@ TEST_F(TestReplStateMachine, async_fetch_pba_test_no_wait) {
 
 TEST_F(TestReplStateMachine, async_fetch_pba_test_wait_timeout_fetch_remote) {
     // To be implemented;
+}
+
+static uint64_t const mock_pba_size{sizeof(uint64_t)};
+
+class MockReplicaSet : public ReplicaSet {
+public:
+    using ReplicaSet::ReplicaSet;
+    MOCK_METHOD(void, send_data_service_response,
+                (sisl::io_blob_list_t const&, boost::intrusive_ptr< sisl::GenericRpcData >&));
+};
+
+class TestDataChannelReceive : public testing::Test {
+protected:
+    void SetUp() override {
+        generate_data(data_size, pbas, data_vec, sgl);
+        setup();
+        EXPECT_CALL(*m_rs, send_data_service_response(_, _)).Times(1);
+    }
+
+    void setup() {
+        m_se = std::make_shared< MockStorageEngine >();
+        m_rs = std::make_shared< MockReplicaSet >(to_string(boost::uuids::random_generator()()), m_se,
+                                                  nullptr /*log store*/);
+        m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
+
+        EXPECT_CALL(*m_se, pba_to_size(_)).WillRepeatedly([](pba_t const&) { return mock_pba_size; });
+        hdr = {boost::uuids::random_generator()(), svr_id};
+        serialized_blob = serialize_to_ioblob(hdr, m_se.get(), pbas, sgl);
+
+        EXPECT_CALL(*m_se, alloc_pbas(_)).WillRepeatedly([](uint32_t) {
+            pba_list_t ret = {get_random_num()};
+            return ret;
+        });
+
+        for (auto const pba : pbas) {
+            fully_qualified_pba fq{svr_id, pba, mock_pba_size};
+            EXPECT_EQ(m_sm->get_pba_state(fq), pba_state_t::unknown);
+        }
+        rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+    }
+
+    void TearDown() override {
+        for (auto const pba : pbas) {
+            fully_qualified_pba fq{svr_id, pba, mock_pba_size};
+            EXPECT_EQ(m_sm->get_pba_state(fq), pba_state_t::completed);
+        }
+        free_resources(sgl, serialized_blob);
+    }
+
+    std::shared_ptr< ReplicaStateMachine > m_sm;
+    std::shared_ptr< MockReplicaSet > m_rs;
+    std::shared_ptr< MockStorageEngine > m_se;
+    size_t data_size{10};
+    pba_list_t pbas;
+    sisl::sg_list sgl;
+    std::vector< uint64_t > data_vec;
+    sisl::io_blob serialized_blob;
+    uint32_t svr_id{1};
+    data_channel_rpc_hdr hdr;
+    boost::intrusive_ptr< sisl::GenericRpcData > rpc_data;
+};
+
+TEST_F(TestDataChannelReceive, on_data_received1) {
+    EXPECT_CALL(*m_se, async_write(_, _, _))
+        .Times(1)
+        .WillRepeatedly(
+            [this](const sisl::sg_list& value, const pba_list_t& in_pba_list, const io_completion_cb_t& cb) {
+                std::thread([this, value, in_pba_list, cb]() {
+                    verify_data(value, data_vec, false);
+                    cb(std::error_condition());
+                }).detach();
+            });
+
+    m_sm->on_data_received(serialized_blob, rpc_data);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+TEST_F(TestDataChannelReceive, on_data_received2) {
+    // change the state of alternate pbas to completed and verify that the async write does not get these pbas
+    std::vector< uint64_t > data_vec_updated;
+    for (uint32_t i = 0; i < pbas.size(); i++) {
+        if (i % 2 == 0) {
+            fully_qualified_pba fq{svr_id, pbas[i], mock_pba_size};
+            m_sm->try_map_pba(fq);
+            m_sm->update_map_pba(fq, pba_state_t::completed);
+        } else {
+            data_vec_updated.emplace_back(data_vec[i]);
+        }
+    }
+
+    EXPECT_CALL(*m_se, async_write(_, _, _))
+        .Times(1)
+        .WillRepeatedly([data_vec_updated](const sisl::sg_list& value, const pba_list_t& in_pba_list,
+                                           const io_completion_cb_t& cb) {
+            std::thread([data_vec_updated, value, in_pba_list, cb]() {
+                verify_data(value, data_vec_updated, false);
+                cb(std::error_condition());
+            }).detach();
+        });
+
+    m_sm->on_data_received(serialized_blob, rpc_data);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+class TestDataChannelFetch : public TestDataChannelReceive {
+protected:
+    void SetUp() override {
+        generate_data(data_size, pbas, data_vec, sgl, false);
+        TestDataChannelReceive::setup();
+    }
+
+    void TearDown() override {
+        free_resources(sgl, serialized_blob);
+        serialized_blob_read_response.buf_free();
+        m_sm->on_fetch_data_completed(rpc_data);
+    }
+
+    void read_pba(pba_t pba, sisl::sg_list& sgs, uint32_t size) {
+        EXPECT_EQ(size, mock_pba_size);
+        EXPECT_EQ(sgs.iovs.size(), 1);
+        size_t i = 0;
+        for (; i < pbas.size(); i++) {
+            if (pbas[i] == pba) { break; }
+        }
+        ASSERT_LT(i, pbas.size());
+        auto rand_num = r_cast< uint64_t* >(sgs.iovs[0].iov_base);
+        *(rand_num) = data_vec[i];
+    }
+
+    sisl::io_blob serialized_blob_read_response;
+};
+
+TEST_F(TestDataChannelFetch, on_fetch_data_request1) {
+    EXPECT_CALL(*m_se, async_read(_, _, _, _))
+        .Times(data_size)
+        .WillRepeatedly([this](pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
+            std::thread([this, pba, &sgs, size, cb]() {
+                read_pba(pba, sgs, size);
+                cb(std::error_condition());
+            }).detach();
+        });
+
+    EXPECT_CALL(*m_se, async_write(_, _, _))
+        .Times(1)
+        .WillRepeatedly(
+            [this](const sisl::sg_list& value, const pba_list_t& in_pba_list, const io_completion_cb_t& cb) {
+                std::thread([this, value, in_pba_list, cb]() {
+                    verify_data(value, data_vec, false);
+                    cb(std::error_condition());
+                }).detach();
+            });
+
+    EXPECT_CALL(*m_rs, send_data_service_response(_, _))
+        .Times(2)
+        .WillOnce(
+            [this](sisl::io_blob_list_t const& outgoing_buf, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+                auto rpc_data_w = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+                serialized_blob_read_response = serialize_to_ioblob(outgoing_buf);
+                m_sm->on_data_received(serialized_blob_read_response, rpc_data_w);
+            })
+        .WillRepeatedly(DoDefault());
+
+    m_sm->on_fetch_data_request(serialized_blob, rpc_data);
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+}
+
+TEST_F(TestDataChannelFetch, on_fetch_data_request2) {
+    EXPECT_CALL(*m_se, async_read(_, _, _, _))
+        .Times(data_size)
+        .WillRepeatedly([this](pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
+            std::thread([this, pba, &sgs, size, cb]() {
+                read_pba(pba, sgs, size);
+                static std::atomic< int > c = 0;
+                auto err = (c == data_size - 2) ? std::make_error_condition(std::errc::invalid_argument)
+                                                : std::error_condition();
+                c++;
+                cb(err);
+            }).detach();
+        });
+
+    EXPECT_CALL(*m_rs, send_data_service_response(_, _))
+        .Times(1)
+        .WillOnce([](sisl::io_blob_list_t const& outgoing_buf, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+            EXPECT_TRUE(outgoing_buf.empty());
+        });
+
+    m_sm->on_fetch_data_request(serialized_blob, rpc_data);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
 SISL_OPTIONS_ENABLE(logging, test_repl_state_machine)
