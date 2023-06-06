@@ -5,7 +5,7 @@
 #include <home_replication/repl_decls.h>
 
 namespace home_replication {
-VENUM(journal_type_t, uint16_t, DATA = 0);
+VENUM(journal_type_t, uint16_t, DATA = 0)
 using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
 
 static constexpr uint16_t JOURNAL_ENTRY_MAJOR{1};
