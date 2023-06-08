@@ -79,7 +79,7 @@ class StateMachineStore;
 struct repl_req;
 using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
 
-ENUM(pba_state_t, uint32_t, unknown, allocated, written, completed);
+ENUM(pba_state_t, uint32_t, unknown, allocated, written, completed)
 
 using batch_completion_cb_t = std::function< void(void) >;
 
