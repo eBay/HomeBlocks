@@ -27,6 +27,7 @@ class HomeReplicationConan(ConanFile):
                 'shared': False,
                 'fPIC': True,
                 'sanitize': False,
+                'sisl:prerelease': True,
             }
 
     generators = "cmake", "cmake_find_package"
