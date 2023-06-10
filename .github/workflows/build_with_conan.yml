@@ -58,7 +58,7 @@ jobs:
       prerelease: ${{ matrix.prerelease }}
 
   BuildPR:
-    needs: BuildDependencies
+    needs: CacheDependencies
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
