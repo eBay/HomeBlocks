@@ -1,0 +1,13 @@
+name: HomeReplication Conan Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+    - name: Checkout Code
+      uses: actions/checkout@v3
