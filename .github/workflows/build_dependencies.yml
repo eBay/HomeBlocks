@@ -39,6 +39,13 @@ jobs:
     - name: Retrieve Dependencies
       uses: actions/checkout@v3
       with:
+        repository: eBay/Homestore
+        path: deps/homestore
+        ref: master
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
         repository: eBay/HomeReplication
         path: deps/home_repl
         ref: ${{ inputs.branch }}
@@ -86,7 +93,7 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        conan export deps/iomgr oss/master
+        conan export deps/homestore oss/master
         conan install \
             -o sisl:prerelease=${{ inputs.prerelease }} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
