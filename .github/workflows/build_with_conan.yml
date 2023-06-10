@@ -116,7 +116,7 @@ jobs:
         path: |
           ~/.conan/data/nuraft
           ~/.conan/data/sisl
-        key: NuMesgDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key: NuMesgDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
 
     - name: Restore IOMgr 3rdParty Cache
       id: restore-iomgr-3rd-party
