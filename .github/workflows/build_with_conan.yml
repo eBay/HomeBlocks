@@ -9,7 +9,7 @@ on:
       - main
 
 jobs:
-  BuildHomestore:
+  InstallHomestore:
     strategy:
       fail-fast: false
       matrix:
@@ -25,14 +25,14 @@ jobs:
             malloc-impl: libc
           - prerelease: "True"
             malloc-impl: jemalloc
-    uses: ./.github/workflows/build_homestore.yml
+    uses: ./.github/workflows/install_homestore.yml
     with:
       build-type: ${{ matrix.build-type }}
       malloc-impl: ${{ matrix.malloc-impl }}
       prerelease: ${{ matrix.prerelease }}
 
   CacheDependencies:
-    needs: BuildHomestore
+    needs: InstallHomestore
     strategy:
       fail-fast: false
       matrix:

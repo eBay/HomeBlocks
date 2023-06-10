@@ -1,4 +1,4 @@
-name: SISL Build
+name: Install Homestore
 
 on:
   workflow_call:
