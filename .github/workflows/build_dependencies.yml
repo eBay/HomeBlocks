@@ -39,15 +39,8 @@ jobs:
     - name: Retrieve Dependencies
       uses: actions/checkout@v3
       with:
-        repository: eBay/iomanager
-        path: deps/iomgr
-        ref: master
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/Homestore
-        path: deps/homestore
+        repository: eBay/HomeReplication
+        path: deps/home_repl
         ref: ${{ inputs.branch }}
 
     - name: Restore Sisl 3rdParty Cache
@@ -83,6 +76,14 @@ jobs:
           ~/.conan/data/iomgr
         key: HomestoreDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
 
+    - name: Restore HomeRepl 3rdParty Cache
+      id: restore-cache-homerepl
+      uses: actions/cache/restore@v3
+      with:
+        path: |
+          ~/.conan/data/homestore
+        key: HomeReplDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+
     - name: Install Dependencies
       run: |
         conan export deps/iomgr oss/master
@@ -92,16 +93,16 @@ jobs:
             -o sisl:testing=False \
             -o iomgr:testing=off \
             -s build_type=${{ inputs.build-type }} \
-            --build missing deps/homestore
+            --build missing deps/home_repl
 
     - name: Cleanup dep builds
       run: |
         rm -rf ~/.conan/data/*/*/*/*/build
 
-    - name: Save Homestore 3rdParty Cache
-      id: save-cache-homestore
+    - name: Save HomeRepl 3rdParty Cache
+      id: save-cache-homerepl
       uses: actions/cache/save@v3
       with:
         path: |
-          ~/.conan/data/iomgr
-        key: HomestoreDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+          ~/.conan/data/homestore
+        key: HomeReplDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
