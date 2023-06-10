@@ -144,7 +144,8 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/iomgr
+          ~/.conan/data/homestore
+          ~/.conan/data/nuraft_mesg
         key: HomeReplDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Checkout Code
