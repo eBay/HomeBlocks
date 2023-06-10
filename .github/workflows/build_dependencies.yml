@@ -17,16 +17,7 @@ on:
         type: string
 
 jobs:
-  HomestoreDeps:
-    uses: eBay/homestore/.github/workflows/build_dependencies.yml@master
-    with:
-      branch: master
-      build-type: ${{ inputs.build-type }}
-      malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
-
   BuildHomestoreDeps:
-    needs: HomestoreDeps
     runs-on: ubuntu-22.04
     steps:
     - name: Setup Python
@@ -48,22 +39,15 @@ jobs:
     - name: Retrieve Dependencies
       uses: actions/checkout@v3
       with:
-        repository: eBay/nuraft_mesg
-        path: deps/nuraft_mesg
-        ref: main
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/HomeStore
-        path: deps/homestore
+        repository: eBay/iomanager
+        path: deps/iomgr
         ref: master
 
     - name: Retrieve Dependencies
       uses: actions/checkout@v3
       with:
-        repository: eBay/HomeReplication
-        path: deps/home_replication
+        repository: eBay/Homestore
+        path: deps/homestore
         ref: ${{ inputs.branch }}
 
     - name: Restore Sisl 3rdParty Cache
@@ -101,26 +85,23 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        conan export deps/homestore oss/master
-        conan export deps/nuraft_mesg oss/main
+        conan export deps/iomgr oss/master
         conan install \
             -o sisl:prerelease=${{ inputs.prerelease }} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
+            -o sisl:testing=False \
             -o iomgr:testing=off \
-            -o homestore:testing=off \
-            -o nuraft_mesg:testing=False \
             -s build_type=${{ inputs.build-type }} \
-            --build missing deps/home_replication
+            --build missing deps/homestore
 
     - name: Cleanup dep builds
       run: |
         rm -rf ~/.conan/data/*/*/*/*/build
 
-    - name: Save HomeReplication 3rdParty Cache
-      id: save-cache-homereplication
+    - name: Save Homestore 3rdParty Cache
+      id: save-cache-homestore
       uses: actions/cache/save@v3
       with:
         path: |
-          ~/.conan/data/homestore
-          ~/.conan/data/nuraft_mesg
-        key: HomeReplDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+          ~/.conan/data/iomgr
+        key: HomestoreDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}

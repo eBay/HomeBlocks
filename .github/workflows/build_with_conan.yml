@@ -9,7 +9,30 @@ on:
       - main
 
 jobs:
-  BuildDependencies:
+  BuildHomestore:
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ["Debug", "Release"]
+        malloc-impl: ["libc", "tcmalloc", "jemalloc"]
+        prerelease: ["True", "False"]
+        exclude:
+          - build-type: Debug
+            malloc-impl: tcmalloc
+          - build-type: Debug
+            malloc-impl: jemalloc
+          - build-type: Release
+            malloc-impl: libc
+          - prerelease: "True"
+            malloc-impl: jemalloc
+    uses: ./.github/workflows/build_homestore.yml
+    with:
+      build-type: ${{ matrix.build-type }}
+      malloc-impl: ${{ matrix.malloc-impl }}
+      prerelease: ${{ matrix.prerelease }}
+
+  CacheDependencies:
+    needs: BuildHomestore
     strategy:
       fail-fast: false
       matrix:
