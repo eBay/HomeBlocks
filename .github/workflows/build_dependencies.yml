@@ -111,7 +111,7 @@ jobs:
     - name: Install Dependencies
       run: |
         conan export deps/homestore oss/master
-        conan export deps/nuraft_mesg oss/master
+        conan export deps/nuraft_mesg oss/main
         conan install \
             -o sisl:prerelease=${{ inputs.prerelease }} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
