@@ -117,6 +117,8 @@ jobs:
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
             -o sisl:testing=False \
             -o iomgr:testing=off \
+            -o homestore:testing=off \
+            -o nuraft_mesg:testing=False \
             -s build_type=${{ inputs.build-type }} \
             --build missing deps/home_repl
 
