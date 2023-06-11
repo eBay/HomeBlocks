@@ -4,14 +4,11 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
 
 jobs:
   InstallHomestore:
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         build-type: ["Debug", "Release"]
         malloc-impl: ["libc", "tcmalloc", "jemalloc"]
@@ -36,7 +33,7 @@ jobs:
   CacheDependencies:
     needs: InstallHomestore
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         build-type: ["Debug", "Release"]
         malloc-impl: ["libc", "tcmalloc", "jemalloc"]
@@ -111,7 +108,7 @@ jobs:
           ~/.conan/data/jemalloc
           ~/.conan/data/prerelease_dummy
           ~/.conan/data/spdlog
-        key: SislDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}
+        key: SislDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Restore NuraftMsg 3rdParty Cache
       id: restore-cache-nuraftmsg
