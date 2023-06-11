@@ -9,3 +9,4 @@ target_link_libraries(storage_engine
             sisl::sisl
         )
 target_compile_features(storage_engine PUBLIC cxx_std_17)
+add_dependencies(storage_engine service)

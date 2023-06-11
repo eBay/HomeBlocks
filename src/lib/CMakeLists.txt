@@ -3,8 +3,8 @@ cmake_minimum_required (VERSION 3.11)
 # add warning options
 add_flags("-Wall -Wextra -Werror -Wpedantic")
 
-add_subdirectory(log_store)
 add_subdirectory(service)
+add_subdirectory(log_store)
 add_subdirectory(storage)
 add_subdirectory(state_machine)
 

@@ -7,3 +7,4 @@ target_sources(state_machine PRIVATE
         )
 target_link_libraries(state_machine ${COMMON_DEPS})
 target_compile_features(state_machine PUBLIC cxx_std_17)
+add_dependencies(state_machine service)
