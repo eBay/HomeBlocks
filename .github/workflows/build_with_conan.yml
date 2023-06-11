@@ -109,14 +109,15 @@ jobs:
           ~/.conan/data/spdlog
         key: SislDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}
 
-    - name: Restore NuraftMesg 3rdParty Cache
-      id: restore-cache-nuraftmesg
+    - name: Restore NuraftMsg 3rdParty Cache
+      id: restore-cache-nuraftmsg
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/nuraft
           ~/.conan/data/sisl
-        key: NuMesgDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}
+          ~/.conan/data/nuraft
+        key: NuMesgDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
+
 
     - name: Restore IOMgr 3rdParty Cache
       id: restore-iomgr-3rd-party
