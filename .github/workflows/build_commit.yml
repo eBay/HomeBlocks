@@ -21,7 +21,7 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
-  NuRaftMesg:
+  NuRaftMesgDeps:
     needs: SislDeps
     uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@main
     with:
@@ -46,7 +46,7 @@ jobs:
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
   HomeReplDeps:
-    needs: [HomeStoreDeps, NuMesgDeps]
+    needs: [HomeStoreDeps, NuRaftMesgDeps]
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: main
