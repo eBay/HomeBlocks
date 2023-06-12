@@ -6,32 +6,7 @@ on:
       - main
 
 jobs:
-  InstallHomestore:
-    strategy:
-      fail-fast: true
-      matrix:
-        build-type: ["Debug", "Release"]
-        malloc-impl: ["libc", "tcmalloc", "jemalloc"]
-        prerelease: ["True", "False"]
-        exclude:
-          - build-type: Debug
-            prerelease: "True"
-          - build-type: Debug
-            malloc-impl: tcmalloc
-          - build-type: Debug
-            malloc-impl: jemalloc
-          - build-type: Release
-            malloc-impl: libc
-          - prerelease: "True"
-            malloc-impl: jemalloc
-    uses: ./.github/workflows/install_homestore.yml
-    with:
-      build-type: ${{ matrix.build-type }}
-      malloc-impl: ${{ matrix.malloc-impl }}
-      prerelease: ${{ matrix.prerelease }}
-
   CacheDependencies:
-    needs: InstallHomestore
     strategy:
       fail-fast: true
       matrix:
@@ -49,9 +24,8 @@ jobs:
             malloc-impl: libc
           - prerelease: "True"
             malloc-impl: jemalloc
-    uses: ./.github/workflows/build_dependencies.yml
+    uses: ./.github/workflows/cache_dependencies.yml
     with:
-      branch: main
       build-type: ${{ matrix.build-type }}
       malloc-impl: ${{ matrix.malloc-impl }}
       prerelease: ${{ matrix.prerelease }}

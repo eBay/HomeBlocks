@@ -1,4 +1,4 @@
-name: Install Homestore
+name: Cache Dependencies
 
 on:
   workflow_call:
@@ -42,6 +42,14 @@ jobs:
     uses: eBay/homestore/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: ${{ inputs.prerelease }}
+  HomeReplDeps:
+    needs: HomeStoreDeps
+    uses: ./.github/workflows/build_dependencies.yml
+    with:
+      branch: main
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
