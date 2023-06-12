@@ -40,20 +40,6 @@ jobs:
         # Set std::string to non-CoW C++11 version
         sed -i 's,compiler.libcxx=libstdc++$,compiler.libcxx=libstdc++11,g' ~/.conan/profiles/default
 
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/nuraft_mesg
-        path: deps/nuraft_mesg
-        ref: main
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/Homestore
-        path: deps/homestore
-        ref: master
-
     - name: Retrieve Code
       uses: actions/checkout@v3
       if: ${{ inputs.native == 'true' }}
@@ -64,6 +50,23 @@ jobs:
         repository: eBay/HomeReplication
         path: deps/home_repl
         ref: ${{ inputs.branch }}
+      if: ${{ inputs.native == 'false' }}
+
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
+        repository: eBay/nuraft_mesg
+        path: deps/nuraft_mesg
+        ref: main
+      if: ${{ inputs.native == 'false' }}
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
+        repository: eBay/Homestore
+        path: deps/homestore
+        ref: master
       if: ${{ inputs.native == 'false' }}
 
     - name: Restore Sisl 3rdParty Cache
