@@ -4,7 +4,7 @@ include_directories (BEFORE ../include/)
 include_directories (BEFORE ../lib/)
 include_directories (BEFORE .)
 
-find_package(GTest REQUIRED)
+find_package(GTest QUIET REQUIRED)
 
 link_directories(${spdk_LIB_DIRS} ${dpdk_LIB_DIRS})
 
