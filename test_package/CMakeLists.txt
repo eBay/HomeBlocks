@@ -4,7 +4,7 @@ project(test_package)
 include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
 conan_basic_setup(TARGETS)
 
-find_package(home_replication REQUIRED)
+find_package(home_replication QUIET REQUIRED)
 
 link_directories(${spdk_LIB_DIRS} ${dpdk_LIB_DIRS})
 

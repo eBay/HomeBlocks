@@ -1,8 +1,8 @@
 cmake_minimum_required (VERSION 3.11)
 
-find_package(Threads REQUIRED)
-find_package(homestore REQUIRED)
-find_package(nuraft_mesg REQUIRED)
+find_package(Threads QUIET REQUIRED)
+find_package(homestore QUIET REQUIRED)
+find_package(nuraft_mesg QUIET REQUIRED)
 
 set (COMMON_DEPS
         homestore::homestore
