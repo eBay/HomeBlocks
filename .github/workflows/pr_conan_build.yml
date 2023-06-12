@@ -91,11 +91,7 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/folly
-          ~/.conan/data/gperftools
-          ~/.conan/data/jemalloc
-          ~/.conan/data/prerelease_dummy
-          ~/.conan/data/spdlog
+          ~/.conan/data
         key: SislDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Restore NuraftMsg 3rdParty Cache
@@ -103,8 +99,7 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/sisl
-          ~/.conan/data/nuraft
+          ~/.conan/data
         key: NuMesgDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}
 
 
@@ -113,12 +108,7 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/dpdk
-          ~/.conan/data/fio
-          ~/.conan/data/grpc_internal
-          ~/.conan/data/liburing
-          ~/.conan/data/sisl
-          ~/.conan/data/spdk
+          ~/.conan/data
         key: IOMgrDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Restore Homestore 3rdParty Cache
@@ -126,7 +116,7 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/iomgr
+          ~/.conan/data
         key: HomestoreDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Restore HomeReplication 3rdParty Cache
@@ -134,8 +124,7 @@ jobs:
       uses: actions/cache/restore@v3
       with:
         path: |
-          ~/.conan/data/homestore
-          ~/.conan/data/nuraft_mesg
+          ~/.conan/data
         key: HomeReplDeps-${{ matrix.build-type }}-${{ matrix.malloc-impl }}-${{ matrix.prerelease }}
 
     - name: Checkout Code
