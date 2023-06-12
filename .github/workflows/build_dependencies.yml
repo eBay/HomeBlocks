@@ -40,35 +40,6 @@ jobs:
         # Set std::string to non-CoW C++11 version
         sed -i 's,compiler.libcxx=libstdc++$,compiler.libcxx=libstdc++11,g' ~/.conan/profiles/default
 
-    - name: Retrieve Code
-      uses: actions/checkout@v3
-      if: ${{ inputs.native == 'true' }}
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/HomeReplication
-        path: deps/home_repl
-        ref: ${{ inputs.branch }}
-      if: ${{ inputs.native == 'false' }}
-
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/nuraft_mesg
-        path: deps/nuraft_mesg
-        ref: main
-      if: ${{ inputs.native == 'false' }}
-
-    - name: Retrieve Dependencies
-      uses: actions/checkout@v3
-      with:
-        repository: eBay/Homestore
-        path: deps/homestore
-        ref: master
-      if: ${{ inputs.native == 'false' }}
-
     - name: Restore Sisl 3rdParty Cache
       id: restore-cache-sisl
       uses: actions/cache/restore@v3
@@ -109,6 +80,35 @@ jobs:
           ~/.conan/data
         key: HomeReplDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
 
+    - name: Retrieve Code
+      uses: actions/checkout@v3
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
+        repository: eBay/HomeReplication
+        path: deps/home_repl
+        ref: ${{ inputs.branch }}
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
+        repository: eBay/nuraft_mesg
+        path: deps/nuraft_mesg
+        ref: main
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
+    - name: Retrieve Dependencies
+      uses: actions/checkout@v3
+      with:
+        repository: eBay/Homestore
+        path: deps/homestore
+        ref: master
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
     - name: Install Dependencies
       run: |
         conan export deps/homestore oss/master
@@ -122,7 +122,7 @@ jobs:
             -o nuraft_mesg:testing=False \
             -s build_type=${{ inputs.build-type }} \
             --build missing deps/home_repl
-      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' && inputs.native == 'false' }}
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Build
       run: |
