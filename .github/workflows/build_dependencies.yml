@@ -71,7 +71,7 @@ jobs:
       with:
         path: |
           ~/.conan/data
-        key: NuMesgDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
+        key: NuMesgDeps-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
 
     - name: Restore IOMgr 3rdParty Cache
       id: restore-cache-iomgr
