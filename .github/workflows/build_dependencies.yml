@@ -56,7 +56,7 @@ jobs:
 
     - name: Retrieve Code
       uses: actions/checkout@v3
-      if: ${{ inputs.native = 'true' }}
+      if: ${{ inputs.native == 'true' }}
 
     - name: Retrieve Dependencies
       uses: actions/checkout@v3
@@ -64,7 +64,7 @@ jobs:
         repository: eBay/HomeReplication
         path: deps/home_repl
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.native = 'false' }}
+      if: ${{ inputs.native == 'false' }}
 
     - name: Restore Sisl 3rdParty Cache
       id: restore-cache-sisl
@@ -119,7 +119,7 @@ jobs:
             -o nuraft_mesg:testing=False \
             -s build_type=${{ inputs.build-type }} \
             --build missing deps/home_repl
-      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' && inputs.native = 'false' }}
+      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit != 'true' && inputs.native == 'false' }}
 
     - name: Build
       run: |
@@ -134,7 +134,7 @@ jobs:
             --build missing \
             . \
             oss/main
-      if: ${{ steps.restore-cache-homerepl.outputs.cache-hit == 'true' && inputs.native = 'true' }}
+      if: ${{ inputs.native == 'true' }}
 
     - name: Cleanup dep builds
       run: |
