@@ -58,6 +58,7 @@ class HomeReplicationConan(ConanFile):
         definitions = {
             'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
             'MEMORY_SANITIZER_ON': 'OFF',
+            'CONAN_CMAKE_SILENT_OUTPUT': 'ON',
         }
         if self.settings.build_type == "Debug" and self.options.sanitize:
             definitions['MEMORY_SANITIZER_ON'] = 'ON'
