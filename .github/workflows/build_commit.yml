@@ -49,8 +49,8 @@ jobs:
     needs: [HomeStoreDeps, NuRaftMesgDeps]
     uses: ./.github/workflows/build_dependencies.yml
     with:
-      branch: main
+      branch: ${{ github.ref }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
-      native: 'true'
+      testing: 'True'
