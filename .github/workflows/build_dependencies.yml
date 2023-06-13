@@ -107,7 +107,7 @@ jobs:
     - name: Retrieve Code
       uses: actions/checkout@v3
       with:
-        path: deps/homestore
+        path: deps/home_repl
         ref: ${{ inputs.branch }}
       if: ${{ inputs.testing == 'True' }}
 
