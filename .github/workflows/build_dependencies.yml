@@ -152,6 +152,7 @@ jobs:
         sed -i 's,compiler.libcxx=libstdc++$,compiler.libcxx=libstdc++11,g' ~/.conan/profiles/default
         conan export deps/homestore oss/master
         conan export deps/nuraft_mesg oss/main
+      if: ${{ inputs.testing == 'True' || steps.restore-cache-iomgr.outputs.cache-hit != 'true' }}
 
     - name: Build Cache
       run: |
