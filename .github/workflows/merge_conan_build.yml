@@ -1,4 +1,4 @@
-name: HomeReplication Main Build
+name: HomeReplication Merge Build
 
 on:
   push:
@@ -8,14 +8,14 @@ on:
 jobs:
   BuildCommit:
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        build-type: ["Release"]
+        build-type: ["Debug", "Release"]
         malloc-impl: ["libc", "tcmalloc", "jemalloc"]
         prerelease: ["True", "False"]
         exclude:
           - build-type: Debug
-            prerelease: "True"
+            prerelease: "False"
           - build-type: Debug
             malloc-impl: tcmalloc
           - build-type: Debug
