@@ -179,7 +179,7 @@ jobs:
             -o nuraft_mesg:testing=False \
             -s build_type=${{ inputs.build-type }} \
             --build missing \
-            deps/homestore
+            deps/home_repl
       if: ${{ inputs.testing == 'True' }}
 
     - name: Cleanup
