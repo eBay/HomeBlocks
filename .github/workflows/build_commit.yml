@@ -3,6 +3,9 @@ name: Build Commit
 on:
   workflow_call:
     inputs:
+      platform:
+        required: true
+        type: string
       build-type:
         required: true
         type: string
@@ -18,6 +21,7 @@ jobs:
     uses: eBay/sisl/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
+      platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
@@ -26,6 +30,7 @@ jobs:
     uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@main
     with:
       branch: main
+      platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
@@ -34,14 +39,16 @@ jobs:
     uses: eBay/iomanager/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
+      platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
-  HomeStoreDeps:
+  HomestoreDeps:
     needs: IOMgrDeps
     uses: eBay/homestore/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
+      platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
@@ -50,6 +57,7 @@ jobs:
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: ${{ github.ref }}
+      platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
