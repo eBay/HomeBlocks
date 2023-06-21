@@ -58,8 +58,10 @@ class HomeReplicationConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            if self.options.coverage or self.options.sanitize:
-                self.options.malloc_impl = 'libc'
+            if self.options.sanitize:
+                self.options['sisl'].malloc_impl = 'libc'
+            elif self.options.coverage:
+                self.options.testing = True
 
     def build(self):
         definitions = {
