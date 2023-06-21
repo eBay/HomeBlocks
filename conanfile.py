@@ -69,7 +69,7 @@ class HomeReplicationConan(ConanFile):
             'CONAN_CMAKE_SILENT_OUTPUT': 'ON',
         }
 
-        if self.settings.build_type == "Debug"
+        if self.settings.build_type == "Debug":
             if self.options.sanitize:
                 definitions['MEMORY_SANITIZER_ON'] = 'ON'
             elif self.options.coverage:
