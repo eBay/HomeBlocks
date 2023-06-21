@@ -23,12 +23,14 @@ class HomeReplicationConan(ConanFile):
                 "fPIC": ['True', 'False'],
                 "coverage": ['True', 'False'],
                 "sanitize": ['True', 'False'],
+                "testing": ['True', 'False'],
               }
     default_options = {
                 'shared': False,
                 'fPIC': True,
                 'coverage': False,
                 'sanitize': False,
+                'testing': True,
                 'sisl:prerelease': True,
             }
 
@@ -60,7 +62,7 @@ class HomeReplicationConan(ConanFile):
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
             if self.options.sanitize:
                 self.options['sisl'].malloc_impl = 'libc'
-            elif self.options.coverage:
+            if self.options.coverage:
                 self.options.testing = True
 
     def build(self):
@@ -80,7 +82,8 @@ class HomeReplicationConan(ConanFile):
         cmake = CMake(self)
         cmake.configure(defs=definitions)
         cmake.build()
-        cmake.test(output_on_failure=True)
+        if self.options.testing:
+             cmake.test(output_on_failure=True)
 
     def package(self):
         lib_dir = join(self.package_folder, "lib")
