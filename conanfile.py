@@ -21,12 +21,16 @@ class HomeReplicationConan(ConanFile):
     options = {
                 "shared": ['True', 'False'],
                 "fPIC": ['True', 'False'],
+                "coverage": ['True', 'False'],
                 "sanitize": ['True', 'False'],
+                "testing": ['True', 'False'],
               }
     default_options = {
                 'shared': False,
                 'fPIC': True,
+                'coverage': False,
                 'sanitize': False,
+                'testing': True,
                 'sisl:prerelease': True,
             }
 
@@ -53,20 +57,33 @@ class HomeReplicationConan(ConanFile):
     def configure(self):
         if self.options.shared:
             del self.options.fPIC
+        if self.settings.build_type == "Debug":
+            if self.options.coverage and self.options.sanitize:
+                raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
+            if self.options.sanitize:
+                self.options['sisl'].malloc_impl = 'libc'
+            if self.options.coverage:
+                self.options.testing = True
 
     def build(self):
         definitions = {
+            'CONAN_BUILD_COVERAGE': 'OFF',
             'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
             'MEMORY_SANITIZER_ON': 'OFF',
             'CONAN_CMAKE_SILENT_OUTPUT': 'ON',
         }
-        if self.settings.build_type == "Debug" and self.options.sanitize:
-            definitions['MEMORY_SANITIZER_ON'] = 'ON'
+
+        if self.settings.build_type == "Debug":
+            if self.options.sanitize:
+                definitions['MEMORY_SANITIZER_ON'] = 'ON'
+            elif self.options.coverage:
+                definitions['CONAN_BUILD_COVERAGE'] = 'ON'
 
         cmake = CMake(self)
         cmake.configure(defs=definitions)
         cmake.build()
-        cmake.test(output_on_failure=True)
+        if self.options.testing:
+             cmake.test(output_on_failure=True)
 
     def package(self):
         lib_dir = join(self.package_folder, "lib")
