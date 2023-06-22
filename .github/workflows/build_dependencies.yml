@@ -113,7 +113,6 @@ jobs:
         key: HomeReplDeps-${{ inputs.platform }} ${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-${{ hashFiles('deps/home_repl/**/conanfile.py') }}
 
     - name: Restore Testing Cache
-      id: restore-cache-testing-homestore
       uses: actions/cache/restore@v3
       with:
         path: |
@@ -122,7 +121,6 @@ jobs:
       if: ${{ github.event_name == 'pull_request' && inputs.testing == 'True' && steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Restore Sisl Cache
-      id: restore-cache-sisl
       uses: actions/cache/restore@v3
       with:
         path: |
@@ -133,7 +131,6 @@ jobs:
       if: ${{ inputs.testing == 'True' || steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Restore NuraftMsg Cache
-      id: restore-cache-nuraftmsg
       uses: actions/cache/restore@v3
       with:
         path: |
@@ -154,7 +151,6 @@ jobs:
       if: ${{ inputs.testing == 'True' || steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Restore Homestore Cache
-      id: restore-cache-homestore
       uses: actions/cache/restore@v3
       with:
         path: |
@@ -192,7 +188,6 @@ jobs:
       if: ${{ inputs.platform == 'ubuntu-22.04' && ( inputs.testing == 'True' || steps.restore-cache-homerepl.outputs.cache-hit != 'true' ) }}
 
     - name: Build Cache
-      id: build_cache
       run: |
         conan install \
             -o sisl:prerelease=${{ inputs.prerelease }} \
@@ -224,7 +219,6 @@ jobs:
       if: ${{ github.event_name != 'pull_request' && steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Save HomeRepl Cache
-      id: save-cache-homerepl
       uses: actions/cache/save@v3
       with:
         path: |
@@ -250,6 +244,26 @@ jobs:
         key: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-${{ hashFiles('deps/iomgr/**/conanfile.py') }}
         fail-on-cache-miss: true
         restore-keys: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-
+      if: ${{ inputs.testing == 'True' && github.event_name != 'pull_request' && steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
+    - name: Restore NuraftMsg Cache
+      uses: actions/cache/restore@v3
+      with:
+        path: |
+          ~/.conan/data
+        key: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-${{ hashFiles('deps/nuraft_mesg/**/conanfile.py') }}
+        fail-on-cache-miss: true
+        restore-keys: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-
+      if: ${{ inputs.testing == 'True' && github.event_name != 'pull_request' && steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
+
+    - name: Restore Homestore Cache
+      uses: actions/cache/restore@v3
+      with:
+        path: |
+          ~/.conan/data
+        key: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-${{ hashFiles('deps/homestore/**/conanfile.py') }}
+        fail-on-cache-miss: true
+        restore-keys: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}-
       if: ${{ inputs.testing == 'True' && github.event_name != 'pull_request' && steps.restore-cache-homerepl.outputs.cache-hit != 'true' }}
 
     - name: Create and test Package
