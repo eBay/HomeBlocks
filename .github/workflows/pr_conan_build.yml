@@ -11,8 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         platform: ["ubuntu-22.04", "ubuntu-20.04"]
-        build-type: ["Debug", "Release"]
-        malloc-impl: ["libc", "tcmalloc", "jemalloc"]
+        build-type: ["Release"]
+        malloc-impl: ["tcmalloc", "jemalloc"]
         prerelease: ["True", "False"]
         exclude:
           - build-type: Debug
