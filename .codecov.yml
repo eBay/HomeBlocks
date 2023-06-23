@@ -2,9 +2,6 @@ codecov:
   notify:
     require_ci_to_pass: no
 
-fixes:
-  - "deps/home_repl/::"
-
 ignore:
   - "**/*_test.c*"
   - "**/*_test.h*"
