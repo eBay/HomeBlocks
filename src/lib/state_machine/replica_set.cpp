@@ -11,7 +11,7 @@
 namespace home_replication {
 ReplicaSet::ReplicaSet(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,
                        const std::shared_ptr< nuraft::log_store >& log_store) :
-        m_state_machine{std::make_shared< ReplicaStateMachine >(sm_store, this)},
+        m_state_machine{nullptr},
         m_state_store{sm_store},
         m_data_journal{log_store},
         m_group_id{group_id} {}
@@ -27,6 +27,8 @@ void ReplicaSet::transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas) {
 // void ReplicaSet::on_data_received() {}
 
 std::shared_ptr< nuraft::state_machine > ReplicaSet::get_state_machine() {
+    if (!m_state_machine)
+        m_state_machine = std::make_shared< ReplicaStateMachine >(m_state_store, this);
     return std::dynamic_pointer_cast< nuraft::state_machine >(m_state_machine);
 }
 
