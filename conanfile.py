@@ -38,7 +38,7 @@ class HomeReplicationConan(ConanFile):
     exports_sources = ("CMakeLists.txt", "cmake/*", "src/*", "LICENSE")
 
     def build_requirements(self):
-        self.build_requires("gtest/1.12.1")
+        self.build_requires("gtest/1.13.0")
 
     def requirements(self):
         self.requires("nuraft_mesg/[~=0,    include_prerelease=True]@oss/main")
@@ -67,9 +67,7 @@ class HomeReplicationConan(ConanFile):
 
     def build(self):
         definitions = {
-            'CONAN_BUILD_COVERAGE': 'OFF',
             'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
-            'MEMORY_SANITIZER_ON': 'OFF',
             'CONAN_CMAKE_SILENT_OUTPUT': 'ON',
         }
 
@@ -77,7 +75,7 @@ class HomeReplicationConan(ConanFile):
             if self.options.sanitize:
                 definitions['MEMORY_SANITIZER_ON'] = 'ON'
             elif self.options.coverage:
-                definitions['CONAN_BUILD_COVERAGE'] = 'ON'
+                definitions['BUILD_COVERAGE'] = 'ON'
 
         cmake = CMake(self)
         cmake.configure(defs=definitions)
