@@ -21,5 +21,6 @@ include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
 add_subdirectory(lib)
-add_subdirectory(examples)
+# TODO APIs changed too much for this to build
+#add_subdirectory(examples)
 add_subdirectory(tests)

@@ -1,8 +1,8 @@
 #pragma once
-#include <boost/uuid/uuid.hpp>
 #include <sisl/utility/enum.hpp>
 #include <sisl/fds/buffer.hpp>
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
+#include "state_machine/state_machine.h"
 
 namespace home_replication {
 VENUM(journal_type_t, uint16_t, DATA = 0)

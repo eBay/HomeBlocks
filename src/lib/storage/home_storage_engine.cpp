@@ -1,6 +1,5 @@
 #include "home_storage_engine.h"
 #include <sisl/fds/utils.hpp>
-#include <boost/uuid/uuid_io.hpp>
 #include <homestore/blkdata_service.hpp>
 #include <iomgr/iomgr_timer.hpp>
 #include "service/repl_config.h"
@@ -10,7 +9,7 @@
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                          \
                                             fmt::make_format_args(file_name(__FILE__), __LINE__));                     \
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                          \
-                                            fmt::make_format_args("rs", boost::uuids::to_string(m_sb_in_mem.uuid)));   \
+                                            fmt::make_format_args("rs", m_sb_in_mem.group_id));                        \
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                               \
                                             fmt::make_format_args(std::forward< decltype(args) >(args)...));           \
                             return true;                                                                               \
@@ -24,12 +23,12 @@ static constexpr store_lsn_t to_store_lsn(repl_lsn_t raft_lsn) { return raft_lsn
 static constexpr repl_lsn_t to_repl_lsn(store_lsn_t store_lsn) { return store_lsn + 1; }
 
 ///////////////////////////// HomeStateMachineStore Section ////////////////////////////
-HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for uuid={}", rs_uuid);
+HomeStateMachineStore::HomeStateMachineStore(std::string const& rs_group_id) : m_sb{"replica_set"} {
+    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for group_id={}", rs_group_id);
 
     // Create a superblk for the replica set.
     m_sb.create(sizeof(home_rs_superblk));
-    m_sb->uuid = rs_uuid;
+    m_sb->group_id = rs_group_id;
 
     // Create logstore to store the free pba records
     m_free_pba_store =
@@ -45,7 +44,7 @@ HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set
 
 HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb) :
         m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for uuid={}", rs_sb->uuid);
+    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for group_id={}", rs_sb->group_id);
     m_sb = rs_sb;
     m_sb_in_mem = *m_sb;
     SM_STORE_LOG(DEBUG, "Opening free pba record logstore={}", m_sb->free_pba_store_id);
@@ -77,8 +76,8 @@ void HomeStateMachineStore::destroy() {
 
 pba_list_t HomeStateMachineStore::alloc_pbas(uint32_t size) { return homestore::data_service().alloc_blks(size); }
 
-void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list_t& in_pba_list,
-                                        const io_completion_cb_t& cb) {
+void HomeStateMachineStore::async_write(const sisl::sg_list&, const pba_list_t& in_pba_list,
+                                        const io_completion_cb_t&) {
     homestore::blk_alloc_hints hints;
     static thread_local std::vector< homestore::BlkId > in_blkids;
     in_blkids.clear();
@@ -88,20 +87,23 @@ void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list
     }
 
     // async write with input block ids;
-    homestore::data_service().async_write(sgs, hints, in_blkids, cb);
+    // TODO API has changed!
+    // homestore::data_service().async_write(sgs, hints, in_blkids, cb);
 }
 
-void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
-    homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
+/// TODO API Has Changed!
+void HomeStateMachineStore::async_read(pba_t, sisl::sg_list&, uint32_t, const io_completion_cb_t&) {
+    // homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
 }
 
 uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
     return homestore::BlkId{pba}.get_nblks() * homestore::data_service().get_page_size();
 }
 
-void HomeStateMachineStore::free_pba(pba_t pba) {
-    homestore::data_service().async_free_blk(homestore::BlkId{pba},
-                                             []([[maybe_unused]] std::error_condition err) { assert(!err); });
+void HomeStateMachineStore::free_pba(pba_t) {
+    // TODO API has changed!
+    // homestore::data_service().async_free_blk(homestore::BlkId{pba},
+    //                                         []([[maybe_unused]] std::error_condition err) { assert(!err); });
 }
 
 //////////////// StateMachine Superblock/commit update section /////////////////////////////
@@ -116,23 +118,26 @@ repl_lsn_t HomeStateMachineStore::get_last_commit_lsn() const {
 }
 
 void HomeStateMachineStore::start_sb_flush_timer() {
-    iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
-        m_sb_flush_timer_hdl =
-            iomanager.schedule_thread_timer(HR_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring */,
-                                            nullptr, [this](void*) { flush_super_block(); });
-    });
+    // TODO API Has Chnaged!
+    //    iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
+    //        m_sb_flush_timer_hdl =
+    //            iomanager.schedule_thread_timer(HR_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /*
+    //            recurring */,
+    //                                            nullptr, [this](void*) { flush_super_block(); });
+    //    });
 }
 
 void HomeStateMachineStore::stop_sb_flush_timer() {
-    if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
-        iomanager.run_on(
-            homestore::logstore_service().truncate_thread(),
-            [this](iomgr::io_thread_addr_t) {
-                iomanager.cancel_timer(m_sb_flush_timer_hdl);
-                m_sb_flush_timer_hdl = iomgr::null_timer_handle;
-            },
-            iomgr::wait_type_t::spin);
-    }
+    // TODO API Has Chnaged!
+    // if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
+    //    iomanager.run_on(
+    //        homestore::logstore_service().truncate_thread(),
+    //        [this](iomgr::io_thread_addr_t) {
+    //            iomanager.cancel_timer(m_sb_flush_timer_hdl);
+    //            m_sb_flush_timer_hdl = iomgr::null_timer_handle;
+    //        },
+    //        iomgr::wait_type_t::spin);
+    //}
 }
 
 void HomeStateMachineStore::flush_super_block() {

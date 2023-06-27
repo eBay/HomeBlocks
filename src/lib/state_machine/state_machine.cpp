@@ -2,20 +2,22 @@
 #include <sisl/fds/utils.hpp>
 #include <sisl/fds/obj_allocator.hpp>
 #include <sisl/fds/vector_pool.hpp>
-#include <home_replication/repl_service.h>
-#include <home_replication/repl_set.h>
+#include <sisl/grpc/generic_service.hpp>
+#include <home_replication/repl_service.hpp>
 #include <iomgr/iomgr_timer.hpp>
 #include "state_machine.h"
+#include "replica_set_impl.hpp"
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
 #include "service/repl_config.h"
+#include "rpc_data_channel_include.h"
 
 SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
 ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
-        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
+        m_state_store{state_store}, m_rs{static_cast< ReplicaSetImpl* >(rs)}, m_group_id{rs->group_id()} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -33,7 +35,7 @@ void ReplicaStateMachine::propose(const sisl::blob& header, const sisl::blob& ke
     auto pbas = m_state_store->alloc_pbas(uint32_cast(value.size));
 
     // Step 2: Send the data to all replicas
-    // m_rs->send_in_data_channel(pbas, value);
+    m_rs->send_in_data_channel(pbas, value);
 
     // Step 3: Create the request structure containing all details essential for callback
     repl_req* req = sisl::ObjectAllocator< repl_req >::make_object();
@@ -98,9 +100,10 @@ raft_buf_ptr_t ReplicaStateMachine::pre_commit_ext(const nuraft::state_machine::
         raft_buf_ptr_t data = params.data;
 
         RS_LOG(DEBUG, "pre_commit: {}, size: {}", lsn, data->size());
-        repl_req* req = lsn_to_req(lsn);
+        [[maybe_unused]] repl_req* req = lsn_to_req(lsn);
 
-        m_rs->m_listener->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
+        // TODO this should be called on the ReplicatedSever
+        // m_rs->listener()->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
     }
     return m_success_ptr;
 }
@@ -109,7 +112,8 @@ void ReplicaStateMachine::after_precommit_in_leader(const nuraft::raft_server::r
     repl_req* req = r_cast< repl_req* >(params.context);
     link_lsn_to_req(req, int64_cast(params.log_idx));
 
-    m_rs->m_listener->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
+    // TODO this should be called on the ReplicatedSever
+    // m_rs->listener()->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
 }
 
 raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_op_params& params) {
@@ -121,7 +125,7 @@ raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_
     repl_req* req = lsn_to_req(lsn);
     if (m_rs->is_leader()) {
         // This is the time to ensure flushing of journal happens in leader
-        if (m_rs->m_data_journal->last_durable_index() < uint64_cast(lsn)) { m_rs->m_data_journal->flush(); }
+        if (m_rs->data_journal()->last_durable_index() < uint64_cast(lsn)) { m_rs->data_journal()->flush(); }
         req->is_raft_written.store(true);
     }
     check_and_commit(req);
@@ -130,7 +134,8 @@ raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_
 
 void ReplicaStateMachine::check_and_commit(repl_req* req) {
     if ((req->num_pbas_written.load() == req->local_pbas.size()) && req->is_raft_written.load()) {
-        m_rs->m_listener->on_commit(req->lsn, req->header, req->key, req->local_pbas, req->user_ctx);
+        // TODO this should be called on the ReplicatedSever
+        // m_rs->listener()->on_commit(req->lsn, req->header, req->key, req->local_pbas, req->user_ctx);
         m_state_store->commit_lsn(req->lsn);
         m_lsn_req_map.erase(req->lsn);
         sisl::ObjectAllocator< repl_req >::deallocate(req);
@@ -241,7 +246,8 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
             if (waiter == nullptr) { waiter = std::make_shared< pba_waiter >(std::move(cb)); }
 
             // same waiter can wait on multiple fq_pbas;
-            RS_DBG_ASSERT_EQ(it->second->m_waiter, nullptr, "not expecting to apply waiter on already waited entry.");
+            // TODO this requires the ability to fmt::format the m_waiter
+            // RS_DBG_ASSERT_EQ(it->second->m_waiter, nullptr, "not expecting to apply waiter on already waited entry.");
             it->second->m_waiter = waiter;
         }
     }
@@ -254,8 +260,7 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
 #endif
         // if in resync mode, fetch data from remote immediately;
         check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
-    }
-    else if (wait_size) {
+    } else if (wait_size) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;
@@ -312,8 +317,13 @@ std::size_t ReplicaStateMachine::remove_map_pba(const fully_qualified_pba& fq_pb
     return m_pba_map.erase(fq_pba.to_key_string());
 }
 
-void ReplicaStateMachine::fetch_pba_data_from_leader(std::unique_ptr< std::vector< fully_qualified_pba > >) {
-    // TODO: to be implemented;
+void ReplicaStateMachine::fetch_pba_data_from_leader(
+    std::unique_ptr< std::vector< fully_qualified_pba > > fq_pba_list) {
+    pba_list_t remote_pbas;
+    for (auto const& fq_pba : *fq_pba_list) {
+        remote_pbas.push_back(fq_pba.pba);
+    }
+    m_rs->fetch_pba_data_from_leader(remote_pbas);
 }
 
 void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
@@ -321,6 +331,171 @@ void ReplicaStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_res
     auto null_except = std::shared_ptr< std::exception >();
     auto ret_val{false};
     if (when_done) when_done(ret_val, null_except);
+}
+
+pba_state_t ReplicaStateMachine::get_pba_state(fully_qualified_pba const& fq_pba) const {
+    const auto key_string = fq_pba.to_key_string();
+    const auto it = m_pba_map.find(key_string);
+    return (it != m_pba_map.end()) ? it->second->m_state : pba_state_t::unknown;
+}
+
+void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf,
+                                           boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+    data_channel_rpc_hdr common_header;
+    sisl::sg_list value;
+    fq_pba_list_t fq_pbas;
+
+    // deserialize incoming buf and get fq pba list and the data to be written
+    data_rpc::deserialize(incoming_buf, common_header, fq_pbas, value);
+
+    // TODO: sanity checks around common_header
+
+    // Prepare context to add to the rpc data
+    class DataReceivedContext : public sisl::GenericRpcContextBase {
+    public:
+        ReplicaStateMachine* sm_ptr;
+        fq_pba_list_t fq_list;
+        bool rpc_data{true};
+        DataReceivedContext(ReplicaStateMachine* sm) : sm_ptr(sm) {}
+    };
+
+    auto rpc_ctx = std::make_unique< DataReceivedContext >(this);
+    auto& fq_pbas_allocated = rpc_ctx->fq_list;
+    pba_list_t pbas_final;
+    sisl::sg_iterator sg_itr(value.iovs);
+    sisl::sg_list value_final{0, {}};
+
+    // pbas which are in allocated state after try_map_pba are pushed in the final lists to be written.
+    // All other states are ignored.
+    for (auto const& fq_pba : fq_pbas) {
+        auto const [pba_list, pba_state] = try_map_pba(fq_pba);
+        switch (pba_state) {
+        case pba_state_t::allocated: {
+            pbas_final.insert(pbas_final.cend(), pba_list.cbegin(), pba_list.cend());
+            value_final.size += fq_pba.size;
+            auto temp_sg = sg_itr.next_iovs(fq_pba.size);
+            value_final.iovs.insert(value_final.iovs.cend(), temp_sg.cbegin(), temp_sg.cend());
+            fq_pbas_allocated.emplace_back(fq_pba);
+            break;
+        }
+        case pba_state_t::written: // fall-through
+        case pba_state_t::completed: {
+            sg_itr.move_offset(fq_pba.size);
+            break;
+        }
+        case pba_state_t::unknown:
+        default:
+            break;
+        }
+    }
+
+    if (!rpc_data) {
+        rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+        rpc_ctx->rpc_data = false;
+    }
+    rpc_data->set_context(std::move(rpc_ctx));
+
+    // issue async write and update the state.
+    if (!pbas_final.empty()) {
+        m_state_store->async_write(value_final, pbas_final,
+                                   [rpc_data]([[maybe_unused]] std::error_condition err) mutable {
+                                       assert(!err);
+                                       auto rpc_ctx = dynamic_cast< DataReceivedContext* >(rpc_data->get_context());
+                                       assert(rpc_ctx != nullptr);
+                                       for (auto const& fq_p : rpc_ctx->fq_list) {
+                                           rpc_ctx->sm_ptr->update_map_pba(fq_p, pba_state_t::completed);
+                                       }
+                                       if (rpc_ctx->rpc_data) {
+                                           rpc_ctx->sm_ptr->m_rs->send_data_service_response({}, rpc_data);
+                                       }
+                                   });
+    }
+}
+
+sisl::io_blob_list_t ReplicaStateMachine::serialize_data_rpc_buf(pba_list_t const& pbas,
+                                                                 sisl::sg_list const& value) const {
+    return data_rpc::serialize(data_channel_rpc_hdr{m_group_id, m_server_id}, pbas, m_state_store.get(), value);
+}
+
+class FetchDataContext : public sisl::GenericRpcContextBase {
+public:
+    ReplicaStateMachine* sm_ptr;
+    std::atomic< size_t > counter;
+    sisl::sg_list sg_final;
+    pba_list_t const pbas;
+    std::vector< sisl::sg_list > sg_cur;
+    sisl::io_blob hdr_blob;
+    std::atomic< bool > success{true};
+    bool rpc_data{true};
+    FetchDataContext(ReplicaStateMachine* sm, pba_list_t const& pba_list) : sm_ptr(sm), pbas(pba_list) {
+        sg_final.iovs.resize(pba_list.size());
+        sg_cur.resize(pba_list.size());
+        sg_final.size = 0;
+    }
+};
+
+void ReplicaStateMachine::on_fetch_data_request(sisl::io_blob const& incoming_buf,
+                                                boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+    // set the completion callback
+    rpc_data->set_comp_cb(
+        [this](boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) { on_fetch_data_completed(rpc_data); });
+
+    // get the pbas for which we need to send the data
+    data_channel_rpc_hdr common_header;
+    pba_list_t pbas;
+    data_rpc::deserialize(incoming_buf, common_header, pbas);
+    // TODO: sanity checks around common_header
+
+    auto rpc_ctx = std::make_unique< FetchDataContext >(this, pbas);
+    if (!rpc_data) {
+        rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(new sisl::GenericRpcData(nullptr, 0));
+        rpc_ctx->rpc_data = false;
+    }
+    auto const num_pbas = pbas.size();
+    rpc_ctx->counter = num_pbas;
+    rpc_data->set_context(std::move(rpc_ctx));
+
+    auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
+    for (size_t i = 0; i < num_pbas; i++) {
+        auto const sz = m_state_store->pba_to_size(pbas[i]);
+        ctx->sg_cur[i] = sisl::sg_list{sz, {iovec{iomanager.iobuf_alloc(512, sz), sz}}};
+        m_state_store->async_read(pbas[i], ctx->sg_cur[i], sz, [i, rpc_data](std::error_condition err) mutable {
+            auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
+            assert(ctx != nullptr);
+            if (!err) {
+                ctx->sg_final.iovs[i] = ctx->sg_cur[i].iovs.back();
+            } else {
+                (ctx->success = false);
+            }
+            if (ctx->rpc_data) {
+                if (ctx->counter.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                    for (auto const& iov : ctx->sg_final.iovs) {
+                        ctx->sg_final.size += iov.iov_len;
+                    }
+                    sisl::io_blob_list_t response_blobs;
+                    if (ctx->success) {
+                        response_blobs = ctx->sm_ptr->serialize_data_rpc_buf(ctx->pbas, ctx->sg_final);
+                        ctx->hdr_blob = response_blobs[0];
+                    }
+                    ctx->sm_ptr->m_rs->send_data_service_response(response_blobs, rpc_data);
+                }
+            }
+        });
+    }
+}
+
+void ReplicaStateMachine::on_fetch_data_completed(boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+    auto ctx = dynamic_cast< FetchDataContext* >(rpc_data->get_context());
+    assert(ctx != nullptr);
+    for (auto& sgl : ctx->sg_cur) {
+        for (auto iov : sgl.iovs) {
+            iomanager.iobuf_free(s_cast< uint8_t* >(iov.iov_base));
+            iov.iov_base = nullptr;
+            iov.iov_len = 0;
+        }
+        sgl.size = 0;
+    }
+    delete[] ctx->hdr_blob.bytes;
 }
 
 } // namespace home_replication

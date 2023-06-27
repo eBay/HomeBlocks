@@ -4,8 +4,9 @@
 #include <functional>
 #include <iomgr/iomgr.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
+#include <sisl/grpc/generic_service.hpp>
 #include <sisl/utility/enum.hpp>
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
 
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push
@@ -19,6 +20,7 @@
 
 namespace home_replication {
 class ReplicaSet;
+class ReplicaSetImpl;
 class StateMachineStore;
 
 #define RS_LOG(level, msg, ...)                                                                                        \
@@ -78,6 +80,16 @@ class StateMachineStore;
 
 struct repl_req;
 using raft_buf_ptr_t = nuraft::ptr< nuraft::buffer >;
+
+// Fully qualified domain pba, unique pba id across replica set
+struct fully_qualified_pba {
+    fully_qualified_pba(uint32_t s, pba_t p, uint32_t sz) : server_id{s}, pba{p}, size{sz} {}
+    uint32_t server_id;
+    pba_t pba;
+    uint32_t size; // corresponding size of this pba;
+    std::string to_key_string() const { return fmt::format("{}_{}", std::to_string(server_id), std::to_string(pba)); }
+};
+using fq_pba_list_t = folly::small_vector< fully_qualified_pba, 4 >;
 
 ENUM(pba_state_t, uint32_t, unknown, allocated, written, completed)
 
@@ -248,6 +260,13 @@ public:
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);
 
+    // data service apis and helpers
+    void on_data_received(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_request(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_completed(boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    sisl::io_blob_list_t serialize_data_rpc_buf(pba_list_t const& pbas, sisl::sg_list const& value) const;
+    pba_state_t get_pba_state(fully_qualified_pba const& fq_pba) const;
+
 private:
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& params);
     void check_and_commit(repl_req* req);
@@ -256,7 +275,7 @@ private:
     std::shared_ptr< StateMachineStore > m_state_store;
     folly::ConcurrentHashMap< std::string, local_pba_info_ptr > m_pba_map; // fully_qualified_pba to local pba mapping;
     folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
-    ReplicaSet* m_rs;
+    ReplicaSetImpl* m_rs;
     std::string m_group_id;
     uint32_t m_server_id;                        // TODO: Populate the value from replica set/RAFT
     nuraft::ptr< nuraft::buffer > m_success_ptr; // Preallocate the success return to raft

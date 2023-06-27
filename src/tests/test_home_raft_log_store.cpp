@@ -5,7 +5,7 @@
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
 
 using namespace home_replication;
 
@@ -111,7 +111,7 @@ public:
 
     void pack_test(uint64_t from, int32_t cnt, pack_result_t& out_pack) {
         out_pack.actual_data = m_rls->pack(from, cnt);
-        ASSERT_NE(out_pack.actual_data.get(), nullptr);
+        RELEASE_ASSERT_NOTNULL(out_pack.actual_data.get());
         out_pack.exp_data.assign(m_shadow_log.begin() + from - 1, m_shadow_log.begin() + from + cnt - 1);
     }
 
@@ -223,9 +223,9 @@ public:
         }
 
         LOGINFO("Starting iomgr with {} threads, spdk: {}", nthreads, false);
-        ioenvironment.with_iomgr(nthreads, false);
+        ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = nthreads, .is_spdk = false, .num_fibers = 1});
 
-        const uint64_t app_mem_size = ((ndevices * dev_size) * 15) / 100;
+            const uint64_t app_mem_size = ((ndevices * dev_size) * 15) / 100;
         LOGINFO("Initialize and start HomeStore with app_mem_size = {}", homestore::in_bytes(app_mem_size));
 
         homestore::hs_input_params params;

@@ -33,6 +33,10 @@ SISL_LOGGING_DECL(home_replication)
                         }),                                                                                            \
                         msg, ##__VA_ARGS__);
 
+namespace nuraft {
+auto format_as(log_val_type f) { return fmt::underlying(f); }
+} // namespace nuraft
+
 namespace home_replication {
 static constexpr store_lsn_t to_store_lsn(uint64_t raft_lsn) { return s_cast< store_lsn_t >(raft_lsn) - 1; }
 static constexpr store_lsn_t to_store_lsn(repl_lsn_t repl_lsn) { return repl_lsn - 1; }

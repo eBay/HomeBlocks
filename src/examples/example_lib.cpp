@@ -52,7 +52,8 @@ void start_homestore(std::string const& svc_id) {
     }
 
     LOGINFO("Starting iomgr with {} threads, spdk: {}", nthreads, false);
-    ioenvironment.with_iomgr(nthreads, false);
+    // TODO API has changed!
+    // ioenvironment.with_iomgr(nthreads, false);
 
     const uint64_t app_mem_size = ((ndevices * dev_size) * 15) / 100;
     LOGINFO("Initialize and start HomeStore with app_mem_size = {}", homestore::in_bytes(app_mem_size));

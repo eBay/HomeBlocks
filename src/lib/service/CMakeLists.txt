@@ -2,7 +2,7 @@ cmake_minimum_required (VERSION 3.11)
 
 add_library(service OBJECT)
 target_sources(service PRIVATE
-            repl_service.cpp
+            repl_service_impl.cpp
             home_repl_backend.cpp
         )
 target_link_libraries(service

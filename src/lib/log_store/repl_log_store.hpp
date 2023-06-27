@@ -1,6 +1,6 @@
 #pragma once
 
-#include <home_replication/repl_service.h>
+#include <home_replication/repl_service.hpp>
 #include "state_machine/state_machine.h"
 #include "log_store/journal_entry.h"
 

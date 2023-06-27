@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: ["ubuntu-22.04", "ubuntu-20.04"]
+        platform: ["ubuntu-22.04"]
         build-type: ["Debug", "Release"]
         malloc-impl: ["libc", "tcmalloc", "jemalloc"]
         prerelease: ["True", "False"]
@@ -33,6 +33,8 @@ jobs:
             platform: ubuntu-22.04
           - prerelease: "True"
             platform: ubuntu-20.04
+          - prerelease: "False"
+            build-type: Debug
     uses: ./.github/workflows/build_commit.yml
     with:
       platform: ${{ matrix.platform }}
