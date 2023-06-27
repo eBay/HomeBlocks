@@ -11,6 +11,10 @@ else ()
     message("The file conanbuildinfo.cmake doesn't exist, some properties will be unavailable")
 endif ()
 
+if (NOT DEFINED BUILD_COVERAGE)
+    set(BUILD_COVERAGE OFF)
+endif()
+
 if (${CMAKE_BUILD_TYPE} STREQUAL "Debug")
     include (cmake/debug_flags.cmake)
 endif()
