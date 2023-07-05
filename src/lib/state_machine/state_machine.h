@@ -164,8 +164,7 @@ using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
 
 class ReplicaStateMachine : public nuraft::state_machine {
 public:
-    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs,
-                        const std::string& group_id);
+    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs);
     ~ReplicaStateMachine() override = default;
     ReplicaStateMachine(ReplicaStateMachine const&) = delete;
     ReplicaStateMachine& operator=(ReplicaStateMachine const&) = delete;

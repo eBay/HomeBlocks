@@ -25,9 +25,8 @@ SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
-ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs,
-                                         const std::string& group_id) :
-        m_state_store{state_store}, m_rs{rs}, m_group_id{group_id} {
+ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
+        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -444,6 +443,10 @@ public:
 
 void ReplicaStateMachine::on_fetch_data_request(sisl::io_blob const& incoming_buf,
                                                 boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+    // set the completion callback
+    rpc_data->set_comp_cb(
+        [this](boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) { on_fetch_data_completed(rpc_data); });
+
     // get the pbas for which we need to send the data
     data_channel_rpc_hdr common_header;
     pba_list_t pbas;

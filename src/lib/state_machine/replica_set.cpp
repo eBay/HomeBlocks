@@ -49,8 +49,7 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
             SEND_DATA, m_group_id,
             [this](sisl::io_blob const& incoming_buf, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
                 m_state_machine->on_data_received(incoming_buf, rpc_data);
-            },
-            nullptr);
+            });
         !resp) {
         // LOG ERROR
         return false;
@@ -60,9 +59,6 @@ bool ReplicaSet::register_data_service_apis(std::shared_ptr< nuraft_mesg::consen
             FETCH_DATA, m_group_id,
             [this](sisl::io_blob const& incoming_buf, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
                 m_state_machine->on_fetch_data_request(incoming_buf, rpc_data);
-            },
-            [this](boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
-                m_state_machine->on_fetch_data_completed(rpc_data);
             });
         !resp) {
         // LOG ERROR
