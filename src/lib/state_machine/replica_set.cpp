@@ -9,15 +9,7 @@
 #include "log_store/journal_entry.h"
 #include "storage/storage_engine.h"
 #include <boost/uuid/string_generator.hpp>
-
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include "rpc_data_channel.h"
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic pop
-#endif
+#include "rpc_data_channel_include.h"
 
 namespace home_replication {
 ReplicaSet::ReplicaSet(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,

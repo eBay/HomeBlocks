@@ -11,15 +11,7 @@
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
 #include "service/repl_config.h"
-
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include "rpc_data_channel.h"
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic pop
-#endif
+#include "rpc_data_channel_include.h"
 
 SISL_LOGGING_DECL(home_replication)
 

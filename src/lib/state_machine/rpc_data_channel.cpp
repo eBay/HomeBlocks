@@ -1,12 +1,9 @@
 #include "storage/storage_engine.h"
+#include "rpc_data_channel_include.h"
 
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-#include "rpc_data_channel.h"
-#if defined __clang__ or defined __GNUC__
-#pragma GCC diagnostic pop
+#pragma GCC diagnostic ignored "-Warray-bounds"
 #endif
 
 namespace home_replication {
@@ -64,3 +61,7 @@ void data_rpc::deserialize(sisl::io_blob const& incoming_buf, data_channel_rpc_h
 }
 
 } // namespace home_replication
+
+#if defined __clang__ or defined __GNUC__
+#pragma GCC diagnostic pop
+#endif
