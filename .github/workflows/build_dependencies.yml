@@ -91,7 +91,7 @@ jobs:
       uses: eBay/sisl/.github/actions/load_conan@stable/v8.x
       with:
         testing: ${{ inputs.testing }}
-        key_prefix: HomeReplDeps-${{ inputs.platform }} ${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: HomeReplDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
 
     - name: Load Sisl Cache
       uses: eBay/sisl/.github/actions/load_conan@stable/v8.x
