@@ -37,3 +37,11 @@ target_link_libraries(test_repl_state_machine
             GTest::gmock)
 add_test(NAME ReplStateMachine COMMAND ${CMAKE_BINARY_DIR}/bin/test_repl_state_machine)
 set_property(TEST ReplStateMachine PROPERTY RUN_SERIAL 1)
+
+add_executable(test_rpc_data_channel)
+target_sources(test_rpc_data_channel PRIVATE test_rpc_data_channel.cpp)
+target_link_libraries(test_rpc_data_channel 
+            home_replication 
+            ${COMMON_TEST_DEPS} 
+            GTest::gmock)
+add_test(NAME RpcDataChannel COMMAND ${CMAKE_BINARY_DIR}/bin/test_rpc_data_channel)

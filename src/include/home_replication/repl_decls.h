@@ -7,6 +7,7 @@
 #include <sisl/logging/logging.h>
 #include <iomgr/reactor.hpp>
 #include <homestore/homestore_decl.hpp>
+#include <sisl/fds/buffer.hpp>
 
 SISL_LOGGING_DECL(home_replication)
 
@@ -26,4 +27,9 @@ struct fully_qualified_pba {
     std::string to_key_string() const { return fmt::format("{}_{}", std::to_string(server_id), std::to_string(pba)); }
 };
 using fq_pba_list_t = folly::small_vector< fully_qualified_pba, 4 >;
+
+// data service api names
+static std::string const SEND_DATA{"send_data"};
+static std::string const FETCH_DATA{"fetch_data"};
+
 } // namespace home_replication

@@ -248,6 +248,13 @@ public:
     void link_lsn_to_req(repl_req* req, int64_t lsn);
     repl_req* lsn_to_req(int64_t lsn);
 
+    // data service apis and helpers
+    void on_data_received(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_request(sisl::io_blob const&, boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void on_fetch_data_completed(boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    sisl::io_blob_list_t serialize_data_rpc_buf(pba_list_t const& pbas, sisl::sg_list const& value) const;
+    pba_state_t get_pba_state(fully_qualified_pba const& fq_pba) const;
+
 private:
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& params);
     void check_and_commit(repl_req* req);
