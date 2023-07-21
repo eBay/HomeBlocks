@@ -5,13 +5,13 @@
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
 #include <boost/uuid/uuid_generators.hpp>
-#include "storage/home_storage_engine.h"
-#include <home_replication/repl_service.h> // includes repl_set.h
+#include <home_replication/repl_service.hpp>
 #include <gtest/gtest.h>
-
 #include <sisl/grpc/generic_service.hpp>
-#include <home_replication/repl_decls.h>
+
+#include "state_machine/replica_set.hpp"
 #include "state_machine/state_machine.h"
+#include "storage/home_storage_engine.h"
 #include "mock_storage_engine.h"
 #include "test_common.h"
 
@@ -105,7 +105,7 @@ public:
         if (!restart) {
             m_hsm = std::make_shared< HomeStateMachineStore >(m_uuid);
             //  m_rs = std::make_shared< home_replication::ReplicaSet >("Test_Group_Id", m_hsm, nullptr /*log store*/);
-            m_rs = new home_replication::ReplicaSet("Test_Group_Id", m_hsm, nullptr /*log store*/);
+            m_rs = new home_replication::ReplicaSetImpl("Test_Group_Id", m_hsm, nullptr /*log store*/);
             m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
         }
     }
@@ -133,7 +133,7 @@ public:
     std::shared_ptr< ReplicaStateMachine > m_sm{nullptr}; // state machine
 
 private:
-    home_replication::ReplicaSet* m_rs{nullptr}; // dummy replica set, it is just initialized for unit test purpose;
+    home_replication::ReplicaSetImpl* m_rs{nullptr}; // dummy replica set, it is just initialized for unit test purpose;
 #if 0
     std::shared_ptr< home_replication::ReplicaSet > m_rs{nullptr};
 #endif
@@ -231,9 +231,9 @@ TEST_F(TestReplStateMachine, async_fetch_pba_test_wait_timeout_fetch_remote) {
 
 static uint64_t const mock_pba_size{sizeof(uint64_t)};
 
-class MockReplicaSet : public ReplicaSet {
+class MockReplicaSet : public ReplicaSetImpl {
 public:
-    using ReplicaSet::ReplicaSet;
+    using ReplicaSetImpl::ReplicaSetImpl;
     MOCK_METHOD(void, send_data_service_response,
                 (sisl::io_blob_list_t const&, boost::intrusive_ptr< sisl::GenericRpcData >&));
 };

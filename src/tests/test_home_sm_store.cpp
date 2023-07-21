@@ -7,7 +7,7 @@
 #include <homestore/blkdata_service.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include "storage/home_storage_engine.h"
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
 using namespace home_replication;
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)

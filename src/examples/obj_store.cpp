@@ -14,6 +14,7 @@
 
 #include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/string_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
 #include <nuraft_mesg/messaging.hpp>
@@ -21,7 +22,7 @@
 #include <sisl/options/options.h>
 #include <sisl/version.hpp>
 
-#include "home_replication/repl_service.h"
+#include <home_replication/repl_service.hpp>
 
 ///
 // From example_lib.cpp
@@ -122,16 +123,15 @@ int main(int argc, char** argv) {
     consensus_params.enable_data_service = true;
 
     // Start the NuRaft gRPC service.
-    auto consensus_instance = std::make_shared< nuraft_mesg::service >();
-    consensus_instance->start(consensus_params);
+    // auto consensus_instance = std::make_shared< nuraft_mesg::service >();
+    // consensus_instance->start(consensus_params);
 
     LOGINFO("Initializing replication backend...");
-    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
-                                                         consensus_instance, &on_set_init);
+    auto repl_svc = home_replication::create_repl_service(&on_set_init, [](auto const& id) { return std::string(); });
 
     // Create a replication group
     auto const set_id = boost::uuids::string_generator()("f0d3ec17-9075-429b-afa7-68d7542f7403");
-    auto repl_set = repl_svc.create_replica_set(set_id);
+    auto repl_set = repl_svc->create_replica_set(set_id);
 
     auto http_server = ioenvironment.with_http_server().get_http_server();
     http_server->setup_route(

@@ -3,11 +3,11 @@
 #include <sisl/fds/obj_allocator.hpp>
 #include <sisl/fds/vector_pool.hpp>
 #include <sisl/grpc/generic_service.hpp>
-#include <home_replication/repl_service.h>
-#include <home_replication/repl_set.h>
+#include <home_replication/repl_service.hpp>
 #include <iomgr/iomgr_timer.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include "state_machine.h"
+#include "replica_set.hpp"
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
 #include "service/repl_config.h"
@@ -18,7 +18,7 @@ SISL_LOGGING_DECL(home_replication)
 namespace home_replication {
 
 ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
-        m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
+        m_state_store{state_store}, m_rs{static_cast<ReplicaSetImpl*>(rs)}, m_group_id{rs->group_id()} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -103,7 +103,7 @@ raft_buf_ptr_t ReplicaStateMachine::pre_commit_ext(const nuraft::state_machine::
         RS_LOG(DEBUG, "pre_commit: {}, size: {}", lsn, data->size());
         repl_req* req = lsn_to_req(lsn);
 
-        m_rs->m_listener->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
+        m_rs->listener()->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
     }
     return m_success_ptr;
 }
@@ -112,7 +112,7 @@ void ReplicaStateMachine::after_precommit_in_leader(const nuraft::raft_server::r
     repl_req* req = r_cast< repl_req* >(params.context);
     link_lsn_to_req(req, int64_cast(params.log_idx));
 
-    m_rs->m_listener->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
+    m_rs->listener()->on_pre_commit(req->lsn, req->header, req->key, req->user_ctx);
 }
 
 raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_op_params& params) {
@@ -124,7 +124,7 @@ raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_
     repl_req* req = lsn_to_req(lsn);
     if (m_rs->is_leader()) {
         // This is the time to ensure flushing of journal happens in leader
-        if (m_rs->m_data_journal->last_durable_index() < uint64_cast(lsn)) { m_rs->m_data_journal->flush(); }
+        if (m_rs->data_journal()->last_durable_index() < uint64_cast(lsn)) { m_rs->data_journal()->flush(); }
         req->is_raft_written.store(true);
     }
     check_and_commit(req);
@@ -133,7 +133,7 @@ raft_buf_ptr_t ReplicaStateMachine::commit_ext(const nuraft::state_machine::ext_
 
 void ReplicaStateMachine::check_and_commit(repl_req* req) {
     if ((req->num_pbas_written.load() == req->local_pbas.size()) && req->is_raft_written.load()) {
-        m_rs->m_listener->on_commit(req->lsn, req->header, req->key, req->local_pbas, req->user_ctx);
+        m_rs->listener()->on_commit(req->lsn, req->header, req->key, req->local_pbas, req->user_ctx);
         m_state_store->commit_lsn(req->lsn);
         m_lsn_req_map.erase(req->lsn);
         sisl::ObjectAllocator< repl_req >::deallocate(req);
@@ -257,8 +257,7 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
 #endif
         // if in resync mode, fetch data from remote immediately;
         check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
-    }
-    else if (wait_size) {
+    } else if (wait_size) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;

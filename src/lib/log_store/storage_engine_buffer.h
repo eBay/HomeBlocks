@@ -96,8 +96,8 @@ struct SEBuf {
         if (len) { memcpy(dst.buf, buf, len); }
     }
 
-    size_t len {0};
-    void* buf {nullptr};
+    size_t len{0};
+    void* buf{nullptr};
 
     /**
      * To easily free buffer (to avoid memory leak by mistake),

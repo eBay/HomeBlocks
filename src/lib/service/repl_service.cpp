@@ -1,19 +1,20 @@
-#include <home_replication/repl_service.h>
+#include "repl_service.h"
 
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <nuraft_mesg/messaging_if.hpp>
 #include <sisl/logging/logging.h>
 
-#include <home_replication/repl_set.h>
+#include <home_replication/repl_set_listener.hpp>
+
+#include "state_machine/replica_set.hpp"
 #include "service/repl_backend.h"
 #include "service/home_repl_backend.h"
 
 namespace home_replication {
-ReplicationService::ReplicationService(backend_impl_t backend,
-                                       std::shared_ptr< nuraft_mesg::consensus_component > messaging,
-                                       on_replica_set_init_t cb) :
-        m_on_rs_init_cb{std::move(cb)}, m_messaging(messaging) {
+ReplicationServiceImpl::ReplicationServiceImpl(backend_impl_t backend, on_replica_set_init_t cb,
+                                               ReplicationService::lookup_member_cb) :
+        m_on_rs_init_cb{std::move(cb)}, m_messaging(nullptr) {
     switch (backend) {
     case backend_impl_t::homestore:
         m_backend = std::make_unique< HomeReplicationBackend >(this);
@@ -53,23 +54,23 @@ ReplicationService::ReplicationService(backend_impl_t backend,
     m_messaging->register_mgr_type("home_replication", group_type_params);
 }
 
-ReplicationService::~ReplicationService() = default;
+ReplicationServiceImpl::~ReplicationServiceImpl() = default;
 
-rs_ptr_t ReplicationService::lookup_replica_set(uuid_t uuid) {
+rs_ptr_t ReplicationServiceImpl::lookup_replica_set(uuid_t const& uuid) const {
     std::unique_lock lg(m_rs_map_mtx);
     auto it = m_rs_map.find(uuid);
     return (it == m_rs_map.end() ? nullptr : it->second);
 }
 
-rs_ptr_t ReplicationService::create_replica_set(uuid_t const uuid) {
+rs_ptr_t ReplicationServiceImpl::create_replica_set(uuid_t const& uuid) {
     auto log_store = m_backend->create_log_store();
     auto sm_store = m_backend->create_state_store(uuid);
     return on_replica_store_found(uuid, sm_store, log_store);
 }
 
-rs_ptr_t ReplicationService::on_replica_store_found(uuid_t const uuid,
-                                                    const std::shared_ptr< StateMachineStore >& sm_store,
-                                                    const std::shared_ptr< nuraft::log_store >& log_store) {
+rs_ptr_t ReplicationServiceImpl::on_replica_store_found(uuid_t const uuid,
+                                                        const std::shared_ptr< StateMachineStore >& sm_store,
+                                                        const std::shared_ptr< nuraft::log_store >& log_store) {
     auto it = m_rs_map.end();
     bool happened = false;
 
@@ -80,19 +81,25 @@ rs_ptr_t ReplicationService::on_replica_store_found(uuid_t const uuid,
     DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
     if (!happened) return it->second;
 
-    it->second = std::make_shared< ReplicaSet >(boost::uuids::to_string(uuid), sm_store, log_store);
-    it->second->attach_listener(std::move(m_on_rs_init_cb(it->second)));
-    m_backend->link_log_store_to_replica_set(log_store.get(), it->second.get());
-    if (!it->second->register_data_service_apis(m_messaging)) {
+    auto repl_set = std::make_shared< ReplicaSetImpl >(boost::uuids::to_string(uuid), sm_store, log_store);
+    it->second = repl_set;
+    repl_set->attach_listener(std::move(m_on_rs_init_cb(repl_set)));
+    m_backend->link_log_store_to_replica_set(log_store.get(), repl_set.get());
+    if (!repl_set->register_data_service_apis(m_messaging)) {
         // TODO: log error message
     }
-    return it->second;
+    return repl_set;
 }
 
-void ReplicationService::iterate_replica_sets(const std::function< void(const rs_ptr_t&) >& cb) {
+void ReplicationServiceImpl::iterate_replica_sets(ReplicationService::each_set_cb cb) const {
     std::unique_lock lg(m_rs_map_mtx);
     for (const auto& [uuid, rs] : m_rs_map) {
         cb(rs);
     }
+}
+
+std::shared_ptr< ReplicationService > create_repl_service(ReplicationService::on_replica_set_init_t cb,
+                                                          ReplicationService::lookup_member_cb l_cb) {
+    return std::make_shared< ReplicationServiceImpl >(ReplicationServiceImpl::backend_impl_t::homestore, cb, l_cb);
 }
 } // namespace home_replication

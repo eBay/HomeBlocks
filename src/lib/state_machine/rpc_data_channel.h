@@ -1,6 +1,7 @@
 #pragma once
 #include <sisl/utility/enum.hpp>
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
+#include "state_machine.h"
 
 namespace home_replication {
 

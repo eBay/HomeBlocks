@@ -1,33 +1,23 @@
 #pragma once
 
-#include <home_replication/repl_decls.h>
-
 #include <string>
 
-#include <folly/concurrency/ConcurrentHashMap.h>
-#include <nuraft_mesg/messaging_if.hpp>
-#include <sisl/fds/buffer.hpp>
+#include <home_replication/repl_set.hpp>
 
 namespace home_replication {
 
 struct repl_req;
+
 class ReplicaSetListener;
 class ReplicaStateMachine;
 class StateMachineStore;
 
-class ReplicaStateMachine;
-class StateMachineStore;
-struct repl_req;
-
-class ReplicaSet : public nuraft_mesg::mesg_state_mgr {
+class ReplicaSetImpl : public ReplicaSet {
 public:
-    friend class ReplicaStateMachine;
-    friend class ReplicationService;
+    ReplicaSetImpl(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,
+                   const std::shared_ptr< nuraft::log_store >& log_store);
 
-    ReplicaSet(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,
-               const std::shared_ptr< nuraft::log_store >& log_store);
-
-    virtual ~ReplicaSet() = default;
+    ~ReplicaSetImpl() override = default;
 
     /// @brief Replicate the data to the replica set. This method goes through the following steps
     /// Step 1: Allocates pba from the storage engine to write the value into. Storage engine returns a pba_list in
@@ -42,18 +32,18 @@ public:
     /// tracking this seperately to support consistent read use cases
     /// @param value - vector of io buffers that contain value for the key
     /// @param user_ctx - User supplied opaque context which will be passed to listener callbacks
-    virtual void write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx);
+    void write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx) override;
 
     /// @brief After data is replicated and on_commit to the listener is called. the pbas are implicityly transferred to
     /// listener. This call will transfer the ownership of pba back to the replication service. This listener should
     /// never free the pbas on its own and should always transfer the ownership after it is no longer useful.
     /// @param lsn - LSN of the old pba that is being transferred
     /// @param pbas - PBAs to be transferred.
-    virtual void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas);
+    void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas) override;
 
     /// @brief Checks if this replica is the leader in this replica set
     /// @return true or false
-    bool is_leader();
+    bool is_leader() const override;
 
     /// @brief Register server side implimentation callbacks to data service apis
     /// @param messaging - messaging service pointer
@@ -68,8 +58,8 @@ public:
     /// @brief Send the final responce to the rpc client. This method is defined virtual for mocking in the gtest
     /// @param outgoing_buf - response buf to client
     /// @param rpc_data - context provided by the rpc server
-    virtual void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
-                                            boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data);
+    void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
+                                    boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) override;
 
     /// @brief Fetch pba data from the leader
     /// @param remote_pbas - list of remote pbas for which data is needed from the leader
@@ -77,16 +67,19 @@ public:
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
-protected:
     uint32_t get_logstore_id() const override { return 0; }
 
     void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
 
-    std::shared_ptr< nuraft::log_store > data_journal() { return m_data_journal; }
+    std::shared_ptr< nuraft::log_store > data_journal() const { return m_data_journal; }
 
     void permanent_destroy() override {}
 
     void leave() override {}
+
+    std::string group_id() const override { return m_group_id; }
+
+    auto& listener() const { return m_listener; }
 
 private:
     nuraft::ptr< nuraft::cluster_config > load_config() override { return nullptr; }
@@ -99,7 +92,6 @@ private:
 
     void after_precommit_in_leader(const nuraft::raft_server::req_ext_cb_params& cb_params);
 
-private:
     std::shared_ptr< ReplicaStateMachine > m_state_machine;
     std::shared_ptr< StateMachineStore > m_state_store;
     std::unique_ptr< ReplicaSetListener > m_listener;

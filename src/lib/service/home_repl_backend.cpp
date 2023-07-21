@@ -1,5 +1,8 @@
-#include <home_replication/repl_service.h>
 #include "service/home_repl_backend.h"
+
+#include <home_replication/repl_set_listener.hpp>
+
+#include "repl_service.h"
 #include "log_store/repl_log_store.hpp"
 #include "log_store/home_raft_log_store.h"
 #include "storage/home_storage_engine.h"
@@ -25,7 +28,7 @@ void HomeReplicationBackend::rs_super_blk_found(const sisl::byte_view& buf, void
 
     auto sms = std::make_shared< HomeStateMachineStore >(rs_sb);
     auto rls = std::make_shared< ReplicaLogStore< HomeRaftLogStore > >(rs_sb->m_data_journal_id);
-    m_svc->on_replica_store_found(rs_sb->uuid, sms, rls);
+    static_cast< ReplicationServiceImpl* >(m_svc)->on_replica_store_found(rs_sb->uuid, sms, rls);
 }
 
 std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(uuid_t uuid) {

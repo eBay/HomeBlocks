@@ -14,7 +14,7 @@
  *********************************************************************************/
 #pragma once
 
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
 #include <homestore/logstore_service.hpp>
 
 #if defined __clang__ or defined __GNUC__

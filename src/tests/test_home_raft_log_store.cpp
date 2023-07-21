@@ -5,7 +5,7 @@
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
-#include <home_replication/repl_decls.h>
+#include <home_replication/common.hpp>
 
 using namespace home_replication;
 
