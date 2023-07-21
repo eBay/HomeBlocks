@@ -1,6 +1,5 @@
 #include "mock_storage_engine.h"
 #include "test_common.h"
-#include <boost/uuid/random_generator.hpp>
 
 SISL_LOGGING_INIT(HOMEREPL_LOG_MODS)
 SISL_OPTIONS_ENABLE(logging);
@@ -30,7 +29,7 @@ TEST(RpcDataChannel, SerializeAndDeserialize) {
     });
 
     // create a hdr with random group id and replica id and serialize hdr, pbas and value into a list of io_blobs
-    data_channel_rpc_hdr hdr = {boost::uuids::random_generator()(), svr_id};
+    auto hdr = data_channel_rpc_hdr{"RpcDataChannelTest", svr_id};
     auto serialized_blob = serialize_to_ioblob(hdr, &mock_engine, pbas, sgl);
 
     // verify the equality of deserialized and serialized values

@@ -28,11 +28,11 @@ void HomeReplicationBackend::rs_super_blk_found(const sisl::byte_view& buf, void
 
     auto sms = std::make_shared< HomeStateMachineStore >(rs_sb);
     auto rls = std::make_shared< ReplicaLogStore< HomeRaftLogStore > >(rs_sb->m_data_journal_id);
-    static_cast< ReplicationServiceImpl* >(m_svc)->on_replica_store_found(rs_sb->uuid, sms, rls);
+    static_cast< ReplicationServiceImpl* >(m_svc)->on_replica_store_found(rs_sb->group_id, sms, rls);
 }
 
-std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(uuid_t uuid) {
-    return std::make_shared< HomeStateMachineStore >(uuid);
+std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(std::string const& group_id) {
+    return std::make_shared< HomeStateMachineStore >(group_id);
 }
 
 std::shared_ptr< nuraft::log_store > HomeReplicationBackend::create_log_store() {

@@ -15,7 +15,7 @@ struct home_rs_superblk {
 
     uint64_t magic{REPLICA_SET_SB_MAGIC};
     uint32_t version{REPLICA_SET_SB_VERSION};
-    uuid_t uuid;                                // uuid of this replica set
+    std::string group_id;                       // group_id of this replica set
     homestore::logstore_id_t free_pba_store_id; // Logstore id for storing free pba records
     homestore::logstore_id_t m_data_journal_id; // Logstore id for the data journal
     repl_lsn_t commit_lsn;                      // LSN upto which this replica has committed
@@ -28,7 +28,7 @@ struct home_rs_superblk {
 
 class HomeStateMachineStore : public StateMachineStore {
 public:
-    HomeStateMachineStore(uuid_t rs_uuid);
+    HomeStateMachineStore(std::string const& group_id);
     HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb);
     virtual ~HomeStateMachineStore();
 

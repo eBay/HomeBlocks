@@ -1,7 +1,5 @@
 #include "repl_service.h"
 
-#include <boost/uuid/string_generator.hpp>
-#include <boost/uuid/uuid_io.hpp>
 #include <nuraft_mesg/messaging_if.hpp>
 #include <sisl/logging/logging.h>
 
@@ -41,34 +39,26 @@ ReplicationServiceImpl::ReplicationServiceImpl(backend_impl_t backend, on_replic
     auto group_type_params = nuraft_mesg::consensus_component::register_params{
         r_params,
         [this](int32_t const, std::string const& group_id) mutable -> std::shared_ptr< nuraft_mesg::mesg_state_mgr > {
-            // boost::uuids can throw
-            uuid_t sanitized_group_id;
-            try {
-                sanitized_group_id = boost::uuids::string_generator()(group_id);
-            } catch (std::runtime_error const&) {
-                LOGERROR("invalid uuid format, {}", group_id);
-                return nullptr;
-            }
-            return create_replica_set(sanitized_group_id);
+            return create_replica_set(group_id);
         }};
     m_messaging->register_mgr_type("home_replication", group_type_params);
 }
 
 ReplicationServiceImpl::~ReplicationServiceImpl() = default;
 
-rs_ptr_t ReplicationServiceImpl::lookup_replica_set(uuid_t const& uuid) const {
+rs_ptr_t ReplicationServiceImpl::lookup_replica_set(std::string const& group_id) const {
     std::unique_lock lg(m_rs_map_mtx);
-    auto it = m_rs_map.find(uuid);
+    auto it = m_rs_map.find(group_id);
     return (it == m_rs_map.end() ? nullptr : it->second);
 }
 
-rs_ptr_t ReplicationServiceImpl::create_replica_set(uuid_t const& uuid) {
+rs_ptr_t ReplicationServiceImpl::create_replica_set(std::string const& group_id) {
     auto log_store = m_backend->create_log_store();
-    auto sm_store = m_backend->create_state_store(uuid);
-    return on_replica_store_found(uuid, sm_store, log_store);
+    auto sm_store = m_backend->create_state_store(group_id);
+    return on_replica_store_found(group_id, sm_store, log_store);
 }
 
-rs_ptr_t ReplicationServiceImpl::on_replica_store_found(uuid_t const uuid,
+rs_ptr_t ReplicationServiceImpl::on_replica_store_found(std::string const group_id,
                                                         const std::shared_ptr< StateMachineStore >& sm_store,
                                                         const std::shared_ptr< nuraft::log_store >& log_store) {
     auto it = m_rs_map.end();
@@ -76,12 +66,12 @@ rs_ptr_t ReplicationServiceImpl::on_replica_store_found(uuid_t const uuid,
 
     {
         std::unique_lock lg(m_rs_map_mtx);
-        std::tie(it, happened) = m_rs_map.emplace(std::make_pair(uuid, nullptr));
+        std::tie(it, happened) = m_rs_map.emplace(std::make_pair(group_id, nullptr));
     }
     DEBUG_ASSERT(m_rs_map.end() != it, "Could not insert into map!");
     if (!happened) return it->second;
 
-    auto repl_set = std::make_shared< ReplicaSetImpl >(boost::uuids::to_string(uuid), sm_store, log_store);
+    auto repl_set = std::make_shared< ReplicaSetImpl >(group_id, sm_store, log_store);
     it->second = repl_set;
     repl_set->attach_listener(std::move(m_on_rs_init_cb(repl_set)));
     m_backend->link_log_store_to_replica_set(log_store.get(), repl_set.get());
@@ -93,7 +83,7 @@ rs_ptr_t ReplicationServiceImpl::on_replica_store_found(uuid_t const uuid,
 
 void ReplicationServiceImpl::iterate_replica_sets(ReplicationService::each_set_cb cb) const {
     std::unique_lock lg(m_rs_map_mtx);
-    for (const auto& [uuid, rs] : m_rs_map) {
+    for (const auto& [group_id, rs] : m_rs_map) {
         cb(rs);
     }
 }

@@ -14,7 +14,7 @@ SISL_LOGGING_DECL(home_replication)
 namespace home_replication {
 
 using endpoint = std::string;
-using uuid_t = boost::uuids::uuid;
+using boost::uuids::uuid;
 
 using pba_t = uint64_t;
 using pba_list_t = folly::small_vector< pba_t, 4 >;

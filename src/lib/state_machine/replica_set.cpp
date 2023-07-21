@@ -8,7 +8,6 @@
 #include "log_store/repl_log_store.hpp"
 #include "log_store/journal_entry.h"
 #include "storage/storage_engine.h"
-#include <boost/uuid/string_generator.hpp>
 #include "rpc_data_channel_include.h"
 
 // data service api names
@@ -17,10 +16,11 @@ extern std::string const FETCH_DATA{"fetch_data"};
 
 namespace home_replication {
 ReplicaSetImpl::ReplicaSetImpl(const std::string& group_id, const std::shared_ptr< StateMachineStore >& sm_store,
-                       const std::shared_ptr< nuraft::log_store >& log_store) :
+                               const std::shared_ptr< nuraft::log_store >& log_store) :
         m_state_machine{nullptr}, m_state_store{sm_store}, m_data_journal{log_store}, m_group_id{group_id} {}
 
-void ReplicaSetImpl::write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx) {
+void ReplicaSetImpl::write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value,
+                           void* user_ctx) {
     m_state_machine->propose(header, key, value, user_ctx);
 }
 
@@ -36,7 +36,7 @@ std::shared_ptr< nuraft::state_machine > ReplicaSetImpl::get_state_machine() {
 bool ReplicaSetImpl::is_leader() const { return m_repl_svc_ctx->is_raft_leader(); }
 
 void ReplicaSetImpl::send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
-                                            boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
+                                                boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) {
     m_repl_svc_ctx->send_data_service_response(outgoing_buf, rpc_data);
 }
 
@@ -67,18 +67,16 @@ bool ReplicaSetImpl::register_data_service_apis(std::shared_ptr< nuraft_mesg::co
 void ReplicaSetImpl::send_in_data_channel(const pba_list_t& pbas, const sisl::sg_list& value) {
     m_repl_svc_ctx->data_service_request(
         SEND_DATA,
-        data_rpc::serialize(
-            data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), 0 /*replace with replica id*/}, pbas,
-            m_state_store.get(), value),
+        data_rpc::serialize(data_channel_rpc_hdr{m_group_id, 0 /*replace with replica id*/}, pbas, m_state_store.get(),
+                            value),
         nullptr); // response callback is null as this is fire and forget
 }
 
 void ReplicaSetImpl::fetch_pba_data_from_leader(const pba_list_t& remote_pbas) {
     m_repl_svc_ctx->data_service_request(
         FETCH_DATA,
-        data_rpc::serialize(
-            data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), 0 /*replace with replica id*/},
-            remote_pbas, m_state_store.get(), {}),
+        data_rpc::serialize(data_channel_rpc_hdr{m_group_id, 0 /*replace with replica id*/}, remote_pbas,
+                            m_state_store.get(), {}),
         [this](sisl::io_blob const& incoming_buf) {
             auto null_rpc_data = boost::intrusive_ptr< sisl::GenericRpcData >(nullptr);
             m_state_machine->on_data_received(incoming_buf, null_rpc_data);

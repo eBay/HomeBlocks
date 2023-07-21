@@ -130,8 +130,7 @@ int main(int argc, char** argv) {
     auto repl_svc = home_replication::create_repl_service(&on_set_init, [](auto const& id) { return std::string(); });
 
     // Create a replication group
-    auto const set_id = boost::uuids::string_generator()("f0d3ec17-9075-429b-afa7-68d7542f7403");
-    auto repl_set = repl_svc->create_replica_set(set_id);
+    auto repl_set = repl_svc->create_replica_set("ExampleObjStore:Group1");
 
     auto http_server = ioenvironment.with_http_server().get_http_server();
     http_server->setup_route(

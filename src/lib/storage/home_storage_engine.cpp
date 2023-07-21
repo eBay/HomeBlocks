@@ -1,6 +1,5 @@
 #include "home_storage_engine.h"
 #include <sisl/fds/utils.hpp>
-#include <boost/uuid/uuid_io.hpp>
 #include <homestore/blkdata_service.hpp>
 #include <iomgr/iomgr_timer.hpp>
 #include "service/repl_config.h"
@@ -10,7 +9,7 @@
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                          \
                                             fmt::make_format_args(file_name(__FILE__), __LINE__));                     \
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},                          \
-                                            fmt::make_format_args("rs", boost::uuids::to_string(m_sb_in_mem.uuid)));   \
+                                            fmt::make_format_args("rs", m_sb_in_mem.group_id));                        \
                             fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                               \
                                             fmt::make_format_args(std::forward< decltype(args) >(args)...));           \
                             return true;                                                                               \
@@ -24,12 +23,12 @@ static constexpr store_lsn_t to_store_lsn(repl_lsn_t raft_lsn) { return raft_lsn
 static constexpr repl_lsn_t to_repl_lsn(store_lsn_t store_lsn) { return store_lsn + 1; }
 
 ///////////////////////////// HomeStateMachineStore Section ////////////////////////////
-HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for uuid={}", rs_uuid);
+HomeStateMachineStore::HomeStateMachineStore(std::string const& rs_group_id) : m_sb{"replica_set"} {
+    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for group_id={}", rs_group_id);
 
     // Create a superblk for the replica set.
     m_sb.create(sizeof(home_rs_superblk));
-    m_sb->uuid = rs_uuid;
+    m_sb->group_id = rs_group_id;
 
     // Create logstore to store the free pba records
     m_free_pba_store =
@@ -45,7 +44,7 @@ HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set
 
 HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb) :
         m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for uuid={}", rs_sb->uuid);
+    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for group_id={}", rs_sb->group_id);
     m_sb = rs_sb;
     m_sb_in_mem = *m_sb;
     SM_STORE_LOG(DEBUG, "Opening free pba record logstore={}", m_sb->free_pba_store_id);

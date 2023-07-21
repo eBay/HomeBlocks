@@ -4,7 +4,6 @@
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
-#include <boost/uuid/uuid_generators.hpp>
 #include <home_replication/repl_service.hpp>
 #include <gtest/gtest.h>
 #include <sisl/grpc/generic_service.hpp>
@@ -39,10 +38,7 @@ static void init_files(uint32_t ndevices, uint64_t dev_size) {
 
 class TestReplStateMachine : public ::testing::Test {
 public:
-    void SetUp() {
-        boost::uuids::random_generator gen;
-        m_uuid = gen();
-    }
+    void SetUp() { m_group_id = "TestReplStateMachine"; }
 
     void start_homestore(bool restart = false) {
         auto const ndevices = SISL_OPTIONS["num_devs"].as< uint32_t >();
@@ -103,7 +99,7 @@ public:
             .init(true /* wait_for_init */);
 
         if (!restart) {
-            m_hsm = std::make_shared< HomeStateMachineStore >(m_uuid);
+            m_hsm = std::make_shared< HomeStateMachineStore >(m_group_id);
             //  m_rs = std::make_shared< home_replication::ReplicaSet >("Test_Group_Id", m_hsm, nullptr /*log store*/);
             m_rs = new home_replication::ReplicaSetImpl("Test_Group_Id", m_hsm, nullptr /*log store*/);
             m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
@@ -126,7 +122,7 @@ public:
         homestore::superblk< home_rs_superblk > rs_sb;
         rs_sb.load(buf, meta_cookie);
         m_hsm = std::make_shared< HomeStateMachineStore >(rs_sb);
-        m_uuid = rs_sb->uuid;
+        m_group_id = rs_sb->group_id;
     }
 
 public:
@@ -138,7 +134,7 @@ private:
     std::shared_ptr< home_replication::ReplicaSet > m_rs{nullptr};
 #endif
     std::shared_ptr< HomeStateMachineStore > m_hsm{nullptr}; // Home SM Store
-    boost::uuids::uuid m_uuid;
+    std::string m_group_id;
 };
 
 TEST_F(TestReplStateMachine, map_pba_basic_test) {
@@ -248,12 +244,11 @@ protected:
 
     void setup() {
         m_se = std::make_shared< MockStorageEngine >();
-        m_rs = std::make_shared< MockReplicaSet >(to_string(boost::uuids::random_generator()()), m_se,
-                                                  nullptr /*log store*/);
+        m_rs = std::make_shared< MockReplicaSet >("MockReplicaSet", m_se, nullptr /*log store*/);
         m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
 
         EXPECT_CALL(*m_se, pba_to_size(_)).WillRepeatedly([](pba_t const&) { return mock_pba_size; });
-        hdr = {boost::uuids::random_generator()(), svr_id};
+        hdr = {"RandomString", svr_id};
         serialized_blob = serialize_to_ioblob(hdr, m_se.get(), pbas, sgl);
 
         EXPECT_CALL(*m_se, alloc_pbas(_)).WillRepeatedly([](uint32_t) {

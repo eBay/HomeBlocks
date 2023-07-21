@@ -14,14 +14,14 @@ using rs_ptr_t = std::shared_ptr< ReplicaSet >;
 
 class ReplicationService {
 public:
-    using lookup_member_cb = std::function< std::string(uuid_t const&) >;
+    using lookup_member_cb = std::function< std::string(uuid const&) >;
     using each_set_cb = std::function< void(const rs_ptr_t&) >;
     using on_replica_set_init_t = std::function< std::unique_ptr< ReplicaSetListener >(const rs_ptr_t& rs) >;
 
     virtual ~ReplicationService() = default;
 
-    virtual rs_ptr_t create_replica_set(uuid_t const& uuid) = 0;
-    virtual rs_ptr_t lookup_replica_set(uuid_t const& uuid) const = 0;
+    virtual rs_ptr_t create_replica_set(std::string const& group_id) = 0;
+    virtual rs_ptr_t lookup_replica_set(std::string const& group_id) const = 0;
     virtual void iterate_replica_sets(each_set_cb cb) const = 0;
 };
 

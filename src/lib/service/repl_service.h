@@ -23,7 +23,7 @@ class StateMachineStore;
 class ReplicationServiceImpl : public ReplicationService {
     std::unique_ptr< ReplicationServiceBackend > m_backend;
     mutable std::mutex m_rs_map_mtx;
-    std::map< uuid_t, rs_ptr_t > m_rs_map;
+    std::map< std::string, rs_ptr_t > m_rs_map;
     on_replica_set_init_t m_on_rs_init_cb;
 
     std::shared_ptr< nuraft_mesg::consensus_component > m_messaging;
@@ -35,11 +35,11 @@ public:
                            ReplicationService::lookup_member_cb);
     ~ReplicationServiceImpl() override;
 
-    rs_ptr_t on_replica_store_found(uuid_t const uuid, const std::shared_ptr< StateMachineStore >& sm_store,
+    rs_ptr_t on_replica_store_found(std::string const group_id, const std::shared_ptr< StateMachineStore >& sm_store,
                                     const std::shared_ptr< nuraft::log_store >& log_store);
 
-    rs_ptr_t create_replica_set(uuid_t const& uuid) override;
-    rs_ptr_t lookup_replica_set(uuid_t const& uuid) const override;
+    rs_ptr_t create_replica_set(std::string const& group_id) override;
+    rs_ptr_t lookup_replica_set(std::string const& group_id) const override;
     void iterate_replica_sets(each_set_cb cb) const override;
 };
 

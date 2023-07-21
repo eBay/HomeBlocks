@@ -5,7 +5,6 @@
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
-#include <boost/uuid/uuid_generators.hpp>
 #include "storage/home_storage_engine.h"
 #include <home_replication/common.hpp>
 using namespace home_replication;
@@ -42,10 +41,7 @@ typedef std::function< void(std::error_condition err, std::shared_ptr< pba_list_
 
 class TestHomeStateMachineStore : public ::testing::Test {
 public:
-    void SetUp() {
-        boost::uuids::random_generator gen;
-        m_uuid = gen();
-    }
+    void SetUp() { m_group_id = "TestHomeStateMachineStore"; }
 
     void start_homestore(bool restart = false, bool ds_test = false) {
         auto const ndevices = SISL_OPTIONS["num_devs"].as< uint32_t >();
@@ -122,7 +118,7 @@ public:
                 .init(true /* wait_for_init */);
         }
 
-        if (!restart) { m_hsm = std::make_unique< HomeStateMachineStore >(m_uuid); }
+        if (!restart) { m_hsm = std::make_unique< HomeStateMachineStore >(m_group_id); }
     }
 
     void shutdown(bool cleanup = true) {
@@ -140,7 +136,7 @@ public:
         homestore::superblk< home_rs_superblk > rs_sb;
         rs_sb.load(buf, meta_cookie);
         m_hsm = std::make_unique< HomeStateMachineStore >(rs_sb);
-        m_uuid = rs_sb->uuid;
+        m_group_id = rs_sb->group_id;
     }
 
     void add(int64_t lsn) {
@@ -280,7 +276,7 @@ protected:
     homestore::logstore_id_t m_store_id{UINT32_MAX};
     sisl::sparse_vector< pba_list_t > m_shadow_log;
     std::atomic< uint64_t > m_cur_pba{0};
-    boost::uuids::uuid m_uuid;
+    std::string m_group_id;
     // below is for data service testing;
     std::mutex m_mtx;
     std::condition_variable m_cv;
