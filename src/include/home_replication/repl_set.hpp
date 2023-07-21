@@ -7,9 +7,15 @@
 
 namespace home_replication {
 
+class ReplicaSetListener;
+
 class ReplicaSet : public nuraft_mesg::mesg_state_mgr {
 public:
     virtual ~ReplicaSet() = default;
+
+    /// @brief Attach the callbacks that will be made in the context of the StateMachine processing operations below
+    /// to a RSL.
+    virtual void attach_listener(std::unique_ptr< ReplicaSetListener > listener) = 0;
 
     /// @brief Replicate the data to the replica set. This method goes through the following steps
     /// Step 1: Allocates pba from the storage engine to write the value into. Storage engine returns a pba_list in

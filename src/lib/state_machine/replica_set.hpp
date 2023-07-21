@@ -69,7 +69,7 @@ public:
 
     uint32_t get_logstore_id() const override { return 0; }
 
-    void attach_listener(std::unique_ptr< ReplicaSetListener > listener) { m_listener = std::move(listener); }
+    void attach_listener(std::unique_ptr< ReplicaSetListener > listener) override { m_listener = std::move(listener); }
 
     std::shared_ptr< nuraft::log_store > data_journal() const { return m_data_journal; }
 
