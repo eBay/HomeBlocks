@@ -30,7 +30,7 @@ class HomeReplicationConan(ConanFile):
                 'fPIC': True,
                 'coverage': False,
                 'sanitize': False,
-                'testing': True,
+                'testing': False,
                 'sisl:prerelease': True,
             }
 
