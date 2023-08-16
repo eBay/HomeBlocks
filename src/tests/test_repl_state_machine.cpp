@@ -79,7 +79,7 @@ public:
         }
 
         LOGINFO("Starting iomgr with {} threads, spdk: {}", nthreads, false);
-        ioenvironment.with_iomgr(nthreads, false);
+        ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = nthreads, .is_spdk = false});
 
         const uint64_t app_mem_size = ((ndevices * dev_size) * 15) / 100;
         LOGINFO("Initialize and start HomeStore with app_mem_size = {}", homestore::in_bytes(app_mem_size));

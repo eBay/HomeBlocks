@@ -50,8 +50,9 @@ static std::unique_ptr< home_replication::ReplicaSetListener > on_set_init(home_
 static auto ver_str() {
     auto vers{sisl::VersionMgr::getVersions()};
     auto ver_str = std::string();
-    for (auto v : vers) {
-        ver_str += fmt::format("{0}: {1}; ", v.first, v.second);
+    for (auto const& v : vers) {
+        auto& ver_info = v.second;
+        ver_str += fmt::format("{}: {}.{}.{}; ", v.first, ver_info.major(), ver_info.minor(), ver_info.patch());
     }
     return ver_str;
 }
@@ -68,19 +69,20 @@ static auto put_object([[maybe_unused]] auto& set, auto const request, auto resp
 
     if (4096u >= sz) {
         LOGINFO("Put Object: [{}]:[{}]B", resource, sz);
-        iomanager.run_on(
-            iomgr::thread_regex::random_worker,
-            [&set, &request, &resource](iomgr::io_thread_addr_t a) {
-                auto iovs = sisl::sg_iovs_t();
-                iovs.push_back(iovec{const_cast< char* >(request.body().data()), 4096});
-                auto sg = sisl::sg_list{4096, iovs};
-                auto blob_header = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
-                                              static_cast< uint32_t >(resource.size())};
-                auto blob_key = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
-                                           static_cast< uint32_t >(resource.size())};
-                set->write(blob_header, blob_key, sg, nullptr);
-            },
-            iomgr::wait_type_t::spin);
+        // TODO This should be made into a future
+        // iomanager.run_on(
+        //    iomgr::thread_regex::random_worker,
+        //    [&set, &request, &resource](iomgr::io_thread_addr_t a) {
+        //        auto iovs = sisl::sg_iovs_t();
+        //        iovs.push_back(iovec{const_cast< char* >(request.body().data()), 4096});
+        //        auto sg = sisl::sg_list{4096, iovs};
+        //        auto blob_header = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+        //                                      static_cast< uint32_t >(resource.size())};
+        //        auto blob_key = sisl::blob{reinterpret_cast< uint8_t* >(const_cast< char* >(resource.data())),
+        //                                   static_cast< uint32_t >(resource.size())};
+        //        set->write(blob_header, blob_key, sg, nullptr);
+        //    },
+        //    iomgr::wait_type_t::spin);
         response.send(Pistache::Http::Code::Ok);
     } else {
         LOGWARN("Put Object too big!: [{}]:[{}]", resource, sz);

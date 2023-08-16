@@ -222,7 +222,6 @@ std::pair< pba_list_t, pba_state_t > ReplicaStateMachine::try_map_pba(const full
 bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualified_pba >& fq_pba_list,
                                                  batch_completion_cb_t cb) {
     std::vector< fully_qualified_pba > wait_to_fill_fq_pbas;
-    std::shared_ptr< pba_waiter > waiter = nullptr;
 
     for (const auto& fq_pba : fq_pba_list) {
         const auto key_string = fq_pba.to_key_string();
@@ -240,12 +239,9 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
 
         // now "it" points to either newly created map entry or already existed entry;
         if (it->second->m_state != pba_state_t::completed) {
-            // only create waiter when there is at least one fq_pba that needs to be waited on;
-            if (waiter == nullptr) { waiter = std::make_shared< pba_waiter >(std::move(cb)); }
-
             // same waiter can wait on multiple fq_pbas;
-            RS_DBG_ASSERT_EQ(it->second->m_waiter, nullptr, "not expecting to apply waiter on already waited entry.");
-            it->second->m_waiter = waiter;
+            RS_DBG_ASSERT(!it->second->m_waiter, "not expecting to apply waiter on already waited entry.");
+            it->second->m_waiter = std::make_shared< pba_waiter >(std::move(cb));
         }
     }
 
@@ -257,8 +253,7 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
 #endif
         // if in resync mode, fetch data from remote immediately;
         check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
-    }
-    else if (wait_size) {
+    } else if (wait_size) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;
