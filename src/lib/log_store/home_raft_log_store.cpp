@@ -117,8 +117,8 @@ nuraft::ptr< nuraft::log_entry > HomeRaftLogStore::last_entry() const {
 }
 
 ulong HomeRaftLogStore::append(nuraft::ptr< nuraft::log_entry >& entry) {
-    REPL_STORE_LOG(TRACE, "append entry term={}, log_val_type={} size={}", entry->get_term(), entry->get_val_type(),
-                   entry->get_buf().size());
+    REPL_STORE_LOG(TRACE, "append entry term={}, log_val_type={} size={}", entry->get_term(),
+                   (uint8_t)entry->get_val_type(), entry->get_buf().size());
 
     raft_buf_ptr_t entry_buf = entry->serialize();
     auto next_seq = m_log_store->append_async(

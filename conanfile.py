@@ -41,12 +41,9 @@ class HomeReplicationConan(ConanFile):
         self.build_requires("gtest/1.13.0")
 
     def requirements(self):
-        self.requires("nuraft_mesg/[~=0,    include_prerelease=True]@oss/main")
+        self.requires("nuraft_mesg/[~=1,    include_prerelease=True]@oss/main")
         self.requires("homestore/[~=4,      include_prerelease=True]@oss/master")
-        self.requires("sisl/[~=9,           include_prerelease=True]@oss/master")
-
-        self.requires("openssl/1.1.1s", override=True)
-        self.requires("zlib/1.2.12", override=True)
+        self.requires("sisl/[~=10,          include_prerelease=True]@oss/master")
 
     def validate(self):
         if self.info.settings.os in ["Macos", "Windows"]:

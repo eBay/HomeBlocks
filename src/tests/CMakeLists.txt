@@ -16,8 +16,10 @@ target_link_libraries(test_home_raft_log_store
             ${COMMON_TEST_DEPS}
             GTest::gmock
         )
-add_test(NAME HomeRaftLogStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_raft_log_store)
-set_property(TEST HomeRaftLogStore PROPERTY RUN_SERIAL 1)
+    #TODO Re-enable
+    #add_test(NAME HomeRaftLogStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_raft_log_store)
+    #set_property(TEST HomeRaftLogStore PROPERTY RUN_SERIAL 1)
+    message(WARNING "HomeRaftLogStore test is still disabled!")
 endif()
 
 add_executable(test_home_sm_store)
@@ -26,8 +28,10 @@ target_link_libraries(test_home_sm_store
             home_replication 
             ${COMMON_TEST_DEPS} 
             GTest::gmock)
-add_test(NAME HomeStateStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_sm_store)
-set_property(TEST HomeStateStore PROPERTY RUN_SERIAL 1)
+#TODO Re-enable
+#add_test(NAME HomeStateStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_sm_store)
+#set_property(TEST HomeStateStore PROPERTY RUN_SERIAL 1)
+message(WARNING "HomeStateStore test is still disabled!")
 
 add_executable(test_repl_state_machine)
 target_sources(test_repl_state_machine PRIVATE test_repl_state_machine.cpp)

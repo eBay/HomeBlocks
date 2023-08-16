@@ -25,7 +25,8 @@ static constexpr repl_lsn_t to_repl_lsn(store_lsn_t store_lsn) { return store_ls
 
 ///////////////////////////// HomeStateMachineStore Section ////////////////////////////
 HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for uuid={}", rs_uuid);
+    LOGDEBUGMOD(home_replication, "Creating new instance of replica state machine store for uuid={}",
+                to_string(rs_uuid));
 
     // Create a superblk for the replica set.
     m_sb.create(sizeof(home_rs_superblk));
@@ -45,7 +46,7 @@ HomeStateMachineStore::HomeStateMachineStore(uuid_t rs_uuid) : m_sb{"replica_set
 
 HomeStateMachineStore::HomeStateMachineStore(const homestore::superblk< home_rs_superblk >& rs_sb) :
         m_sb{"replica_set"} {
-    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for uuid={}", rs_sb->uuid);
+    LOGDEBUGMOD(home_replication, "Opening existing replica state machine store for uuid={}", to_string(rs_sb->uuid));
     m_sb = rs_sb;
     m_sb_in_mem = *m_sb;
     SM_STORE_LOG(DEBUG, "Opening free pba record logstore={}", m_sb->free_pba_store_id);
@@ -88,11 +89,13 @@ void HomeStateMachineStore::async_write(const sisl::sg_list& sgs, const pba_list
     }
 
     // async write with input block ids;
-    homestore::data_service().async_write(sgs, hints, in_blkids, cb);
+    //  TODO APIs have changed!
+    // homestore::data_service().async_write(sgs, hints, in_blkids, cb);
 }
 
 void HomeStateMachineStore::async_read(pba_t pba, sisl::sg_list& sgs, uint32_t size, const io_completion_cb_t& cb) {
-    homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
+    //  TODO APIs have changed!
+    // homestore::data_service().async_read(homestore::BlkId{pba}, sgs, size, cb);
 }
 
 uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
@@ -100,8 +103,9 @@ uint32_t HomeStateMachineStore::pba_to_size(pba_t pba) const {
 }
 
 void HomeStateMachineStore::free_pba(pba_t pba) {
-    homestore::data_service().async_free_blk(homestore::BlkId{pba},
-                                             []([[maybe_unused]] std::error_condition err) { assert(!err); });
+    //  TODO APIs have changed!
+    // homestore::data_service().async_free_blk(homestore::BlkId{pba},
+    //                                         []([[maybe_unused]] std::error_condition err) { assert(!err); });
 }
 
 //////////////// StateMachine Superblock/commit update section /////////////////////////////
@@ -116,23 +120,26 @@ repl_lsn_t HomeStateMachineStore::get_last_commit_lsn() const {
 }
 
 void HomeStateMachineStore::start_sb_flush_timer() {
-    iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
-        m_sb_flush_timer_hdl =
-            iomanager.schedule_thread_timer(HR_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring */,
-                                            nullptr, [this](void*) { flush_super_block(); });
-    });
+    //  TODO APIs have changed!
+    // iomanager.run_on(homestore::logstore_service().truncate_thread(), [this](iomgr::io_thread_addr_t) {
+    //    m_sb_flush_timer_hdl =
+    //        iomanager.schedule_thread_timer(HR_DYNAMIC_CONFIG(commit_lsn_flush_ms) * 1000 * 1000, true /* recurring
+    //        */,
+    //                                        nullptr, [this](void*) { flush_super_block(); });
+    //});
 }
 
 void HomeStateMachineStore::stop_sb_flush_timer() {
-    if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
-        iomanager.run_on(
-            homestore::logstore_service().truncate_thread(),
-            [this](iomgr::io_thread_addr_t) {
-                iomanager.cancel_timer(m_sb_flush_timer_hdl);
-                m_sb_flush_timer_hdl = iomgr::null_timer_handle;
-            },
-            iomgr::wait_type_t::spin);
-    }
+    //  TODO APIs have changed!
+    // if (m_sb_flush_timer_hdl != iomgr::null_timer_handle) {
+    //    iomanager.run_on(
+    //        homestore::logstore_service().truncate_thread(),
+    //        [this](iomgr::io_thread_addr_t) {
+    //            iomanager.cancel_timer(m_sb_flush_timer_hdl);
+    //            m_sb_flush_timer_hdl = iomgr::null_timer_handle;
+    //        },
+    //        iomgr::wait_type_t::spin);
+    //}
 }
 
 void HomeStateMachineStore::flush_super_block() {

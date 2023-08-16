@@ -1,5 +1,7 @@
 cmake_minimum_required (VERSION 3.11)
 
+add_flags(-Wno-unused-parameter)
+
 add_library(storage_engine OBJECT)
 target_sources(storage_engine PRIVATE
             home_storage_engine.cpp
