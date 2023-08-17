@@ -22,30 +22,13 @@ public:
 
     virtual ~ReplicaSetImpl() = default;
 
-    /// @brief Replicate the data to the replica set. This method goes through the following steps
-    /// Step 1: Allocates pba from the storage engine to write the value into. Storage engine returns a pba_list in
-    /// cases where single contiguous blocks are not available. For convenience, the comment will continue to refer
-    /// pba_list as pba.
-    /// Step 2: Uses data channel to send the <pba, value> to all replicas
-    /// Step 3: Creates a log/journal entry with <header, key, pba> and calls nuraft to append the entry and replicate
-    /// using nuraft channel (also called header_channel).
-    ///
-    /// @param header - Blob representing the header (it is opaque and will be copied as-is to the journal entry)
-    /// @param key - Blob representing the key (it is opaque and will be copied as-is to the journal entry). We are
-    /// tracking this seperately to support consistent read use cases
-    /// @param value - vector of io buffers that contain value for the key
-    /// @param user_ctx - User supplied opaque context which will be passed to listener callbacks
     void write(const sisl::blob& header, const sisl::blob& key, const sisl::sg_list& value, void* user_ctx) override;
 
-    /// @brief After data is replicated and on_commit to the listener is called. the pbas are implicityly transferred to
-    /// listener. This call will transfer the ownership of pba back to the replication service. This listener should
-    /// never free the pbas on its own and should always transfer the ownership after it is no longer useful.
-    /// @param lsn - LSN of the old pba that is being transferred
-    /// @param pbas - PBAs to be transferred.
     void transfer_pba_ownership(int64_t lsn, const pba_list_t& pbas) override;
 
-    /// @brief Checks if this replica is the leader in this replica set
-    /// @return true or false
+    void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
+                                    boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) override;
+
     bool is_leader() const override;
 
     /// @brief Register server side implimentation callbacks to data service apis
@@ -58,21 +41,12 @@ public:
     /// @param value - data to be sent
     void send_in_data_channel(const pba_list_t& pbas, const sisl::sg_list& value);
 
-    /// @brief Send the final responce to the rpc client. This method is defined virtual for mocking in the gtest
-    /// @param outgoing_buf - response buf to client
-    /// @param rpc_data - context provided by the rpc server
-    void send_data_service_response(sisl::io_blob_list_t const& outgoing_buf,
-                                    boost::intrusive_ptr< sisl::GenericRpcData >& rpc_data) override;
-
     /// @brief Fetch pba data from the leader
     /// @param remote_pbas - list of remote pbas for which data is needed from the leader
     void fetch_pba_data_from_leader(const pba_list_t& remote_pbas);
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
-    /// @brief Append an application/user specific message to the journal.
-    ///
-    /// @param buffer - Opaque buffer to be interpreted by the user
     void append_entry(nuraft::buffer const&) override {}
 
     std::string group_id() const override { return m_group_id; }

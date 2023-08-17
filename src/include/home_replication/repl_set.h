@@ -110,7 +110,10 @@ public:
     /// @param buffer - Opaque buffer to be interpreted by the user
     virtual void append_entry(nuraft::buffer const& b) = 0;
 
+    /// @brief Checks if this replica is the leader in this replica set
+    /// @return true or false
     virtual bool is_leader() const = 0;
+
     virtual std::string group_id() const = 0;
 };
 
