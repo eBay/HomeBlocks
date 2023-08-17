@@ -9,7 +9,7 @@ required_conan_version = ">=1.50.0"
 
 class HomeReplicationConan(ConanFile):
     name = "home_replication"
-    version = "0.0.8"
+    version = "0.1.1"
     homepage = "https://github.com/eBay/HomeReplication"
     description = "Fast Storage Replication using NuRaft"
     topics = ("ebay")

@@ -1,4 +1,4 @@
-#include <home_replication/repl_service.h>
+#include "service/repl_service_impl.h"
 #include "service/home_repl_backend.h"
 #include "log_store/repl_log_store.hpp"
 #include "log_store/home_raft_log_store.h"
@@ -8,7 +8,7 @@ SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
-HomeReplicationBackend::HomeReplicationBackend(ReplicationService* svc) : ReplicationServiceBackend{svc} {
+HomeReplicationBackend::HomeReplicationBackend(ReplicationServiceImpl* svc) : ReplicationServiceBackend{svc} {
     homestore::meta_service().register_handler(
         "replica_set",
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t) {
@@ -25,11 +25,11 @@ void HomeReplicationBackend::rs_super_blk_found(const sisl::byte_view& buf, void
 
     auto sms = std::make_shared< HomeStateMachineStore >(rs_sb);
     auto rls = std::make_shared< ReplicaLogStore< HomeRaftLogStore > >(rs_sb->m_data_journal_id);
-    m_svc->on_replica_store_found(rs_sb->uuid, sms, rls);
+    m_svc->on_replica_store_found(rs_sb->gid, sms, rls);
 }
 
-std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(uuid_t uuid) {
-    return std::make_shared< HomeStateMachineStore >(uuid);
+std::shared_ptr< StateMachineStore > HomeReplicationBackend::create_state_store(std::string const& gid) {
+    return std::make_shared< HomeStateMachineStore >(gid);
 }
 
 std::shared_ptr< nuraft::log_store > HomeReplicationBackend::create_log_store() {

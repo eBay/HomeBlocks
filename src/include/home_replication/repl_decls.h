@@ -2,7 +2,6 @@
 #include <iostream>
 #include <string>
 
-#include <boost/uuid/uuid.hpp>
 #include <folly/small_vector.h>
 #include <sisl/logging/logging.h>
 #include <iomgr/iomgr_types.hpp>
@@ -16,7 +15,6 @@ SISL_LOGGING_DECL(home_replication)
 namespace home_replication {
 using pba_t = uint64_t;
 using pba_list_t = folly::small_vector< pba_t, 4 >;
-using uuid_t = boost::uuids::uuid;
 
 // Fully qualified domain pba, unique pba id across replica set
 struct fully_qualified_pba {

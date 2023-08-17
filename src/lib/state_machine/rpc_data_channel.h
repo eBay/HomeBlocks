@@ -12,7 +12,7 @@ struct data_channel_rpc_hdr {
     static constexpr uint16_t MINOR_VERSION{1};
     static constexpr uint32_t max_hdr_size{512};
 
-    uuid_t group_id;            // UUID of the replica set
+    std::string group_id;       // gid of the replica set
     uint32_t issuer_replica_id; // Server ID it is initiated from
     uint16_t major_version{MAJOR_VERSION};
     uint16_t minor_version{MINOR_VERSION};

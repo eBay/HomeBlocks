@@ -1,17 +1,18 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <gtest/gtest.h>
+
 #include <iomgr/io_environment.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
-#include <boost/uuid/uuid_generators.hpp>
-#include "storage/home_storage_engine.h"
-#include <home_replication/repl_service.h> // includes repl_set.h
-#include <gtest/gtest.h>
-
 #include <sisl/grpc/generic_service.hpp>
 #include <home_replication/repl_decls.h>
+
 #include "state_machine/state_machine.h"
+#include "state_machine/repl_set_impl.h"
+#include "storage/home_storage_engine.h"
+#include "service/repl_service_impl.h" // includes repl_set.h
 #include "mock_storage_engine.h"
 #include "test_common.h"
 
@@ -39,10 +40,7 @@ static void init_files(uint32_t ndevices, uint64_t dev_size) {
 
 class TestReplStateMachine : public ::testing::Test {
 public:
-    void SetUp() {
-        boost::uuids::random_generator gen;
-        m_uuid = gen();
-    }
+    void SetUp() { m_gid = "test_repl_state_machine"; }
 
     void start_homestore(bool restart = false) {
         auto const ndevices = SISL_OPTIONS["num_devs"].as< uint32_t >();
@@ -103,9 +101,9 @@ public:
             .init(true /* wait_for_init */);
 
         if (!restart) {
-            m_hsm = std::make_shared< HomeStateMachineStore >(m_uuid);
+            m_hsm = std::make_shared< HomeStateMachineStore >(m_gid);
             //  m_rs = std::make_shared< home_replication::ReplicaSet >("Test_Group_Id", m_hsm, nullptr /*log store*/);
-            m_rs = new home_replication::ReplicaSet("Test_Group_Id", m_hsm, nullptr /*log store*/);
+            m_rs = new home_replication::ReplicaSetImpl("Test_Group_Id", m_hsm, nullptr /*log store*/);
             m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
         }
     }
@@ -126,19 +124,19 @@ public:
         homestore::superblk< home_rs_superblk > rs_sb;
         rs_sb.load(buf, meta_cookie);
         m_hsm = std::make_shared< HomeStateMachineStore >(rs_sb);
-        m_uuid = rs_sb->uuid;
+        m_gid = rs_sb->gid;
     }
 
 public:
     std::shared_ptr< ReplicaStateMachine > m_sm{nullptr}; // state machine
 
 private:
-    home_replication::ReplicaSet* m_rs{nullptr}; // dummy replica set, it is just initialized for unit test purpose;
+    home_replication::ReplicaSetImpl* m_rs{nullptr}; // dummy replica set, it is just initialized for unit test purpose;
 #if 0
     std::shared_ptr< home_replication::ReplicaSet > m_rs{nullptr};
 #endif
     std::shared_ptr< HomeStateMachineStore > m_hsm{nullptr}; // Home SM Store
-    boost::uuids::uuid m_uuid;
+    std::string m_gid;
 };
 
 TEST_F(TestReplStateMachine, map_pba_basic_test) {
@@ -231,9 +229,9 @@ TEST_F(TestReplStateMachine, async_fetch_pba_test_wait_timeout_fetch_remote) {
 
 static uint64_t const mock_pba_size{sizeof(uint64_t)};
 
-class MockReplicaSet : public ReplicaSet {
+class MockReplicaSet : public ReplicaSetImpl {
 public:
-    using ReplicaSet::ReplicaSet;
+    using ReplicaSetImpl::ReplicaSetImpl;
     MOCK_METHOD(void, send_data_service_response,
                 (sisl::io_blob_list_t const&, boost::intrusive_ptr< sisl::GenericRpcData >&));
 };
@@ -248,12 +246,11 @@ protected:
 
     void setup() {
         m_se = std::make_shared< MockStorageEngine >();
-        m_rs = std::make_shared< MockReplicaSet >(to_string(boost::uuids::random_generator()()), m_se,
-                                                  nullptr /*log store*/);
+        m_rs = std::make_shared< MockReplicaSet >("TestDataChannelReceive", m_se, nullptr /*log store*/);
         m_sm = std::dynamic_pointer_cast< ReplicaStateMachine >(m_rs->get_state_machine());
 
         EXPECT_CALL(*m_se, pba_to_size(_)).WillRepeatedly([](pba_t const&) { return mock_pba_size; });
-        hdr = {boost::uuids::random_generator()(), svr_id};
+        hdr = {"random_header", svr_id};
         serialized_blob = serialize_to_ioblob(hdr, m_se.get(), pbas, sgl);
 
         EXPECT_CALL(*m_se, alloc_pbas(_)).WillRepeatedly([](uint32_t) {

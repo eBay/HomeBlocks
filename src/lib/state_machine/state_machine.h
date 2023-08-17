@@ -18,7 +18,7 @@
 #undef auto_lock
 
 namespace home_replication {
-class ReplicaSet;
+class ReplicaSetImpl;
 class StateMachineStore;
 
 #define RS_LOG(level, msg, ...)                                                                                        \
@@ -164,7 +164,7 @@ using local_pba_info_ptr = std::shared_ptr< local_pba_info >;
 
 class ReplicaStateMachine : public nuraft::state_machine {
 public:
-    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs);
+    ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSetImpl* rs);
     ~ReplicaStateMachine() override = default;
     ReplicaStateMachine(ReplicaStateMachine const&) = delete;
     ReplicaStateMachine& operator=(ReplicaStateMachine const&) = delete;
@@ -263,7 +263,7 @@ private:
     std::shared_ptr< StateMachineStore > m_state_store;
     folly::ConcurrentHashMap< std::string, local_pba_info_ptr > m_pba_map; // fully_qualified_pba to local pba mapping;
     folly::ConcurrentHashMap< int64_t, repl_req* > m_lsn_req_map;
-    ReplicaSet* m_rs;
+    ReplicaSetImpl* m_rs;
     std::string m_group_id;
     uint32_t m_server_id;                        // TODO: Populate the value from replica set/RAFT
     nuraft::ptr< nuraft::buffer > m_success_ptr; // Preallocate the success return to raft
