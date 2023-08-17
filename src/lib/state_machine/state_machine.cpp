@@ -3,10 +3,8 @@
 #include <sisl/fds/obj_allocator.hpp>
 #include <sisl/fds/vector_pool.hpp>
 #include <sisl/grpc/generic_service.hpp>
-#include <home_replication/repl_service.h>
-#include <home_replication/repl_set.h>
+#include "state_machine/repl_set_impl.h"
 #include <iomgr/iomgr_timer.hpp>
-#include <boost/uuid/string_generator.hpp>
 #include "state_machine.h"
 #include "storage/storage_engine.h"
 #include "log_store/journal_entry.h"
@@ -17,7 +15,7 @@ SISL_LOGGING_DECL(home_replication)
 
 namespace home_replication {
 
-ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSet* rs) :
+ReplicaStateMachine::ReplicaStateMachine(const std::shared_ptr< StateMachineStore >& state_store, ReplicaSetImpl* rs) :
         m_state_store{state_store}, m_rs{rs}, m_group_id{rs->m_group_id} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
@@ -407,8 +405,7 @@ void ReplicaStateMachine::on_data_received(sisl::io_blob const& incoming_buf,
 
 sisl::io_blob_list_t ReplicaStateMachine::serialize_data_rpc_buf(pba_list_t const& pbas,
                                                                  sisl::sg_list const& value) const {
-    return data_rpc::serialize(data_channel_rpc_hdr{boost::uuids::string_generator()(m_group_id), m_server_id}, pbas,
-                               m_state_store.get(), value);
+    return data_rpc::serialize(data_channel_rpc_hdr{m_group_id, m_server_id}, pbas, m_state_store.get(), value);
 }
 
 class FetchDataContext : public sisl::GenericRpcContextBase {

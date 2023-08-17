@@ -10,10 +10,10 @@
 
 #include <condition_variable>
 #include <filesystem>
+#include <folly/executors/QueuedImmediateExecutor.h>
 #include <mutex>
 
 #include <boost/uuid/random_generator.hpp>
-#include <boost/uuid/string_generator.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
 #include <nuraft_mesg/messaging.hpp>
@@ -118,22 +118,15 @@ int main(int argc, char** argv) {
     LOGINFO("[{}] starting homestore service...", svc_id);
     start_homestore(svc_id);
 
-    LOGINFO("[{}] starting messaging service...", svc_id);
-    auto consensus_params = nuraft_mesg::consensus_component::params{
-        svc_id, listen_port, [](std::string const& client) -> std::string { return client; }, "home_replication"};
-    consensus_params.enable_data_service = true;
-
-    // Start the NuRaft gRPC service.
-    auto consensus_instance = std::make_shared< nuraft_mesg::service >();
-    consensus_instance->start(consensus_params);
-
     LOGINFO("Initializing replication backend...");
-    auto repl_svc = home_replication::ReplicationService(home_replication::backend_impl_t::homestore,
-                                                         consensus_instance, &on_set_init);
+    auto repl_svc =
+        home_replication::create_repl_service([](home_replication::rs_ptr_t const& p) { return on_set_init(p); });
 
     // Create a replication group
-    auto const set_id = boost::uuids::string_generator()("f0d3ec17-9075-429b-afa7-68d7542f7403");
-    auto repl_set = repl_svc.create_replica_set(set_id);
+    auto repl_set = std::get< home_replication::rs_ptr_t >(
+        repl_svc->create_replica_set("obj_store", std::set< std::string, std::less<> >())
+            .via(&folly::QueuedImmediateExecutor::instance())
+            .get());
 
     auto http_server = ioenvironment.with_http_server().get_http_server();
     http_server->setup_route(

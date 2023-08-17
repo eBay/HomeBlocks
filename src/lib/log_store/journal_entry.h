@@ -1,5 +1,4 @@
 #pragma once
-#include <boost/uuid/uuid.hpp>
 #include <sisl/utility/enum.hpp>
 #include <sisl/fds/buffer.hpp>
 #include <home_replication/repl_decls.h>
