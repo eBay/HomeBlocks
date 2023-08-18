@@ -93,13 +93,13 @@ class HomeReplicationConan(ConanFile):
         copy(self, "*.h*", join(self.source_folder, "src", "include"), join(self.package_folder, "include"), keep_path=True)
 
     def package_info(self):
-        self.cpp_info.libs = ["home_replication"]
+        self.cpp_info.names["cmake_find_package"] = "HomeReplication"
+        self.cpp_info.names["cmake_find_package_multi"] = "HomeReplication"
+        self.cpp_info.components["nuraft"].libs = ["home_replication"]
+        self.cpp_info.components["nuraft"].requires = ["nuraft_mesg::nuraft_mesg", "homestore::homestore"]
+        self.cpp_info.components["mock"].libs = ["home_replication_mock"]
+        self.cpp_info.components["mock"].requires = ["nuraft_mesg::nuraft_mesg", "homestore::homestore"]
 
         if self.settings.os == "Linux":
-            self.cpp_info.system_libs.append("pthread")
-
-        if  self.options.sanitize:
-            self.cpp_info.sharedlinkflags.append("-fsanitize=address")
-            self.cpp_info.exelinkflags.append("-fsanitize=address")
-            self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
-            self.cpp_info.exelinkflags.append("-fsanitize=undefined")
+            self.cpp_info.components["nuraft"].system_libs.append("pthread")
+            self.cpp_info.components["mock"].system_libs.append("pthread")
