@@ -6,8 +6,6 @@ include_directories (BEFORE .)
 
 find_package(GTest QUIET REQUIRED)
 
-link_directories(${spdk_LIB_DIRS} ${dpdk_LIB_DIRS})
-
 if (NOT ${BUILD_COVERAGE})
 add_executable(test_home_raft_log_store)
 target_sources(test_home_raft_log_store PRIVATE test_home_raft_log_store.cpp)

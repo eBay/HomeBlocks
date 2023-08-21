@@ -251,7 +251,8 @@ bool ReplicaStateMachine::async_fetch_write_pbas(const std::vector< fully_qualif
 #endif
         // if in resync mode, fetch data from remote immediately;
         check_and_fetch_remote_pbas(std::move(wait_to_fill_fq_pbas));
-    } else if (wait_size) {
+    }
+    else if (wait_size) {
         // some pbas are not in completed state, let's schedule a timer to check it again;
         // either we wait for data channel to fill in the data or we wait for certain time and trigger a fetch from
         // remote;

@@ -7,3 +7,5 @@ target_sources(home_replication_mock PRIVATE
 target_link_libraries(home_replication_mock
             ${COMMON_DEPS}
         )
+
+add_subdirectory(tests)

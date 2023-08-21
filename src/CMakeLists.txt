@@ -4,6 +4,8 @@ find_package(Threads QUIET REQUIRED)
 find_package(homestore QUIET REQUIRED)
 find_package(nuraft_mesg QUIET REQUIRED)
 
+link_directories(${spdk_LIB_DIRS} ${dpdk_LIB_DIRS})
+
 set (COMMON_DEPS
         homestore::homestore
         nuraft_mesg::nuraft_mesg
