@@ -16,9 +16,8 @@ target_link_libraries(test_home_raft_log_store
             ${COMMON_TEST_DEPS}
             GTest::gmock
         )
-    #TODO Re-enable
-    #add_test(NAME HomeRaftLogStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_raft_log_store)
-    #set_property(TEST HomeRaftLogStore PROPERTY RUN_SERIAL 1)
+    add_test(NAME HomeRaftLogStore COMMAND ${CMAKE_BINARY_DIR}/bin/test_home_raft_log_store)
+    set_property(TEST HomeRaftLogStore PROPERTY RUN_SERIAL 1)
     message(WARNING "HomeRaftLogStore test is still disabled!")
 endif()
 
