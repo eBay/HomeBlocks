@@ -59,6 +59,8 @@ public:
 folly::SemiFuture< ReplicationService::set_var >
 MockReplicationService::create_replica_set(std::string const& group_id,
                                            std::set< std::string, std::less<> >&& members) {
+    if (1 > members.size()) return folly::makeSemiFuture< set_var >(ReplServiceError::BAD_REQUEST);
+
     auto lk = std::scoped_lock(_map_lock);
     if (auto [it, happened] = _set_map.try_emplace(group_id, nullptr); _set_map.end() != it) {
         if (!happened) return folly::makeSemiFuture< set_var >(ReplServiceError::SERVER_ALREADY_EXISTS);
