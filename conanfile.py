@@ -31,14 +31,13 @@ class HomeReplicationConan(ConanFile):
                 'coverage': False,
                 'sanitize': False,
                 'testing': False,
-                'sisl:prerelease': True,
             }
 
     generators = "cmake", "cmake_find_package"
     exports_sources = ("CMakeLists.txt", "cmake/*", "src/*", "LICENSE")
 
     def build_requirements(self):
-        self.build_requires("gtest/1.13.0")
+        self.build_requires("gtest/1.14.0")
 
     def requirements(self):
         self.requires("nuraft_mesg/[~=1,    include_prerelease=True]@oss/main")
@@ -49,7 +48,7 @@ class HomeReplicationConan(ConanFile):
         if self.info.settings.os in ["Macos", "Windows"]:
             raise ConanInvalidConfiguration("{} Builds are unsupported".format(self.info.settings.os))
         if self.info.settings.compiler.cppstd:
-            check_min_cppstd(self, 11)
+            check_min_cppstd(self, 20)
 
     def configure(self):
         if self.options.shared:
@@ -57,10 +56,9 @@ class HomeReplicationConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            if self.options.sanitize:
-                self.options['sisl'].malloc_impl = 'libc'
-            if self.options.coverage:
-                self.options.testing = True
+            if self.options.testing == 'off':
+                if self.options.coverage or self.options.sanitize:
+                    raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
 
     def build(self):
         definitions = {

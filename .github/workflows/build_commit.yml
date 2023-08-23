@@ -15,6 +15,9 @@ on:
       prerelease:
         required: true
         type: string
+      tooling:
+        required: true
+        type: string
 
 jobs:
   SislDeps:
@@ -25,7 +28,9 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: None
     if: ${{ github.event_name != 'pull_request' }}
+
   NuRaftMesgDeps:
     needs: SislDeps
     uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@main
@@ -35,7 +40,9 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: None
     if: ${{ github.event_name != 'pull_request' }}
+
   IOMgrDeps:
     needs: SislDeps
     uses: eBay/iomanager/.github/workflows/build_dependencies.yml@master
@@ -45,7 +52,9 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: None
     if: ${{ github.event_name != 'pull_request' }}
+
   HomeStoreDeps:
     needs: IOMgrDeps
     uses: eBay/homestore/.github/workflows/build_dependencies.yml@master
@@ -55,7 +64,9 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: None
     if: ${{ github.event_name != 'pull_request' }}
+
   HomeReplDeps:
     needs: [HomeStoreDeps, NuRaftMesgDeps]
     uses: ./.github/workflows/build_dependencies.yml
@@ -65,8 +76,10 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name != 'pull_request' }}
+
   HomeReplBuild:
     uses: ./.github/workflows/build_dependencies.yml
     with:
@@ -75,5 +88,6 @@ jobs:
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
       prerelease: ${{ inputs.prerelease }}
+      tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name == 'pull_request' }}
