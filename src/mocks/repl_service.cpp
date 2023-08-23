@@ -34,7 +34,7 @@ public:
     void transfer_pba_ownership(int64_t, const pba_list_t&) override {}
     void send_data_service_response(sisl::io_blob_list_t const&,
                                     boost::intrusive_ptr< sisl::GenericRpcData >&) override {}
-    void append_entry(nuraft::buffer const&) override {}
+    void append_entry(nuraft::buffer const&, void*) override {}
     bool is_leader() const override { return true; }
     std::string group_id() const override { return _g_id; }
 

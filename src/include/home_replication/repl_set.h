@@ -108,7 +108,8 @@ public:
     /// @brief Append an application/user specific message to the journal.
     ///
     /// @param buffer - Opaque buffer to be interpreted by the user
-    virtual void append_entry(nuraft::buffer const& b) = 0;
+    /// @user_ctx - User supplied opaque context which will be passed to listener callbacks 
+    virtual void append_entry(nuraft::buffer const& b, void* user_ctx) = 0;
 
     /// @brief Checks if this replica is the leader in this replica set
     /// @return true or false

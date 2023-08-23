@@ -47,7 +47,7 @@ public:
 
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
 
-    void append_entry(nuraft::buffer const&) override {}
+    void append_entry(nuraft::buffer const&, void*) override {}
 
     std::string group_id() const override { return m_group_id; }
 
