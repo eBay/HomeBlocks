@@ -56,7 +56,7 @@ class HomeReplicationConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            if self.options.testing == 'off':
+            if not self.options.testing:
                 if self.options.coverage or self.options.sanitize:
                     raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
 
