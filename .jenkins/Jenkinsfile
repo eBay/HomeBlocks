@@ -9,7 +9,7 @@ pipeline {
     }
 
     stages {
-        stage('Adjust Tag for Master/PR') {
+        stage('Adjust Tag for Main/PR') {
             when { not {
                 branch "${STABLE_BRANCH}"
             } }
@@ -52,55 +52,13 @@ pipeline {
             }
         }
 
-/* Commented out until unit tests are available
-        stage('Coverage') {
-            when { not {
-                branch "${STABLE_BRANCH}"
-            } }
-
-            stages {
-                stage("Adjust Sonar Branch") {
-                    when {
-                        not {
-                            branch "${TARGET_BRANCH}"
-                        }
-                    }
-                    steps {
-                        sh "echo \"sonar.branch.target=${TARGET_BRANCH}\" >> sonar-project.properties"
-                    }
-                }
-                stage("Code Coverage") {
-                    steps {
-                        slackSend channel: '#sds-ci', message: "*${PROJECT}:${TAG}* is undergoing Code Coverage."
-                        sh "echo \"sonar.branch.name=${BRANCH_NAME}\" >> sonar-project.properties"
-                        sh "conan install -o sisl:prerelease=True -pr debug ${BUILD_MISSING} -o ${PROJECT}:coverage=True ."
-                        sh "build-wrapper-linux-x86-64 --out-dir /tmp/sonar conan build ."
-                        sh "find . -name \"*.gcno\" -exec gcov {} \\;"
-                        withSonarQubeEnv('sds-sonar')  {
-                            sh "sonar-scanner -Dsonar.projectBaseDir=. -Dsonar.projectVersion=\"${VER}\""
-                        }
-                    }
-                }
-                stage("Quality Gate") {
-                    steps {
-                        timeout(time: 5, unit: 'MINUTES') {
-                            waitForQualityGate abortPipeline: false
-                        }
-                    }
-                }
-            }
-        }
-*/
-
         stage("Compile") {
             steps {
-/* Need some additional variants from homestore and iomgr to build this.
-                sh "conan create ${BUILD_MISSING} -o sisl:prerelease=False -o ${PROJECT}:sanitize=True -pr debug . ${PROJECT}/${TAG}"
-                sh "conan remove -f ${PROJECT}/${TAG}"
-*/
-                sh "conan create ${BUILD_MISSING} -o sisl:prerelease=True -pr debug . ${PROJECT}/${TAG}"
-                sh "conan create ${BUILD_MISSING} -o sisl:prerelease=True -pr test . ${PROJECT}/${TAG}"
-                sh "conan create ${BUILD_MISSING} -o sisl:prerelease=False -pr test . ${PROJECT}/${TAG}"
+                sh "conan create ${BUILD_MISSING} -pr debug -o ${PROJECT}:sanitize=True . ${PROJECT}/${TAG} ; \
+                    conan create ${BUILD_MISSING} -pr debug . ${PROJECT}/${TAG} ; \
+                    conan create ${BUILD_MISSING} -pr test -o sisl:malloc_impl=tcmalloc . ${PROJECT}/${TAG} ; \
+                    conan create ${BUILD_MISSING} -pr test -o sisl:prerelease=True -o sisl:malloc_impl=tcmalloc . ${PROJECT}/${TAG} ; \
+                "
             }
         }
 

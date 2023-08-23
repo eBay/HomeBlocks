@@ -30,7 +30,7 @@ class HomeReplicationConan(ConanFile):
                 'fPIC': True,
                 'coverage': False,
                 'sanitize': False,
-                'testing': False,
+                'testing': True,
             }
 
     generators = "cmake", "cmake_find_package"
