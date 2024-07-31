@@ -99,7 +99,7 @@ class HomeBlocksConan(ConanFile):
         #self.cpp_info.components["homestore"].requires = ["homestore::homestore", "sisl::sisl"]
         self.cpp_info.components["memory"].libs = ["homeblocks_memory"]
         self.cpp_info.components["memory"].requires = ["homestore::homestore", "sisl::sisl"]
-        self.cpp_info.components["homeblocks"].requires = ["homestore"]
+        self.cpp_info.components["homeblocks"].requires = ["memory"]
 
         if self.settings.os == "Linux":
             #self.cpp_info.components["homestore"].system_libs.append("pthread")
