@@ -1,5 +1,5 @@
 cmake_minimum_required (VERSION 3.11)
-project (homeobject LANGUAGES CXX)
+project (homeblocks LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
