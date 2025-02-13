@@ -42,7 +42,8 @@ struct Volume {
 };
 
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
-    virtual VolumeManager::NullAsyncResult _create_volume(VolumeInfo&& volume_info) = 0;
+    // TODO: we don't plan to have another HSHomeBlksImpl, so can remove _create_volume;
+    virtual VolumeManager::NullAsyncResult _create_volume(VolumeInfo&& volume_info) = 0; 
     virtual bool _get_stats(volume_id_t id, VolumeStats& stats) const = 0;
     virtual void _get_volume_ids(std::vector< volume_id_t >& vol_ids) const = 0;
 
@@ -80,7 +81,11 @@ public:
     HomeBlocksStats get_stats() const final { return _get_stats(); }
 
     /// VolumeManager
-    VolumeManager::NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
+    NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
+
+    NullAsyncResult remove_volume(const volume_id_t& id) final;
+    
+    VolumePtr lookup_volume(const volume_id_t& id) final;
 
     // see api comments in base class;
     bool get_stats(volume_id_t id, VolumeStats& stats) const final;

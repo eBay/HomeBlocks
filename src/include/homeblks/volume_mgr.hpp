@@ -12,8 +12,8 @@ namespace homeblocks {
 ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, UNSUPPORTED_OP, CRC_MISMATCH,
      NO_SPACE_LEFT, DRIVE_WRITE_ERROR);
 
-// class Volume;
-// using VolumePtr = std::shared_ptr< Volume >;
+class Volume;
+using VolumePtr = std::shared_ptr< Volume >;
 
 struct VolumeInfo {
     VolumeInfo(volume_id_t _id, uint64_t _num_bytes) : id(_id), size_bytes(_num_bytes) {}
@@ -51,9 +51,9 @@ class VolumeManager : public Manager< VolumeError > {
 public:
     virtual NullAsyncResult create_volume(VolumeInfo&& volume_info) = 0;
 
-    // virtual NullAsyncResult remove_volume(const volume_id_t& id) = 0;
+    virtual NullAsyncResult remove_volume(const volume_id_t& id) = 0;
     
-    // virtual VolumtPtr lookup_volume(const volume_id_t& id) = 0;
+    virtual VolumePtr lookup_volume(const volume_id_t& id) = 0;
 
     // TODO: read/write/unmap APIs
 
