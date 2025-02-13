@@ -44,7 +44,7 @@ class HomeBlocksConan(ConanFile):
         self.test_requires("gtest/1.14.0")
 
     def requirements(self):
-        self.requires("homestore/[~6.4, include_prerelease=True]@oss/master", transitive_headers=True)
+        self.requires("homestore/[^6.5]@oss/master")
         self.requires("sisl/[~12.2, include_prerelease=True]@oss/master", transitive_headers=True)
         self.requires("lz4/1.9.4", override=True)
 

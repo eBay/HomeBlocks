@@ -3,8 +3,8 @@
 #include <boost/intrusive_ptr.hpp>
 #include <sisl/logging/logging.h>
 
-#include <homeblocks/homeblocks.hpp>
-#include <homeblocks/volume_manager.hpp>
+#include <homeblks/home_blks.hpp>
+#include <homeblks/volume_mgr.hpp>
 
 #define LOGT(...) LOGTRACEMOD(homeblocks, ##__VA_ARGS__)
 #define LOGD(...) LOGDEBUGMOD(homeblocks, ##__VA_ARGS__)
