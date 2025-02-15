@@ -13,6 +13,7 @@ add_executable (memory_test)
 target_sources(memory_test PRIVATE
     $<TARGET_OBJECTS:test_fixture>
 )
+
 target_link_libraries(memory_test
     ${PROJECT_NAME}_memory
     ${COMMON_TEST_DEPS}

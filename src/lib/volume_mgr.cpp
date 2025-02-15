@@ -8,18 +8,14 @@ std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return share
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(vol_info.id), vol_info.size_bytes);
-    return _create_volume(std::move(vol_info));
-}
-
-VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     return folly::Unit();
 }
 
-VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
-    return nullptr;
-}
+VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) { return folly::Unit(); }
 
-bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return _get_stats(id, stats); }
-void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const { return _get_volume_ids(vol_ids); }
+VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) { return nullptr; }
 
-} // namespace homeobject
+bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
+
+void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
+} // namespace homeblocks

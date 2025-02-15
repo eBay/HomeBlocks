@@ -9,7 +9,7 @@ extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksAp
 
 MemoryHomeBlocks::MemoryHomeBlocks(std::weak_ptr< HomeBlocksApplication >&& application) :
         HomeBlocksImpl::HomeBlocksImpl(std::move(application)) {
-    _our_id = _application.lock()->discover_svcid(std::nullopt);
+    // _our_id = _application.lock()->discover_svcid(std::nullopt);
 }
 
 } // namespace homeblocks
