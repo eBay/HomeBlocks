@@ -13,7 +13,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) { return folly::Unit(); }
 
-VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) { return nullptr; }
+VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) { return nullptr; }
 
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
 

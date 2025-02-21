@@ -105,7 +105,7 @@ public:
 
     NullAsyncResult remove_volume(const volume_id_t& id) final;
 
-    VolumePtr lookup_volume(const volume_id_t& id) final;
+    VolumeInfoPtr lookup_volume(const volume_id_t& id) final;
 
     // see api comments in base class;
     bool get_stats(volume_id_t id, VolumeStats& stats) const final;
