@@ -98,22 +98,9 @@ private:
 #endif
 };
 
-void HomeBlocksImpl::init_homestore() {
-    auto app = _application.lock();
-    RELEASE_ASSERT(app, "HomeObjectApplication lifetime unexpected!");
-
-    LOGI("Starting iomgr with {} threads, spdk: {}", app->threads(), false);
-    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = app->threads(), .is_spdk = app->spdk_mode()})
-        .with_http_server();
-
-    const uint64_t app_mem_size = app->app_mem_size();
-    LOGI("Initialize and start HomeStore with app_mem_size = {}", app_mem_size);
-
-    std::vector< homestore::dev_info > device_info;
-    bool has_data_dev = false;
-    bool has_fast_dev = false;
+void HomeBlocksImpl::get_dev_info(shared< HomeBlocksApplication > app, std::vector< homestore::dev_info >& dev_info,
+                                  bool& has_data_dev, bool& has_fast_dev) {
     for (auto const& dev : app->devices()) {
-        // TODO: Simplify this logic;
         auto input_dev_type = dev.type;
         auto detected_type = get_device_type(dev.path.string());
         LOGD("Device {} detected as {}", dev.path.string(), detected_type);
@@ -129,8 +116,24 @@ void HomeBlocksImpl::init_homestore() {
         auto hs_type = (final_type == DevType::HDD) ? homestore::HSDevType::Data : homestore::HSDevType::Fast;
         if (hs_type == homestore::HSDevType::Data) { has_data_dev = true; }
         if (hs_type == homestore::HSDevType::Fast) { has_fast_dev = true; }
-        device_info.emplace_back(std::filesystem::canonical(dev.path).string(), hs_type);
+        dev_info.emplace_back(std::filesystem::canonical(dev.path).string(), hs_type);
     }
+}
+
+void HomeBlocksImpl::init_homestore() {
+    auto app = _application.lock();
+    RELEASE_ASSERT(app, "HomeObjectApplication lifetime unexpected!");
+
+    LOGI("Starting iomgr with {} threads, spdk: {}", app->threads(), false);
+    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = app->threads(), .is_spdk = app->spdk_mode()})
+        .with_http_server();
+
+    const uint64_t app_mem_size = app->app_mem_size();
+    LOGI("Initialize and start HomeStore with app_mem_size = {}", app_mem_size);
+
+    std::vector< homestore::dev_info > device_info;
+    bool has_data_dev{false}, has_fast_dev{false};
+    get_dev_info(app, device_info, has_data_dev, has_fast_dev);
 
     RELEASE_ASSERT(device_info.size() != 0, "No supported devices found!");
     using namespace homestore;
@@ -142,19 +145,20 @@ void HomeBlocksImpl::init_homestore() {
                            .with_repl_data_service(repl_app) // chunk selector defaulted to round_robine
                            .start(hs_input_params{.devices = device_info, .app_mem_size = app_mem_size},
                                   [this]() { register_metablk_cb(); });
-
     if (need_format) {
         LOGI("We are starting for the first time. Formatting HomeStore. ");
         if (has_data_dev && has_fast_dev) {
+            // NOTE: chunk_size, num_chunks only has to specify one, can be deduced from each other.
             HomeStore::instance()->format_and_start({
-                {HS_SERVICE::META, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 9.0, .num_chunks = 64}},
+                {HS_SERVICE::META, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 9.0}},
                 {HS_SERVICE::LOG,
-                 hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 45.0, .chunk_size = 32 * Mi}},
-                {HS_SERVICE::INDEX, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 45.0, .num_chunks = 128}},
+                 hs_format_params{
+                     .dev_type = HSDevType::Fast, .size_pct = 45.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
+                {HS_SERVICE::INDEX, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 45.0}},
                 {HS_SERVICE::REPLICATION,
                  hs_format_params{.dev_type = HSDevType::Data,
                                   .size_pct = 95.0,
-                                  .num_chunks = 0,
+                                  .num_chunks = 0, // num_chunks will be deduced from chunk_size
                                   .chunk_size = HS_CHUNK_SIZE,
                                   .block_size = DATA_BLK_SIZE}},
             });
@@ -162,13 +166,14 @@ void HomeBlocksImpl::init_homestore() {
             auto run_on_type = has_fast_dev ? homestore::HSDevType::Fast : homestore::HSDevType::Data;
             LOGD("Running with Single mode, all service on {}", run_on_type);
             HomeStore::instance()->format_and_start({
-                {HS_SERVICE::META, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0, .num_chunks = 1}},
-                {HS_SERVICE::LOG, hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .chunk_size = 32 * Mi}},
-                {HS_SERVICE::INDEX, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0, .num_chunks = 1}},
+                {HS_SERVICE::META, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
+                {HS_SERVICE::LOG,
+                 hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
+                {HS_SERVICE::INDEX, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
                 {HS_SERVICE::REPLICATION,
                  hs_format_params{.dev_type = run_on_type,
                                   .size_pct = 75.0,
-                                  .num_chunks = 0,
+                                  .num_chunks = 0, // num_chunks will be deduced from chunk_size;
                                   .chunk_size = HS_CHUNK_SIZE,
                                   .block_size = DATA_BLK_SIZE}},
             });

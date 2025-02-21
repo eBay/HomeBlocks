@@ -127,6 +127,8 @@ private:
     void superblk_init();
     void register_metablk_cb();
 
+    void get_dev_info(shared< HomeBlocksApplication > app, std::vector< homestore::dev_info >& device_info,
+                      bool& has_data_dev, bool& has_fast_dev);
     DevType get_device_type(std::string const& devname);
     auto defer() const { return folly::makeSemiFuture().via(executor_); }
 };
