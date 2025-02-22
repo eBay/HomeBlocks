@@ -187,29 +187,66 @@ void HomeBlocksImpl::init_homestore() {
 }
 
 void HomeBlocksImpl::superblk_init() {
-    auto sb = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
-    sb.create(sizeof(homeblks_sb_t));
-    sb->magic = HB_SB_MAGIC;
-    sb->version = HB_SB_VER;
-    sb->boot_cnt = 0;
-    sb->init_flag(0);
-    sb.write();
+    sb_ = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
+    sb_.create(sizeof(homeblks_sb_t));
+    sb_->magic = HB_SB_MAGIC;
+    sb_->version = HB_SB_VER;
+    sb_->boot_cnt = 0;
+    sb_->init_flag(0);
+    sb_.write();
+}
+
+void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    // auto sb = homestore::superblk< vol_sb_t >(VOL_META_NAME);
+    // sb.load(buf, cookie);
+    // TODO:
+}
+
+void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    sb_ = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
+    sb_.load(buf, cookie);
+    // sb verification
+    RELEASE_ASSERT_EQ(sb_->version, HB_SB_VER);
+    RELEASE_ASSERT_EQ(sb_->magic, HB_SB_MAGIC);
+
+    if (sb_->test_flag(SB_FLAGS_GRACEFUL_SHUTDOWN)) {
+        // if it is a gracefuln shutdown, this flag should be set again in shutdown routine;
+        sb_->clear_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
+        LOGI("System was shutdown gracefully");
+    } else {
+        LOGI("System experienced sudden crash since last boot");
+    }
+
+    ++sb_->boot_cnt;
+
+    // avoid doing sb meta blk write in callback which will cause deadlock;
+    // the 1st CP should flush all dirty SB before taking traffic;
 }
 
 void HomeBlocksImpl::register_metablk_cb() {
     // register some callbacks for metadata recovery;
     using namespace homestore;
+
+    // HomeBlks SB
     HomeStore::instance()->meta_service().register_handler(
         HB_META_NAME,
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            auto sb = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
-            sb.load(buf, mblk);
+            on_hb_meta_blk_found(std::move(buf), voidptr_cast(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
+
+    // Volume SB
+    HomeStore::instance()->meta_service().register_handler(
+        VOL_META_NAME,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_vol_meta_blk_found(std::move(buf), voidptr_cast(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
 }
 
 void HomeBlocksImpl::on_init_complete() {
-    // TODO: register to meta service for HomeBlks meta block handler;
+    // this is called after HomeStore all recovery completed.
+    // Add anything that needs to be done here.
 }
 
 void HomeBlocksImpl::init_cp() {}

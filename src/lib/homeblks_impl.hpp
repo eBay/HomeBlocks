@@ -63,11 +63,12 @@ class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enab
 
 private:
     inline static auto const HB_META_NAME = std::string("HomeBlks2");
+    inline static auto const VOL_META_NAME = std::string("Volume2");
     static constexpr uint64_t HB_SB_MAGIC{0xCEEDDEEB};
     static constexpr uint32_t HB_SB_VER{0x1};
     static constexpr uint64_t HS_CHUNK_SIZE = 2 * Gi;
     static constexpr uint32_t DATA_BLK_SIZE = 4096;
-    static constexpr uint32_t SB_FLAGS_CLEAN_SHUTDOWN{0x00000001};
+    static constexpr uint32_t SB_FLAGS_GRACEFUL_SHUTDOWN{0x00000001};
     static constexpr uint32_t SB_FLAGS_RESTRICTED{0x00000002};
 
 private:
@@ -80,6 +81,7 @@ private:
     std::map< volume_id_t, unique< Volume > > _volume_map;
 
     bool recovery_done_{false};
+    homestore::superblk< homeblks_sb_t > sb_;
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
@@ -129,8 +131,13 @@ private:
 
     void get_dev_info(shared< HomeBlocksApplication > app, std::vector< homestore::dev_info >& device_info,
                       bool& has_data_dev, bool& has_fast_dev);
+
     DevType get_device_type(std::string const& devname);
     auto defer() const { return folly::makeSemiFuture().via(executor_); }
+
+    // recovery apis
+    void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
