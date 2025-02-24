@@ -4,7 +4,7 @@
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 
-#include <homeblocks/homeblocks.hpp>
+#include <homeblks/home_blks.hpp>
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTIONS_ENABLE(logging, homeblocks)

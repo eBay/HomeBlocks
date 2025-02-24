@@ -17,13 +17,22 @@ struct VolumeInfo {
 
     volume_id_t id;
     uint64_t size_bytes{0};
+    uint64_t page_size{0};
+    std::string vol_name;
 
     auto operator<=>(VolumeInfo const& rhs) const {
         return boost::uuids::hash_value(id) <=> boost::uuids::hash_value(rhs.id);
     }
+
     auto operator==(VolumeInfo const& rhs) const { return id == rhs.id; }
+
+    std::string to_string() {
+        return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={}", boost::uuids::to_string(id),
+                           size_bytes, page_size, vol_name);
+    }
 };
 
+using VolumeInfoPtr = std::shared_ptr< VolumeInfo >;
 struct VolumeStats {
     volume_id_t id;
 
@@ -39,6 +48,12 @@ struct VolumeStats {
 class VolumeManager : public Manager< VolumeError > {
 public:
     virtual NullAsyncResult create_volume(VolumeInfo&& volume_info) = 0;
+
+    virtual NullAsyncResult remove_volume(const volume_id_t& id) = 0;
+
+    virtual VolumeInfoPtr lookup_volume(const volume_id_t& id) = 0;
+
+    // TODO: read/write/unmap APIs
 
     /**
      * Retrieves the statistics for a specific Volume identified by its ID.
