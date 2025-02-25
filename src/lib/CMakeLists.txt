@@ -14,4 +14,5 @@ target_link_libraries(${PROJECT_NAME}_core
 
 #add_subdirectory(homestore_backend)
 #add_subdirectory(memory_backend)
+add_subdirectory(volume)
 add_subdirectory(tests)

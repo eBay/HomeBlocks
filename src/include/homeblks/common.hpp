@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/uuid/uuid.hpp>
+#include <boost/intrusive_ptr.hpp>
 #include <folly/Expected.h>
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
@@ -24,6 +25,21 @@ namespace homeblocks {
 
 using peer_id_t = boost::uuids::uuid;
 using volume_id_t = boost::uuids::uuid;
+
+template < typename T >
+using shared = std::shared_ptr< T >;
+
+template < typename T >
+using cshared = const std::shared_ptr< T >;
+
+template < typename T >
+using unique = std::unique_ptr< T >;
+
+template < typename T >
+using intrusive = boost::intrusive_ptr< T >;
+
+template < typename T >
+using cintrusive = const boost::intrusive_ptr< T >;
 
 template < class E >
 class Manager {
