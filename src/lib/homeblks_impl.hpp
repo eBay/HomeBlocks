@@ -9,13 +9,6 @@
 #include <homeblks/common.hpp>
 #include "volume/volume.hpp"
 
-#define LOGT(...) LOGTRACEMOD(homeblocks, ##__VA_ARGS__)
-#define LOGD(...) LOGDEBUGMOD(homeblocks, ##__VA_ARGS__)
-#define LOGI(...) LOGINFOMOD(homeblocks, ##__VA_ARGS__)
-#define LOGW(...) LOGWARNMOD(homeblocks, ##__VA_ARGS__)
-#define LOGE(...) LOGERRORMOD(homeblocks, ##__VA_ARGS__)
-#define LOGC(...) LOGCRITICALMOD(homeblocks, ##__VA_ARGS__)
-
 namespace homeblocks {
 
 class Volume;

@@ -10,7 +10,7 @@
 namespace homeblocks {
 
 ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, UNSUPPORTED_OP, CRC_MISMATCH,
-     NO_SPACE_LEFT, DRIVE_WRITE_ERROR);
+     NO_SPACE_LEFT, DRIVE_WRITE_ERROR, INTERNAL_ERROR);
 
 struct VolumeInfo {
     VolumeInfo() = default;

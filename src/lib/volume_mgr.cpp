@@ -32,10 +32,12 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
     }
 
     auto vol_ptr = Volume::make_volume(std::move(vol_info));
-
-    {
+    if (vol_ptr) {
         auto lg = std::scoped_lock(vol_lock_);
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+    } else {
+        LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
+        return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
     }
 
     return folly::Unit();

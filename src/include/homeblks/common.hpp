@@ -12,6 +12,12 @@
 SISL_LOGGING_DECL(homeblocks);
 
 #define HOMEBLOCKS_LOG_MODS homeblocks
+#define LOGT(...) LOGTRACEMOD(homeblocks, ##__VA_ARGS__)
+#define LOGD(...) LOGDEBUGMOD(homeblocks, ##__VA_ARGS__)
+#define LOGI(...) LOGINFOMOD(homeblocks, ##__VA_ARGS__)
+#define LOGW(...) LOGWARNMOD(homeblocks, ##__VA_ARGS__)
+#define LOGE(...) LOGERRORMOD(homeblocks, ##__VA_ARGS__)
+#define LOGC(...) LOGCRITICALMOD(homeblocks, ##__VA_ARGS__)
 
 #ifndef Ki
 constexpr uint64_t Ki = 1024ul;

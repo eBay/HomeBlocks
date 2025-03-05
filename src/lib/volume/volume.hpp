@@ -13,6 +13,7 @@ using VolumeIndexTable = homestore::IndexTable< VolumeIndexKey, VolumeIndexValue
 using VolumePtr = shared< Volume >;
 using VolIdxTablePtr = shared< VolumeIndexTable >;
 
+using ReplDevPtr = shared< homestore::ReplDev >;
 class Volume {
     using index_cfg_t = homestore::BtreeConfig;
 
@@ -51,33 +52,46 @@ public:
     Volume(Volume&& volume) = default;
     Volume& operator=(Volume const& volume) = delete;
     Volume& operator=(Volume&& volume) = default;
+
+    // TODO: volume destructor should remove volume meta block;
     virtual ~Volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
     static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie) {
         auto vol = std::make_shared< Volume >(buf, cookie);
-        vol->init(true /*is_recovery*/);
-        return vol;
+        auto ret = vol->init();
+        return ret ? vol : nullptr;
     }
 
     static VolumePtr make_volume(VolumeInfo&& info) {
         auto vol = std::make_shared< Volume >(std::move(info));
-        vol->init();
-        return vol;
+        auto ret = vol->init(true /*is_recovery*/);
+        // in failure case, volume shared ptr will be destroyed automatically;
+        return ret ? vol : nullptr;
     }
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
     volume_id_t id() const { return uuid_; };
+    ReplDevPtr rd() const { return rd_; }
 
 private:
+    //
     // this API will be called to initialize volume in both volume creation and volume recovery;
-    void init(bool is_recovery = false);
+    // it also creates repl dev underlying the volume which provides read/write apis to the volume;
+    // init is synchronous and will return false in case of failure to create repl dev and volume instance will be
+    // destroyed automatically; if success, the repl dev will be stored in the volume object;
+    //
+    bool init(bool is_recovery = false);
+
+    //
+    // initialize index table for this volume and saves the index handle in the volume object;
+    //
     void init_index_table();
 
 private:
     VolumeInfo vol_info_;
     volume_id_t uuid_;
-    shared< homestore::ReplDev > rd_;
+    ReplDevPtr rd_;
     VolIdxTablePtr indx_tbl_;
     superblk< vol_sb_t > sb_;
 };
