@@ -29,7 +29,7 @@ HomeBlocksStats HomeBlocksImpl::get_stats() const {
 }
 
 HomeBlocksImpl::HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application) :
-        _application(std::move(application)) {
+        _application(std::move(application)), sb_{HB_META_NAME} {
     auto exe_type = SISL_OPTIONS["executor"].as< std::string >();
     std::transform(exe_type.begin(), exe_type.end(), exe_type.begin(), ::tolower);
 
@@ -187,7 +187,6 @@ void HomeBlocksImpl::init_homestore() {
 }
 
 void HomeBlocksImpl::superblk_init() {
-    sb_ = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
     sb_.create(sizeof(homeblks_sb_t));
     sb_->magic = HB_SB_MAGIC;
     sb_->version = HB_SB_VER;
@@ -196,14 +195,7 @@ void HomeBlocksImpl::superblk_init() {
     sb_.write();
 }
 
-void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    // auto sb = homestore::superblk< vol_sb_t >(VOL_META_NAME);
-    // sb.load(buf, cookie);
-    // TODO:
-}
-
 void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    sb_ = homestore::superblk< homeblks_sb_t >(HB_META_NAME);
     sb_.load(buf, cookie);
     // sb verification
     RELEASE_ASSERT_EQ(sb_->version, HB_SB_VER);
@@ -237,7 +229,7 @@ void HomeBlocksImpl::register_metablk_cb() {
 
     // Volume SB
     HomeStore::instance()->meta_service().register_handler(
-        VOL_META_NAME,
+        Volume::VOL_META_NAME,
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
             on_vol_meta_blk_found(std::move(buf), voidptr_cast(mblk));
         },

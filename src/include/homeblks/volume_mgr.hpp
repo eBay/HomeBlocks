@@ -13,12 +13,12 @@ ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, U
      NO_SPACE_LEFT, DRIVE_WRITE_ERROR);
 
 struct VolumeInfo {
-    VolumeInfo(volume_id_t _id, uint64_t _num_bytes) : id(_id), size_bytes(_num_bytes) {}
+    VolumeInfo() = default;
 
     volume_id_t id;
     uint64_t size_bytes{0};
     uint64_t page_size{0};
-    std::string vol_name;
+    std::string name;
 
     auto operator<=>(VolumeInfo const& rhs) const {
         return boost::uuids::hash_value(id) <=> boost::uuids::hash_value(rhs.id);
@@ -28,7 +28,7 @@ struct VolumeInfo {
 
     std::string to_string() {
         return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={}", boost::uuids::to_string(id),
-                           size_bytes, page_size, vol_name);
+                           size_bytes, page_size, name);
     }
 };
 
