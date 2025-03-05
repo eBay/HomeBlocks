@@ -6,6 +6,8 @@
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
 #include <sisl/logging/logging.h>
+#include <homestore/homestore_decl.hpp>
+#include <homestore/superblk_handler.hpp>
 
 SISL_LOGGING_DECL(homeblocks);
 
@@ -22,7 +24,6 @@ constexpr uint64_t Gi = Ki * Mi;
 #endif
 
 namespace homeblocks {
-
 using peer_id_t = boost::uuids::uuid;
 using volume_id_t = boost::uuids::uuid;
 
@@ -41,6 +42,9 @@ using intrusive = boost::intrusive_ptr< T >;
 template < typename T >
 using cintrusive = const boost::intrusive_ptr< T >;
 
+template < typename T >
+using superblk = homestore::superblk< T >;
+
 template < class E >
 class Manager {
 public:
@@ -53,6 +57,11 @@ public:
     using NullAsyncResult = AsyncResult< folly::Unit >;
 
     virtual ~Manager() = default;
+};
+
+class hb_utils {
+public:
+    static homestore::uuid_t gen_random_uuid();
 };
 
 } // namespace homeblocks

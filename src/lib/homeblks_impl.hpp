@@ -35,7 +35,6 @@ class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enab
 
 private:
     inline static auto const HB_META_NAME = std::string("HomeBlks2");
-    inline static auto const VOL_META_NAME = std::string("Volume2");
     static constexpr uint64_t HB_SB_MAGIC{0xCEEDDEEB};
     static constexpr uint32_t HB_SB_VER{0x1};
     static constexpr uint64_t HS_CHUNK_SIZE = 2 * Gi;
@@ -53,7 +52,7 @@ private:
     std::map< volume_id_t, VolumePtr > vol_map_;
 
     bool recovery_done_{false};
-    homestore::superblk< homeblks_sb_t > sb_;
+    superblk< homeblks_sb_t > sb_;
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);

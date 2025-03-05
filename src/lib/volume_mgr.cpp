@@ -6,6 +6,19 @@ namespace homeblocks {
 
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
+void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    // auto sb = homestore::superblk< vol_sb_t >(VOL_META_NAME);
+    // sb.load(buf, cookie);
+    auto vol_ptr = Volume::make_volume(buf, cookie);
+    auto id = vol_ptr->id();
+    {
+        auto lg = std::scoped_lock(vol_lock_);
+        DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
+                     "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
+        vol_map_.emplace(std::make_pair(id, vol_ptr));
+    }
+}
+
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
     auto id = vol_info.id;
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
