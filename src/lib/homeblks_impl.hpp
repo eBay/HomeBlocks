@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 #include <string>
 #include <sisl/logging/logging.h>
 #include <homestore/homestore.hpp>

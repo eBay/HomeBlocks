@@ -7,6 +7,7 @@
 #include <sisl/fds/buffer.hpp>
 
 namespace homeblocks {
+using lba_t = std::uint64_t;
 
 class VolumeIndexKey : public homestore::BtreeIntervalKey {
 private:
@@ -17,10 +18,11 @@ private:
 
 public:
     VolumeIndexKey() = default;
-    VolumeIndexKey(uint64_t k) {
+    VolumeIndexKey(lba_t k) {
         m_base = uint32_cast(k >> 32);
         m_offset = uint32_cast(k & 0xFFFFFFFF);
     }
+
     VolumeIndexKey(uint32_t b, uint32_t o) : m_base{b}, m_offset{o} {}
     VolumeIndexKey(const VolumeIndexKey& other) = default;
     VolumeIndexKey(const homestore::BtreeKey& other) : VolumeIndexKey(other.serialize(), true) {}
@@ -112,15 +114,17 @@ public:
     bool operator<(const VolumeIndexKey& o) const { return (compare(o) < 0); }
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
 
-    uint64_t key() const { return (uint64_cast(m_base) << 32) | m_offset; }
-    uint64_t start_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
+    lba_t key() const { return (uint64_cast(m_base) << 32) | m_offset; }
+    lba_t start_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
         const VolumeIndexKey& k = (const VolumeIndexKey&)(range.start_key());
         return k.key();
     }
-    uint64_t end_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
+
+    lba_t end_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
         const VolumeIndexKey& k = (const VolumeIndexKey&)(range.end_key());
         return k.key();
     }
+
     friend std::ostream& operator<<(std::ostream& os, const VolumeIndexKey& k) {
         os << k.to_string();
         return os;
