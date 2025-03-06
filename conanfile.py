@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "0.0.2"
+    version = "0.0.3"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -97,9 +97,9 @@ class HomeBlocksConan(ConanFile):
 
     def package_info(self):
         #self.cpp_info.components["homestore"].libs = ["homeblocks_homestore"]
-        #self.cpp_info.components["homestore"].requires = ["homestore::homestore", "sisl::sisl"]
+        #self.cpp_info.components["homestore"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
         self.cpp_info.components["memory"].libs = ["homeblocks_memory"]
-        self.cpp_info.components["memory"].requires = ["homestore::homestore", "sisl::sisl"]
+        self.cpp_info.components["memory"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
         self.cpp_info.components["homeblocks"].requires = ["memory"]
 
         if self.settings.os == "Linux":
