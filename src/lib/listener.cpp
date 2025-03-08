@@ -13,10 +13,11 @@ bool HBListener::on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl
 void HBListener::on_error(homestore::ReplServiceError error, const sisl::blob& header, const sisl::blob& key,
                           cintrusive< homestore::repl_req_ctx >& ctx) {}
 
-homestore::ReplResult< homestore::blk_alloc_hints > get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size) {
+homestore::ReplResult< homestore::blk_alloc_hints > HBListener::get_blk_alloc_hints(sisl::blob const& header,
+                                                                                    uint32_t data_size) {
     return homestore::blk_alloc_hints();
 }
 
-void on_destroy(const homestore::group_id_t& group_id) {}
+void HBListener::on_destroy(const homestore::group_id_t& group_id) {}
 
 } // namespace homeblocks

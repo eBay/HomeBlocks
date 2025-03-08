@@ -1,52 +1,18 @@
 #pragma once
+#include <map>
 #include <string>
-#include <boost/intrusive_ptr.hpp>
 #include <sisl/logging/logging.h>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/superblk_handler.hpp>
 #include <homeblks/home_blks.hpp>
 #include <homeblks/volume_mgr.hpp>
-
-#define LOGT(...) LOGTRACEMOD(homeblocks, ##__VA_ARGS__)
-#define LOGD(...) LOGDEBUGMOD(homeblocks, ##__VA_ARGS__)
-#define LOGI(...) LOGINFOMOD(homeblocks, ##__VA_ARGS__)
-#define LOGW(...) LOGWARNMOD(homeblocks, ##__VA_ARGS__)
-#define LOGE(...) LOGERRORMOD(homeblocks, ##__VA_ARGS__)
-#define LOGC(...) LOGCRITICALMOD(homeblocks, ##__VA_ARGS__)
+#include <homeblks/common.hpp>
+#include "volume/volume.hpp"
 
 namespace homeblocks {
 
-template < typename T >
-using shared = std::shared_ptr< T >;
-
-template < typename T >
-using cshared = const std::shared_ptr< T >;
-
-template < typename T >
-using unique = std::unique_ptr< T >;
-
-template < typename T >
-using intrusive = boost::intrusive_ptr< T >;
-
-template < typename T >
-using cintrusive = const boost::intrusive_ptr< T >;
-#if 0
-class VolumeIndexKey;
-class VolumeIndexValue;
-using VolumeIndexTable = homestore::IndexTable< VolumeIndexKey, VolumeIndexValue >;
-#endif
-// TODO: move Volume to volume file
-struct Volume {
-    explicit Volume(VolumeInfo info) : volume_info_(std::move(info)) {}
-    Volume(Volume const& volume) = delete;
-    Volume(Volume&& volume) = default;
-    Volume& operator=(Volume const& volume) = delete;
-    Volume& operator=(Volume&& volume) = default;
-    virtual ~Volume() = default;
-
-    VolumeInfo volume_info_;
-};
+class Volume;
 
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
     struct homeblks_sb_t {
@@ -63,7 +29,6 @@ class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enab
 
 private:
     inline static auto const HB_META_NAME = std::string("HomeBlks2");
-    inline static auto const VOL_META_NAME = std::string("Volume2");
     static constexpr uint64_t HB_SB_MAGIC{0xCEEDDEEB};
     static constexpr uint32_t HB_SB_VER{0x1};
     static constexpr uint64_t HS_CHUNK_SIZE = 2 * Gi;
@@ -77,11 +42,11 @@ private:
     folly::Executor::KeepAlive<> executor_;
 
     ///
-    mutable std::shared_mutex _volume_lock;
-    std::map< volume_id_t, unique< Volume > > _volume_map;
+    mutable std::shared_mutex vol_lock_;
+    std::map< volume_id_t, VolumePtr > vol_map_;
 
     bool recovery_done_{false};
-    homestore::superblk< homeblks_sb_t > sb_;
+    superblk< homeblks_sb_t > sb_;
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
