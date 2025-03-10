@@ -65,5 +65,5 @@ public:
     virtual HomeBlocksStats get_stats() const = 0;
 };
 
-extern std::shared_ptr< HomeBlocks > init_homeobject(std::weak_ptr< HomeBlocksApplication >&& application);
+extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application);
 } // namespace homeblocks

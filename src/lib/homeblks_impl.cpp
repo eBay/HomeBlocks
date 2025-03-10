@@ -15,7 +15,7 @@ SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 
-extern std::shared_ptr< HomeBlocks > init_homeobject(std::weak_ptr< HomeBlocksApplication >&& application) {
+extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application) {
     LOGI("Initializing HomeBlocks");
     auto inst = std::make_shared< HomeBlocksImpl >(std::move(application));
     inst->init_homestore();
