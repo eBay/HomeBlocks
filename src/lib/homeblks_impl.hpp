@@ -51,7 +51,7 @@ private:
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
 
-    ~HomeBlocksImpl() override = default;
+    ~HomeBlocksImpl() override;
     HomeBlocksImpl(const HomeBlocksImpl&) = delete;
     HomeBlocksImpl(HomeBlocksImpl&&) noexcept = delete;
     HomeBlocksImpl& operator=(const HomeBlocksImpl&) = delete;
@@ -79,7 +79,7 @@ public:
     void get_volume_ids(std::vector< volume_id_t >& vol_ids) const final;
 
     // Index
-    // shared< VolumeIndexTable > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
+    shared< VolumeIndexTable > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
 
     // HomeStore
     void init_homestore();
@@ -111,8 +111,7 @@ public:
     shared< homestore::IndexTableBase >
     on_index_table_found(homestore::superblk< homestore::index_table_sb >&& sb) override {
         LOGI("Recovered index table to index service");
-        // return hb_->recover_index_table(std::move(sb)); // TODO:
-        return nullptr;
+        return hb_->recover_index_table(std::move(sb));
     }
 
 private:

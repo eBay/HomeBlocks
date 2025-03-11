@@ -74,6 +74,12 @@ public:
     volume_id_t id() const { return uuid_; };
     ReplDevPtr rd() const { return rd_; }
 
+    //
+    // initialize index table for this volume and saves the index handle in the volume object;
+    //
+    shared< VolumeIndexTable > init_index_table(bool is_recovery,
+                                                homestore::superblk< homestore::index_table_sb >&& sb = {});
+
 private:
     //
     // this API will be called to initialize volume in both volume creation and volume recovery;
@@ -82,11 +88,6 @@ private:
     // destroyed automatically; if success, the repl dev will be stored in the volume object;
     //
     bool init(bool is_recovery = false);
-
-    //
-    // initialize index table for this volume and saves the index handle in the volume object;
-    //
-    void init_index_table();
 
 private:
     VolumeInfo vol_info_;

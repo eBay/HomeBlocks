@@ -3,7 +3,8 @@
 
 namespace homeblocks {
 
-void Volume::init_index_table() {
+shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery,
+                                                    homestore::superblk< homestore::index_table_sb >&& sb) {
     // create index table;
     auto uuid = hb_utils::gen_random_uuid();
 
@@ -12,7 +13,11 @@ void Volume::init_index_table() {
     cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
 
     // user_sb_size is not currently enabled in homestore;
+    // parent uuid is used during recovery in homeblks layer;
     indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, vol_info_.id /*parent uuid*/, 0 /*user_sb_size*/, cfg);
+
+    homestore::hs()->index_service().add_index_table(indx_table());
+    return indx_table();
 }
 
 Volume::Volume(sisl::byte_view const& buf, void* cookie) : sb_{VOL_META_NAME} {
@@ -31,10 +36,6 @@ bool Volume::init(bool is_recovery) {
         // write to disk;
         sb_.write();
     }
-
-    // initalize index table and save index handle;
-    init_index_table();
-    homestore::hs()->index_service().add_index_table(indx_table());
 
     // create solo repl dev for volume;
     // members left empty on purpose for solo repl dev
