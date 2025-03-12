@@ -55,9 +55,16 @@ TEST_F(VolumeTest, CreateVolume) {
     auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 
     for (uint32_t i = 0; i < num_vols; ++i) {
-        auto ret = vol_mgr->create_volume(std::move(gen_vol_info(i))).get();
+        auto vinfo = gen_vol_info(i);
+        auto ret = vol_mgr->create_volume(vinfo).get();
         ASSERT_TRUE(ret);
+
+        auto vinfo_ptr = vol_mgr->lookup_volume(vinfo.id);
     }
+
+    g_helper->restart();
+
+    // verify the volumes are still there
 }
 
 int main(int argc, char* argv[]) {

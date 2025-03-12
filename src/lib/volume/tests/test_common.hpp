@@ -106,6 +106,13 @@ public:
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }
 
+    void restart(uint64_t delay_secs = 0) {
+        LOGI("Stoping homeblocks after {} secs, replica={}", delay_secs);
+        hb_.reset();
+        if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
+        hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
+    }
+
     shared< homeblocks::HomeBlocks > inst() { return hb_; }
 
     void teardown() {

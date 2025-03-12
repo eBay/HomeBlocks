@@ -14,6 +14,8 @@ ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, U
 
 struct VolumeInfo {
     VolumeInfo() = default;
+    VolumeInfo(VolumeInfo const& rhs) :
+            id{rhs.id}, size_bytes{rhs.size_bytes}, page_size{rhs.page_size}, name{rhs.name} {}
 
     volume_id_t id;
     uint64_t size_bytes{0};

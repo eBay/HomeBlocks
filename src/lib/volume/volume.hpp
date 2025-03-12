@@ -89,6 +89,8 @@ public:
     volume_id_t id() const { return uuid_; };
     ReplDevPtr rd() const { return rd_; }
 
+    VolumeInfoPtr info() const { return std::make_shared< VolumeInfo >(vol_info_); }
+
     //
     // initialize index table for this volume and saves the index handle in the volume object;
     //

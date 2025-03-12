@@ -36,7 +36,7 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
 }
 
 shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
-    auto id = sb->parent_uuid;
+    auto id = sb->parent_uuid; // parent uuid is the volume id;
     {
         auto lg = std::scoped_lock(vol_lock_);
         auto it = vol_map_.find(id);
@@ -73,7 +73,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) { return folly::Unit(); }
 
-VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) { return nullptr; }
+VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
+    auto lg = std::shared_lock(vol_lock_);
+    if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second->info(); }
+    return nullptr;
+}
 
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
 
