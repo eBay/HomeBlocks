@@ -24,7 +24,9 @@
 #include <sisl/settings/settings.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/nil_generator.hpp>
-
+#include <chrono>
+#include <iostream>
+#include <thread>
 #include <homeblks/home_blks.hpp>
 
 SISL_OPTION_GROUP(
@@ -107,7 +109,7 @@ public:
     }
 
     void restart(uint64_t delay_secs = 0) {
-        LOGI("Stoping homeblocks after {} secs, replica={}", delay_secs);
+        LOGI("Stoping homeblocks after {} secs", delay_secs);
         hb_.reset();
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
