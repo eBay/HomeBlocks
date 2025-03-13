@@ -16,6 +16,7 @@
  * HomeBlocks Testing Binaries shared common define, apis and data structure;
  * */
 #pragma once
+#include <fcntl.h>
 #include <string>
 #include <vector>
 #include <map>
