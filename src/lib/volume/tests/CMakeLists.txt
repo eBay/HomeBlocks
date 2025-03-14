@@ -11,3 +11,4 @@ target_link_libraries(test_volume
     -rdynamic
 )
 
+add_test(NAME VolumeTest COMMAND test_volume)

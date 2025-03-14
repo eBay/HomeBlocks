@@ -1,9 +1,25 @@
+
+/*********************************************************************************
+ * Modifications Copyright 2017-2019 eBay Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *    https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed
+ * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+ * CONDITIONS OF ANY KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations under the License.
+ *
+ *********************************************************************************/
 #pragma once
 #include "index.hpp"
 #include <homeblks/volume_mgr.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/replication/repl_dev.h>
+#include <homeblks/common.hpp>
 
 namespace homeblocks {
 class Volume;
@@ -46,7 +62,9 @@ private:
     };
 
 public:
-    explicit Volume(VolumeInfo&& info) : vol_info_(std::move(info)), sb_{VOL_META_NAME} {}
+    explicit Volume(VolumeInfo&& info) : sb_{VOL_META_NAME} {
+        vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name);
+    }
     explicit Volume(sisl::byte_view const& buf, void* cookie);
     Volume(Volume const& volume) = delete;
     Volume(Volume&& volume) = default;
@@ -59,20 +77,29 @@ public:
     // static APIs exposed to HomeBlks Implementation Layer;
     static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie) {
         auto vol = std::make_shared< Volume >(buf, cookie);
-        auto ret = vol->init();
+        auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
     }
 
     static VolumePtr make_volume(VolumeInfo&& info) {
         auto vol = std::make_shared< Volume >(std::move(info));
-        auto ret = vol->init(true /*is_recovery*/);
+        auto ret = vol->init();
         // in failure case, volume shared ptr will be destroyed automatically;
         return ret ? vol : nullptr;
     }
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
-    volume_id_t id() const { return uuid_; };
+    volume_id_t id() const { return vol_info_->id; };
     ReplDevPtr rd() const { return rd_; }
+
+    VolumeInfoPtr info() const { return vol_info_; }
+
+    //
+    // This API is called for both volume creation and volume recovery;
+    // Initialize index table for this volume and saves the index handle in the volume object;
+    //
+    shared< VolumeIndexTable > init_index_table(bool is_recovery,
+                                                homestore::superblk< homestore::index_table_sb >&& sb = {});
 
 private:
     //
@@ -83,14 +110,8 @@ private:
     //
     bool init(bool is_recovery = false);
 
-    //
-    // initialize index table for this volume and saves the index handle in the volume object;
-    //
-    void init_index_table();
-
 private:
-    VolumeInfo vol_info_;
-    volume_id_t uuid_;
+    VolumeInfoPtr vol_info_;
     ReplDevPtr rd_;
     VolIdxTablePtr indx_tbl_;
     superblk< vol_sb_t > sb_;

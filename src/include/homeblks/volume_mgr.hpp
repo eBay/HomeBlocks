@@ -14,6 +14,12 @@ ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, U
 
 struct VolumeInfo {
     VolumeInfo() = default;
+    VolumeInfo(const VolumeInfo&) = delete;
+    VolumeInfo(VolumeInfo&& rhs) noexcept :
+            id(rhs.id), size_bytes(rhs.size_bytes), page_size(rhs.page_size), name(std::move(rhs.name)) {}
+
+    VolumeInfo(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
+            id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
 
     volume_id_t id;
     uint64_t size_bytes{0};

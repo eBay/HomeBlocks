@@ -1,3 +1,18 @@
+
+/*********************************************************************************
+ * Modifications Copyright 2017-2019 eBay Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *    https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed
+ * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+ * CONDITIONS OF ANY KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations under the License.
+ *
+ *********************************************************************************/
 #include <algorithm>
 
 #include <iomgr/io_environment.hpp>
@@ -15,7 +30,7 @@ SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 
-extern std::shared_ptr< HomeBlocks > init_homeobject(std::weak_ptr< HomeBlocksApplication >&& application) {
+extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application) {
     LOGI("Initializing HomeBlocks");
     auto inst = std::make_shared< HomeBlocksImpl >(std::move(application));
     inst->init_homestore();
@@ -26,6 +41,12 @@ extern std::shared_ptr< HomeBlocks > init_homeobject(std::weak_ptr< HomeBlocksAp
 HomeBlocksStats HomeBlocksImpl::get_stats() const {
     HomeBlocksStats s;
     return s;
+}
+
+HomeBlocksImpl::~HomeBlocksImpl() {
+    homestore::HomeStore::instance()->shutdown();
+    homestore::HomeStore::reset_instance();
+    iomanager.stop();
 }
 
 HomeBlocksImpl::HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application) :
@@ -128,7 +149,7 @@ void HomeBlocksImpl::init_homestore() {
     ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = app->threads(), .is_spdk = app->spdk_mode()})
         .with_http_server();
 
-    const uint64_t app_mem_size = app->app_mem_size();
+    const uint64_t app_mem_size = app->app_mem_size() * 1024 * 1024 * 1024;
     LOGI("Initialize and start HomeStore with app_mem_size = {}", app_mem_size);
 
     std::vector< homestore::dev_info > device_info;
