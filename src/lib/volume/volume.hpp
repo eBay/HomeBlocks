@@ -30,8 +30,8 @@ using VolumePtr = shared< Volume >;
 using VolIdxTablePtr = shared< VolumeIndexTable >;
 
 using ReplDevPtr = shared< homestore::ReplDev >;
+using index_cfg_t = homestore::BtreeConfig;
 class Volume {
-    using index_cfg_t = homestore::BtreeConfig;
 
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
@@ -90,16 +90,15 @@ public:
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
     volume_id_t id() const { return vol_info_->id; };
+    std::string id_str() const { return boost::uuids::to_string(vol_info_->id); };
     ReplDevPtr rd() const { return rd_; }
 
     VolumeInfoPtr info() const { return vol_info_; }
 
     //
-    // This API is called for both volume creation and volume recovery;
     // Initialize index table for this volume and saves the index handle in the volume object;
     //
-    shared< VolumeIndexTable > init_index_table(bool is_recovery,
-                                                homestore::superblk< homestore::index_table_sb >&& sb = {});
+    shared< VolumeIndexTable > init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl = nullptr);
 
 private:
     //

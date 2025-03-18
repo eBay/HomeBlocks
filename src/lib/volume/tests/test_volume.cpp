@@ -68,7 +68,7 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(vinfo_ptr != nullptr);
         }
     }
-#if 0
+
     g_helper->restart(5);
 
     // verify the volumes are still there
@@ -82,7 +82,6 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(vinfo_ptr != nullptr);
         }
     }
-#endif
 }
 
 int main(int argc, char* argv[]) {

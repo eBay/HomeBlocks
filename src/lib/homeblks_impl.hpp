@@ -61,6 +61,9 @@ private:
     mutable std::shared_mutex vol_lock_;
     std::map< volume_id_t, VolumePtr > vol_map_;
 
+    mutable std::shared_mutex index_lock_;
+    std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
+
     bool recovery_done_{false};
     superblk< homeblks_sb_t > sb_;
 

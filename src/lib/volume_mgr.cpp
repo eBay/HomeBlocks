@@ -22,11 +22,17 @@ namespace homeblocks {
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    // auto sb = homestore::superblk< vol_sb_t >(VOL_META_NAME);
-    // sb.load(buf, cookie);
     auto vol_ptr = Volume::make_volume(buf, cookie);
-    vol_ptr->init_index_table(false);
     auto id = vol_ptr->id();
+
+    {
+        auto lg = std::scoped_lock(index_lock_);
+        auto it = idx_tbl_map_.find(vol_ptr->id_str());
+        DEBUG_ASSERT(it != idx_tbl_map_.end(), "index pid: {} not exists in recovery path, not expected!",
+                     boost::uuids::to_string(vol_ptr->id()));
+        vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+    }
+
     {
         auto lg = std::scoped_lock(vol_lock_);
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
@@ -36,14 +42,17 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
 }
 
 shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
-    auto id = sb->parent_uuid; // parent uuid is the volume id;
+    auto pid_str = boost::uuids::to_string(sb->parent_uuid); // parent_uuid is the volume id
     {
-        auto lg = std::scoped_lock(vol_lock_);
-        auto it = vol_map_.find(id);
-        DEBUG_ASSERT(it != vol_map_.end(), "volume id: {} not exists in recovery path, not expected!",
-                     boost::uuids::to_string(id));
+        auto lg = std::scoped_lock(index_lock_);
+        index_cfg_t cfg(homestore::hs()->index_service().node_size());
+        cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
+        cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
 
-        return it->second->init_index_table(true, std::move(sb));
+        LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
+        auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
+        idx_tbl_map_.emplace(pid_str, tbl);
+        return tbl;
     }
 }
 

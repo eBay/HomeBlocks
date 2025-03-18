@@ -19,13 +19,12 @@
 namespace homeblocks {
 
 // this API will be called by volume manager after volume sb is recovered and volume is created;
-shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery,
-                                                    homestore::superblk< homestore::index_table_sb >&& sb) {
-    index_cfg_t cfg(homestore::hs()->index_service().node_size());
-    cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
-    cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
-
+shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl) {
     if (!is_recovery) {
+        index_cfg_t cfg(homestore::hs()->index_service().node_size());
+        cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
+        cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
+
         // create index table;
         auto uuid = hb_utils::gen_random_uuid();
 
@@ -34,15 +33,11 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery,
         LOGI("Creating index table for volume: {}, index_uuid: {}, parent_uuid: {}", vol_info_->name,
              boost::uuids::to_string(uuid), boost::uuids::to_string(id()));
         indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg);
-        homestore::hs()->index_service().add_index_table(indx_table());
     } else {
-        // recovery path
-        LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid),
-             boost::uuids::to_string(sb->parent_uuid));
-        indx_tbl_ = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
-        // HomeStore will add the index table to the index service in recovery case, its done in its constructor;
+        indx_tbl_ = tbl;
     }
 
+    homestore::hs()->index_service().add_index_table(indx_table());
     return indx_table();
 }
 
@@ -60,6 +55,9 @@ bool Volume::init(bool is_recovery) {
         sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name);
         // write to disk;
         sb_.write();
+
+        init_index_table(false /*is_recovery*/);
+
         // create solo repl dev for volume;
         // members left empty on purpose for solo repl dev
         LOGI("Creating solo repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
