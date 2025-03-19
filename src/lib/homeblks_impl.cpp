@@ -44,7 +44,7 @@ HomeBlocksStats HomeBlocksImpl::get_stats() const {
 }
 
 HomeBlocksImpl::~HomeBlocksImpl() {
-    homestore::HomeStore::instance()->shutdown();
+    homestore::hs()->shutdown();
     homestore::HomeStore::reset_instance();
     iomanager.stop();
 }
@@ -161,7 +161,7 @@ void HomeBlocksImpl::init_homestore() {
     // Note: timeline_consistency doesn't matter as we are using solo repl dev;
     auto repl_app =
         std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this, _application);
-    bool need_format = HomeStore::instance()
+    bool need_format = homestore::hs()
                            ->with_index_service(std::make_unique< HBIndexSvcCB >(this))
                            .with_repl_data_service(repl_app) // chunk selector defaulted to round_robine
                            .start(hs_input_params{.devices = device_info, .app_mem_size = app_mem_size},
@@ -170,7 +170,7 @@ void HomeBlocksImpl::init_homestore() {
         LOGI("We are starting for the first time. Formatting HomeStore. ");
         if (has_data_dev && has_fast_dev) {
             // NOTE: chunk_size, num_chunks only has to specify one, can be deduced from each other.
-            HomeStore::instance()->format_and_start({
+            homestore::hs()->format_and_start({
                 {HS_SERVICE::META, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 9.0}},
                 {HS_SERVICE::LOG,
                  hs_format_params{
@@ -186,7 +186,7 @@ void HomeBlocksImpl::init_homestore() {
         } else {
             auto run_on_type = has_fast_dev ? homestore::HSDevType::Fast : homestore::HSDevType::Data;
             LOGD("Running with Single mode, all service on {}", run_on_type);
-            HomeStore::instance()->format_and_start({
+            homestore::hs()->format_and_start({
                 {HS_SERVICE::META, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
                 {HS_SERVICE::LOG,
                  hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
@@ -199,7 +199,7 @@ void HomeBlocksImpl::init_homestore() {
                                   .block_size = DATA_BLK_SIZE}},
             });
         }
-        repl_app->on_repl_devs_init_completed();
+        // repl_app->on_repl_devs_init_completed();
         superblk_init();
     }
 
@@ -241,18 +241,10 @@ void HomeBlocksImpl::register_metablk_cb() {
     using namespace homestore;
 
     // HomeBlks SB
-    HomeStore::instance()->meta_service().register_handler(
+    homestore::hs()->meta_service().register_handler(
         HB_META_NAME,
         [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
             on_hb_meta_blk_found(std::move(buf), voidptr_cast(mblk));
-        },
-        nullptr /*recovery_comp_cb*/, true /* do_crc */);
-
-    // Volume SB
-    HomeStore::instance()->meta_service().register_handler(
-        Volume::VOL_META_NAME,
-        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            on_vol_meta_blk_found(std::move(buf), voidptr_cast(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
 }
@@ -260,6 +252,18 @@ void HomeBlocksImpl::register_metablk_cb() {
 void HomeBlocksImpl::on_init_complete() {
     // this is called after HomeStore all recovery completed.
     // Add anything that needs to be done here.
+    using namespace homestore;
+
+    // Volume SB
+    homestore::hs()->meta_service().register_handler(
+        Volume::VOL_META_NAME,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_vol_meta_blk_found(std::move(buf), voidptr_cast(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */,
+        std::optional< meta_subtype_vec_t >({homestore::hs()->repl_service().get_meta_blk_name()}));
+
+    homestore::hs()->meta_service().read_sub_sb(Volume::VOL_META_NAME);
 }
 
 void HomeBlocksImpl::init_cp() {}
