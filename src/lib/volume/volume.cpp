@@ -84,4 +84,24 @@ bool Volume::init(bool is_recovery) {
     return true;
 }
 
+void Volume::destroy() {
+    // destroy the repl dev;
+    if (rd_) {
+        LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+        homestore::hs()->repl_service().remove_repl_dev(id()).get();
+        rd_ = nullptr;
+    }
+
+    // destroy the index table;
+    if (indx_tbl_) {
+        LOGI("Destroying index table for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+        homestore::hs()->index_service().remove_index_table(indx_tbl_);
+        indx_tbl_->destroy();
+        indx_tbl_ = nullptr;
+    }
+
+    // destroy the superblock which will remove sb from meta svc;
+    sb_.destroy();
+}
+
 } // namespace homeblocks

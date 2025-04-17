@@ -80,7 +80,21 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
     return folly::Unit();
 }
 
-VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) { return folly::Unit(); }
+VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
+    {
+        auto lg = std::scoped_lock(vol_lock_);
+        if (auto it = vol_map_.find(id); it != vol_map_.end()) {
+            auto vol_ptr = it->second;
+            vol_map_.erase(it);
+            vol_ptr->destroy();
+            LOGI("Volume {} removed successfully", boost::uuids::to_string(id));
+        } else {
+            LOGW("remove_volume with input id: {} not found", boost::uuids::to_string(id));
+            return folly::makeUnexpected(VolumeError::INVALID_ARG);
+        }
+    }
+    return folly::Unit();
+}
 
 VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
     auto lg = std::shared_lock(vol_lock_);
