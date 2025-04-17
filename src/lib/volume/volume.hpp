@@ -71,7 +71,6 @@ public:
     Volume& operator=(Volume const& volume) = delete;
     Volume& operator=(Volume&& volume) = default;
 
-    // TODO: volume destructor should remove volume meta block;
     virtual ~Volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
@@ -99,6 +98,8 @@ public:
     // Initialize index table for this volume and saves the index handle in the volume object;
     //
     shared< VolumeIndexTable > init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl = nullptr);
+
+    void destroy();
 
 private:
     //
