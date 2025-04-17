@@ -28,8 +28,9 @@ bool HBListener::on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl
 void HBListener::on_error(homestore::ReplServiceError error, const sisl::blob& header, const sisl::blob& key,
                           cintrusive< homestore::repl_req_ctx >& ctx) {}
 
-homestore::ReplResult< homestore::blk_alloc_hints > HBListener::get_blk_alloc_hints(sisl::blob const& header,
-                                                                                    uint32_t data_size) {
+homestore::ReplResult< homestore::blk_alloc_hints >
+HBListener::get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
+                                cintrusive< homestore::repl_req_ctx >& hs_ctx) {
     return homestore::blk_alloc_hints();
 }
 
