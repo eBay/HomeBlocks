@@ -81,10 +81,15 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
+    LOGI("remove_volume with input id: {}", boost::uuids::to_string(id));
+
+    std::string vol_id_str;
+    // 1. remove destroy volume and remove volume from vol_map;
     {
         auto lg = std::scoped_lock(vol_lock_);
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             auto vol_ptr = it->second;
+            vol_id_str = vol_ptr->id_str();
             vol_map_.erase(it);
             vol_ptr->destroy();
             LOGI("Volume {} removed successfully", boost::uuids::to_string(id));
@@ -93,6 +98,18 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
             return folly::makeUnexpected(VolumeError::INVALID_ARG);
         }
     }
+
+    // 2. remove index handler from index_map if it exists;
+    {
+        auto lg = std::scoped_lock(index_lock_);
+        auto it = idx_tbl_map_.find(vol_id_str);
+        if (it != idx_tbl_map_.end()) {
+            idx_tbl_map_.erase(it);
+            LOGI("Volume {} index table removed successfully", boost::uuids::to_string(id));
+        }
+    }
+
+    // Volume Destructor will be called after vol_ptr goes out of scope;
     return folly::Unit();
 }
 
