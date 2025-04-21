@@ -61,6 +61,7 @@ private:
     mutable std::shared_mutex vol_lock_;
     std::map< volume_id_t, VolumePtr > vol_map_;
 
+    // index table map which only used during recovery;
     mutable std::shared_mutex index_lock_;
     std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
 

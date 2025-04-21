@@ -18,7 +18,8 @@
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
-
+#include <sisl/flip/flip_client.hpp>
+#include <iomgr/iomgr_flip.hpp>
 #include <homeblks/home_blks.hpp>
 #include <homeblks/volume_mgr.hpp>
 #include "test_common.hpp"
@@ -46,6 +47,22 @@ public:
         vol_info.id = hb_utils::gen_random_uuid();
         return vol_info;
     }
+
+#ifdef _PRERELEASE
+    void set_flip_point(const std::string flip_name) {
+        flip::FlipCondition null_cond;
+        flip::FlipFrequency freq;
+        freq.set_count(1);
+        freq.set_percent(100);
+        m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
+        LOGI("Flip {} set", flip_name);
+    }
+#endif
+
+private:
+#ifdef _PRERELEASE
+    flip::FlipClient m_fc{iomgr_flip::instance()};
+#endif
 };
 
 TEST_F(VolumeTest, CreateDestroyVolume) {
@@ -72,7 +89,8 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
             auto id = vol_ids[i];
             auto ret = vol_mgr->remove_volume(id).get();
             ASSERT_TRUE(ret);
-
+            // sleep for a while
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
             auto vinfo_ptr = vol_mgr->lookup_volume(id);
             // verify the volume is not there
             ASSERT_TRUE(vinfo_ptr == nullptr);
@@ -114,6 +132,40 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(vinfo_ptr != nullptr);
         }
     }
+}
+
+TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
+
+#ifdef _PRERELEASE
+    set_flip_point("vol_destroy_crash_simulation");
+#endif
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb->volume_manager();
+
+        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            ASSERT_TRUE(ret);
+
+            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is there
+            ASSERT_TRUE(vinfo_ptr != nullptr);
+        }
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto id = vol_ids[i];
+            auto ret = vol_mgr->remove_volume(id).get();
+            ASSERT_TRUE(ret);
+        }
+    }
+
+    g_helper->restart(5);
 }
 
 int main(int argc, char* argv[]) {
