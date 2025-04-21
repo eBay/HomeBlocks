@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include <boost/uuid/uuid_io.hpp>
+#include <iomgr/iomgr.hpp>
 #include "volume/volume.hpp"
 #include "homeblks_impl.hpp"
 
@@ -29,8 +30,11 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         auto lg = std::scoped_lock(index_lock_);
         auto it = idx_tbl_map_.find(vol_ptr->id_str());
         DEBUG_ASSERT(it != idx_tbl_map_.end(), "index pid: {} not exists in recovery path, not expected!",
-                     boost::uuids::to_string(vol_ptr->id()));
+                     vol_ptr->id_str());
         vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+
+        // don't need it after volume is initialized with index table;
+        idx_tbl_map_.erase(it);
     }
 
     {
@@ -38,6 +42,11 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
                      "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+    }
+
+    if (vol_ptr->is_destroying()) {
+        // resume volume destroying;
+        remove_volume(id);
     }
 }
 
@@ -81,35 +90,29 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
-    LOGI("remove_volume with input id: {}", boost::uuids::to_string(id));
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
+        LOGI("remove_volume with input id: {}", boost::uuids::to_string(id));
 
-    std::string vol_id_str;
-    // 1. remove destroy volume and remove volume from vol_map;
-    {
-        auto lg = std::scoped_lock(vol_lock_);
-        if (auto it = vol_map_.find(id); it != vol_map_.end()) {
-            auto vol_ptr = it->second;
-            vol_id_str = vol_ptr->id_str();
-            vol_map_.erase(it);
-            vol_ptr->destroy();
-            LOGI("Volume {} removed successfully", boost::uuids::to_string(id));
-        } else {
-            LOGW("remove_volume with input id: {} not found", boost::uuids::to_string(id));
-            return folly::makeUnexpected(VolumeError::INVALID_ARG);
+        // 1. remove destroy volume and remove volume from vol_map;
+        {
+            auto lg = std::scoped_lock(vol_lock_);
+            if (auto it = vol_map_.find(id); it != vol_map_.end()) {
+                auto vol_ptr = it->second;
+                vol_ptr->destroy();
+#ifdef _PRERELEASE
+                if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
+#endif
+                vol_map_.erase(it);
+                LOGI("Volume {} removed successfully", vol_ptr->id_str());
+            } else {
+                LOGW("remove_volume with input id: {} not found", boost::uuids::to_string(id));
+            }
+
+            // Volume Destructor will be called after vol_ptr goes out of scope;
         }
-    }
 
-    // 2. remove index handler from index_map if it exists;
-    {
-        auto lg = std::scoped_lock(index_lock_);
-        auto it = idx_tbl_map_.find(vol_id_str);
-        if (it != idx_tbl_map_.end()) {
-            idx_tbl_map_.erase(it);
-            LOGI("Volume {} index table removed successfully", boost::uuids::to_string(id));
-        }
-    }
-
-    // Volume Destructor will be called after vol_ptr goes out of scope;
+        return folly::Unit();
+    });
     return folly::Unit();
 }
 
