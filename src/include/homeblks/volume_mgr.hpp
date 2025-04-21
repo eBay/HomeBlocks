@@ -4,6 +4,7 @@
 
 #include <boost/uuid/uuid_io.hpp>
 #include <sisl/utility/enum.hpp>
+#include <sisl/utility/obj_life_counter.hpp>
 
 #include "common.hpp"
 
@@ -11,6 +12,33 @@ namespace homeblocks {
 
 ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, UNSUPPORTED_OP, CRC_MISMATCH,
      NO_SPACE_LEFT, DRIVE_WRITE_ERROR, INTERNAL_ERROR);
+
+using lba_t = uint64_t;
+using lba_count_t = uint32_t;
+
+struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
+    uint8_t* buffer{nullptr};
+    lba_t lba;
+    lba_count_t nlbas;
+    sisl::atomic_counter< int > refcount;
+    bool part_of_batch{false};
+    uint64_t request_id;
+
+    friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
+
+    friend void intrusive_ptr_release(vol_interface_req* req) {
+        if (req->refcount.decrement_testz()) { req->free_yourself(); }
+    }
+
+public:
+    vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas) :
+            buffer(buf), lba(lba), nlbas(nlbas) {}
+
+    virtual ~vol_interface_req() = default; // override; sisl::ObjLifeCounter should have virtual destructor
+    virtual void free_yourself() { delete this; }
+};
+
+using vol_interface_req_ptr = boost::intrusive_ptr< vol_interface_req >;
 
 struct VolumeInfo {
     VolumeInfo() = default;
@@ -59,7 +87,12 @@ public:
 
     virtual VolumeInfoPtr lookup_volume(const volume_id_t& id) = 0;
 
-    // TODO: read/write/unmap APIs
+    // TODO: read/unmap APIs
+
+    virtual NullAsyncResult write(const volume_id_t& id, const vol_interface_req_ptr& req,
+                                  bool part_of_batch = false) = 0;
+
+    virtual void submit_io_batch() = 0;
 
     /**
      * Retrieves the statistics for a specific Volume identified by its ID.

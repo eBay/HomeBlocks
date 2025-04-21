@@ -19,7 +19,14 @@ namespace homeblocks {
 
 void HBListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                            std::vector< homestore::MultiBlkId > const& blkids,
-                           cintrusive< homestore::repl_req_ctx >& ctx) {}
+                           cintrusive< homestore::repl_req_ctx >& ctx) {
+    const HomeBlksMessageHeader* msg_header = r_cast< const HomeBlksMessageHeader* >(header.cbytes());
+    switch (msg_header->msg_type) {
+    case HomeBlksMsgType::WRITE:
+        hb_->on_write(lsn, header, key, blkids, ctx);
+        break;
+    }
+}
 
 bool HBListener::on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                                cintrusive< homestore::repl_req_ctx >& ctx) {

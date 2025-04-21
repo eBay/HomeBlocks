@@ -15,6 +15,7 @@
  *********************************************************************************/
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
+#include <homestore/crc.h>
 #include "volume/volume.hpp"
 #include "homeblks_impl.hpp"
 
@@ -132,4 +133,57 @@ VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
 
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
+
+VolumeManager::NullAsyncResult HomeBlocksImpl::write(const volume_id_t& volume_id, const vol_interface_req_ptr& vol_req,
+                                                     bool part_of_batch) {
+    VolumePtr vol_ptr = nullptr;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        if (auto it = vol_map_.find(volume_id); it == vol_map_.end()) {
+            LOGE("Invalid volume id: {} ", boost::uuids::to_string(volume_id));
+            return folly::makeUnexpected(VolumeError::UNKNOWN_VOLUME);
+        } else {
+            vol_ptr = it->second;
+        }
+    }
+
+    auto key_size = sizeof(HomeBlksMessageKey) + sizeof(homestore::csum_t) * vol_req->nlbas;
+    auto req =
+        repl_result_ctx< VolumeManager::NullResult >::make(sizeof(HomeBlksMessageHeader) /* header size */, key_size);
+    req->header()->msg_type = HomeBlksMsgType::WRITE;
+    req->header()->seal();
+
+    // Add lba, nlbas, checksum as key.
+    HomeBlksMessageKey key{vol_req->lba, vol_req->nlbas};
+    auto key_buf = req->key_buf().bytes();
+    std::memcpy(key_buf, &key, sizeof(key));
+    key_buf += sizeof(key);
+    auto buffer = vol_req->buffer;
+    auto blk_size = vol_ptr->rd()->get_blk_size();
+    for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
+        auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(buffer), blk_size);
+        std::memcpy(key_buf, &csum, sizeof(csum));
+        buffer += blk_size;
+        key_buf += sizeof(csum);
+    }
+
+    req->add_data_sg(vol_req->buffer, vol_req->nlbas * blk_size);
+
+    // TODO add part_of_batch
+    vol_ptr->rd()->async_alloc_write(req->cheader_buf(), req->ckey_buf(), req->data_sgs(), req);
+    return req->result().deferValue([](const auto& result) -> folly::Expected< folly::Unit, VolumeError > {
+        if (result.hasError()) {
+            auto err = result.error();
+            return folly::makeUnexpected(err);
+        }
+
+        return folly::Unit();
+    });
+}
+
+void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                              const homestore::MultiBlkId& pbas, cintrusive< homestore::repl_req_ctx >& ctx) {}
+
+void HomeBlocksImpl::submit_io_batch() {}
+
 } // namespace homeblocks
