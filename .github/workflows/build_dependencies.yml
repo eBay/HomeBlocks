@@ -16,9 +16,6 @@ on:
       malloc-impl:
         required: true
         type: string
-      prerelease:
-        required: true
-        type: string
       tooling:
         required: false
         type: string
@@ -56,14 +53,6 @@ on:
           - libc
           - tcmalloc
           - jemalloc
-      prerelease:
-        description: 'Fault Instrumentation'
-        required: false
-        type: choice
-        options:
-          - 'True'
-          - 'False'
-        default: 'False'
       tooling:
         required: false
         type: choice
@@ -102,20 +91,20 @@ jobs:
       uses: eBay/sisl/.github/actions/load_conan@master
       with:
         testing: ${{ inputs.testing }}
-        key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
 
     - name: Load Sisl Cache
       uses: eBay/sisl/.github/actions/load_conan@master
       with:
         load_any: 'True'
-        key_prefix: SislDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: SislDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-false
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load IOMgr Cache
       uses: eBay/sisl/.github/actions/load_conan@master
       with:
         load_any: 'True'
-        key_prefix: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-false
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Retrieve Dependencies NuRaftMesg
@@ -131,7 +120,7 @@ jobs:
       with:
         testing: 'False'
         path: import/nuraft_mesg
-        key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-false
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
@@ -148,7 +137,7 @@ jobs:
       with:
         testing: 'False'
         path: import/homestore
-        key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-false
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
@@ -171,10 +160,8 @@ jobs:
 
     - name: Build Cache
       run: |
-        pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl:prerelease=${{ inputs.prerelease }}" || echo "")
         conan install \
             -c tools.build:skip_test=True \
-            ${pre} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
             -o iomgr:testing=off \
             -o homestore:testing=off \
@@ -186,7 +173,7 @@ jobs:
     - name: Save Conan Cache
       uses: eBay/sisl/.github/actions/store_conan@master
       with:
-        key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
+        key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
       if: ${{ github.event_name != 'pull_request' && steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Reload Sisl11 Cache
@@ -231,9 +218,7 @@ jobs:
     - name: Create and Test Package
       run: |
         sanitize=$([[ "${{ inputs.tooling }}" == "Sanitize" ]] && echo "True" || echo "False")
-        pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl:prerelease=${{ inputs.prerelease }}" || echo "")
         conan create \
-            ${pre} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
             -o iomgr:testing=off \
             -o homestore:testing=off \
@@ -245,9 +230,7 @@ jobs:
 
     - name: Code Coverage Run
       run: |
-        pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl:prerelease=${{ inputs.prerelease }}" || echo "")
         conan install \
-            ${pre} \
             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
             -o iomgr:testing=off \
             -o homestore:testing=off \

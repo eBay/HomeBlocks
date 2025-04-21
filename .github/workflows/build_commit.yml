@@ -12,9 +12,6 @@ on:
       malloc-impl:
         required: true
         type: string
-      prerelease:
-        required: true
-        type: string
       tooling:
         required: true
         type: string
@@ -27,7 +24,7 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: false
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -39,7 +36,7 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: false
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -51,7 +48,7 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: false
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -63,7 +60,7 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: false
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -75,7 +72,6 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
       tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name != 'pull_request' }}
@@ -87,7 +83,6 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
       tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name == 'pull_request' }}
