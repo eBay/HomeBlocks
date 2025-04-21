@@ -23,6 +23,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <sisl/settings/settings.hpp>
+#include <iomgr/io_environment.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/nil_generator.hpp>
 #include <boost/uuid/random_generator.hpp>
@@ -36,7 +37,7 @@ SISL_OPTION_GROUP(
     (num_threads, "", "num_threads", "number of threads", ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
     (num_devs, "", "num_devs", "number of devices to create", ::cxxopts::value< uint32_t >()->default_value("3"),
      "number"),
-    (dev_size_mb, "", "dev_size_mb", "size of each device in MB", ::cxxopts::value< uint64_t >()->default_value("2048"),
+    (dev_size_mb, "", "dev_size_mb", "size of each device in MB", ::cxxopts::value< uint64_t >()->default_value("4096"),
      "number"),
     (device_list, "", "device_list", "Device List instead of default created",
      ::cxxopts::value< std::vector< std::string > >(), "path [...]"),
@@ -55,6 +56,71 @@ SISL_OPTION_GROUP(
 using namespace homeblocks;
 
 namespace test_common {
+
+struct Runner {
+    uint64_t total_tasks_{0};
+    uint32_t qdepth_{8};
+    std::atomic< uint64_t > issued_tasks_{0};
+    std::atomic< uint64_t > completed_tasks_{0};
+    std::function< void(void) > task_;
+    folly::Promise< folly::Unit > comp_promise_;
+
+    Runner(uint64_t num_tasks, uint32_t qd = 8) : total_tasks_{num_tasks}, qdepth_{qd} {
+        if (total_tasks_ < (uint64_t)qdepth_) { total_tasks_ = qdepth_; }
+    }
+    Runner() : Runner{SISL_OPTIONS["num_io"].as< uint64_t >(), SISL_OPTIONS["qdepth"].as< uint32_t >()} {}
+    Runner(const Runner&) = delete;
+    Runner& operator=(const Runner&) = delete;
+
+    void set_num_tasks(uint64_t num_tasks) { total_tasks_ = std::max((uint64_t)qdepth_, num_tasks); }
+    void set_task(std::function< void(void) > f) {
+        issued_tasks_.store(0);
+        completed_tasks_.store(0);
+        comp_promise_ = folly::Promise< folly::Unit >{};
+        task_ = std::move(f);
+    }
+
+    folly::Future< folly::Unit > execute() {
+        for (uint32_t i{0}; i < qdepth_; ++i) {
+            run_task();
+        }
+        return comp_promise_.getFuture();
+    }
+
+    void next_task() {
+        auto ctasks = completed_tasks_.fetch_add(1);
+        if ((issued_tasks_.load() < total_tasks_)) {
+            run_task();
+        } else if ((ctasks + 1) == total_tasks_) {
+            comp_promise_.setValue();
+        }
+    }
+
+    void run_task() {
+        ++issued_tasks_;
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, task_);
+    }
+};
+
+struct Waiter {
+    std::atomic< uint64_t > expected_comp{0};
+    std::atomic< uint64_t > actual_comp{0};
+    folly::Promise< folly::Unit > comp_promise;
+
+    Waiter(uint64_t num_op) : expected_comp{num_op} {}
+    Waiter() : Waiter{SISL_OPTIONS["num_io"].as< uint64_t >()} {}
+    Waiter(const Waiter&) = delete;
+    Waiter& operator=(const Waiter&) = delete;
+
+    folly::Future< folly::Unit > start(std::function< void(void) > f) {
+        f();
+        return comp_promise.getFuture();
+    }
+
+    void one_complete() {
+        if ((actual_comp.fetch_add(1) + 1) >= expected_comp.load()) { comp_promise.setValue(); }
+    }
+};
 
 class HBTestHelper {
     class HBTestApplication : public homeblocks::HomeBlocksApplication {
@@ -113,8 +179,9 @@ public:
     }
 
     void restart(uint64_t delay_secs = 0) {
-        LOGINFO("Stoping HomeBlocks after {} secs", delay_secs);
+        LOGINFO("Restart HomeBlocks");
         hb_.reset();
+        LOGINFO("Start HomeBlocks after {} secs", delay_secs);
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }
@@ -122,12 +189,29 @@ public:
     shared< homeblocks::HomeBlocks > inst() { return hb_; }
 
     void teardown() {
-        LOGINFO("tearing down test.");
+        LOGINFO("Tearing down test.");
         hb_.reset();
+        remove_files();
     }
 
     peer_id_t svc_id() { return svc_id_; }
     std::vector< std::string > const& dev_list() const { return dev_list_; }
+    Runner& runner() { return io_runner_; }
+    Waiter& waiter() { return waiter_; }
+
+    static void fill_data_buf(uint8_t* buf, uint64_t size, uint64_t pattern = 0) {
+        uint64_t* ptr = r_cast< uint64_t* >(buf);
+        for (uint64_t i = 0ul; i < size / sizeof(uint64_t); ++i) {
+            *(ptr + i) = (pattern == 0) ? i : pattern;
+        }
+    }
+
+    static void validate_data_buf(uint8_t const* buf, uint64_t size, uint64_t pattern = 0) {
+        uint64_t const* ptr = r_cast< uint64_t const* >(buf);
+        for (uint64_t i = 0ul; i < size / sizeof(uint64_t); ++i) {
+            RELEASE_ASSERT_EQ(ptr[i], ((pattern == 0) ? i : pattern), "data_buf mismatch at offset={}", i);
+        }
+    }
 
 private:
     void init_devices(bool is_file, uint64_t dev_size = 0) {
@@ -172,6 +256,15 @@ private:
         }
     }
 
+    void remove_files() {
+        for (const auto& fpath : dev_list_) {
+            if (std::filesystem::exists(fpath)) {
+                LOGINFO("Removing file {}", fpath);
+                std::filesystem::remove(fpath);
+            }
+        }
+    }
+
 private:
     std::string test_name_;
     std::vector< std::string > args_;
@@ -180,6 +273,8 @@ private:
     shared< homeblocks::HomeBlocks > hb_;
     shared< HBTestApplication > app_;
     peer_id_t svc_id_;
+    Runner io_runner_;
+    Waiter waiter_;
 };
 
 } // namespace test_common
