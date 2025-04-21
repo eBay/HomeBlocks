@@ -46,6 +46,7 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
 
     if (vol_ptr->is_destroying()) {
         // resume volume destroying;
+        LOGINFO("Volume {} is in destroying state, resume destroy", vol_ptr->id_str());
         remove_volume(id);
     }
 }
@@ -91,7 +92,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
-        LOGI("remove_volume with input id: {}", boost::uuids::to_string(id));
+        LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
 
         // 1. remove destroy volume and remove volume from vol_map;
         {
@@ -103,9 +104,9 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
                 if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
 #endif
                 vol_map_.erase(it);
-                LOGI("Volume {} removed successfully", vol_ptr->id_str());
+                LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
             } else {
-                LOGW("remove_volume with input id: {} not found", boost::uuids::to_string(id));
+                LOGWARN("remove_volume with input id: {} not found", boost::uuids::to_string(id));
             }
 
             // Volume Destructor will be called after vol_ptr goes out of scope;
