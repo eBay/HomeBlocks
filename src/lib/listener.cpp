@@ -18,7 +18,8 @@
 namespace homeblocks {
 
 void HBListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
-                           homestore::MultiBlkId const& blkids, cintrusive< homestore::repl_req_ctx >& ctx) {}
+                           std::vector< homestore::MultiBlkId > const& blkids,
+                           cintrusive< homestore::repl_req_ctx >& ctx) {}
 
 bool HBListener::on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                                cintrusive< homestore::repl_req_ctx >& ctx) {
