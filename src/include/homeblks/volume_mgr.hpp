@@ -11,11 +11,11 @@
 namespace homeblocks {
 
 ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, UNSUPPORTED_OP, CRC_MISMATCH,
-     NO_SPACE_LEFT, DRIVE_WRITE_ERROR, INTERNAL_ERROR);
+     NO_SPACE_LEFT, DRIVE_WRITE_ERROR, INTERNAL_ERROR, INDEX_ERROR);
 
-    using lba_t = uint64_t;
-    using lba_count_t = uint32_t;
-    
+using lba_t = uint64_t;
+using lba_count_t = uint32_t;
+
 struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     uint8_t* buffer{nullptr};
     lba_t lba;
@@ -62,7 +62,7 @@ struct VolumeInfo {
 
     std::string to_string() {
         return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={}", boost::uuids::to_string(id),
-                            size_bytes, page_size, name);
+                           size_bytes, page_size, name);
     }
 };
 
@@ -102,36 +102,36 @@ public:
      * @return std::error_condition no_error or error in issuing writes
      */
     virtual NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req,
-        bool part_of_batch = false) = 0;
+                                  bool part_of_batch = false) = 0;
 
     /**
-    * @brief Read the data from the volume asynchronously, created from the request. After completion the attached
-    * callback function will be called with this req ptr.
-    *
-    * @param vol Pointer to the volume
-    * @param req Request created which contains all the read parameters
-    * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
-    * call before issuing the reads. IO might already be started or even completed (in case of errors) before
-    * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
-    *
-    * @return std::error_condition no_error or error in issuing reads
-    */
+     * @brief Read the data from the volume asynchronously, created from the request. After completion the attached
+     * callback function will be called with this req ptr.
+     *
+     * @param vol Pointer to the volume
+     * @param req Request created which contains all the read parameters
+     * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
+     * call before issuing the reads. IO might already be started or even completed (in case of errors) before
+     * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
+     *
+     * @return std::error_condition no_error or error in issuing reads
+     */
     virtual NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req,
-        bool part_of_batch = false) = 0;
+                                 bool part_of_batch = false) = 0;
 
     /**
-    * @brief unmap the given block range
-    *
-    * @param vol Pointer to the volume
-    * @param req Request created which contains all the read parameters
-    */
+     * @brief unmap the given block range
+     *
+     * @param vol Pointer to the volume
+     * @param req Request created which contains all the read parameters
+     */
     virtual NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) = 0;
 
     /**
-    * @brief Submit the io batch, which is a mandatory method to be called if read/write are issued with part_of_batch
-    * is set to true. In those cases, without this method, IOs might not be even issued. No-op if previous io requests
-    * are not part of batch.
-    */
+     * @brief Submit the io batch, which is a mandatory method to be called if read/write are issued with part_of_batch
+     * is set to true. In those cases, without this method, IOs might not be even issued. No-op if previous io requests
+     * are not part of batch.
+     */
     virtual void submit_io_batch() = 0;
 
     /**

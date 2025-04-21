@@ -2,6 +2,7 @@ cmake_minimum_required (VERSION 3.11)
 
 add_flags("-Wall -Wextra -Werror -Wpedantic")
 include_directories (BEFORE include/)
+include_directories (BEFORE lib)
 include_directories (AFTER .)
 
 find_package(Threads QUIET REQUIRED)
