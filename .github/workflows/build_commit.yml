@@ -12,46 +12,43 @@ on:
       malloc-impl:
         required: true
         type: string
-      prerelease:
-        required: true
-        type: string
       tooling:
         required: true
         type: string
 
 jobs:
-  Sisl11Deps:
+  SislDeps:
     uses: eBay/sisl/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: "False"
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
   NuraftMesgDeps:
-    needs: Sisl11Deps
+    needs: SislDeps
     uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@main
     with:
       branch: main
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: "False"
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
   IOMgrDeps:
-    needs: [Sisl11Deps]
+    needs: [SislDeps]
     uses: eBay/iomanager/.github/workflows/build_dependencies.yml@master
     with:
       branch: master
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: "False"
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -63,7 +60,7 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
+      prerelease: "False"
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -75,7 +72,6 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
       tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name != 'pull_request' }}
@@ -87,7 +83,6 @@ jobs:
       platform: ${{ inputs.platform }}
       build-type: ${{ inputs.build-type }}
       malloc-impl: ${{ inputs.malloc-impl }}
-      prerelease: ${{ inputs.prerelease }}
       tooling: ${{ inputs.tooling }}
       testing: 'True'
     if: ${{ github.event_name == 'pull_request' }}
