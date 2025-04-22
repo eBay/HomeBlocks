@@ -93,27 +93,33 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
         LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
-
-        // 1. remove destroy volume and remove volume from vol_map;
+        // 1. get the volume ptr from the map;
+        VolumePtr vol_ptr = nullptr;
         {
             auto lg = std::scoped_lock(vol_lock_);
-            if (auto it = vol_map_.find(id); it != vol_map_.end()) {
-                auto vol_ptr = it->second;
-                vol_ptr->destroy();
-#ifdef _PRERELEASE
-                if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
-#endif
-                vol_map_.erase(it);
-                LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
-            } else {
-                LOGWARN("remove_volume with input id: {} not found", boost::uuids::to_string(id));
-            }
-
-            // Volume Destructor will be called after vol_ptr goes out of scope;
+            if (auto it = vol_map_.find(id); it != vol_map_.end()) { vol_ptr = it->second; }
         }
 
+        if (vol_ptr) {
+            // 2. do volume destroy;
+            vol_ptr->destroy();
+#ifdef _PRERELEASE
+            if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
+#endif
+            // 3. remove volume from vol_map;
+            {
+                auto lg = std::scoped_lock(vol_lock_);
+                vol_map_.erase(vol_ptr->id());
+            }
+
+            LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
+        } else {
+            LOGWARN("remove_volume with input id: {} not found", boost::uuids::to_string(id));
+        }
+        // Volume Destructor will be called after vol_ptr goes out of scope;
         return folly::Unit();
     });
+
     return folly::Unit();
 }
 
