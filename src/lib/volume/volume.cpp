@@ -15,6 +15,7 @@
  *********************************************************************************/
 #include "volume.hpp"
 #include <homestore/replication_service.hpp>
+#include <iomgr/iomgr_flip.hpp>
 
 namespace homeblocks {
 
@@ -51,23 +52,28 @@ Volume::Volume(sisl::byte_view const& buf, void* cookie) : sb_{VOL_META_NAME} {
 bool Volume::init(bool is_recovery) {
     if (!is_recovery) {
         // first time creation of the Volume, let's write the superblock;
+
+        // 0. create the superblock;
         sb_.create(sizeof(vol_sb_t));
         sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name);
-        // write to disk;
-        sb_.write();
 
-        init_index_table(false /*is_recovery*/);
-
-        // create solo repl dev for volume;
+        // 1. create solo repl dev for volume;
         // members left empty on purpose for solo repl dev
         LOGI("Creating solo repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
         auto ret = homestore::hs()->repl_service().create_repl_dev(id(), {} /*members*/).get();
         if (ret.hasError()) {
             LOGE("Failed to create solo repl dev for volume: {}, uuid: {}, error: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id), ret.error());
+
             return false;
         }
         rd_ = ret.value();
+
+        // 2. create the index table;
+        init_index_table(false /*is_recovery*/);
+
+        // 3. mark state as online;
+        state_change(vol_state::ONLINE);
     } else {
         // recovery path
         LOGI("Getting repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
@@ -80,19 +86,33 @@ bool Volume::init(bool is_recovery) {
             return false;
         }
         rd_ = ret.value();
+
+        // index table will be recovered via in subsequent callback with init_index_table API;
     }
     return true;
 }
 
 void Volume::destroy() {
-    // destroy the repl dev;
+    // 0. Set destroying state in superblock;
+    state_change(vol_state::DESTROYING);
+
+    // 1. destroy the repl dev;
     if (rd_) {
         LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
         homestore::hs()->repl_service().remove_repl_dev(id()).get();
         rd_ = nullptr;
     }
 
-    // destroy the index table;
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
+        // this is to simulate crash during volume destroy;
+        // volume should be able to resume destroy on next reboot;
+        LOGI("Volume destroy crash simulation flip is set, aborting");
+        return;
+    }
+#endif
+
+    // 2. destroy the index table;
     if (indx_tbl_) {
         LOGI("Destroying index table for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
         homestore::hs()->index_service().remove_index_table(indx_tbl_);

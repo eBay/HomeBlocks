@@ -15,6 +15,7 @@
  *********************************************************************************/
 #pragma once
 #include "index.hpp"
+#include "sisl/utility/enum.hpp"
 #include <homeblks/volume_mgr.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
@@ -31,6 +32,18 @@ using VolIdxTablePtr = shared< VolumeIndexTable >;
 
 using ReplDevPtr = shared< homestore::ReplDev >;
 using index_cfg_t = homestore::BtreeConfig;
+
+ENUM(vol_state, uint32_t,
+     INIT,       // initialized, but not ready online yet;
+     ONLINE,     // online and ready to be used;
+     OFFLINE,    // offline and not ready to be used;
+     DESTROYING, // being destroyed, this state will be used for vol-destroy crash recovery;
+     DESTROYED,  // fully destroyed, currently not used,
+                 // for future use of lazy-destroy, e.g. set destroyed and move forward, let the volume be destroyed in
+                 // background;
+     READONLY    // in read only mode;
+);
+
 class Volume {
 
 public:
@@ -48,6 +61,7 @@ private:
         uint64_t size; // privisioned size in bytes of volume;
         volume_id_t id;
         char name[VOL_NAME_SIZE];
+        vol_state state{vol_state::INIT};
 
         void init(uint32_t page_sz, uint64_t sz_bytes, volume_id_t vid, std::string const& name_str) {
             magic = VOL_SB_MAGIC;
@@ -100,6 +114,18 @@ public:
     shared< VolumeIndexTable > init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl = nullptr);
 
     void destroy();
+
+    bool is_destroying() const { return sb_->state == vol_state::DESTROYING; }
+
+    //
+    // This API will be called to set the volume state and persist to disk;
+    //
+    void state_change(vol_state s) {
+        if (sb_->state != s) {
+            sb_->state = s;
+            sb_.write();
+        }
+    }
 
 private:
     //
