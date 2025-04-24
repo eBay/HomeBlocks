@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "0.0.9"
+    version = "0.0.10"
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
     topics = ("ebay")
@@ -43,7 +43,7 @@ class HomeBlocksConan(ConanFile):
         self.test_requires("gtest/1.14.0")
 
     def requirements(self):
-        self.requires("homestore/[^6.10]@oss/master")
+        self.requires("homestore/[~6.11.0]@oss/master")
         self.requires("iomgr/[^11.3]@oss/master")
         self.requires("sisl/[^12.2]@oss/master", transitive_headers=True)
         self.requires("lz4/1.9.4", override=True)
