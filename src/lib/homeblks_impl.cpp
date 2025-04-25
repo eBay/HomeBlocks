@@ -98,7 +98,7 @@ public:
 #endif
     }
 
-    void destroy_repl_dev_listener(group_id_t group_id) override {
+    void destroy_repl_dev_listener(homestore::group_id_t group_id) override {
         LOGINFO("Destroying repl dev listener for group_id {}", boost::uuids::to_string(group_id));
     }
 
