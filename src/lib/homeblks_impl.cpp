@@ -98,6 +98,10 @@ public:
 #endif
     }
 
+    void destroy_repl_dev_listener(group_id_t group_id) override {
+        LOGINFO("Destroying repl dev listener for group_id {}", boost::uuids::to_string(group_id));
+    }
+
     void on_repl_devs_init_completed() override { hb_->on_init_complete(); }
 
     std::pair< std::string, uint16_t > lookup_peer(homestore::replica_id_t uuid) const override {
