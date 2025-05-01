@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "0.0.10"
+    version = "0.0.11"
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
     topics = ("ebay")

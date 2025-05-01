@@ -22,9 +22,21 @@ void HBListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob con
                            cintrusive< homestore::repl_req_ctx >& ctx) {
     const HomeBlksMessageHeader* msg_header = r_cast< const HomeBlksMessageHeader* >(header.cbytes());
     switch (msg_header->msg_type) {
-    case HomeBlksMsgType::WRITE:
-        hb_->on_write(lsn, header, key, blkids, ctx);
-        break;
+        case HomeBlksMsgType::WRITE: {
+            hb_->on_write(lsn, header, key, blkids, ctx);
+            break;
+        }
+        case HomeBlksMsgType::READ: {
+            LOGWARN("Unsupported message type: {} in HBListener::on_commit", msg_header->msg_type);
+            break;
+        }
+        case HomeBlksMsgType::UNMAP: {
+            LOGWARN("Unsupported message type: {} in HBListener::on_commit", msg_header->msg_type);
+            break;
+        }
+        default: {
+            LOGERROR("Invalid message type: {} in HBListener::on_commit", msg_header->msg_type);
+        }
     }
 }
 

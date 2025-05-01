@@ -182,7 +182,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const volume_id_t& volume_i
 }
 
 void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
-                              const homestore::MultiBlkId& pbas, cintrusive< homestore::repl_req_ctx >& ctx) {}
+                              const std::vector< homestore::MultiBlkId >& pbas, cintrusive< homestore::repl_req_ctx >& ctx) {}
 
 void HomeBlocksImpl::submit_io_batch() {}
 

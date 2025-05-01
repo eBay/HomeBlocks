@@ -117,7 +117,7 @@ public:
 
     void on_init_complete();
 
-    void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key, const homestore::MultiBlkId& pbas,
+    void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key, const std::vector< homestore::MultiBlkId >& pbas,
                   cintrusive< homestore::repl_req_ctx >& ctx);
 
 private:
