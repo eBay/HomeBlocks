@@ -4,6 +4,7 @@
 
 #include <boost/uuid/uuid_io.hpp>
 #include <sisl/utility/enum.hpp>
+#include <sisl/utility/obj_life_counter.hpp>
 
 #include "common.hpp"
 
@@ -11,6 +12,33 @@ namespace homeblocks {
 
 ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, UNSUPPORTED_OP, CRC_MISMATCH,
      NO_SPACE_LEFT, DRIVE_WRITE_ERROR, INTERNAL_ERROR);
+
+    using lba_t = uint64_t;
+    using lba_count_t = uint32_t;
+    
+struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
+    uint8_t* buffer{nullptr};
+    lba_t lba;
+    lba_count_t nlbas;
+    sisl::atomic_counter< int > refcount;
+    bool part_of_batch{false};
+    uint64_t request_id;
+
+    friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
+
+    friend void intrusive_ptr_release(vol_interface_req* req) {
+        if (req->refcount.decrement_testz()) { req->free_yourself(); }
+    }
+
+public:
+    vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas) :
+            buffer(buf), lba(lba), nlbas(nlbas) {}
+
+    virtual ~vol_interface_req() = default; // override; sisl::ObjLifeCounter should have virtual destructor
+    virtual void free_yourself() { delete this; }
+};
+
+using vol_interface_req_ptr = boost::intrusive_ptr< vol_interface_req >;
 
 struct VolumeInfo {
     VolumeInfo() = default;
@@ -34,7 +62,7 @@ struct VolumeInfo {
 
     std::string to_string() {
         return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={}", boost::uuids::to_string(id),
-                           size_bytes, page_size, name);
+                            size_bytes, page_size, name);
     }
 };
 
@@ -51,6 +79,8 @@ struct VolumeStats {
     }
 };
 
+class Volume;
+using VolumePtr = shared< Volume >;
 class VolumeManager : public Manager< VolumeError > {
 public:
     virtual NullAsyncResult create_volume(VolumeInfo&& volume_info) = 0;
@@ -59,7 +89,50 @@ public:
 
     virtual VolumeInfoPtr lookup_volume(const volume_id_t& id) = 0;
 
-    // TODO: read/write/unmap APIs
+    /**
+     * @brief Write the data to the volume asynchronously, created from the request. After completion the attached
+     * callback function will be called with this req ptr.
+     *
+     * @param vol Pointer to the volume
+     * @param req Request created which contains all the write parameters
+     * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
+     * call before issuing the writes. IO might already be started or even completed (in case of errors) before
+     * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
+     *
+     * @return std::error_condition no_error or error in issuing writes
+     */
+    virtual NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req,
+        bool part_of_batch = false) = 0;
+
+    /**
+    * @brief Read the data from the volume asynchronously, created from the request. After completion the attached
+    * callback function will be called with this req ptr.
+    *
+    * @param vol Pointer to the volume
+    * @param req Request created which contains all the read parameters
+    * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
+    * call before issuing the reads. IO might already be started or even completed (in case of errors) before
+    * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
+    *
+    * @return std::error_condition no_error or error in issuing reads
+    */
+    virtual NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req,
+        bool part_of_batch = false) = 0;
+
+    /**
+    * @brief unmap the given block range
+    *
+    * @param vol Pointer to the volume
+    * @param req Request created which contains all the read parameters
+    */
+    virtual NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) = 0;
+
+    /**
+    * @brief Submit the io batch, which is a mandatory method to be called if read/write are issued with part_of_batch
+    * is set to true. In those cases, without this method, IOs might not be even issued. No-op if previous io requests
+    * are not part of batch.
+    */
+    virtual void submit_io_batch() = 0;
 
     /**
      * Retrieves the statistics for a specific Volume identified by its ID.

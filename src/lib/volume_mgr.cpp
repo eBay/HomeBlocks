@@ -132,4 +132,25 @@ VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
 
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
+
+VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req,
+    bool part_of_batch) {
+        RELEASE_ASSERT(false, "Write Not implemented");
+        return folly::Unit();
+}
+
+VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req,
+    bool part_of_batch) {
+        RELEASE_ASSERT(false, "Read Not implemented");
+    return folly::Unit();
+}
+
+VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
+        RELEASE_ASSERT(false, "Unmap Not implemented");
+        return folly::Unit();
+}
+
+void HomeBlocksImpl::submit_io_batch() {
+    RELEASE_ASSERT(false, "submit_io_batch Not implemented");
+}
 } // namespace homeblocks
