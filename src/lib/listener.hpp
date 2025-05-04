@@ -66,6 +66,9 @@ public:
     virtual void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
                                     std::shared_ptr< homestore::snapshot_obj > snp_obj) override {}
     virtual void free_user_snp_ctx(void*& user_snp_ctx) override {}
+    virtual void on_no_space_left(homestore::repl_lsn_t lsn, homestore::chunk_num_t chunk_id) override {}
+    virtual void notify_committed_lsn(int64_t lsn) override {}
+    virtual void on_config_rollback(int64_t lsn) override {}
     // <<<<< end of r1: mockup apis >>>>>>>>>>
 
 private:
