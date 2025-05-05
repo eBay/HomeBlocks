@@ -64,7 +64,7 @@ private:
     flip::FlipClient m_fc{iomgr_flip::instance()};
 #endif
 };
-#if 0
+
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -133,8 +133,8 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         }
     }
 }
-#endif
-#if 1
+
+#if 0
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
 #ifdef _PRERELEASE
