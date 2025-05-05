@@ -134,7 +134,6 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
     }
 }
 
-#if 0
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
 #ifdef _PRERELEASE
@@ -168,7 +167,6 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(5);
 }
-#endif
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;

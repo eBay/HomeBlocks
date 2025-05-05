@@ -17,6 +17,8 @@
 
 #include <folly/futures/Future.h>
 #include <homestore/replication/repl_dev.h>
+#include <homestore/replication/repl_decls.h>
+#include <homestore/blk.h>
 #include "homeblks_impl.hpp"
 
 namespace homeblocks {
