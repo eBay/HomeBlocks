@@ -17,6 +17,8 @@
 
 #include <folly/futures/Future.h>
 #include <homestore/replication/repl_dev.h>
+#include <homestore/replication/repl_decls.h>
+#include <homestore/blk.h>
 #include "homeblks_impl.hpp"
 
 namespace homeblocks {
@@ -66,6 +68,10 @@ public:
     virtual void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
                                     std::shared_ptr< homestore::snapshot_obj > snp_obj) override {}
     virtual void free_user_snp_ctx(void*& user_snp_ctx) override {}
+
+    virtual void notify_committed_lsn(int64_t) override {}
+    virtual void on_config_rollback(int64_t) override {}
+    virtual void on_no_space_left(homestore::repl_lsn_t, homestore::chunk_num_t) override {}
     // <<<<< end of r1: mockup apis >>>>>>>>>>
 
 private:

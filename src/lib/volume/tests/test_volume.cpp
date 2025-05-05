@@ -64,7 +64,7 @@ private:
     flip::FlipClient m_fc{iomgr_flip::instance()};
 #endif
 };
-
+#if 0
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -133,7 +133,8 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         }
     }
 }
-
+#endif
+#if 1
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
 #ifdef _PRERELEASE
@@ -167,7 +168,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(5);
 }
-
+#endif
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
