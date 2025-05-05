@@ -87,7 +87,7 @@ public:
 
     virtual NullAsyncResult remove_volume(const volume_id_t& id) = 0;
 
-    virtual VolumeInfoPtr lookup_volume(const volume_id_t& id) = 0;
+    virtual VolumePtr lookup_volume(const volume_id_t& id) = 0;
 
     /**
      * @brief Write the data to the volume asynchronously, created from the request. After completion the attached

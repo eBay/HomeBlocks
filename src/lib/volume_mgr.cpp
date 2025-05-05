@@ -123,9 +123,9 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
     return folly::Unit();
 }
 
-VolumeInfoPtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
+VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
     auto lg = std::shared_lock(vol_lock_);
-    if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second->info(); }
+    if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second; }
     return nullptr;
 }
 
@@ -135,19 +135,19 @@ void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req,
     bool part_of_batch) {
-        RELEASE_ASSERT(false, "Write Not implemented");
-        return folly::Unit();
+    RELEASE_ASSERT(false, "Write Not implemented");
+    return folly::Unit();
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req,
     bool part_of_batch) {
-        RELEASE_ASSERT(false, "Read Not implemented");
+    RELEASE_ASSERT(false, "Read Not implemented");
     return folly::Unit();
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
-        RELEASE_ASSERT(false, "Unmap Not implemented");
-        return folly::Unit();
+    RELEASE_ASSERT(false, "Unmap Not implemented");
+    return folly::Unit();
 }
 
 void HomeBlocksImpl::submit_io_batch() {
