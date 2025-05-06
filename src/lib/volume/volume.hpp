@@ -23,11 +23,9 @@
 #include <homeblks/common.hpp>
 
 namespace homeblocks {
-class Volume;
 class VolumeIndexKey;
 class VolumeIndexValue;
 using VolumeIndexTable = homestore::IndexTable< VolumeIndexKey, VolumeIndexValue >;
-using VolumePtr = shared< Volume >;
 using VolIdxTablePtr = shared< VolumeIndexTable >;
 
 using ReplDevPtr = shared< homestore::ReplDev >;

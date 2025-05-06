@@ -92,7 +92,7 @@ public:
     static uint32_t get_fixed_size() { return sizeof(VolumeIndexKey); }
 
     /////////////////// Overriding methods of BtreeIntervalKey /////////////////
-    void shift(int n) override { m_offset += n; }
+    void shift(int n, void* app_ctx) override { m_offset += n; }
 
     int distance(homestore::BtreeKey const& f) const override {
         VolumeIndexKey const& from = s_cast< VolumeIndexKey const& >(f);
@@ -203,7 +203,7 @@ public:
     }
 
     ///////////////////////////// Overriding methods of BtreeIntervalValue //////////////////////////
-    void shift(int n) override { m_offset += n; }
+    void shift(int n, void* app_ctx) override { m_offset += n; }
 
     sisl::blob serialize_prefix() const override {
         return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_base_val)), uint32_cast(sizeof(uint32_t))};

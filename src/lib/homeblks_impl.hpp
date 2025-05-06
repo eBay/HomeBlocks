@@ -92,7 +92,18 @@ public:
 
     NullAsyncResult remove_volume(const volume_id_t& id) final;
 
-    VolumeInfoPtr lookup_volume(const volume_id_t& id) final;
+    VolumePtr lookup_volume(const volume_id_t& id) final;
+
+    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req,
+        bool part_of_batch = false) final;
+
+    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req,
+        bool part_of_batch = false) final;
+
+    NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
+
+    void submit_io_batch() final;
+
 
     // see api comments in base class;
     bool get_stats(volume_id_t id, VolumeStats& stats) const final;

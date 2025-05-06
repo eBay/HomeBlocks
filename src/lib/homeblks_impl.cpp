@@ -108,6 +108,10 @@ public:
 
     homestore::replica_id_t get_my_repl_id() const override { return hb_->our_uuid(); }
 
+    void destroy_repl_dev_listener(homestore::group_id_t) override {
+        LOGERROR("destroy_repl_dev_listener Unimplimented");
+    }
+
 private:
     homestore::repl_impl_type impl_type_;
     bool tl_consistency_; // indicates whether this application needs timeline consistency;
