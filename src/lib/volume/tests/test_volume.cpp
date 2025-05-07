@@ -52,7 +52,7 @@ public:
     void set_flip_point(const std::string flip_name) {
         flip::FlipCondition null_cond;
         flip::FlipFrequency freq;
-        freq.set_count(1);
+        freq.set_count(2);
         freq.set_percent(100);
         m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
         LOGI("Flip {} set", flip_name);
