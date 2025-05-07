@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "0.0.11"
+    version = "0.0.12"
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
     topics = ("ebay")
@@ -43,8 +43,8 @@ class HomeBlocksConan(ConanFile):
         self.test_requires("gtest/1.14.0")
 
     def requirements(self):
-        self.requires("homestore/[~6.13]@oss/master")
-        self.requires("iomgr/[^11.3]@oss/master")
+        self.requires("homestore/[~6.13]@oss/master", transitive_headers=True)
+        self.requires("iomgr/[^11.3]@oss/master", transitive_headers=True)
         self.requires("sisl/[^12.2]@oss/master", transitive_headers=True)
         self.requires("lz4/1.9.4", override=True)
 
@@ -53,7 +53,22 @@ class HomeBlocksConan(ConanFile):
             check_min_cppstd(self, 20)
 
     def layout(self):
-        cmake_layout(self)
+        self.folders.source = "."
+        if self.options.get_safe("sanitize"):
+            self.folders.build = join("build", "Sanitized")
+        elif self.options.get_safe("coverage"):
+            self.folders.build = join("build", "Coverage")
+        else:
+            self.folders.build = join("build", str(self.settings.build_type))
+        self.folders.generators = join(self.folders.build, "generators")
+
+        self.cpp.source.components["homestore"].includedirs = ["src/include"]
+
+        self.cpp.build.components["homestore"].libdirs = ["src/lib/volume"]
+
+        self.cpp.package.components["homestore"].libs = ["homeblocks_volume"]
+        self.cpp.package.includedirs = ["include"] # includedirs is already set to 'include' by
+        self.cpp.package.libdirs = ["lib"]
 
     def generate(self):
         # This generates "conan_toolchain.cmake" in self.generators_folder
@@ -95,11 +110,9 @@ class HomeBlocksConan(ConanFile):
         copy(self, "*.h*", join(self.source_folder, "src", "include"), join(self.package_folder, "include"), keep_path=True)
 
     def package_info(self):
-        #self.cpp_info.components["homestore"].libs = ["homeblocks_homestore"]
-        #self.cpp_info.components["homestore"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
-        self.cpp_info.components["memory"].libs = ["homeblocks_memory"]
-        self.cpp_info.components["memory"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
-        self.cpp_info.components["homeblocks"].requires = ["memory"]
+        self.cpp_info.components["homestore"].libs = ["homeblocks_volume"]
+        self.cpp_info.components["homestore"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
+        self.cpp_info.components["homeblocks"].requires = ["homestore"]
 
         if self.settings.os == "Linux":
             #self.cpp_info.components["homestore"].system_libs.append("pthread")
