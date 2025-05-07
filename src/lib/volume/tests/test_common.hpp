@@ -104,13 +104,13 @@ public:
         // init device list
         init_dev_list(true /*init_device*/);
 
-        LOGINFO("Starting HomeObject");
+        LOGINFO("Starting HomeBlocks");
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }
 
     void restart(uint64_t delay_secs = 0) {
-        LOGI("Stoping homeblocks after {} secs", delay_secs);
+        LOGI("Stoping HomeBlocks after {} secs", delay_secs);
         hb_.reset();
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
@@ -119,7 +119,7 @@ public:
     shared< homeblocks::HomeBlocks > inst() { return hb_; }
 
     void teardown() {
-        LOGI("tearing down test.");
+        LOGINFO("tearing down test.");
         hb_.reset();
     }
 
