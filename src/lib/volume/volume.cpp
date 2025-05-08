@@ -96,21 +96,21 @@ void Volume::destroy() {
     // 0. Set destroying state in superblock;
     state_change(vol_state::DESTROYING);
 
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
+        // this is to simulate crash during volume destroy;
+        // volume should be able to resume destroy on next reboot;
+        LOGINFO("Volume destroy crash simulation flip is set, aborting");
+        return;
+    }
+#endif
+
     // 1. destroy the repl dev;
     if (rd_) {
         LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
         homestore::hs()->repl_service().remove_repl_dev(id()).get();
         rd_ = nullptr;
     }
-
-#ifdef _PRERELEASE
-    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
-        // this is to simulate crash during volume destroy;
-        // volume should be able to resume destroy on next reboot;
-        LOGI("Volume destroy crash simulation flip is set, aborting");
-        return;
-    }
-#endif
 
     // 2. destroy the index table;
     if (indx_tbl_) {
