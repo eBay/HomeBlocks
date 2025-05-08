@@ -26,8 +26,8 @@
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_volume_setup,
-                  (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
-                   "number"));
+                (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
+                "number"));
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup, homeblocks)
 SISL_LOGGING_DECL(test_volume)
 

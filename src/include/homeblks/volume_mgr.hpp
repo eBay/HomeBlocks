@@ -36,6 +36,7 @@ public:
 
     virtual ~vol_interface_req() = default; // override; sisl::ObjLifeCounter should have virtual destructor
     virtual void free_yourself() { delete this; }
+    lba_t end_lba() const { return lba + nlbas - 1; }
 };
 
 using vol_interface_req_ptr = boost::intrusive_ptr< vol_interface_req >;
@@ -95,14 +96,13 @@ public:
      *
      * @param vol Pointer to the volume
      * @param req Request created which contains all the write parameters
-     * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
+     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait for batch_submit
      * call before issuing the writes. IO might already be started or even completed (in case of errors) before
      * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
      *
      * @return std::error_condition no_error or error in issuing writes
      */
-    virtual NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req,
-                                  bool part_of_batch = false) = 0;
+    virtual NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req) = 0;
 
     /**
      * @brief Read the data from the volume asynchronously, created from the request. After completion the attached
@@ -110,14 +110,13 @@ public:
      *
      * @param vol Pointer to the volume
      * @param req Request created which contains all the read parameters
-     * @param part_of_batch Is this request part of a batch request. If so, implementation can wait for batch_submit
+     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait for batch_submit
      * call before issuing the reads. IO might already be started or even completed (in case of errors) before
      * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
      *
      * @return std::error_condition no_error or error in issuing reads
      */
-    virtual NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req,
-                                 bool part_of_batch = false) = 0;
+    virtual NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req) = 0;
 
     /**
      * @brief unmap the given block range
