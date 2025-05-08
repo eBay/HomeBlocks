@@ -84,6 +84,9 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             // verify the volume is there
             ASSERT_TRUE(vinfo_ptr != nullptr);
         }
+
+        auto const s = hb->get_stats();
+        LOGINFO("Stats: {}", s.to_string());
     }
 
     g_helper->restart(5);

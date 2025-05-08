@@ -39,8 +39,8 @@ extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksAp
 }
 
 HomeBlocksStats HomeBlocksImpl::get_stats() const {
-    HomeBlocksStats s;
-    return s;
+    auto const stats = homestore::hs()->repl_service().get_cap_stats();
+    return {stats.total_capacity, stats.used_capacity};
 }
 
 HomeBlocksImpl::~HomeBlocksImpl() {
