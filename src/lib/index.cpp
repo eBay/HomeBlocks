@@ -33,7 +33,7 @@ HomeBlocksImpl::write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t 
     // For value shift() will get the blk_num and checksum for each lba.
     IndexValueContext app_ctx{&blocks_info, start_lba};
     const BlkId& start_blkid = blocks_info[start_lba].new_blkid;
-    VolumeIndexValue value{start_blkid};
+    VolumeIndexValue value{start_blkid, blocks_info[start_lba].checksum};
 
     auto req = homestore::BtreeRangePutRequest< VolumeIndexKey >{
         homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, true, VolumeIndexKey{end_lba}, true},
@@ -48,6 +48,18 @@ HomeBlocksImpl::write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t 
         return folly::makeUnexpected(VolumeError::INDEX_ERROR);
     }
 
+    return folly::Unit();
+}
+
+VolumeManager::Result< folly::Unit > HomeBlocksImpl::read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
+                         std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out_vector) {
+    homestore::BtreeQueryRequest< VolumeIndexKey > qreq{homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, 
+                                VolumeIndexKey{req->end_lba()}}, homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
+    auto index_table = vol_ptr->indx_table();
+    RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(vol_ptr->id()));
+    if (auto ret = index_table->query(qreq, out_vector); ret != homestore::btree_status_t::success) {
+        return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+    }
     return folly::Unit();
 }
 

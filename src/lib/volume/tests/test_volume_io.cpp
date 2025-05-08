@@ -174,6 +174,7 @@ public:
             });
     }
 
+<<<<<<< HEAD
     void verify_all_data() {
         for (auto& [lba, data_pattern] : m_lba_data) {
             auto buffer = iomanager.iobuf_alloc(512, 4096);
@@ -185,7 +186,46 @@ public:
             LOGDEBUG("Verify data vol={} lba={} pattern={} {}", m_vol_name, lba, data_pattern,
                      *r_cast< uint64_t* >(buffer));
             iomanager.iobuf_free(buffer);
+=======
+    void read_and_verify(lba_t start_lba, uint32_t nlbas) {
+        auto sz = nlbas * m_vol_ptr->info()->page_size;
+        sisl::io_blob_safe read_blob(sz, 512);
+        auto buf = read_blob.bytes();
+        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas});
+        auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
+        if(read_resp.hasError()) {
+            LOGERROR("Read failed with error={}", read_resp.error());
         }
+        RELEASE_ASSERT(!read_resp.hasError(), "Read failed with error={}", read_resp.error());
+        auto read_sz = m_vol_ptr->info()->page_size;
+        for(auto lba = start_lba; lba < start_lba + nlbas; lba++, buf += read_sz) {
+            uint64_t data_pattern = 0;
+            if(auto it = m_lba_data.find(lba); it != m_lba_data.end()) {
+                data_pattern = it->second;
+                test_common::HBTestHelper::validate_data_buf(buf, m_vol_ptr->info()->page_size, data_pattern);
+            } else {
+                test_common::HBTestHelper::validate_zeros(buf, m_vol_ptr->info()->page_size);
+            }
+            
+            LOGDEBUG("Verify data lba={} pattern expected={} actual={}", lba, data_pattern, *r_cast< uint64_t* >(read_blob.bytes()));
+        } 
+    }
+
+    void verify_data(uint64_t nlbas_per_io = 1) {
+        auto start_lba = m_lba_data.begin()->first;
+        auto max_lba = m_lba_data.rbegin()->first;
+        verify_data(start_lba, max_lba, nlbas_per_io);
+    }
+
+    void verify_data(lba_t start_lba, lba_t max_lba, uint64_t nlbas_per_io) {
+        uint64_t num_lbas_verified = 0;
+        for(auto lba = start_lba; lba < max_lba; lba += nlbas_per_io) {
+            auto num_lbas_this_round = std::min(nlbas_per_io, max_lba - lba);
+            read_and_verify(lba, num_lbas_this_round);
+            num_lbas_verified += num_lbas_this_round;
+>>>>>>> read API implementation
+        }
+        LOGINFO("Verified {} lbas for volume {}", num_lbas_verified, m_vol_ptr->info()->name);
     }
 
 #ifdef _PRERELEASE
@@ -238,7 +278,6 @@ public:
                 // Get a random volume.
                 vol = m_vols_impl[rand() % m_vols_impl.size()];
             }
-
             vol->generate_io(start_lba, nblks);
         });
 
@@ -246,13 +285,20 @@ public:
         LOGINFO("IO completed");
     }
 
+<<<<<<< HEAD
     void verify_all_data(shared< VolumeIOImpl > vol_impl = nullptr) {
         if (vol_impl) {
             vol_impl->verify_all_data();
+=======
+    void verify_data(shared< VolumeIOImpl > vol_impl = nullptr, uint64_t nlbas_per_io = 1) {
+        if (vol_impl) {
+            vol_impl->verify_data(nlbas_per_io);
+>>>>>>> read API implementation
             return;
         }
 
         for (auto& vol_impl : m_vols_impl) {
+<<<<<<< HEAD
             vol_impl->verify_all_data();
         }
     }
@@ -261,6 +307,9 @@ public:
         g_helper->restart(shutdown_delay);
         for (auto& vol_impl : m_vols_impl) {
             vol_impl->reset();
+=======
+            vol_impl->verify_data(nlbas_per_io);
+>>>>>>> read API implementation
         }
     }
 
@@ -286,16 +335,45 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
     restart(5);
 
     LOGINFO("Verify data");
+<<<<<<< HEAD
     verify_all_data(vol);
+=======
+    verify_data(vol, 30 /* nlbas_per_io */);
+>>>>>>> read API implementation
 
     // Write and verify again on same LBA range to single volume multiple times.
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
     for (uint32_t i = 0; i < num_iter; i++) {
         generate_io_single(vol, start_lba, nblks);
     }
+<<<<<<< HEAD
 
     verify_all_data(vol);
+=======
+    verify_data(vol);
+
+    // verify random lba ranges
+
+>>>>>>> read API implementation
     LOGINFO("SingleVolumeWriteData test done.");
+}
+
+TEST_F(VolumeIOTest, SingleVolumeReadData) {
+    // Write and verify fixed LBA range to single volume multiple times.
+    auto vol = volume_list().back();
+    uint32_t nblks = 500;
+    lba_t start_lba = 1000;
+    uint32_t num_iter = 1;
+    LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
+    for (uint32_t i = 0; i < num_iter; i++) {
+        generate_io_single(vol, start_lba, nblks);
+    }
+
+    vol->verify_data(300, 800, 40);
+    vol->verify_data(2000, 3000, 40);
+    vol->verify_data(800, 1800, 40);
+
+    LOGINFO("SingleVolumeReadHoles test done.");
 }
 
 TEST_F(VolumeIOTest, MultipleVolumeWriteData) {

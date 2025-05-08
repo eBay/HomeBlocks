@@ -213,6 +213,12 @@ public:
         }
     }
 
+    static void validate_zeros(uint8_t const* buf, uint64_t size) {
+        sisl::io_blob_safe blob(size, 512);
+        std::memset(blob.bytes(), 0, size);
+        RELEASE_ASSERT_EQ(std::memcmp(buf, blob.bytes(), size), 0, "data_buf mismatch");
+    }
+
 private:
     void init_devices(bool is_file, uint64_t dev_size = 0) {
         if (is_file) {
