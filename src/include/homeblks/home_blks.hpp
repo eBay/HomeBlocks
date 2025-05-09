@@ -15,7 +15,7 @@
 #pragma once
 
 #include <list>
-
+#include <iomgr/iomgr_types.hpp>
 #include <sisl/utility/enum.hpp>
 
 #include "common.hpp"
@@ -77,6 +77,7 @@ public:
     virtual peer_id_t our_uuid() const = 0;
     virtual std::shared_ptr< VolumeManager > volume_manager() = 0;
     virtual HomeBlocksStats get_stats() const = 0;
+    virtual iomgr::drive_type data_drive_type() const = 0;
 };
 
 extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application);

@@ -65,7 +65,6 @@ private:
 #endif
 };
 
-#if 1
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -87,15 +86,9 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
         }
 
         auto const s = hb->get_stats();
-        LOGINFO("Stats: {}", s.to_string());
-    }
+        auto const dtype = hb->data_drive_type();
+        LOGINFO("Stats: {}, drive_type: {}", s.to_string(), dtype);
 
-    // verify the volumes are still there
-    {
-        auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
-
-#if 1
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
             auto ret = vol_mgr->remove_volume(id).get();
@@ -106,14 +99,11 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
             // verify the volume is not there
             ASSERT_TRUE(vinfo_ptr == nullptr);
         }
-#endif
     }
 
     g_helper->restart(5);
 }
-#endif
 
-#if 1
 TEST_F(VolumeTest, CreateVolumeThenRecover) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -183,7 +173,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(5);
 }
-#endif
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
