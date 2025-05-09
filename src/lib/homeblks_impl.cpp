@@ -38,6 +38,17 @@ extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksAp
     return inst;
 }
 
+iomgr::drive_type HomeBlocksImpl::data_drive_type() const {
+    auto const dtype = homestore::hs()->data_service().get_dev_type();
+    if (dtype == homestore::HSDevType::Data) {
+        return iomgr::drive_type::block_hdd;
+    } else if (dtype == homestore::HSDevType::Fast) {
+        return iomgr::drive_type::block_nvme;
+    } else {
+        return iomgr::drive_type::unknown;
+    }
+}
+
 HomeBlocksStats HomeBlocksImpl::get_stats() const {
     auto const stats = homestore::hs()->repl_service().get_cap_stats();
     return {stats.total_capacity, stats.used_capacity};

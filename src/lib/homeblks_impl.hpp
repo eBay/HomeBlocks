@@ -82,6 +82,8 @@ public:
     /// HomeBlocks
     /// Returns the UUID of this HomeBlocks.
     HomeBlocksStats get_stats() const final;
+    iomgr::drive_type data_drive_type() const final;
+
     peer_id_t our_uuid() const final {
         // not expected to be called;
         return peer_id_t{};
@@ -94,16 +96,13 @@ public:
 
     VolumePtr lookup_volume(const volume_id_t& id) final;
 
-    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req,
-        bool part_of_batch = false) final;
+    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req, bool part_of_batch = false) final;
 
-    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req,
-        bool part_of_batch = false) final;
+    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req, bool part_of_batch = false) final;
 
     NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
 
     void submit_io_batch() final;
-
 
     // see api comments in base class;
     bool get_stats(volume_id_t id, VolumeStats& stats) const final;

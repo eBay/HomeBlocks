@@ -80,12 +80,14 @@ bool Volume::init(bool is_recovery) {
         auto ret = homestore::hs()->repl_service().get_repl_dev(id());
 
         if (ret.hasError()) {
-            LOGE("Failed to get repl dev for volume name: {}, uuid: {}, error: {}", vol_info_->name,
-                 boost::uuids::to_string(vol_info_->id), ret.error());
-            DEBUG_ASSERT(false, "Failed to get repl dev for volume");
-            return false;
+            LOGI("Volume in destroying state? Failed to get repl dev for volume name: {}, uuid: {}, error: {}",
+                 vol_info_->name, boost::uuids::to_string(vol_info_->id), ret.error());
+            rd_ = nullptr;
+            // DEBUG_ASSERT(false, "Failed to get repl dev for volume");
+            // return false;
+        } else {
+            rd_ = ret.value();
         }
-        rd_ = ret.value();
 
         // index table will be recovered via in subsequent callback with init_index_table API;
     }
@@ -96,6 +98,13 @@ void Volume::destroy() {
     // 0. Set destroying state in superblock;
     state_change(vol_state::DESTROYING);
 
+    // 1. destroy the repl dev;
+    if (rd_) {
+        LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+        homestore::hs()->repl_service().remove_repl_dev(id()).get();
+        rd_ = nullptr;
+    }
+
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
         // this is to simulate crash during volume destroy;
@@ -104,13 +113,6 @@ void Volume::destroy() {
         return;
     }
 #endif
-
-    // 1. destroy the repl dev;
-    if (rd_) {
-        LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
-        homestore::hs()->repl_service().remove_repl_dev(id()).get();
-        rd_ = nullptr;
-    }
 
     // 2. destroy the index table;
     if (indx_tbl_) {

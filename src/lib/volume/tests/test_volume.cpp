@@ -65,7 +65,7 @@ private:
 #endif
 };
 
-TEST_F(VolumeTest, CreateVolumeThenRecover) {
+TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
@@ -86,7 +86,43 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         }
 
         auto const s = hb->get_stats();
-        LOGINFO("Stats: {}", s.to_string());
+        auto const dtype = hb->data_drive_type();
+        LOGINFO("Stats: {}, drive_type: {}", s.to_string(), dtype);
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto id = vol_ids[i];
+            auto ret = vol_mgr->remove_volume(id).get();
+            ASSERT_TRUE(ret);
+            // sleep for a while
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is not there
+            ASSERT_TRUE(vinfo_ptr == nullptr);
+        }
+    }
+
+    g_helper->restart(5);
+}
+
+TEST_F(VolumeTest, CreateVolumeThenRecover) {
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb->volume_manager();
+
+        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            ASSERT_TRUE(ret);
+
+            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is there
+            ASSERT_TRUE(vinfo_ptr != nullptr);
+        }
     }
 
     g_helper->restart(5);
@@ -136,39 +172,6 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
     }
 
     g_helper->restart(5);
-}
-
-TEST_F(VolumeTest, CreateDestroyVolume) {
-    std::vector< volume_id_t > vol_ids;
-    {
-        auto hb = g_helper->inst();
-        auto vol_mgr = hb->volume_manager();
-
-        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
-
-        for (uint32_t i = 0; i < num_vols; ++i) {
-            auto vinfo = gen_vol_info(i);
-            auto id = vinfo.id;
-            vol_ids.emplace_back(id);
-            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
-            ASSERT_TRUE(ret);
-
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
-            // verify the volume is there
-            ASSERT_TRUE(vinfo_ptr != nullptr);
-        }
-
-        for (uint32_t i = 0; i < num_vols; ++i) {
-            auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
-            ASSERT_TRUE(ret);
-            // sleep for a while
-            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
-            // verify the volume is not there
-            ASSERT_TRUE(vinfo_ptr == nullptr);
-        }
-    }
 }
 
 int main(int argc, char* argv[]) {
