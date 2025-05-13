@@ -25,6 +25,7 @@
 #include <sisl/settings/settings.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/nil_generator.hpp>
+#include <boost/uuid/random_generator.hpp>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -82,7 +83,9 @@ class HBTestHelper {
             return devs;
         }
 
-        peer_id_t discover_svcid(std::optional< peer_id_t > const&) const override { return helper_.svc_id(); }
+        std::optional< peer_id_t > discover_svc_id(std::optional< peer_id_t > const&) const override {
+            return helper_.svc_id();
+        }
 
         uint64_t app_mem_size() const override {
             // return SISL_OPTIONS["app_mem_size"].as< uint64_t >();
@@ -99,7 +102,7 @@ public:
         sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");
 
         // init svc_id_
-        svc_id_ = boost::uuids::nil_uuid();
+        svc_id_ = boost::uuids::random_generator()();
 
         // init device list
         init_dev_list(true /*init_device*/);

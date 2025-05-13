@@ -59,7 +59,7 @@ public:
     virtual uint64_t app_mem_size() const = 0;
 
     // Callback made after determining if a SvcId exists or not during initialization, will consume response
-    virtual peer_id_t discover_svcid(std::optional< peer_id_t > const& found) const = 0;
+    virtual std::optional< peer_id_t > discover_svc_id(std::optional< peer_id_t > const& found) const = 0;
 };
 
 struct HomeBlocksStats {
