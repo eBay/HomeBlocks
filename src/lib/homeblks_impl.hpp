@@ -36,6 +36,7 @@ class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enab
         uint32_t version;
         uint32_t flag;
         uint64_t boot_cnt;
+        peer_id_t svc_id;
 
         void init_flag(uint32_t f) { flag = f; }
         void set_flag(uint32_t bit) { flag |= bit; }
@@ -67,6 +68,7 @@ private:
 
     bool recovery_done_{false};
     superblk< homeblks_sb_t > sb_;
+    peer_id_t our_uuid_;
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
@@ -84,10 +86,7 @@ public:
     HomeBlocksStats get_stats() const final;
     iomgr::drive_type data_drive_type() const final;
 
-    peer_id_t our_uuid() const final {
-        // not expected to be called;
-        return peer_id_t{};
-    }
+    peer_id_t our_uuid() const final { return our_uuid_; }
 
     /// VolumeManager
     NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
