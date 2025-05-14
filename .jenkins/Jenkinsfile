@@ -1,5 +1,5 @@
 pipeline {
-    agent { label 'sds-builder-v5' }
+    agent { label 'sds-builder-v7' }
 
     environment {
         ARTIFACTORY_PASS = credentials('ARTIFACTORY_PASS')
@@ -71,25 +71,26 @@ pipeline {
                 expression { !(env.BRANCH_NAME =~ /PR-/) }
             }
             steps {
-                sh "conan user -r ebay-local -p ${ARTIFACTORY_PASS} _service_sds"
-                sh "conan upload ${PROJECT}/${TAG} -c --all -r ebay-local"
+                sh "conan remote login -p ${ARTIFACTORY_PASS} ebay-local _service_sds"
+                sh "conan graph info ./ | grep 'ref: ' | awk '{print \$2}'  | sort | uniq | grep -v ${PROJECT} | grep -v '#' | while read pkg; do conan upload -r ebay-local -c \"\${pkg}\"; done"
+                sh "conan upload ${PROJECT}/${TAG} -c -r ebay-local"
             }
         }
         stage("Downstream Build") {
             when { allOf {
-               expression { (env.BRANCH_NAME == "${STABLE_BRANCH}") }
+               expression { (env.BRANCH_NAME == "${TARGET_BRANCH}") }
                expression { (!"${upstream_triggered}") || ("${upstream_triggered}" == "") }
             } }
         
             stages {
-                stage('StorageManager') {
+                stage('BlockManager') {
                     steps {
                         script {
-                            def hobj_res = build job: "StorageManager/main", parameters: [[$class: 'StringParameterValue', name: 'upstream_triggered', value: 'true']], propagate: true
+                            def hblk_res = build job: "BlockMgr/main", parameters: [[$class: 'StringParameterValue', name: 'upstream_triggered', value: 'true']], propagate: true
                         }
                     }
                     post {
-                        failure { script { failed_pkg = "StorageManager" } }
+                        failure { script { failed_pkg = "BlockMgr" } }
                     }
                 }
             }
