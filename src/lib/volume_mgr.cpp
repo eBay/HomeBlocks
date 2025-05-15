@@ -15,6 +15,7 @@
  *********************************************************************************/
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
+#include <homestore/crc.h>
 #include "volume/volume.hpp"
 #include "homeblks_impl.hpp"
 
@@ -57,7 +58,7 @@ shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superb
         auto lg = std::scoped_lock(index_lock_);
         index_cfg_t cfg(homestore::hs()->index_service().node_size());
         cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
-        cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
+        cfg.m_int_node_type = homestore::btree_node_type::FIXED;
 
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
@@ -133,15 +134,121 @@ bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { retur
 
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
 
-VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req,
-    bool part_of_batch) {
-    RELEASE_ASSERT(false, "Write Not implemented");
-    return folly::Unit();
+VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol_ptr, const vol_interface_req_ptr& vol_req,
+                                                     bool part_of_batch) {
+
+    // Step 1. Allocate new blkids. Homestore might return multiple blkid's pointing
+    // to different contigious memory locations.
+    auto data_size = vol_req->nlbas * vol_ptr->rd()->get_blk_size();
+    std::vector< homestore::MultiBlkId > new_blkids;
+    auto result = vol_ptr->rd()->alloc_blks(data_size, homestore::blk_alloc_hints{}, new_blkids);
+    if (result) {
+        LOGE("Failed to allocate blocks");
+        return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
+    }
+
+    // Step 2. Write the data to those allocated blkids.
+    sisl::sg_list data_sgs;
+    data_sgs.iovs.emplace_back(iovec{.iov_base = vol_req->buffer, .iov_len = data_size});
+    data_sgs.size = data_size;
+    return vol_ptr->rd()
+        ->async_write(new_blkids, data_sgs, part_of_batch)
+        .thenValue([this, vol_ptr, vol_req,
+                    new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
+            if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
+
+            using homestore::BlkId;
+            std::vector< BlkId > old_blkids;
+            std::unordered_map< lba_t, BlockInfo > blocks_info;
+            auto blk_size = vol_ptr->rd()->get_blk_size();
+            auto data_size = vol_req->nlbas * blk_size;
+            auto data_buffer = vol_req->buffer;
+            lba_t start_lba = vol_req->lba;
+            for (auto& blkid : new_blkids) {
+                DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
+
+                // Split the large blkid to individual blkid having only one block because each LBA points
+                // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
+                // block which is also stored in index.
+                for (uint32_t i = 0; i < blkid.blk_count(); i++) {
+                    auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
+                    auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
+                    blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                    data_buffer += blk_size;
+                }
+
+                // Step 3. For range [start_lba, end_lba] in this blkid, write the values to index.
+                // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
+                // in blocks_info after write_to_index
+                lba_t end_lba = start_lba + blkid.blk_count() - 1;
+                auto status = write_to_index(vol_ptr, start_lba, end_lba, blocks_info);
+                if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
+
+                start_lba = end_lba + 1;
+            }
+
+            // Collect all old blocks to write to journal.
+            for (auto& [_, info] : blocks_info) {
+                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+            }
+
+            auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
+            auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
+            auto key_size = sizeof(VolJournalEntry) + csum_size + old_blkids_size;
+
+            auto req = repl_result_ctx< VolumeManager::NullResult >::make(
+                sizeof(HomeBlksMessageHeader) /* header size */, key_size);
+            req->vol_ptr_ = vol_ptr;
+            req->header()->msg_type = HomeBlksMsgType::WRITE;
+            // Store volume id for recovery path (log replay)
+            req->header()->volume_id = vol_ptr->id();
+
+            // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
+            // New blkid's are written to journal by the homestore async_write_journal. After journal flush, on_commit
+            // will be called where we free the old blkid's and the write iscompleted.
+            VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
+            auto key_buf = req->key_buf().bytes();
+            std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
+            key_buf += sizeof(VolJournalEntry);
+
+            auto lba = vol_req->lba;
+            for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
+                std::memcpy(key_buf, &blocks_info[lba].checksum, sizeof(homestore::csum_t));
+                key_buf += sizeof(homestore::csum_t);
+                lba++;
+            }
+
+            for (auto& blkid : old_blkids) {
+                std::memcpy(key_buf, &blkid, sizeof(BlkId));
+                key_buf += sizeof(BlkId);
+            }
+
+            vol_ptr->rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+            return req->result().deferValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                if (result.hasError()) {
+                    auto err = result.error();
+                    return folly::makeUnexpected(err);
+                }
+                return folly::Unit();
+            });
+        });
 }
 
-VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req,
-    bool part_of_batch) {
-    RELEASE_ASSERT(false, "Read Not implemented");
+VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol_ptr, const vol_interface_req_ptr& vol_req,
+                                                    bool part_of_batch) {
+    // TODO remove when read is merged.
+    auto data_size = vol_req->nlbas * vol_ptr->rd()->get_blk_size();
+    sisl::sg_list data_sgs;
+    data_sgs.iovs.emplace_back(iovec{.iov_base = vol_req->buffer, .iov_len = data_size});
+    data_sgs.size = data_size;
+
+    VolumeIndexKey key(vol_req->lba);
+    VolumeIndexValue value;
+    homestore::BtreeSingleGetRequest get_req(&key, &value);
+    auto ret = vol_ptr->indx_table()->get(get_req);
+    RELEASE_ASSERT(ret == homestore::btree_status_t::success, "Cant find lba");
+    auto err = vol_ptr->rd()->async_read(value.blkid(), data_sgs, data_size).get();
+    RELEASE_ASSERT(!err, "async_read failed");
     return folly::Unit();
 }
 
@@ -150,7 +257,33 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const
     return folly::Unit();
 }
 
-void HomeBlocksImpl::submit_io_batch() {
-    RELEASE_ASSERT(false, "submit_io_batch Not implemented");
+void HomeBlocksImpl::submit_io_batch() { RELEASE_ASSERT(false, "submit_io_batch Not implemented"); }
+
+void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                              const std::vector< homestore::MultiBlkId >& blkids,
+                              cintrusive< homestore::repl_req_ctx >& ctx) {
+    repl_result_ctx< VolumeManager::NullResult >* repl_ctx{nullptr};
+    if (ctx) { repl_ctx = boost::static_pointer_cast< repl_result_ctx< VolumeManager::NullResult > >(ctx).get(); }
+    auto msg_header = r_cast< HomeBlksMessageHeader* >(const_cast< uint8_t* >(header.cbytes()));
+
+    // Avoid expensive lock during normal write flow.
+    VolumePtr vol_ptr{nullptr};
+    if (repl_ctx) {
+        vol_ptr = repl_ctx->vol_ptr_;
+    } else {
+        // For recovery path there wont repl_ctx and vol_ptr.
+        auto lg = std::shared_lock(vol_lock_);
+        auto it = vol_map_.find(msg_header->volume_id);
+        RELEASE_ASSERT(it != vol_map_.end(), "Didnt find volume {}", boost::uuids::to_string(msg_header->volume_id));
+        vol_ptr = it->second;
+    }
+
+    // Free all the old blkids.
+    for (auto& blkid : blkids) {
+        vol_ptr->rd()->async_free_blks(lsn, blkid);
+    }
+
+    if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }
+
 } // namespace homeblocks

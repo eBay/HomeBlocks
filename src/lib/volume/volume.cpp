@@ -24,7 +24,7 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
     if (!is_recovery) {
         index_cfg_t cfg(homestore::hs()->index_service().node_size());
         cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
-        cfg.m_int_node_type = homestore::btree_node_type::PREFIX;
+        cfg.m_int_node_type = homestore::btree_node_type::FIXED;
 
         // create index table;
         auto uuid = hb_utils::gen_random_uuid();

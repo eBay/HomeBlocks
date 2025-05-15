@@ -18,6 +18,8 @@
 #include <map>
 #include <string>
 #include <sisl/logging/logging.h>
+#include <sisl/utility/obj_life_counter.hpp>
+#include <homestore/crc.h>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/superblk_handler.hpp>
@@ -29,6 +31,14 @@
 namespace homeblocks {
 
 class Volume;
+
+ENUM(HomeBlksMsgType, uint8_t, READ, WRITE, UNMAP);
+
+struct VolJournalEntry {
+    lba_t start_lba;
+    lba_count_t nlbas;
+    uint16_t num_old_blks;
+};
 
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
     struct homeblks_sb_t {
@@ -118,6 +128,9 @@ public:
 
     void on_init_complete();
 
+    void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                  const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
+
 private:
     // Should only be called for first-time-boot
     void superblk_init();
@@ -132,6 +145,9 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+
+    VolumeManager::Result< folly::Unit > write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t end_lba,
+                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info);
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
@@ -146,4 +162,61 @@ public:
 private:
     HomeBlocksImpl* hb_;
 };
+
+const homestore::csum_t init_crc_16 = 0x8005;
+
+struct HomeBlksMessageHeader {
+    HomeBlksMessageHeader() = default;
+    HomeBlksMsgType msg_type;
+    volume_id_t volume_id;
+
+    std::string to_string() const {
+        return fmt::format(" msg_type={}volume={}\n", enum_name(msg_type), boost::uuids::to_string(volume_id));
+    }
+};
+
+struct homeblks_repl_ctx : public homestore::repl_req_ctx {
+    sisl::io_blob_safe hdr_buf_;
+    sisl::io_blob_safe key_buf_;
+
+    homeblks_repl_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homestore::repl_req_ctx{} {
+        hdr_buf_ = std::move(sisl::io_blob_safe{uint32_cast(sizeof(HomeBlksMessageHeader) + hdr_extn_size), 0});
+        new (hdr_buf_.bytes()) HomeBlksMessageHeader();
+
+        if (key_size) { key_buf_ = std::move(sisl::io_blob_safe{key_size, 0}); }
+    }
+
+    ~homeblks_repl_ctx() {
+        if (hdr_buf_.bytes()) { header()->~HomeBlksMessageHeader(); }
+    }
+
+    template < typename T >
+    T* to() {
+        return r_cast< T* >(this);
+    }
+
+    HomeBlksMessageHeader* header() { return r_cast< HomeBlksMessageHeader* >(hdr_buf_.bytes()); }
+    uint8_t* header_extn() { return hdr_buf_.bytes() + sizeof(HomeBlksMessageHeader); }
+
+    sisl::io_blob_safe& header_buf() { return hdr_buf_; }
+    sisl::io_blob_safe const& cheader_buf() const { return hdr_buf_; }
+
+    sisl::io_blob_safe& key_buf() { return key_buf_; }
+    sisl::io_blob_safe const& ckey_buf() const { return key_buf_; }
+};
+
+template < typename T >
+struct repl_result_ctx : public homeblks_repl_ctx {
+    folly::Promise< T > promise_;
+    VolumePtr vol_ptr_{nullptr};
+
+    template < typename... Args >
+    static intrusive< repl_result_ctx< T > > make(Args&&... args) {
+        return intrusive< repl_result_ctx< T > >{new repl_result_ctx< T >(std::forward< Args >(args)...)};
+    }
+
+    repl_result_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homeblks_repl_ctx{hdr_extn_size, key_size} {}
+    folly::SemiFuture< T > result() { return promise_.getSemiFuture(); }
+};
+
 } // namespace homeblocks

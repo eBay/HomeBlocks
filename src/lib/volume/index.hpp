@@ -21,35 +21,52 @@
 #include <homestore/blk.h>
 #include <sisl/fds/buffer.hpp>
 
+using homestore::BlkId;
+using homestore::BtreeKey;
+using homestore::BtreeValue;
+
 namespace homeblocks {
 using lba_t = std::uint64_t;
+
+struct BlockInfo {
+    // Checksum calculated on new data and written to new_blkid.
+    homestore::BlkId new_blkid;
+    homestore::BlkId old_blkid;
+    homestore::csum_t checksum;
+};
+
+struct IndexValueContext {
+    std::unordered_map< lba_t, BlockInfo >* block_info;
+    lba_t start_lba;
+};
 
 class VolumeIndexKey : public homestore::BtreeIntervalKey {
 private:
 #pragma pack(1)
-    uint32_t m_base{0};
-    uint32_t m_offset{0};
+    // We use lba as the key with 32 bit LSB used as suffix and 32 bit MSB used as prefix.
+    uint32_t m_lba_base{0};
+    uint32_t m_lba_offset{0};
 #pragma pack()
 
 public:
     VolumeIndexKey() = default;
     VolumeIndexKey(lba_t k) {
-        m_base = uint32_cast(k >> 32);
-        m_offset = uint32_cast(k & 0xFFFFFFFF);
+        m_lba_base = uint32_cast(k >> 32);
+        m_lba_offset = uint32_cast(k & 0xFFFFFFFF);
     }
 
-    VolumeIndexKey(uint32_t b, uint32_t o) : m_base{b}, m_offset{o} {}
+    VolumeIndexKey(uint32_t b, uint32_t o) : m_lba_base{b}, m_lba_offset{o} {}
     VolumeIndexKey(const VolumeIndexKey& other) = default;
-    VolumeIndexKey(const homestore::BtreeKey& other) : VolumeIndexKey(other.serialize(), true) {}
+    VolumeIndexKey(const BtreeKey& other) : VolumeIndexKey(other.serialize(), true) {}
     VolumeIndexKey(const sisl::blob& b, bool copy) : homestore::BtreeIntervalKey() {
         VolumeIndexKey const* other = r_cast< VolumeIndexKey const* >(b.cbytes());
-        m_base = other->m_base;
-        m_offset = other->m_offset;
+        m_lba_base = other->m_lba_base;
+        m_lba_offset = other->m_lba_offset;
     }
 
     VolumeIndexKey& operator=(VolumeIndexKey const& other) {
-        m_base = other.m_base;
-        m_offset = other.m_offset;
+        m_lba_base = other.m_lba_base;
+        m_lba_offset = other.m_lba_offset;
         return *this;
     };
     virtual ~VolumeIndexKey() = default;
@@ -57,13 +74,13 @@ public:
     /////////////////// Overriding methods of BtreeKey /////////////////
     int compare(homestore::BtreeKey const& o) const override {
         VolumeIndexKey const& other = s_cast< VolumeIndexKey const& >(o);
-        if (m_base < other.m_base) {
+        if (m_lba_base < other.m_lba_base) {
             return -1;
-        } else if (m_base > other.m_base) {
+        } else if (m_lba_base > other.m_lba_base) {
             return 1;
-        } else if (m_offset < other.m_offset) {
+        } else if (m_lba_offset < other.m_lba_offset) {
             return -1;
-        } else if (m_offset > other.m_offset) {
+        } else if (m_lba_offset > other.m_lba_offset) {
             return 1;
         } else {
             return 0;
@@ -79,11 +96,11 @@ public:
     void deserialize(sisl::blob const& b, bool copy) override {
         assert(b.size() == sizeof(VolumeIndexKey));
         VolumeIndexKey const* other = r_cast< VolumeIndexKey const* >(b.cbytes());
-        m_base = other->m_base;
-        m_offset = other->m_offset;
+        m_lba_base = other->m_lba_base;
+        m_lba_offset = other->m_lba_offset;
     }
 
-    std::string to_string() const override { return fmt::format("{}.{}", m_base, m_offset); }
+    std::string to_string() const override { return fmt::format("{}", key()); }
 
     static uint32_t get_max_size() { return sizeof(VolumeIndexKey); }
 
@@ -92,23 +109,27 @@ public:
     static uint32_t get_fixed_size() { return sizeof(VolumeIndexKey); }
 
     /////////////////// Overriding methods of BtreeIntervalKey /////////////////
-    void shift(int n, void* app_ctx) override { m_offset += n; }
 
-    int distance(homestore::BtreeKey const& f) const override {
+    void shift(int n, void* app_ctx) override {
+        // Increment the suffix part for lba.
+        m_lba_offset += n;
+    }
+
+    int distance(BtreeKey const& f) const override {
         VolumeIndexKey const& from = s_cast< VolumeIndexKey const& >(f);
-        DEBUG_ASSERT_EQ(m_base, from.m_base, "Invalid from key for distance");
-        DEBUG_ASSERT_GE(m_offset, from.m_offset, "Invalid from key for distance");
-        return m_offset - from.m_offset;
+        DEBUG_ASSERT_EQ(m_lba_base, from.m_lba_base, "Invalid from key for distance");
+        DEBUG_ASSERT_GE(m_lba_offset, from.m_lba_offset, "Invalid from key for distance");
+        return m_lba_offset - from.m_lba_offset;
     }
 
     bool is_interval_key() const override { return true; }
 
     sisl::blob serialize_prefix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_base)), uint32_cast(sizeof(uint32_t))};
+        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_lba_base)), uint32_cast(sizeof(uint32_t))};
     }
 
     sisl::blob serialize_suffix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_offset)), uint32_cast(sizeof(uint32_t))};
+        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_lba_offset)), uint32_cast(sizeof(uint32_t))};
     }
 
     uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
@@ -119,17 +140,17 @@ public:
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
         DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint32_t), "Invalid suffix size on deserialize");
         uint32_t const* other_p = r_cast< uint32_t const* >(prefix.cbytes());
-        m_base = *other_p;
+        m_lba_base = *other_p;
 
         uint32_t const* other_s = r_cast< uint32_t const* >(suffix.cbytes());
-        m_offset = *other_s;
+        m_lba_offset = *other_s;
     }
 
     /////////////////// Local methods for helping tests //////////////////
     bool operator<(const VolumeIndexKey& o) const { return (compare(o) < 0); }
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
 
-    lba_t key() const { return (uint64_cast(m_base) << 32) | m_offset; }
+    lba_t key() const { return (uint64_cast(m_lba_base) << 32) | m_lba_offset; }
     lba_t start_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
         const VolumeIndexKey& k = (const VolumeIndexKey&)(range.start_key());
         return k.key();
@@ -146,11 +167,11 @@ public:
     }
 
     friend std::istream& operator>>(std::istream& is, VolumeIndexKey& k) {
-        uint32_t m_base;
-        uint32_t m_offset;
+        uint32_t m_lba_base;
+        uint32_t m_lba_offset;
         char dummy;
-        is >> m_base >> dummy >> m_offset;
-        k = VolumeIndexKey{m_base, m_offset};
+        is >> m_lba_base >> dummy >> m_lba_offset;
+        k = VolumeIndexKey{m_lba_base, m_lba_offset};
         return is;
     }
 };
@@ -158,18 +179,35 @@ public:
 class VolumeIndexValue : public homestore::BtreeIntervalValue {
 private:
 #pragma pack(1)
-    uint32_t m_base_val{0};
-    uint16_t m_offset{0};
+    // Store blkid and checksum as the value. Most significant 32 bits of BlkId contains chunk_num
+    // and num_blks which is same in a single blkid and used as the prefix. Checksum and least significant 32 bits which
+    // contains blk num are unique and used as suffix. Ignore the multiblkid bit.
+    uint32_t m_blkid_prefix;
+    uint32_t m_blkid_suffix;
+    homestore::csum_t m_checksum;
 #pragma pack()
 
 public:
-    VolumeIndexValue(homestore::bnodeid_t val) { assert(0); }
-    VolumeIndexValue(uint32_t val, uint16_t o) : homestore::BtreeIntervalValue(), m_base_val{val}, m_offset{o} {}
+    VolumeIndexValue(const BlkId& base_blkid) : homestore::BtreeIntervalValue() {
+        m_blkid_suffix = uint32_cast(base_blkid.to_integer() & 0xFFFFFFFF) >> 1;
+        m_blkid_prefix = uint32_cast(base_blkid.to_integer() >> 32);
+    }
     VolumeIndexValue() = default;
     VolumeIndexValue(const VolumeIndexValue& other) :
-            homestore::BtreeIntervalValue(), m_base_val{other.m_base_val}, m_offset{other.m_offset} {}
+            homestore::BtreeIntervalValue(),
+            m_blkid_prefix(other.m_blkid_prefix),
+            m_blkid_suffix(other.m_blkid_suffix) {}
     VolumeIndexValue(const sisl::blob& b, bool copy) : homestore::BtreeIntervalValue() { this->deserialize(b, copy); }
     virtual ~VolumeIndexValue() = default;
+
+    homestore::BlkId blkid() const {
+        homestore::blk_num_t blk_num = m_blkid_suffix;
+        homestore::chunk_num_t chunk_num = m_blkid_prefix >> 16;
+        homestore::blk_count_t nblks = m_blkid_prefix & 0xFFFF;
+        return BlkId{blk_num, nblks, chunk_num};
+    }
+
+    homestore::csum_t checksum() const { return m_checksum; }
 
     ///////////////////////////// Overriding methods of BtreeValue //////////////////////////
     VolumeIndexValue& operator=(const VolumeIndexValue& other) = default;
@@ -182,11 +220,12 @@ public:
     static uint32_t get_fixed_size() { return sizeof(VolumeIndexValue); }
     void deserialize(const sisl::blob& b, bool) {
         VolumeIndexValue const* other = r_cast< VolumeIndexValue const* >(b.cbytes());
-        m_base_val = other->m_base_val;
-        m_offset = other->m_offset;
+        m_blkid_prefix = other->m_blkid_prefix;
+        m_blkid_suffix = other->m_blkid_suffix;
+        m_checksum = other->m_checksum;
     }
 
-    std::string to_string() const override { return fmt::format("{}.{}", m_base_val, m_offset); }
+    std::string to_string() const override { return fmt::format("{} csum={}", blkid().to_string(), m_checksum); }
 
     friend std::ostream& operator<<(std::ostream& os, const VolumeIndexValue& v) {
         os << v.to_string();
@@ -194,35 +233,52 @@ public:
     }
 
     friend std::istream& operator>>(std::istream& is, VolumeIndexValue& v) {
-        uint32_t m_base_val;
-        uint16_t m_offset;
+        uint32_t base_val;
+        uint32_t offset;
         char dummy;
-        is >> m_base_val >> dummy >> m_offset;
-        v = VolumeIndexValue{m_base_val, m_offset};
+        is >> base_val >> dummy >> offset;
+        v = VolumeIndexValue{BlkId{}};
         return is;
     }
 
     ///////////////////////////// Overriding methods of BtreeIntervalValue //////////////////////////
-    void shift(int n, void* app_ctx) override { m_offset += n; }
+    void shift(int n, void* app_ctx) override {
+        auto ctx = r_cast< IndexValueContext* >(app_ctx);
+        DEBUG_ASSERT(ctx, "Context null");
+
+        // Get the next blk num and checksum
+        m_blkid_suffix += n;
+        auto curr_lba = ctx->start_lba + n;
+        LOGINFO("shift n={} blk_num={} curr_lba={}", n, m_blkid_suffix, curr_lba);
+        DEBUG_ASSERT(ctx->block_info->find(curr_lba) != ctx->block_info->end(), "Invalid index");
+        m_checksum = (*ctx->block_info)[curr_lba].checksum;
+    }
 
     sisl::blob serialize_prefix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_base_val)), uint32_cast(sizeof(uint32_t))};
+        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_blkid_prefix)), uint32_cast(sizeof(uint32_t))};
     }
     sisl::blob serialize_suffix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint16_t* >(&m_offset)), uint32_cast(sizeof(uint16_t))};
+        // Include both m_blkid_suffix and checksum in the suffix.
+        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_blkid_suffix)),
+                          uint32_cast(sizeof(uint32_t) + sizeof(homestore::csum_t))};
     }
     uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
-    uint32_t serialized_suffix_size() const override { return uint32_cast(sizeof(uint16_t)); }
+    uint32_t serialized_suffix_size() const override {
+        return uint32_cast(sizeof(uint32_t) + sizeof(homestore::csum_t));
+    }
 
     void deserialize(sisl::blob const& prefix, sisl::blob const& suffix, bool) override {
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
-        DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint16_t), "Invalid suffix size on deserialize");
-        m_base_val = *(r_cast< uint32_t const* >(prefix.cbytes()));
-        m_offset = *(r_cast< uint16_t const* >(suffix.cbytes()));
+        DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint32_t) + sizeof(homestore::csum_t),
+                        "Invalid suffix size on deserialize");
+        m_blkid_prefix = *(r_cast< uint32_t const* >(prefix.cbytes()));
+        m_blkid_suffix = *(r_cast< uint32_t const* >(suffix.cbytes()));
+        m_checksum = *(r_cast< homestore::csum_t const* >(suffix.cbytes() + sizeof(uint32_t)));
     }
 
     bool operator==(VolumeIndexValue const& other) const {
-        return ((m_base_val == other.m_base_val) && (m_offset == other.m_offset));
+        return ((m_blkid_prefix == other.m_blkid_prefix) && (m_blkid_suffix == other.m_blkid_suffix) &&
+                (m_checksum == other.m_checksum));
     }
 };
 } // namespace homeblocks
