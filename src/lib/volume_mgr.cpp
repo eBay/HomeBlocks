@@ -274,7 +274,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     for (uint32_t i = 0, blk_count = 0, start_idx = 0; i < out_vector.size(); ++i, ++cur_lba) {
         auto const& [key, value] = out_vector[i];
         // cur_lba is used to keep track of the holes
-        // fill the read buffer with zeroes for the holes
+        // move the read buffer by the size of the holes
         if(cur_lba != key.key()) {
             if(blk_count > 0) {
                 // submit the read for the previous blkids
@@ -282,9 +282,8 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
                 start_idx = i;
                 blk_count = 0;
             }
-            auto fill_size = (key.key() - cur_lba) * vol->rd()->get_blk_size();
-            std::memset(read_buf, 0, fill_size);
-            read_buf += fill_size;
+            auto offset = (key.key() - cur_lba) * vol->rd()->get_blk_size();
+            read_buf += offset;
             cur_lba = key.key();
         }
 
@@ -309,10 +308,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         if(i == out_vector.size() - 1) {
             submit_read_to_backend(read_buf, futs, out_vector[start_idx], 1, vol, req->part_of_batch);
         }
-    }
-    // fill the holes at the end of the read buffer
-    if(cur_lba != req->end_lba() + 1) {
-        std::memset(read_buf, 0, (req->end_lba() - cur_lba + 1) * vol->rd()->get_blk_size());
     }
 
     return out_vector.empty() ? folly::Unit() :

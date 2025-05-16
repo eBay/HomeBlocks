@@ -203,8 +203,6 @@ public:
             if(auto it = m_lba_data.find(lba); it != m_lba_data.end()) {
                 data_pattern = it->second;
                 test_common::HBTestHelper::validate_data_buf(buf, m_vol_ptr->info()->page_size, data_pattern);
-            } else {
-                test_common::HBTestHelper::validate_zeros(buf, m_vol_ptr->info()->page_size);
             }
             
             LOGDEBUG("Verify data lba={} pattern expected={} actual={}", lba, data_pattern, *r_cast< uint64_t* >(read_blob.bytes()));
