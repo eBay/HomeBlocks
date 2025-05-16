@@ -105,9 +105,9 @@ public:
 
     VolumePtr lookup_volume(const volume_id_t& id) final;
 
-    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req, bool part_of_batch = false) final;
+    NullAsyncResult write(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
 
-    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req, bool part_of_batch = false) final;
+    NullAsyncResult read(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
 
     NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
 
@@ -148,6 +148,8 @@ private:
 
     VolumeManager::Result< folly::Unit > write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t end_lba,
                                                         std::unordered_map< lba_t, BlockInfo >& blocks_info);
+    VolumeManager::Result< folly::Unit > read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
+                        std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out_vector);
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
