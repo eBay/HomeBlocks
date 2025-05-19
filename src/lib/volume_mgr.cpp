@@ -260,27 +260,57 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const
 void HomeBlocksImpl::submit_io_batch() { RELEASE_ASSERT(false, "submit_io_batch Not implemented"); }
 
 void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
-                              const std::vector< homestore::MultiBlkId >& blkids,
+                              const std::vector< homestore::MultiBlkId >& new_blkids,
                               cintrusive< homestore::repl_req_ctx >& ctx) {
     repl_result_ctx< VolumeManager::NullResult >* repl_ctx{nullptr};
     if (ctx) { repl_ctx = boost::static_pointer_cast< repl_result_ctx< VolumeManager::NullResult > >(ctx).get(); }
     auto msg_header = r_cast< HomeBlksMessageHeader* >(const_cast< uint8_t* >(header.cbytes()));
 
-    // Avoid expensive lock during normal write flow.
+    // Key contains the list of checksums and old blkids. Before we ack the client
+    // request, we free the old blkid's. Also if its recovery we overwrite the index
+    // with checksum and new blkid's. We need to overwrite index during recovery as all the
+    // index writes may not be flushed to disk during crash.
     VolumePtr vol_ptr{nullptr};
-    if (repl_ctx) {
-        vol_ptr = repl_ctx->vol_ptr_;
-    } else {
-        // For recovery path there wont repl_ctx and vol_ptr.
+    auto journal_entry = r_cast< const VolJournalEntry* >(key.cbytes());
+    auto key_buffer = r_cast< const uint8_t* >(journal_entry + 1);
+
+    if (repl_ctx == nullptr) {
+        // For recovery path repl_ctx and vol_ptr wont be available.
         auto lg = std::shared_lock(vol_lock_);
         auto it = vol_map_.find(msg_header->volume_id);
         RELEASE_ASSERT(it != vol_map_.end(), "Didnt find volume {}", boost::uuids::to_string(msg_header->volume_id));
         vol_ptr = it->second;
+
+        // During log recovery overwrite new blkid and checksum to index.
+        std::unordered_map< lba_t, BlockInfo > blocks_info;
+        lba_t start_lba = journal_entry->start_lba;
+        for (auto& blkid : new_blkids) {
+            for (uint32_t i = 0; i < blkid.blk_count(); i++) {
+                auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
+                auto csum = *r_cast< const homestore::csum_t* >(key_buffer);
+                blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                key_buffer += sizeof(homestore::csum_t);
+            }
+
+            // We ignore the existing values we got in blocks_info from index as it will be
+            // same checksum, blkid we see in the journal entry.
+            lba_t end_lba = start_lba + blkid.blk_count() - 1;
+            auto status = write_to_index(vol_ptr, start_lba, end_lba, blocks_info);
+            RELEASE_ASSERT(status, "Index error during recovery");
+            start_lba = end_lba + 1;
+        }
+    } else {
+        // Avoid expensive lock during normal write flow.
+        vol_ptr = repl_ctx->vol_ptr_;
+        key_buffer += (journal_entry->nlbas * sizeof(homestore::csum_t));
     }
 
-    // Free all the old blkids.
-    for (auto& blkid : blkids) {
-        vol_ptr->rd()->async_free_blks(lsn, blkid);
+    // Free all the old blkids. This happens for both normal writes
+    // and crash recovery.
+    for (uint32_t i = 0; i < journal_entry->num_old_blks; i++) {
+        BlkId old_blkid = *r_cast< const BlkId* >(key_buffer);
+        vol_ptr->rd()->async_free_blks(lsn, old_blkid);
+        key_buffer += sizeof(BlkId);
     }
 
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }

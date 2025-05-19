@@ -15,6 +15,7 @@
 
 #include <string>
 
+#include <boost/icl/interval_set.hpp>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
@@ -56,6 +57,7 @@ private:
 public:
     void create_volume() {
         auto vinfo = gen_vol_info(m_volume_id_++);
+        m_vol_name = vinfo.name;
         m_vol_id = vinfo.id;
 
         auto vol_mgr = g_helper->inst()->volume_manager();
@@ -78,13 +80,39 @@ public:
         ASSERT_TRUE(m_vol_ptr != nullptr);
     }
 
+    void get_random_non_overlapping_lba(lba_t& start_lba, uint32_t& nblks, uint64_t max_blks) {
+        if (start_lba != 0 && nblks != 0) {
+            lba_t end_lba = start_lba + nblks - 1;
+            auto new_range = boost::icl::interval< int >::closed(start_lba, end_lba);
+            // For user provided lba and nblks, check if they are already in flight.
+            std::lock_guard lock(m_mutex);
+            ASSERT_TRUE(m_inflight_ios.find(new_range) == m_inflight_ios.end());
+            m_inflight_ios.insert(new_range);
+            return;
+        }
+
+        do {
+            // Generate lba which are not overlapped with the inflight ios, otherwise
+            // we cant decide which io completed last and cant verify the data.
+            start_lba = rand() % max_blks;
+            nblks = std::max(1, rand() % 64);
+            lba_t end_lba = start_lba + nblks - 1;
+            auto new_range = boost::icl::interval< int >::closed(start_lba, end_lba);
+            std::lock_guard lock(m_mutex);
+            if (m_inflight_ios.find(new_range) == m_inflight_ios.end()) {
+                m_inflight_ios.insert(new_range);
+                break;
+            }
+
+        } while (true);
+    }
+
     auto build_random_data(lba_t& start_lba, uint32_t& nblks) {
         // Write upto 1-64 nblks * 4k = 256k size.
         auto info = m_vol_ptr->info();
         uint64_t page_size = info->page_size;
         uint64_t max_blks = info->size_bytes / page_size;
-        start_lba = start_lba == 0 ? rand() % max_blks : start_lba;
-        nblks = nblks == 0 ? std::max(1, rand() % 64) : nblks;
+        get_random_non_overlapping_lba(start_lba, nblks, max_blks);
         nblks = std::min(static_cast< uint64_t >(nblks), max_blks - static_cast< uint64_t >(start_lba));
 
         auto data_size = nblks * page_size;
@@ -94,9 +122,13 @@ public:
             uint64_t data_pattern = ((long long)rand() << 32) | rand();
             test_common::HBTestHelper::fill_data_buf(data_bytes, page_size, data_pattern);
             data_bytes += page_size;
-            // Store the lba to pattern mapping
-            m_lba_data[lba] = data_pattern;
-            LOGINFO("Generate data lba={} pattern={}", lba, data_pattern);
+            {
+                // Store the lba to pattern mapping
+                std::lock_guard lock(m_mutex);
+                m_lba_data[lba] = data_pattern;
+            }
+
+            LOGDEBUG("Generate data vol={} lba={} pattern={}", m_vol_name, lba, data_pattern);
             lba++;
         }
 
@@ -112,8 +144,13 @@ public:
             auto vol_mgr = g_helper->inst()->volume_manager();
             vol_mgr->write(m_vol_ptr, req)
                 .via(&folly::InlineExecutor::instance())
-                .thenValue([this, data, &waiter](auto&& result) {
+                .thenValue([this, data, req, &waiter](auto&& result) {
                     ASSERT_FALSE(result.hasError());
+                    {
+                        std::lock_guard lock(m_mutex);
+                        m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
+                    }
+
                     waiter.one_complete();
                 });
         });
@@ -125,22 +162,28 @@ public:
         auto data = build_random_data(start_lba, nblks);
         vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks});
         auto vol_mgr = g_helper->inst()->volume_manager();
-        vol_mgr->write(m_vol_ptr, req).via(&folly::InlineExecutor::instance()).thenValue([this, data](auto&& result) {
-            ASSERT_FALSE(result.hasError());
-            g_helper->runner().next_task();
-        });
+        vol_mgr->write(m_vol_ptr, req)
+            .via(&folly::InlineExecutor::instance())
+            .thenValue([this, req, data](auto&& result) {
+                ASSERT_FALSE(result.hasError());
+                {
+                    std::lock_guard lock(m_mutex);
+                    m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
+                }
+                g_helper->runner().next_task();
+            });
     }
 
-    void verify_data() {
+    void verify_all_data() {
         for (auto& [lba, data_pattern] : m_lba_data) {
             auto buffer = iomanager.iobuf_alloc(512, 4096);
             vol_interface_req_ptr req(new vol_interface_req{buffer, lba, 1});
 
             auto vol_mgr = g_helper->inst()->volume_manager();
             vol_mgr->read(m_vol_ptr, req).get();
-            // LOGINFO("Data read={}", fmt::format("{}", spdlog::to_hex((buffer), (buffer) + (128))));
             test_common::HBTestHelper::validate_data_buf(buffer, 4096, data_pattern);
-            LOGINFO("Verify data lba={} pattern={} {}", lba, data_pattern, *r_cast< uint64_t* >(buffer));
+            LOGDEBUG("Verify data vol={} lba={} pattern={} {}", m_vol_name, lba, data_pattern,
+                     *r_cast< uint64_t* >(buffer));
             iomanager.iobuf_free(buffer);
         }
     }
@@ -160,10 +203,14 @@ private:
 #ifdef _PRERELEASE
     flip::FlipClient m_fc{iomgr_flip::instance()};
 #endif
+    std::mutex m_mutex;
+    std::string m_vol_name;
     VolumePtr m_vol_ptr;
     volume_id_t m_vol_id;
     static inline uint32_t m_volume_id_{1};
+    // Mapping from lba to data patttern.
     std::map< lba_t, uint64_t > m_lba_data;
+    boost::icl::interval_set< int > m_inflight_ios;
 };
 
 class VolumeIOTest : public ::testing::Test {
@@ -199,14 +246,21 @@ public:
         LOGINFO("IO completed");
     }
 
-    void verify_data(shared< VolumeIOImpl > vol_impl = nullptr) {
+    void verify_all_data(shared< VolumeIOImpl > vol_impl = nullptr) {
         if (vol_impl) {
-            vol_impl->verify_data();
+            vol_impl->verify_all_data();
             return;
         }
 
         for (auto& vol_impl : m_vols_impl) {
-            vol_impl->verify_data();
+            vol_impl->verify_all_data();
+        }
+    }
+
+    void restart(int shutdown_delay) {
+        g_helper->restart(shutdown_delay);
+        for (auto& vol_impl : m_vols_impl) {
+            vol_impl->reset();
         }
     }
 
@@ -225,15 +279,14 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
     for (uint32_t i = 0; i < num_iter; i++) {
         generate_io_single(vol, start_lba, nblks);
-        verify_data(vol);
+        verify_all_data(vol);
     }
 
     // Verify data after restart.
-    g_helper->restart(10);
-    vol->reset();
+    restart(5);
 
     LOGINFO("Verify data");
-    verify_data(vol);
+    verify_all_data(vol);
 
     // Write and verify again on same LBA range to single volume multiple times.
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
@@ -241,7 +294,7 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
         generate_io_single(vol, start_lba, nblks);
     }
 
-    verify_data(vol);
+    verify_all_data(vol);
     LOGINFO("SingleVolumeWriteData test done.");
 }
 
@@ -251,24 +304,38 @@ TEST_F(VolumeIOTest, MultipleVolumeWriteData) {
     generate_io();
 
     LOGINFO("Verify data");
-    verify_data();
+    verify_all_data();
+
+    restart(5);
+
+    LOGINFO("Verify data again");
+    verify_all_data();
+
+    LOGINFO("Write data randomly");
+    generate_io();
+
+    LOGINFO("Verify data");
+    verify_all_data();
+
     LOGINFO("MultipleVolumeWriteData test done.");
 }
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
-    ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks);
-    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
-    parsed_argc = 1;
-    auto f = ::folly::Init(&parsed_argc, &argv, true);
+    char** orig_argv = argv;
 
     std::vector< std::string > args;
     for (int i = 0; i < argc; ++i) {
         args.emplace_back(argv[i]);
     }
 
-    g_helper = std::make_unique< test_common::HBTestHelper >("test_volume_io", args, argv);
+    ::testing::InitGoogleTest(&parsed_argc, argv);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks);
+    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
+    parsed_argc = 1;
+    auto f = ::folly::Init(&parsed_argc, &argv, true);
+
+    g_helper = std::make_unique< test_common::HBTestHelper >("test_volume_io", args, orig_argv);
     g_helper->setup();
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();

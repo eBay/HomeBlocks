@@ -249,7 +249,6 @@ public:
         // Get the next blk num and checksum
         m_blkid_suffix += n;
         auto curr_lba = ctx->start_lba + n;
-        LOGINFO("shift n={} blk_num={} curr_lba={}", n, m_blkid_suffix, curr_lba);
         DEBUG_ASSERT(ctx->block_info->find(curr_lba) != ctx->block_info->end(), "Invalid index");
         m_checksum = (*ctx->block_info)[curr_lba].checksum;
     }
