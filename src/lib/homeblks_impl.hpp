@@ -111,6 +111,8 @@ public:
 
     NullAsyncResult unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) final;
 
+    // Submit the io batch, which is a mandatory method to be called if read/write are issued
+    // with part_of_batchis set to true.
     void submit_io_batch() final;
 
     // see api comments in base class;
