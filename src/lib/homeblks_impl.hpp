@@ -133,6 +133,9 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
+    VolumeManager::Result< folly::Unit > verify_checksum(std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >const& index_kvs, 
+                                                            uint8_t* buf, lba_t start_lba, uint32_t blk_size);
+
 private:
     // Should only be called for first-time-boot
     void superblk_init();

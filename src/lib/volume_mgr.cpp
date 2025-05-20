@@ -255,11 +255,19 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol_ptr, c
         });
 }
 
+struct vol_mgr_read_ctx {
+    uint8_t* buf;
+    lba_t start_lba;
+    uint32_t blk_sz;
+    std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > > index_kvs{};
+};
+
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     // TODO: check if the system is accepting ios (shutdown in progress etc)
     RELEASE_ASSERT(vol != nullptr, "VolumePtr is null");
     // Step 1: get the blk ids from index table
-    std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > > index_kvs;
+    vol_mgr_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_sz = vol->rd()->get_blk_size()};
+    auto& index_kvs = read_ctx.index_kvs;
     if(auto index_resp = read_from_index(vol, req, index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}",
              req->lba, req->end_lba(), boost::uuids::to_string(vol->id()), index_resp.error());
@@ -314,32 +322,36 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         }
     }
 
-    return  folly::collectAllUnsafe(futs).thenValue([index_kvs = std::move(index_kvs), buf = req->buffer
-        , start_lba = req->lba, blk_size = vol->rd()->get_blk_size()](auto&& vf) -> VolumeManager::Result< folly::Unit > {
+    return  folly::collectAllUnsafe(futs).thenValue([this, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
         for (auto const& err_c : vf) {
             if (sisl_unlikely(err_c.value())) {
                 auto ec = err_c.value();
                 return folly::makeUnexpected(to_volume_error(ec));
             }
-            // verify the checksum
-            auto read_buf = buf;
-            for(uint64_t cur_lba = start_lba, i = 0; i < index_kvs.size(); ++i, ++cur_lba) {
-                auto const& [key, value] = index_kvs[i];
-                // ignore the holes
-                if(cur_lba != key.key()) {
-                    read_buf += (key.key() - cur_lba) * blk_size;
-                    cur_lba = key.key();
-                }
-                auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), blk_size);
-                if(checksum != value.checksum()) {
-                    LOGE("crc mismatch for lba: {}, blk id {}, expected: {}, actual: {}", cur_lba, value.blkid().to_string(), value.checksum(), checksum);
-                    return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
-                }
-                read_buf += blk_size;
-            }
         }
-        return folly::Unit();
+        // verify the checksum and return
+        return verify_checksum(read_ctx.index_kvs, read_ctx.buf, read_ctx.start_lba, read_ctx.blk_sz);
     });
+}
+
+VolumeManager::Result< folly::Unit > HomeBlocksImpl::verify_checksum(std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >const& index_kvs, 
+                                                        uint8_t* buf, lba_t start_lba, uint32_t blk_size) {
+    auto read_buf = buf;
+    for(uint64_t cur_lba = start_lba, i = 0; i < index_kvs.size(); ++i, ++cur_lba) {
+        auto const& [key, value] = index_kvs[i];
+        // ignore the holes
+        if(cur_lba != key.key()) {
+            read_buf += (key.key() - cur_lba) * blk_size;
+            cur_lba = key.key();
+        }
+        auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), blk_size);
+        if(checksum != value.checksum()) {
+            LOGE("crc mismatch for lba: {}, blk id {}, expected: {}, actual: {}", cur_lba, value.blkid().to_string(), value.checksum(), checksum);
+            return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
+        }
+        read_buf += blk_size;
+    }
+    return folly::Unit();
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
