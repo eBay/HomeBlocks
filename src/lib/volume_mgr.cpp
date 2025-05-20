@@ -259,11 +259,14 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     // TODO: check if the system is accepting ios (shutdown in progress etc)
     RELEASE_ASSERT(vol != nullptr, "VolumePtr is null");
     // Step 1: get the blk ids from index table
-    std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > > out_vector;
-    if(auto index_resp = read_from_index(vol, req, out_vector); index_resp.hasError()) {
+    std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > > index_kvs;
+    if(auto index_resp = read_from_index(vol, req, index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}",
              req->lba, req->end_lba(), boost::uuids::to_string(vol->id()), index_resp.error());
         return index_resp;
+    }
+    if (index_kvs.empty()) {
+        return folly::Unit();
     }
     
     // Step 2: Consolidate the blk ids and issue read requests
@@ -271,14 +274,14 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     auto* read_buf = req->buffer;
     DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
     auto cur_lba = req->lba;
-    for (uint32_t i = 0, blk_count = 0, start_idx = 0; i < out_vector.size(); ++i, ++cur_lba) {
-        auto const& [key, value] = out_vector[i];
+    for (uint32_t i = 0, blk_count = 0, start_idx = 0; i < index_kvs.size(); ++i, ++cur_lba) {
+        auto const& [key, value] = index_kvs[i];
         // cur_lba is used to keep track of the holes
         // move the read buffer by the size of the holes
         if(cur_lba != key.key()) {
             if(blk_count > 0) {
                 // submit the read for the previous blkids
-                submit_read_to_backend(read_buf, futs, out_vector[start_idx], blk_count, vol, req->part_of_batch);
+                submit_read_to_backend(read_buf, futs, index_kvs[start_idx], blk_count, vol, req->part_of_batch);
                 start_idx = i;
                 blk_count = 0;
             }
@@ -288,30 +291,30 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         }
 
         // Contiguous blkids are merged into a single read request
-        bool is_contiguous = (i == 0 || value.blkid().blk_num() == out_vector[i-1].second.blkid().blk_num() + 1);
+        bool is_contiguous = (i == 0 || (value.blkid().blk_num() == index_kvs[i-1].second.blkid().blk_num() + 1
+                                && value.blkid().chunk_num() == index_kvs[i-1].second.blkid().chunk_num())); 
         if(is_contiguous) {
             blk_count++;
-            if(i < out_vector.size() - 1) {
+            if(i < index_kvs.size() - 1) {
                 continue;
             }
         }
         // submit the read for the previous blkids
-        submit_read_to_backend(read_buf, futs, out_vector[start_idx], blk_count, vol, req->part_of_batch);
-        if(out_vector[start_idx].second.blkid().blk_num() + blk_count - 1 == value.blkid().blk_num()) {
-            // this is the last entry in the out vector
+        submit_read_to_backend(read_buf, futs, index_kvs[start_idx], blk_count, vol, req->part_of_batch);
+        if(index_kvs[start_idx].second.blkid().blk_num() + blk_count - 1 == value.blkid().blk_num()) {
+            // this is the last entry in the index_kvs
             continue;
         }
 
         // reset the blkids and size for the next read
         blk_count = 0;
         start_idx = i;
-        if(i == out_vector.size() - 1) {
-            submit_read_to_backend(read_buf, futs, out_vector[start_idx], 1, vol, req->part_of_batch);
+        if(i == index_kvs.size() - 1) {
+            submit_read_to_backend(read_buf, futs, index_kvs[start_idx], 1, vol, req->part_of_batch);
         }
     }
 
-    return out_vector.empty() ? folly::Unit() :
-      folly::collectAllUnsafe(futs).thenValue([out_vector = std::move(out_vector), buf = req->buffer
+    return  folly::collectAllUnsafe(futs).thenValue([index_kvs = std::move(index_kvs), buf = req->buffer
         , start_lba = req->lba, blk_size = vol->rd()->get_blk_size()](auto&& vf) -> VolumeManager::Result< folly::Unit > {
         for (auto const& err_c : vf) {
             if (sisl_unlikely(err_c.value())) {
@@ -320,8 +323,8 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
             }
             // verify the checksum
             auto read_buf = buf;
-            for(uint64_t cur_lba = start_lba, i = 0; i < out_vector.size(); ++i, ++cur_lba) {
-                auto const& [key, value] = out_vector[i];
+            for(uint64_t cur_lba = start_lba, i = 0; i < index_kvs.size(); ++i, ++cur_lba) {
+                auto const& [key, value] = index_kvs[i];
                 // ignore the holes
                 if(cur_lba != key.key()) {
                     read_buf += (key.key() - cur_lba) * blk_size;
