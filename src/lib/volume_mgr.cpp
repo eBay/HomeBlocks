@@ -257,7 +257,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const
     return folly::Unit();
 }
 
-void HomeBlocksImpl::submit_io_batch() { RELEASE_ASSERT(false, "submit_io_batch Not implemented"); }
+void HomeBlocksImpl::submit_io_batch() { homestore::data_service().submit_io_batch(); }
 
 void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                               const std::vector< homestore::MultiBlkId >& new_blkids,
