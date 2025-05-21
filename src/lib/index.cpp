@@ -52,12 +52,12 @@ HomeBlocksImpl::write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t 
 }
 
 VolumeManager::Result< folly::Unit > HomeBlocksImpl::read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
-                         std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out_vector) {
+                                                                    index_kv_list_t& index_kvs) {
     homestore::BtreeQueryRequest< VolumeIndexKey > qreq{homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, 
                                 VolumeIndexKey{req->end_lba()}}, homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
     auto index_table = vol_ptr->indx_table();
     RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(vol_ptr->id()));
-    if (auto ret = index_table->query(qreq, out_vector); ret != homestore::btree_status_t::success) {
+    if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
         return folly::makeUnexpected(VolumeError::INDEX_ERROR);
     }
     return folly::Unit();

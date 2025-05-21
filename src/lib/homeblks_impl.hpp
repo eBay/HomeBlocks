@@ -40,6 +40,16 @@ struct VolJournalEntry {
     uint16_t num_old_blks;
 };
 
+using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
+using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
+
+struct vol_mgr_read_ctx {
+    uint8_t* buf;
+    lba_t start_lba;
+    uint32_t blk_size;
+    index_kv_list_t index_kvs{};
+};
+
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
     struct homeblks_sb_t {
         uint64_t magic;
@@ -133,8 +143,7 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
-    VolumeManager::Result< folly::Unit > verify_checksum(std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >const& index_kvs, 
-                                                            uint8_t* buf, lba_t start_lba, uint32_t blk_size);
+    VolumeManager::Result< folly::Unit > verify_checksum(vol_mgr_read_ctx const& read_ctx);
 
 private:
     // Should only be called for first-time-boot
@@ -154,7 +163,10 @@ private:
     VolumeManager::Result< folly::Unit > write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t end_lba,
                                                         std::unordered_map< lba_t, BlockInfo >& blocks_info);
     VolumeManager::Result< folly::Unit > read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
-                        std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out_vector);
+                                                         index_kv_list_t& index_kvs);
+    void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
+    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req, 
+                                const VolumePtr& vol, std::vector< folly::Future< std::error_code > >& futs);
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {

@@ -28,21 +28,6 @@ static VolumeError to_volume_error(std::error_code ec) {
     }
 }
 
-static void submit_read_to_backend(uint8_t*& read_buf, std::vector< folly::Future< std::error_code > >& futs,
-                        const std::pair< VolumeIndexKey, VolumeIndexValue >& first_blk_in_contiguous_range, uint32_t blk_count,
-                        const VolumePtr& vol, bool part_of_batch) {
-    // construct the blkid
-    auto blk_num = first_blk_in_contiguous_range.second.blkid().blk_num();
-    auto chunk_num = first_blk_in_contiguous_range.second.blkid().chunk_num();
-    auto blkid = homestore::MultiBlkId(blk_num, blk_count, chunk_num);
-    sisl::sg_list sgs;
-    auto size = blk_count * vol->rd()->get_blk_size();
-    sgs.size = size;
-    sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = size});
-    read_buf += size;
-    futs.emplace_back(vol->rd()->async_read(blkid, sgs, size, part_of_batch));
-}
-
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
@@ -255,73 +240,73 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol_ptr, c
         });
 }
 
-struct vol_mgr_read_ctx {
-    uint8_t* buf;
-    lba_t start_lba;
-    uint32_t blk_sz;
-    std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > > index_kvs{};
-};
+void HomeBlocksImpl::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read) {
+    for(uint32_t i = 0, start_idx = 0; i < index_kvs.size(); ++i) {
+        auto const& [key, value] = index_kvs[i];
+        bool is_contiguous = (i == 0 || (value.blkid().blk_num() == index_kvs[i-1].second.blkid().blk_num() + 1
+                                && value.blkid().chunk_num() == index_kvs[i-1].second.blkid().chunk_num()));
+        if(is_contiguous && i < index_kvs.size() - 1) {
+            // continue to the next entry if it is contiguous
+            continue;
+        }
+        // prepare the previous contiguous blkids to read
+        auto blk_num = index_kvs[start_idx].second.blkid().blk_num();
+        auto chunk_num = index_kvs[start_idx].second.blkid().chunk_num();
+        // if the last entry is part of the contiguous block,
+        // we need to account for it in the blk_count
+        auto blk_count = is_contiguous ? (i - start_idx + 1) : (i - start_idx);
+        blks_to_read.emplace_back(index_kvs[start_idx].first.key(), homestore::MultiBlkId(blk_num, blk_count, chunk_num));
+        start_idx = i;
+        if(!is_contiguous && i == index_kvs.size() - 1) {
+            // if the last entry is not contiguous, we need to add it as well
+            blks_to_read.emplace_back(key.key(), homestore::MultiBlkId(value.blkid().blk_num(), 1, value.blkid().chunk_num()));
+        }
+    }
+}
+
+void HomeBlocksImpl::submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req, 
+                                            const VolumePtr& vol, std::vector< folly::Future< std::error_code > >& futs) {
+    auto* read_buf = req->buffer;
+    DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
+    for(uint32_t i = 0, prev_lba = req->lba, prev_nblks = 0; i < blks_to_read.size(); ++i) {
+        auto const& [start_lba, blkids] = blks_to_read[i];
+        DEBUG_ASSERT(start_lba >= prev_lba + prev_nblks, "Invalid start lba: {}, prev_lba: {}, prev_nblks: {}",
+                     start_lba, prev_lba, prev_nblks);
+        auto holes_nblks = start_lba - (prev_lba + prev_nblks);
+        read_buf += (holes_nblks * vol->rd()->get_blk_size());
+        sisl::sg_list sgs;
+        sgs.size = blkids.blk_count() * vol->rd()->get_blk_size();
+        sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = sgs.size});
+        read_buf += sgs.size;
+        futs.emplace_back(vol->rd()->async_read(blkids, sgs, sgs.size, req->part_of_batch));
+        prev_lba = start_lba;
+        prev_nblks = blkids.blk_count();
+    }
+}
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     // TODO: check if the system is accepting ios (shutdown in progress etc)
     RELEASE_ASSERT(vol != nullptr, "VolumePtr is null");
     // Step 1: get the blk ids from index table
-    vol_mgr_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_sz = vol->rd()->get_blk_size()};
-    auto& index_kvs = read_ctx.index_kvs;
-    if(auto index_resp = read_from_index(vol, req, index_kvs); index_resp.hasError()) {
+    vol_mgr_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_size = vol->rd()->get_blk_size()};
+    if(auto index_resp = read_from_index(vol, req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}",
              req->lba, req->end_lba(), boost::uuids::to_string(vol->id()), index_resp.error());
         return index_resp;
     }
-    if (index_kvs.empty()) {
+    if (read_ctx.index_kvs.empty()) {
         return folly::Unit();
     }
     
-    // Step 2: Consolidate the blk ids and issue read requests
+    // Step 2: Consolidate the blocks by merging the contiguous blkids
     std::vector< folly::Future< std::error_code > > futs;
-    auto* read_buf = req->buffer;
-    DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
-    auto cur_lba = req->lba;
-    for (uint32_t i = 0, blk_count = 0, start_idx = 0; i < index_kvs.size(); ++i, ++cur_lba) {
-        auto const& [key, value] = index_kvs[i];
-        // cur_lba is used to keep track of the holes
-        // move the read buffer by the size of the holes
-        if(cur_lba != key.key()) {
-            if(blk_count > 0) {
-                // submit the read for the previous blkids
-                submit_read_to_backend(read_buf, futs, index_kvs[start_idx], blk_count, vol, req->part_of_batch);
-                start_idx = i;
-                blk_count = 0;
-            }
-            auto offset = (key.key() - cur_lba) * vol->rd()->get_blk_size();
-            read_buf += offset;
-            cur_lba = key.key();
-        }
+    read_blks_list_t blks_to_read;
+    generate_blkids_to_read(read_ctx.index_kvs, blks_to_read);
 
-        // Contiguous blkids are merged into a single read request
-        bool is_contiguous = (i == 0 || (value.blkid().blk_num() == index_kvs[i-1].second.blkid().blk_num() + 1
-                                && value.blkid().chunk_num() == index_kvs[i-1].second.blkid().chunk_num())); 
-        if(is_contiguous) {
-            blk_count++;
-            if(i < index_kvs.size() - 1) {
-                continue;
-            }
-        }
-        // submit the read for the previous blkids
-        submit_read_to_backend(read_buf, futs, index_kvs[start_idx], blk_count, vol, req->part_of_batch);
-        if(index_kvs[start_idx].second.blkid().blk_num() + blk_count - 1 == value.blkid().blk_num()) {
-            // this is the last entry in the index_kvs
-            continue;
-        }
+    // Step 3: Submit the read requests to backend
+    submit_read_to_backend(blks_to_read, req, vol, futs);
 
-        // reset the blkids and size for the next read
-        blk_count = 0;
-        start_idx = i;
-        if(i == index_kvs.size() - 1) {
-            submit_read_to_backend(read_buf, futs, index_kvs[start_idx], 1, vol, req->part_of_batch);
-        }
-    }
-
+    // Step 4: verify the checksum after all the reads are done
     return  folly::collectAllUnsafe(futs).thenValue([this, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
         for (auto const& err_c : vf) {
             if (sisl_unlikely(err_c.value())) {
@@ -330,26 +315,25 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
             }
         }
         // verify the checksum and return
-        return verify_checksum(read_ctx.index_kvs, read_ctx.buf, read_ctx.start_lba, read_ctx.blk_sz);
+        return verify_checksum(read_ctx);
     });
 }
 
-VolumeManager::Result< folly::Unit > HomeBlocksImpl::verify_checksum(std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >const& index_kvs, 
-                                                        uint8_t* buf, lba_t start_lba, uint32_t blk_size) {
-    auto read_buf = buf;
-    for(uint64_t cur_lba = start_lba, i = 0; i < index_kvs.size(); ++i, ++cur_lba) {
-        auto const& [key, value] = index_kvs[i];
+VolumeManager::Result< folly::Unit > HomeBlocksImpl::verify_checksum(vol_mgr_read_ctx const& read_ctx) {
+    auto read_buf = read_ctx.buf;
+    for(uint64_t cur_lba = read_ctx.start_lba, i = 0; i < read_ctx.index_kvs.size(); ++i, ++cur_lba) {
+        auto const& [key, value] = read_ctx.index_kvs[i];
         // ignore the holes
         if(cur_lba != key.key()) {
-            read_buf += (key.key() - cur_lba) * blk_size;
+            read_buf += (key.key() - cur_lba) * read_ctx.blk_size;
             cur_lba = key.key();
         }
-        auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), blk_size);
+        auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), read_ctx.blk_size);
         if(checksum != value.checksum()) {
             LOGE("crc mismatch for lba: {}, blk id {}, expected: {}, actual: {}", cur_lba, value.blkid().to_string(), value.checksum(), checksum);
             return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
         }
-        read_buf += blk_size;
+        read_buf += read_ctx.blk_size;
     }
     return folly::Unit();
 }
