@@ -188,15 +188,18 @@ private:
 #pragma pack()
 
 public:
-    VolumeIndexValue(const BlkId& base_blkid) : homestore::BtreeIntervalValue() {
+    VolumeIndexValue(const BlkId& base_blkid, homestore::csum_t csum) : homestore::BtreeIntervalValue() {
         m_blkid_suffix = uint32_cast(base_blkid.to_integer() & 0xFFFFFFFF) >> 1;
         m_blkid_prefix = uint32_cast(base_blkid.to_integer() >> 32);
+        m_checksum = csum;
     }
+    VolumeIndexValue(const BlkId& base_blkid) : VolumeIndexValue(base_blkid, 0) {}
     VolumeIndexValue() = default;
     VolumeIndexValue(const VolumeIndexValue& other) :
             homestore::BtreeIntervalValue(),
             m_blkid_prefix(other.m_blkid_prefix),
-            m_blkid_suffix(other.m_blkid_suffix) {}
+            m_blkid_suffix(other.m_blkid_suffix),
+            m_checksum(other.m_checksum) {}
     VolumeIndexValue(const sisl::blob& b, bool copy) : homestore::BtreeIntervalValue() { this->deserialize(b, copy); }
     virtual ~VolumeIndexValue() = default;
 
