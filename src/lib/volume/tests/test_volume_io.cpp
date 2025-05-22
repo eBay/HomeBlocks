@@ -359,6 +359,35 @@ TEST_F(VolumeIOTest, SingleVolumeReadData) {
     LOGINFO("SingleVolumeRead test done.");
 }
 
+TEST_F(VolumeIOTest, SingleVolumeReadHoles) {
+    auto vol = volume_list().back();
+    uint32_t nblks = 5000;
+    lba_t start_lba = 500;
+    generate_io_single(vol, start_lba, nblks);
+
+    // Verify with no holes in the range
+    vol->verify_data(1000, 2000, 40);
+
+    start_lba = 10000;
+    nblks = 50;
+    for(uint32_t i = 0; i/2 < nblks; i+=2) {
+        generate_io_single(vol, start_lba+i, 1);
+    }
+
+    // Verfy with hole after each lba
+    vol->verify_data(10000, 10100, 50);
+
+    start_lba = 20000;
+    for(uint32_t i = 0; i < 100; i++) {
+        if(i%7 > 2) {
+            generate_io_single(vol, start_lba+i, 1);
+        }
+    }
+    // Verify with mixed holes in the range
+    vol->verify_data(20000, 20100, 50);
+
+}
+
 TEST_F(VolumeIOTest, MultipleVolumeWriteData) {
     LOGINFO("Write data randomly on num_vols={} num_io={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
             SISL_OPTIONS["num_io"].as< uint64_t >());
