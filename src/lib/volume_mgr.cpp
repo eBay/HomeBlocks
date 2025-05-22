@@ -288,7 +288,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     // TODO: check if the system is accepting ios (shutdown in progress etc)
     RELEASE_ASSERT(vol != nullptr, "VolumePtr is null");
     // Step 1: get the blk ids from index table
-    vol_mgr_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_size = vol->rd()->get_blk_size()};
+    vol_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_size = vol->rd()->get_blk_size()};
     if(auto index_resp = read_from_index(vol, req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}",
              req->lba, req->end_lba(), boost::uuids::to_string(vol->id()), index_resp.error());
@@ -319,7 +319,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     });
 }
 
-VolumeManager::Result< folly::Unit > HomeBlocksImpl::verify_checksum(vol_mgr_read_ctx const& read_ctx) {
+VolumeManager::Result< folly::Unit > HomeBlocksImpl::verify_checksum(vol_read_ctx const& read_ctx) {
     auto read_buf = read_ctx.buf;
     for(uint64_t cur_lba = read_ctx.start_lba, i = 0; i < read_ctx.index_kvs.size(); ++i, ++cur_lba) {
         auto const& [key, value] = read_ctx.index_kvs[i];

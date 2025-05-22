@@ -43,7 +43,7 @@ struct VolJournalEntry {
 using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
 using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
 
-struct vol_mgr_read_ctx {
+struct vol_read_ctx {
     uint8_t* buf;
     lba_t start_lba;
     uint32_t blk_size;
@@ -143,7 +143,7 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
-    VolumeManager::Result< folly::Unit > verify_checksum(vol_mgr_read_ctx const& read_ctx);
+    VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
 
 private:
     // Should only be called for first-time-boot
