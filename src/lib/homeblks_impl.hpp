@@ -141,15 +141,6 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
-#if 0
-    VolumeManager::Result< folly::Unit > write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t end_lba,
-                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info);
-    VolumeManager::Result< folly::Unit > read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
-                                                         index_kv_list_t& index_kvs);
-    void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
-    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
-                                const VolumePtr& vol, std::vector< folly::Future< std::error_code > >& futs);
-#endif
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
