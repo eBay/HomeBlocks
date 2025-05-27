@@ -133,9 +133,6 @@ void Volume::destroy() {
 }
 
 VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_req) {
-    // increment the outstanding IO count;
-    outstanding_io_cnt_.increment();
-
     // Step 1. Allocate new blkids. Homestore might return multiple blkid's pointing
     // to different contigious memory locations.
     auto data_size = vol_req->nlbas * rd()->get_blk_size();
