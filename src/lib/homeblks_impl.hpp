@@ -32,24 +32,6 @@ namespace homeblocks {
 
 class Volume;
 
-ENUM(HomeBlksMsgType, uint8_t, READ, WRITE, UNMAP);
-
-struct VolJournalEntry {
-    lba_t start_lba;
-    lba_count_t nlbas;
-    uint16_t num_old_blks;
-};
-
-using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
-using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
-
-struct vol_read_ctx {
-    uint8_t* buf;
-    lba_t start_lba;
-    uint32_t blk_size;
-    index_kv_list_t index_kvs{};
-};
-
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
     struct homeblks_sb_t {
         uint64_t magic;
@@ -143,7 +125,7 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
-    VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
+    // VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
 
 private:
     // Should only be called for first-time-boot
@@ -159,14 +141,15 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
-
+#if 0
     VolumeManager::Result< folly::Unit > write_to_index(const VolumePtr& vol_ptr, lba_t start_lba, lba_t end_lba,
                                                         std::unordered_map< lba_t, BlockInfo >& blocks_info);
     VolumeManager::Result< folly::Unit > read_from_index(const VolumePtr& vol_ptr, const vol_interface_req_ptr& req,
                                                          index_kv_list_t& index_kvs);
     void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
-    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req, 
+    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
                                 const VolumePtr& vol, std::vector< folly::Future< std::error_code > >& futs);
+#endif
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
@@ -183,59 +166,4 @@ private:
 };
 
 const homestore::csum_t init_crc_16 = 0x8005;
-
-struct HomeBlksMessageHeader {
-    HomeBlksMessageHeader() = default;
-    HomeBlksMsgType msg_type;
-    volume_id_t volume_id;
-
-    std::string to_string() const {
-        return fmt::format(" msg_type={}volume={}\n", enum_name(msg_type), boost::uuids::to_string(volume_id));
-    }
-};
-
-struct homeblks_repl_ctx : public homestore::repl_req_ctx {
-    sisl::io_blob_safe hdr_buf_;
-    sisl::io_blob_safe key_buf_;
-
-    homeblks_repl_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homestore::repl_req_ctx{} {
-        hdr_buf_ = std::move(sisl::io_blob_safe{uint32_cast(sizeof(HomeBlksMessageHeader) + hdr_extn_size), 0});
-        new (hdr_buf_.bytes()) HomeBlksMessageHeader();
-
-        if (key_size) { key_buf_ = std::move(sisl::io_blob_safe{key_size, 0}); }
-    }
-
-    ~homeblks_repl_ctx() {
-        if (hdr_buf_.bytes()) { header()->~HomeBlksMessageHeader(); }
-    }
-
-    template < typename T >
-    T* to() {
-        return r_cast< T* >(this);
-    }
-
-    HomeBlksMessageHeader* header() { return r_cast< HomeBlksMessageHeader* >(hdr_buf_.bytes()); }
-    uint8_t* header_extn() { return hdr_buf_.bytes() + sizeof(HomeBlksMessageHeader); }
-
-    sisl::io_blob_safe& header_buf() { return hdr_buf_; }
-    sisl::io_blob_safe const& cheader_buf() const { return hdr_buf_; }
-
-    sisl::io_blob_safe& key_buf() { return key_buf_; }
-    sisl::io_blob_safe const& ckey_buf() const { return key_buf_; }
-};
-
-template < typename T >
-struct repl_result_ctx : public homeblks_repl_ctx {
-    folly::Promise< T > promise_;
-    VolumePtr vol_ptr_{nullptr};
-
-    template < typename... Args >
-    static intrusive< repl_result_ctx< T > > make(Args&&... args) {
-        return intrusive< repl_result_ctx< T > >{new repl_result_ctx< T >(std::forward< Args >(args)...)};
-    }
-
-    repl_result_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homeblks_repl_ctx{hdr_extn_size, key_size} {}
-    folly::SemiFuture< T > result() { return promise_.getSemiFuture(); }
-};
-
 } // namespace homeblocks

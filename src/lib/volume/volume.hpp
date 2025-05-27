@@ -16,6 +16,7 @@
 #pragma once
 #include "index.hpp"
 #include "sisl/utility/enum.hpp"
+#include "sisl/utility/atomic_counter.hpp"
 #include <homeblks/volume_mgr.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
@@ -31,6 +32,32 @@ using VolIdxTablePtr = shared< VolumeIndexTable >;
 using ReplDevPtr = shared< homestore::ReplDev >;
 using index_cfg_t = homestore::BtreeConfig;
 
+using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
+using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
+struct vol_read_ctx {
+    uint8_t* buf;
+    lba_t start_lba;
+    uint32_t blk_size;
+    index_kv_list_t index_kvs{};
+};
+
+struct VolJournalEntry {
+    lba_t start_lba;
+    lba_count_t nlbas;
+    uint16_t num_old_blks;
+};
+
+ENUM(MsgType, uint8_t, READ, WRITE, UNMAP);
+struct MsgHeader {
+    MsgHeader() = default;
+    MsgType msg_type;
+    volume_id_t volume_id;
+
+    std::string to_string() const {
+        return fmt::format(" msg_type={}volume={}\n", enum_name(msg_type), boost::uuids::to_string(volume_id));
+    }
+};
+
 ENUM(vol_state, uint32_t,
      INIT,       // initialized, but not ready online yet;
      ONLINE,     // online and ready to be used;
@@ -42,14 +69,14 @@ ENUM(vol_state, uint32_t,
      READONLY    // in read only mode;
 );
 
-class Volume {
-
+class Volume : public std::enable_shared_from_this< Volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
 private:
     static constexpr uint64_t VOL_SB_MAGIC = 0xc01fadeb; // different from old release;
     static constexpr uint64_t VOL_SB_VER = 0x3;          // bump one from old release
     static constexpr uint64_t VOL_NAME_SIZE = 100;
+    static constexpr homestore::csum_t init_crc_16 = 0x8005;
 
     struct vol_sb_t {
         uint64_t magic;
@@ -125,6 +152,13 @@ public:
         }
     }
 
+    VolumeManager::NullAsyncResult write(const vol_interface_req_ptr& vol_req);
+
+    VolumeManager::Result< folly::Unit > write_to_index(lba_t start_lba, lba_t end_lba,
+                                                        std::unordered_map< lba_t, BlockInfo >& blocks_info);
+
+    VolumeManager::NullAsyncResult read(const vol_interface_req_ptr& req);
+
 private:
     //
     // this API will be called to initialize volume in both volume creation and volume recovery;
@@ -134,11 +168,66 @@ private:
     //
     bool init(bool is_recovery = false);
 
+    VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
+
+    void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
+                                std::vector< folly::Future< std::error_code > >& futs);
+
+    void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
+
+    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs);
+
 private:
     VolumeInfoPtr vol_info_;
     ReplDevPtr rd_;
     VolIdxTablePtr indx_tbl_;
     superblk< vol_sb_t > sb_;
+
+    sisl::atomic_counter< uint64_t > outstanding_io_cnt_{0}; // used to track outstanding IOs on the volume;
+};
+
+struct vol_repl_ctx : public homestore::repl_req_ctx {
+    sisl::io_blob_safe hdr_buf_;
+    sisl::io_blob_safe key_buf_;
+
+    vol_repl_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : homestore::repl_req_ctx{} {
+        hdr_buf_ = std::move(sisl::io_blob_safe{uint32_cast(sizeof(MsgHeader) + hdr_extn_size), 0});
+        new (hdr_buf_.bytes()) MsgHeader();
+
+        if (key_size) { key_buf_ = std::move(sisl::io_blob_safe{key_size, 0}); }
+    }
+
+    ~vol_repl_ctx() {
+        if (hdr_buf_.bytes()) { header()->~MsgHeader(); }
+    }
+
+    template < typename T >
+    T* to() {
+        return r_cast< T* >(this);
+    }
+
+    MsgHeader* header() { return r_cast< MsgHeader* >(hdr_buf_.bytes()); }
+    uint8_t* header_extn() { return hdr_buf_.bytes() + sizeof(MsgHeader); }
+
+    sisl::io_blob_safe& header_buf() { return hdr_buf_; }
+    sisl::io_blob_safe const& cheader_buf() const { return hdr_buf_; }
+
+    sisl::io_blob_safe& key_buf() { return key_buf_; }
+    sisl::io_blob_safe const& ckey_buf() const { return key_buf_; }
+};
+
+template < typename T >
+struct repl_result_ctx : public vol_repl_ctx {
+    folly::Promise< T > promise_;
+    VolumePtr vol_ptr_{nullptr};
+
+    template < typename... Args >
+    static intrusive< repl_result_ctx< T > > make(Args&&... args) {
+        return intrusive< repl_result_ctx< T > >{new repl_result_ctx< T >(std::forward< Args >(args)...)};
+    }
+
+    repl_result_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : vol_repl_ctx{hdr_extn_size, key_size} {}
+    folly::SemiFuture< T > result() { return promise_.getSemiFuture(); }
 };
 
 } // namespace homeblocks
