@@ -156,5 +156,4 @@ private:
     HomeBlocksImpl* hb_;
 };
 
-const homestore::csum_t init_crc_16 = 0x8005;
 } // namespace homeblocks
