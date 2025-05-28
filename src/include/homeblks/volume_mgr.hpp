@@ -96,9 +96,9 @@ public:
      *
      * @param vol Pointer to the volume
      * @param req Request created which contains all the write parameters
-     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait for batch_submit
-     * call before issuing the writes. IO might already be started or even completed (in case of errors) before
-     * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
+     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait
+     * for batch_submit call before issuing the writes. IO might already be started or even completed (in case of
+     * errors) before batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
      *
      * @return std::error_condition no_error or error in issuing writes
      */
@@ -110,9 +110,9 @@ public:
      *
      * @param vol Pointer to the volume
      * @param req Request created which contains all the read parameters
-     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait for batch_submit
-     * call before issuing the reads. IO might already be started or even completed (in case of errors) before
-     * batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
+     * req.part_of_batch field can be used if this request is part of a batch request. If so, implementation can wait
+     * for batch_submit call before issuing the reads. IO might already be started or even completed (in case of errors)
+     * before batch_sumbit call, so application cannot assume IO will be started only after submit_batch call.
      *
      * @return std::error_condition no_error or error in issuing reads
      */

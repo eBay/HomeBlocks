@@ -23,15 +23,15 @@ void HBListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob con
     // on_commit called whenever journal has flushed log entries. header contains the msg type and volume
     // id, key contains the list of checksum, list of old blkids for write case. blkid's are the new blkid's
     // where data is written.
-    const HomeBlksMessageHeader* msg_header = r_cast< const HomeBlksMessageHeader* >(header.cbytes());
+    const MsgHeader* msg_header = r_cast< const MsgHeader* >(header.cbytes());
     switch (msg_header->msg_type) {
-    case HomeBlksMsgType::WRITE:
+    case MsgType::WRITE:
         hb_->on_write(lsn, header, key, blkids, ctx);
         break;
 
-    case HomeBlksMsgType::READ:
+    case MsgType::READ:
         break;
-    case HomeBlksMsgType::UNMAP:
+    case MsgType::UNMAP:
         break;
     }
 }
