@@ -45,15 +45,20 @@ struct VolumeInfo {
     VolumeInfo() = default;
     VolumeInfo(const VolumeInfo&) = delete;
     VolumeInfo(VolumeInfo&& rhs) noexcept :
-            id(rhs.id), size_bytes(rhs.size_bytes), page_size(rhs.page_size), name(std::move(rhs.name)) {}
+            id(rhs.id),
+            size_bytes(rhs.size_bytes),
+            page_size(rhs.page_size),
+            name(std::move(rhs.name)),
+            ordinal(rhs.ordinal) {}
 
-    VolumeInfo(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
-            id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
+    VolumeInfo(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name, uint64_t ord) :
+            id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)), ordinal(ord) {}
 
     volume_id_t id;
     uint64_t size_bytes{0};
     uint64_t page_size{0};
     std::string name;
+    uint64_t ordinal;
 
     auto operator<=>(VolumeInfo const& rhs) const {
         return boost::uuids::hash_value(id) <=> boost::uuids::hash_value(rhs.id);
@@ -62,8 +67,8 @@ struct VolumeInfo {
     auto operator==(VolumeInfo const& rhs) const { return id == rhs.id; }
 
     std::string to_string() {
-        return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={}", boost::uuids::to_string(id),
-                           size_bytes, page_size, name);
+        return fmt::format("VolumeInfo: id={} size_bytes={}, page_size={}, name={} ordinal={}",
+                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal);
     }
 };
 

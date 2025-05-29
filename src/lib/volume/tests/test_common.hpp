@@ -31,6 +31,7 @@
 #include <iostream>
 #include <thread>
 #include <homeblks/home_blks.hpp>
+#include "lib/homeblks_impl.hpp"
 
 SISL_OPTION_GROUP(
     test_common_setup,
@@ -174,6 +175,7 @@ public:
         init_dev_list(true /*init_device*/);
 
         LOGINFO("Starting HomeBlocks");
+        homeblocks::HomeBlocksImpl::_hs_chunk_size = 128 * Mi;
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }

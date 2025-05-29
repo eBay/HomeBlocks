@@ -26,8 +26,8 @@
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_volume_setup,
-                (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
-                "number"));
+                  (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
+                   "number"));
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup, homeblocks)
 SISL_LOGGING_DECL(test_volume)
 
@@ -138,6 +138,20 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(vinfo_ptr != nullptr);
         }
     }
+
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb->volume_manager();
+        for (const auto& id : vol_ids) {
+            auto ret = vol_mgr->remove_volume(id).get();
+            ASSERT_TRUE(ret);
+            // sleep for a while
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is not there
+            ASSERT_TRUE(vinfo_ptr == nullptr);
+        }
+    }
 }
 
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
@@ -176,18 +190,20 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
-    ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup, homeblocks);
-    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
-    parsed_argc = 1;
-    auto f = ::folly::Init(&parsed_argc, &argv, true);
+    char** orig_argv = argv;
 
     std::vector< std::string > args;
     for (int i = 0; i < argc; ++i) {
         args.emplace_back(argv[i]);
     }
 
-    g_helper = std::make_unique< test_common::HBTestHelper >("test_volume", args, argv);
+    ::testing::InitGoogleTest(&parsed_argc, argv);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup, homeblocks);
+    spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
+    parsed_argc = 1;
+    auto f = ::folly::Init(&parsed_argc, &argv, true);
+
+    g_helper = std::make_unique< test_common::HBTestHelper >("test_volume", args, orig_argv);
     g_helper->setup();
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();

@@ -23,7 +23,7 @@ namespace homeblocks {
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    auto vol_ptr = Volume::make_volume(buf, cookie);
+    auto vol_ptr = Volume::make_volume(buf, cookie, chunk_selector_);
     auto id = vol_ptr->id();
 
     {
@@ -42,6 +42,8 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
                      "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+        RELEASE_ASSERT(!volume_ordinals_[vol_ptr->ordinal()], "Ordinal already assigned");
+        volume_ordinals_[vol_ptr->ordinal()] = true;
     }
 
     if (vol_ptr->is_destroying()) {
@@ -68,20 +70,23 @@ shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superb
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
     auto id = vol_info.id;
+
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
 
     {
         auto lg = std::shared_lock(vol_lock_);
+        vol_info.ordinal = get_volume_ordinal();
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
             return folly::makeUnexpected(VolumeError::INVALID_ARG);
         }
     }
 
-    auto vol_ptr = Volume::make_volume(std::move(vol_info));
+    auto vol_ptr = Volume::make_volume(std::move(vol_info), chunk_selector_);
     if (vol_ptr) {
         auto lg = std::scoped_lock(vol_lock_);
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+        LOGW("create_volume with input id: {} ordinal: {} ", boost::uuids::to_string(id), vol_ptr->info()->ordinal);
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
         return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
@@ -92,7 +97,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
-        LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
         // 1. get the volume ptr from the map;
         VolumePtr vol_ptr = nullptr;
         {
@@ -101,8 +105,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
         }
 
         if (vol_ptr) {
+            LOGINFO("remove_volume with input id: {} ordinal: {}", boost::uuids::to_string(id),
+                    vol_ptr->info()->ordinal);
+
             // 2. do volume destroy;
-            vol_ptr->destroy();
+            vol_ptr->destroy(chunk_selector_);
 #ifdef _PRERELEASE
             if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
 #endif
@@ -110,6 +117,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
             {
                 auto lg = std::scoped_lock(vol_lock_);
                 vol_map_.erase(vol_ptr->id());
+                volume_ordinals_[vol_ptr->info()->ordinal] = false;
             }
 
             LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
@@ -127,6 +135,22 @@ VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
     auto lg = std::shared_lock(vol_lock_);
     if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second; }
     return nullptr;
+}
+
+void HomeBlocksImpl::update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
+    VolumePtr vol_ptr = nullptr;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto it = vol_map_.begin(); it != vol_map_.end(); it++) {
+            if (it->second->info()->ordinal == volume_ordinal) {
+                vol_ptr = it->second;
+                break;
+            }
+        }
+    }
+
+    RELEASE_ASSERT(vol_ptr != nullptr, "Volume not found");
+    vol_ptr->update_vol_sb_cb(chunk_ids);
 }
 
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
@@ -203,6 +227,20 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     }
 
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
+}
+
+uint32_t HomeBlocksImpl::get_volume_ordinal() {
+    // Lock taken by the caller.
+    uint32_t ordinal = std::numeric_limits< uint32_t >::max();
+    for (uint32_t i = 0; i < volume_ordinals_.size(); i++) {
+        if (!volume_ordinals_[i]) {
+            ordinal = i;
+            break;
+        }
+    }
+    RELEASE_ASSERT(ordinal != std::numeric_limits< uint32_t >::max(), "Couldnt find ordinal");
+    volume_ordinals_[ordinal] = true;
+    return ordinal;
 }
 
 } // namespace homeblocks
