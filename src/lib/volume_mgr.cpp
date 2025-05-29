@@ -23,7 +23,7 @@ namespace homeblocks {
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    auto vol_ptr = Volume::make_volume(buf, cookie);
+    auto vol_ptr = Volume::make_volume(buf, cookie, chunk_selector_);
     auto id = vol_ptr->id();
 
     {
@@ -42,6 +42,7 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
                      "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+        ordinal_reserver_->reserve(vol_ptr->ordinal());
     }
 
     if (vol_ptr->is_destroying()) {
@@ -76,10 +77,17 @@ shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superb
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
     inc_ref();
     auto id = vol_info.id;
+
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
 
     {
         auto lg = std::shared_lock(vol_lock_);
+        vol_info.ordinal = ordinal_reserver_->reserve();
+        if (vol_info.ordinal >= MAX_NUM_VOLUMES) {
+            LOGE("No space to create volume with id: {}", boost::uuids::to_string(id));
+            return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
+        }
+
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
             dec_ref();
@@ -87,10 +95,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
         }
     }
 
-    auto vol_ptr = Volume::make_volume(std::move(vol_info));
+    auto vol_ptr = Volume::make_volume(std::move(vol_info), chunk_selector_);
     if (vol_ptr) {
         auto lg = std::scoped_lock(vol_lock_);
         vol_map_.emplace(std::make_pair(id, vol_ptr));
+        LOGW("create_volume with input id: {} ordinal: {} ", boost::uuids::to_string(id), vol_ptr->info()->ordinal);
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
         dec_ref();
@@ -106,8 +115,8 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 // vol in destroying state already indicates an outstanding volume which consumed in no_outstanding_vols() API;
 //
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
+    LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
-        LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
         // 1. get the volume ptr from the map;
         VolumePtr vol_ptr = nullptr;
         {
@@ -137,9 +146,10 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
             {
                 auto lg = std::scoped_lock(vol_lock_);
                 vol_map_.erase(vol_ptr->id());
+                ordinal_reserver_->unreserve(vol_ptr->info()->ordinal);
             }
 
-            LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
+            LOGINFO("Volume {} ordinal={} removed successfully", vol_ptr->id_str(), vol_ptr->info()->ordinal);
         } else {
             if (vol_ptr) {
                 LOGD("Volume {} is in destroying state or has outstanding requests: {}, backing off and wait for GC to "
@@ -160,6 +170,22 @@ VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
     auto lg = std::shared_lock(vol_lock_);
     if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second; }
     return nullptr;
+}
+
+void HomeBlocksImpl::update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
+    VolumePtr vol_ptr = nullptr;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto it = vol_map_.begin(); it != vol_map_.end(); it++) {
+            if (it->second->info()->ordinal == volume_ordinal) {
+                vol_ptr = it->second;
+                break;
+            }
+        }
+    }
+
+    RELEASE_ASSERT(vol_ptr != nullptr, "Volume not found");
+    vol_ptr->update_vol_sb_cb(chunk_ids);
 }
 
 bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }

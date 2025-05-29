@@ -17,6 +17,7 @@
 #pragma once
 #include <map>
 #include <string>
+#include <sisl/fds/id_reserver.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/utility/obj_life_counter.hpp>
 #include <homestore/crc.h>
@@ -27,6 +28,7 @@
 #include <homeblks/volume_mgr.hpp>
 #include <homeblks/common.hpp>
 #include "volume/volume.hpp"
+#include "volume/volume_chunk_selector.hpp"
 
 namespace homeblocks {
 
@@ -72,6 +74,11 @@ private:
     bool recovery_done_{false};
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
+    shared< VolumeChunkSelector > chunk_selector_;
+    std::unique_ptr< sisl::IDReserver > ordinal_reserver_;
+
+public:
+    static uint64_t _hs_chunk_size;
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
     bool shutdown_started_{false};
@@ -147,6 +154,8 @@ private:
 
     DevType get_device_type(std::string const& devname);
     auto defer() const { return folly::makeSemiFuture().via(executor_); }
+
+    void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
 
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);

@@ -175,6 +175,7 @@ HomeBlocksImpl::HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& applicat
     else
         RELEASE_ASSERT(false, "Unknown Folly Executor type: [{}]", exe_type);
     LOGI("initialized with [executor={}]", exe_type);
+    ordinal_reserver_ = std::make_unique< sisl::IDReserver >(MAX_NUM_VOLUMES);
 }
 
 DevType HomeBlocksImpl::get_device_type(std::string const& devname) {
@@ -230,7 +231,7 @@ private:
     HomeBlocksImpl* hb_;
     std::weak_ptr< HomeBlocksApplication > ho_app_;
 #if 0
-    std::map< homestore::group_id_t, std::shared_ptr< HBListener> > _repl_sm_map; 
+    std::map< homestore::group_id_t, std::shared_ptr< HBListener> > _repl_sm_map;
     std::mutex _repl_sm_map_lock;
 #endif
 };
@@ -257,6 +258,7 @@ void HomeBlocksImpl::get_dev_info(shared< HomeBlocksApplication > app, std::vect
     }
 }
 
+uint64_t HomeBlocksImpl::_hs_chunk_size = HS_CHUNK_SIZE;
 void HomeBlocksImpl::init_homestore() {
     auto app = _application.lock();
     RELEASE_ASSERT(app, "HomeObjectApplication lifetime unexpected!");
@@ -273,13 +275,18 @@ void HomeBlocksImpl::init_homestore() {
     get_dev_info(app, device_info, has_data_dev, has_fast_dev);
 
     RELEASE_ASSERT(device_info.size() != 0, "No supported devices found!");
+
+    chunk_selector_ = std::make_shared< VolumeChunkSelector >(
+        [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
+            update_vol_sb_cb(volume_ordinal, chunk_ids);
+        });
     using namespace homestore;
     // Note: timeline_consistency doesn't matter as we are using solo repl dev;
     auto repl_app =
         std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this, _application);
     bool need_format = homestore::hs()
                            ->with_index_service(std::make_unique< HBIndexSvcCB >(this))
-                           .with_repl_data_service(repl_app) // chunk selector defaulted to round_robine
+                           .with_repl_data_service(repl_app, chunk_selector_) // custom volume chunk selector
                            .start(hs_input_params{.devices = device_info, .app_mem_size = app_mem_size},
                                   [this]() { register_metablk_cb(); });
     if (need_format) {
@@ -300,8 +307,9 @@ void HomeBlocksImpl::init_homestore() {
                  hs_format_params{.dev_type = HSDevType::Data,
                                   .size_pct = 95.0,
                                   .num_chunks = 0, // num_chunks will be deduced from chunk_size
-                                  .chunk_size = HS_CHUNK_SIZE,
-                                  .block_size = DATA_BLK_SIZE}},
+                                  .chunk_size = _hs_chunk_size,
+                                  .block_size = DATA_BLK_SIZE,
+                                  .chunk_sel_type = chunk_selector_type_t::CUSTOM}},
             });
         } else {
             auto run_on_type = has_fast_dev ? homestore::HSDevType::Fast : homestore::HSDevType::Data;
@@ -315,8 +323,9 @@ void HomeBlocksImpl::init_homestore() {
                  hs_format_params{.dev_type = run_on_type,
                                   .size_pct = 75.0,
                                   .num_chunks = 0, // num_chunks will be deduced from chunk_size;
-                                  .chunk_size = HS_CHUNK_SIZE,
-                                  .block_size = DATA_BLK_SIZE}},
+                                  .chunk_size = _hs_chunk_size,
+                                  .block_size = DATA_BLK_SIZE,
+                                  .chunk_sel_type = chunk_selector_type_t::CUSTOM}},
             });
         }
         // repl_app->on_repl_devs_init_completed();
