@@ -54,7 +54,7 @@ private:
     static constexpr uint32_t DATA_BLK_SIZE = 4096;
     static constexpr uint32_t SB_FLAGS_GRACEFUL_SHUTDOWN{0x00000001};
     static constexpr uint32_t SB_FLAGS_RESTRICTED{0x00000002};
-
+    static constexpr uint64_t MAX_VOL_IO_SIZE = 1 * Mi; // 1 MiB
 private:
     /// Our SvcId retrieval and SvcId->IP mapping
     std::weak_ptr< HomeBlocksApplication > _application;
@@ -89,6 +89,8 @@ public:
     iomgr::drive_type data_drive_type() const final;
 
     peer_id_t our_uuid() const final { return our_uuid_; }
+
+    uint64_t max_vol_io_size() const final { return MAX_VOL_IO_SIZE; }
 
     /// VolumeManager
     NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
