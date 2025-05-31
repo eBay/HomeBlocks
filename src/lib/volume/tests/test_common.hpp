@@ -213,6 +213,31 @@ public:
         }
     }
 
+#ifdef _PRERELEASE
+    void set_flip_point(const std::string flip_name) {
+        flip::FlipCondition null_cond;
+        flip::FlipFrequency freq;
+        freq.set_count(2);
+        freq.set_percent(100);
+        m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
+        LOGI("Flip {} set", flip_name);
+    }
+
+    void set_delay_flip(const std::string flip_name, uint64_t delay_usec, uint32_t count = 1, uint32_t percent = 100) {
+        flip::FlipCondition null_cond;
+        flip::FlipFrequency freq;
+        freq.set_count(count);
+        freq.set_percent(percent);
+        m_fc.inject_delay_flip(flip_name, {null_cond}, freq, delay_usec);
+        LOGDEBUG("Flip {} set", flip_name);
+    }
+
+    void remove_flip(const std::string flip_name) {
+        m_fc.remove_flip(flip_name);
+        LOGDEBUG("Flip {} removed", flip_name);
+    }
+#endif
+
 private:
     void init_devices(bool is_file, uint64_t dev_size = 0) {
         if (is_file) {
@@ -275,6 +300,10 @@ private:
     peer_id_t svc_id_;
     Runner io_runner_;
     Waiter waiter_;
+
+#ifdef _PRERELEASE
+    flip::FlipClient m_fc{iomgr_flip::instance()};
+#endif
 };
 
 } // namespace test_common

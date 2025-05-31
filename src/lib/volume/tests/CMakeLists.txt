@@ -22,5 +22,5 @@ target_link_libraries(test_volume_io
     -rdynamic
 )
 
-add_test(NAME VolumeTest COMMAND test_volume)
+add_test(NAME VolumeTest COMMAND test_volume --gc_timer_secs=5)
 add_test(NAME VolumeIOTest COMMAND test_volume_io)

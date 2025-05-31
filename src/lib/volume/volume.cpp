@@ -101,12 +101,12 @@ bool Volume::init(bool is_recovery) {
 }
 
 void Volume::destroy() {
-    // 0. Set destroying state in superblock;
-    state_change(vol_state::DESTROYING);
+    LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+    destroy_started_ = true;
 
     // 1. destroy the repl dev;
     if (rd_) {
-        LOGI("Destroying repl dev for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+        LOGI("Destroying repl dev for volume: {}", vol_info_->name);
         homestore::hs()->repl_service().remove_repl_dev(id()).get();
         rd_ = nullptr;
     }
@@ -232,7 +232,6 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
 
 VolumeManager::Result< folly::Unit > Volume::write_to_index(lba_t start_lba, lba_t end_lba,
                                                             std::unordered_map< lba_t, BlockInfo >& blocks_info) {
-
     // Use filter callback to get the old blkid.
     homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                           BtreeValue const& value) {
