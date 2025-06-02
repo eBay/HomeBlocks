@@ -52,16 +52,15 @@ public:
     }
 };
 
+#ifdef _PRERELEASE
 TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
         auto vol_mgr = hb->volume_manager();
 
-#ifdef _PRERELEASE
         uint32_t delay_sec = 10;
         g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 1, 100);
-#endif
 
         auto num_vols = 1ul;
 
@@ -99,11 +98,11 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
         }
     }
 
-#ifdef _PRERELEASE
     g_helper->remove_flip("vol_fake_io_delay_simulation");
-#endif
+
     g_helper->restart(5);
 }
+#endif
 
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
