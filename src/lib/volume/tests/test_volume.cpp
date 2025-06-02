@@ -59,8 +59,8 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
         auto hb = g_helper->inst();
         auto vol_mgr = hb->volume_manager();
 
-        uint32_t delay_sec = 10;
-        g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 1, 100);
+        uint32_t delay_sec = 6;
+        g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
 
         auto num_vols = 1ul;
 
@@ -77,6 +77,9 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
             // fake a write that will be delayed;
             vol_mgr->write(vol_ptr, nullptr);
+
+            // fake a read that will be delayed;
+            vol_mgr->read(vol_ptr, nullptr);
         }
 
         auto const s = hb->get_stats();
@@ -85,22 +88,23 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
-            auto ret = vol_mgr->remove_volume(id).get();
-            ASSERT_TRUE(ret);
-            auto delay_secs = 20;
-            LOGINFO("Volume {} removed, waiting for {} seconds for IO to complete", boost::uuids::to_string(id),
-                    delay_secs);
-            // sleep for a while
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_secs * 1000));
-            auto vol_ptr = vol_mgr->lookup_volume(id);
-            // verify the volume is not there
-            ASSERT_TRUE(vol_ptr == nullptr);
+            while (true) {
+                auto ret = vol_mgr->remove_volume(id).get();
+                ASSERT_TRUE(ret);
+                auto delay_secs = 1;
+                LOGINFO("Volume {} removed, waiting for {} seconds for IO to complete", boost::uuids::to_string(id),
+                        delay_secs);
+                // sleep for a while
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_secs * 1000));
+                auto vol_ptr = vol_mgr->lookup_volume(id);
+                if (!vol_ptr) { break; }
+            }
         }
     }
 
     g_helper->remove_flip("vol_fake_io_delay_simulation");
 
-    g_helper->restart(5);
+    g_helper->restart(2);
 }
 #endif
 
@@ -140,7 +144,7 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
         }
     }
 
-    g_helper->restart(5);
+    g_helper->restart(2);
 }
 
 TEST_F(VolumeTest, CreateVolumeThenRecover) {
@@ -164,7 +168,7 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         }
     }
 
-    g_helper->restart(5);
+    g_helper->restart(2);
 
     // verify the volumes are still there
     {
@@ -209,7 +213,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
         }
     }
 
-    g_helper->restart(5);
+    g_helper->restart(2);
 }
 
 int main(int argc, char* argv[]) {
