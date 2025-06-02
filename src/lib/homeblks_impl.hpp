@@ -150,6 +150,13 @@ private:
     void vol_gc();
 
     uint64_t gc_timer_secs() const;
+
+#ifdef _PRERELEASE
+    // For testing purpose only
+    // If delay flip is not set, false will be returned;
+    // If delay flip is set, it will delay the IOs for a given VolumePtr
+    bool delay_fake_io(VolumePtr vol);
+#endif
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {

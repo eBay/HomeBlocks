@@ -155,12 +155,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
     }
 
     vol->inc_ref();
+
 #ifdef _PRERELEASE
-    if (iomgr_flip::instance()->delay_flip("vol_fake_io_delay_simulation", [this, vol]() mutable {
-            LOGI("Resuming fake IO delay flip is done. Do nothing ");
-            vol->dec_ref();
-        })) {
-        LOGI("Slow down vol fake IO flip is enabled, scheduling to call later.");
+    if (delay_fake_io(vol)) {
+        // If we are delaying IO, we return immediately without calling vol->write
+        // and let the delay flip handle the completion later.
         return folly::Unit();
     }
 #endif
@@ -178,6 +177,15 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     }
 
     vol->inc_ref();
+
+#ifdef _PRERELEASE
+    if (delay_fake_io(vol)) {
+        // If we are delaying IO, we return immediately without calling vol->read
+        // and let the delay flip handle the completion later.
+        return folly::Unit();
+    }
+#endif
+
     auto ret = vol->read(req);
     vol->dec_ref();
     return ret;
@@ -255,5 +263,18 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
 
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }
+
+#ifdef _PRERELEASE
+bool HomeBlocksImpl::delay_fake_io(VolumePtr v) {
+    if (iomgr_flip::instance()->delay_flip("vol_fake_io_delay_simulation", [this, v]() mutable {
+            LOGI("Resuming fake IO delay flip is done. Do nothing ");
+            v->dec_ref();
+        })) {
+        LOGI("Slow down vol fake IO flip is enabled, scheduling to call later.");
+        return true;
+    }
+    return false;
+}
+#endif
 
 } // namespace homeblocks
