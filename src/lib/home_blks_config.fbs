@@ -1,0 +1,14 @@
+native_include "sisl/utility/non_null_ptr.hpp";
+
+namespace homeblkscfg;
+
+attribute "hotswap";
+attribute "deprecated";
+
+
+table HomeBlksSettings{
+    // reaper thread timer in seconds
+    reaper_thread_timer_secs: uint64 = 120;
+}
+
+root_type HomeBlksSettings;
