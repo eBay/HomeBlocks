@@ -314,37 +314,18 @@ uint64_t HomeBlocksImpl::gc_timer_secs() const {
         LOGINFO("Using gc_timer_secs option value: {}", n);
         return n;
     } else {
-        // default to 60 seconds
-        return 120;
+        return HB_DYNAMIC_CONFIG(reaper_thread_timer_secs);
     }
 }
 
 void HomeBlocksImpl::start_reaper_thread() {
+    auto const nsecs = gc_timer_secs();
+    LOGI("Starting volume garbage collection timer with interval: {} seconds", nsecs);
     vol_gc_timer_hdl_ = iomanager.schedule_global_timer(
-        gc_timer_secs() * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */,
-        iomgr::reactor_regex::all_user, [this](void*) { this->vol_gc(); }, true /* wait_to_schedule */);
+        nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
+        [this](void*) { this->vol_gc(); }, true /* wait_to_schedule */);
 }
 
-#if 0
-void HomeBlocksImpl::start_reaper_thread() {
-    folly::Promise< folly::Unit > p;
-    auto f = p.getFuture();
-    iomanager.create_reactor(
-        "volume_reaper", iomgr::INTERRUPT_LOOP, 4u /* num_fibers */, [this, &p](bool is_started) mutable {
-            if (is_started) {
-                reaper_fiber_ = iomanager.iofiber_self();
-                vol_gc_timer_hdl_ = iomanager.schedule_thread_timer(60ull * 1000 * 1000 * 1000, true /* recurring */,
-                                                                    nullptr /*cookie*/, [this](void*) { vol_gc(); });
-                p.setValue();
-            } else {
-                iomanager.cancel_timer(vol_gc_timer_hdl_, true /* wait */);
-                vol_gc_timer_hdl_ = iomgr::null_timer_handle;
-            }
-        });
-
-    std::move(f).get();
-}
-#endif
 void HomeBlocksImpl::vol_gc() {
     LOGI("Running volume garbage collection");
     // loop through every volume and call remove volume if volume's ref_cnt is zero;

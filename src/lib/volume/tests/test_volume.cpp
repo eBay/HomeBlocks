@@ -88,12 +88,12 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto id = vol_ids[i];
+            auto ret = vol_mgr->remove_volume(id).get();
+            ASSERT_TRUE(ret);
             while (true) {
-                auto ret = vol_mgr->remove_volume(id).get();
-                ASSERT_TRUE(ret);
                 auto delay_secs = 1;
-                LOGINFO("Volume {} removed, waiting for {} seconds for IO to complete", boost::uuids::to_string(id),
-                        delay_secs);
+                LOGINFO("Remove Volume {} triggered, waiting for {} seconds for IO to complete",
+                        boost::uuids::to_string(id), delay_secs);
                 // sleep for a while
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_secs * 1000));
                 auto vol_ptr = vol_mgr->lookup_volume(id);
