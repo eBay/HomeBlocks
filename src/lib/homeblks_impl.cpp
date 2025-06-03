@@ -22,6 +22,7 @@
 #include <sisl/options/options.h>
 #include "homeblks_impl.hpp"
 #include "listener.hpp"
+#include "home_blks_config.hpp"
 
 SISL_OPTION_GROUP(homeblocks,
                   (executor_type, "", "executor", "Executor to use for Future deferal",
@@ -32,7 +33,7 @@ SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 namespace homeblocks {
 
 extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application) {
-    LOGI("Initializing HomeBlocks");
+    LOGI("Initializing HomeBlocks with reaper thread timer: {} seconds", HB_DYNAMIC_CONFIG(reaper_thread_timer_secs));
     auto inst = std::make_shared< HomeBlocksImpl >(std::move(application));
     inst->init_homestore();
     inst->init_cp();
