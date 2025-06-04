@@ -51,17 +51,26 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
 Volume::Volume(sisl::byte_view const& buf, void* cookie) : sb_{VOL_META_NAME} {
     sb_.load(buf, cookie);
     // generate volume info from sb;
-    vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name);
+    vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
     LOGI("Volume superblock loaded from disk, vol_info : {}", vol_info_->to_string());
 }
 
-bool Volume::init(bool is_recovery) {
+bool Volume::init(bool is_recovery, shared< VolumeChunkSelector > chunk_selector) {
     if (!is_recovery) {
         // first time creation of the Volume, let's write the superblock;
 
-        // 0. create the superblock;
-        sb_.create(sizeof(vol_sb_t));
-        sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name);
+        // Allocate initial set of chunks for the volume with thin provisioning.
+        auto chunk_ids = chunk_selector->allocate_volume_chunks(vol_info_->ordinal, vol_info_->size_bytes);
+        if (chunk_ids.empty()) {
+            LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name,
+                 boost::uuids::to_string(vol_info_->id));
+            return false;
+        }
+
+        // 0. create the superblock and store chunk id's
+        sb_.create(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
+        sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal,
+                  chunk_ids);
 
         // 1. create solo repl dev for volume;
         // members left empty on purpose for solo repl dev
@@ -95,12 +104,16 @@ bool Volume::init(bool is_recovery) {
             rd_ = ret.value();
         }
 
+        // Get the chunk id's from metablk and pass to chunk selector for recovery.
+        std::vector< chunk_num_t > chunk_ids(sb_->get_chunk_ids(), sb_->get_chunk_ids() + sb_->num_chunks);
+        chunk_selector->recover_volume_chunks(vol_info_->ordinal, vol_info_->size_bytes, chunk_ids);
+
         // index table will be recovered via in subsequent callback with init_index_table API;
     }
     return true;
 }
 
-void Volume::destroy() {
+void Volume::destroy(shared< VolumeChunkSelector > chunk_selector) {
     // 0. Set destroying state in superblock;
     state_change(vol_state::DESTROYING);
 
@@ -130,14 +143,28 @@ void Volume::destroy() {
 
     // destroy the superblock which will remove sb from meta svc;
     sb_.destroy();
+
+    // Release all the chunk's used by the volume. Superblock is destroyed before releasing
+    // chunks, so that even after crash, these chunks will be available for other volumes.
+    chunk_selector->release_volume_chunks(vol_info_->ordinal);
+}
+
+void Volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
+    // Update the volume superblk with latest set of chunk id's.
+    sb_.create(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
+    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal,
+              chunk_ids);
+    sb_.write();
 }
 
 VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_req) {
     // Step 1. Allocate new blkids. Homestore might return multiple blkid's pointing
     // to different contigious memory locations.
     auto data_size = vol_req->nlbas * rd()->get_blk_size();
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = vol_info_->ordinal;
     std::vector< homestore::MultiBlkId > new_blkids;
-    auto result = rd()->alloc_blks(data_size, homestore::blk_alloc_hints{}, new_blkids);
+    auto result = rd()->alloc_blks(data_size, hints, new_blkids);
     if (result) {
         LOGE("Failed to allocate blocks");
         return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
@@ -149,8 +176,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     data_sgs.size = data_size;
     return rd()
         ->async_write(new_blkids, data_sgs, vol_req->part_of_batch)
-        .thenValue([this, vol_req,
-                    new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
+        .thenValue([this, vol_req, new_blkids](auto&& result) -> VolumeManager::NullAsyncResult {
             if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
 
             using homestore::BlkId;
@@ -170,6 +196,8 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                     auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
                     auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
                     blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                    LOGDEBUG("Write lba={} csum={} blkid={} data={}", start_lba + i, csum, new_bid,
+                             *r_cast< uint64_t* >(data_buffer));
                     data_buffer += blk_size;
                 }
 
@@ -200,8 +228,8 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             req->header()->volume_id = id();
 
             // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
-            // New blkid's are written to journal by the homestore async_write_journal. After journal flush, on_commit
-            // will be called where we free the old blkid's and the write iscompleted.
+            // New blkid's are written to journal by the homestore async_write_journal. After journal flush,
+            // on_commit will be called where we free the old blkid's and the write iscompleted.
             VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
             auto key_buf = req->key_buf().bytes();
             std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
@@ -220,13 +248,14 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             }
 
             rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
-            return req->result().deferValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                if (result.hasError()) {
-                    auto err = result.error();
-                    return folly::makeUnexpected(err);
-                }
-                return folly::Unit();
-            });
+            return req->result().deferValue(
+                [this, req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                    if (result.hasError()) {
+                        auto err = result.error();
+                        return folly::makeUnexpected(err);
+                    }
+                    return folly::Unit();
+                });
         });
 }
 
@@ -283,7 +312,7 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
 
     // Step 4: verify the checksum after all the reads are done
     return folly::collectAllUnsafe(futs).thenValue(
-        [this, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
+        [this, req, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
             for (auto const& err_c : vf) {
                 if (sisl_unlikely(err_c.value())) {
                     auto ec = err_c.value();
@@ -299,7 +328,8 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
     for (uint32_t i = 0, start_idx = 0; i < index_kvs.size(); ++i) {
         auto const& [key, value] = index_kvs[i];
         bool is_contiguous = (i == 0 ||
-                              (value.blkid().blk_num() == index_kvs[i - 1].second.blkid().blk_num() + 1 &&
+                              (key.key() == index_kvs[i - 1].first.key() + 1 &&
+                               value.blkid().blk_num() == index_kvs[i - 1].second.blkid().blk_num() + 1 &&
                                value.blkid().chunk_num() == index_kvs[i - 1].second.blkid().chunk_num()));
         if (is_contiguous && i < index_kvs.size() - 1) {
             // continue to the next entry if it is contiguous
@@ -324,12 +354,13 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
 
 VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const& read_ctx) {
     auto read_buf = read_ctx.buf;
-    for (uint64_t cur_lba = read_ctx.start_lba, i = 0; i < read_ctx.index_kvs.size(); ++i, ++cur_lba) {
+    for (uint64_t cur_lba = read_ctx.start_lba, i = 0; i < read_ctx.index_kvs.size();) {
         auto const& [key, value] = read_ctx.index_kvs[i];
         // ignore the holes
         if (cur_lba != key.key()) {
             read_buf += (key.key() - cur_lba) * read_ctx.blk_size;
             cur_lba = key.key();
+            continue;
         }
         auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), read_ctx.blk_size);
         if (checksum != value.checksum()) {
@@ -337,7 +368,10 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
                  value.checksum(), checksum);
             return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
         }
+
         read_buf += read_ctx.blk_size;
+        ++i;
+        ++cur_lba;
     }
     return folly::Unit();
 }
