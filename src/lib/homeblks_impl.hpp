@@ -149,7 +149,7 @@ private:
 
     void vol_gc();
 
-    uint64_t gc_timer_secs() const;
+    uint64_t gc_timer_nsecs() const;
 
 #ifdef _PRERELEASE
     // For testing purpose only

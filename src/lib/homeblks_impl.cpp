@@ -308,10 +308,10 @@ void HomeBlocksImpl::on_init_complete() {
 
 void HomeBlocksImpl::init_cp() {}
 
-uint64_t HomeBlocksImpl::gc_timer_secs() const {
-    if (SISL_OPTIONS.count("gc_timer_secs")) {
-        auto const n = SISL_OPTIONS["gc_timer_secs"].as< uint32_t >();
-        LOGINFO("Using gc_timer_secs option value: {}", n);
+uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
+    if (SISL_OPTIONS.count("gc_timer_nsecs")) {
+        auto const n = SISL_OPTIONS["gc_timer_nsecs"].as< uint32_t >();
+        LOGINFO("Using gc_timer_nsecs option value: {}", n);
         return n;
     } else {
         return HB_DYNAMIC_CONFIG(reaper_thread_timer_secs);
@@ -319,7 +319,7 @@ uint64_t HomeBlocksImpl::gc_timer_secs() const {
 }
 
 void HomeBlocksImpl::start_reaper_thread() {
-    auto const nsecs = gc_timer_secs();
+    auto const nsecs = gc_timer_nsecs();
     LOGI("Starting volume garbage collection timer with interval: {} seconds", nsecs);
     vol_gc_timer_hdl_ = iomanager.schedule_global_timer(
         nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
