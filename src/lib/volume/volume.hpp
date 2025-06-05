@@ -159,6 +159,12 @@ public:
 
     VolumeManager::NullAsyncResult read(const vol_interface_req_ptr& req);
 
+    bool can_remove() { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
+
+    void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
+    void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
+    uint64_t num_outstanding_reqs() const { return outstanding_reqs_.get(); }
+
 private:
     //
     // this API will be called to initialize volume in both volume creation and volume recovery;
@@ -178,10 +184,14 @@ private:
     VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs);
 
 private:
-    VolumeInfoPtr vol_info_;
-    ReplDevPtr rd_;
-    VolIdxTablePtr indx_tbl_;
-    superblk< vol_sb_t > sb_;
+    VolumeInfoPtr vol_info_;  // volume info
+    ReplDevPtr rd_;           // replication device for this volume, which provides read/write APIs to the volume;
+    VolIdxTablePtr indx_tbl_; // index table for this volume
+    superblk< vol_sb_t > sb_; // meta data of the volume
+
+    sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
+    bool destroy_started_{
+        false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
 };
 
 struct vol_repl_ctx : public homestore::repl_req_ctx {

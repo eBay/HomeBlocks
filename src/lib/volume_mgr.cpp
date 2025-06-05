@@ -97,10 +97,19 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
         VolumePtr vol_ptr = nullptr;
         {
             auto lg = std::scoped_lock(vol_lock_);
-            if (auto it = vol_map_.find(id); it != vol_map_.end()) { vol_ptr = it->second; }
+            if (auto it = vol_map_.find(id); it != vol_map_.end()) {
+                vol_ptr = it->second;
+            } else {
+                LOGWARN("Volume with id {} not found, cannot remove", boost::uuids::to_string(id));
+                return folly::Unit();
+            }
         }
 
-        if (vol_ptr) {
+        vol_ptr->state_change(vol_state::DESTROYING);
+
+        // if vol is already started with destroy or there is any outstanding reqs on the vol, we will not do anything
+        // on this vol and let reaper thread to handle it
+        if (vol_ptr->can_remove()) {
             // 2. do volume destroy;
             vol_ptr->destroy();
 #ifdef _PRERELEASE
@@ -114,7 +123,13 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
 
             LOGINFO("Volume {} removed successfully", vol_ptr->id_str());
         } else {
-            LOGWARN("remove_volume with input id: {} not found", boost::uuids::to_string(id));
+            if (vol_ptr) {
+                LOGD("Volume {} is in destroying state or has outstanding requests: {}, backing off and wait for GC to "
+                     "cleanup.",
+                     vol_ptr->id_str(), vol_ptr->num_outstanding_reqs());
+            } else {
+                LOGWARN("Volume with id {} not found, cannot remove", boost::uuids::to_string(id));
+            }
         }
         // Volume Destructor will be called after vol_ptr goes out of scope;
         return folly::Unit();
@@ -133,19 +148,63 @@ bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { retur
 
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
 
-VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol_ptr, const vol_interface_req_ptr& vol_req) {
-    return vol_ptr->write(vol_req);
+VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& vol_req) {
+    if (vol->is_destroying()) {
+        LOGE("Volume {} is in destroying state, cannot write", vol->id_str());
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    }
+
+    vol->inc_ref();
+
+#ifdef _PRERELEASE
+    if (delay_fake_io(vol)) {
+        // If we are delaying IO, we return immediately without calling vol->write
+        // and let the delay flip handle the completion later.
+        return folly::Unit();
+    }
+#endif
+
+    auto ret = vol->write(vol_req);
+    vol->dec_ref();
+
+    return ret;
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
-    return vol->read(req);
+    if (vol->is_destroying()) {
+        LOGE("Volume {} is in destroying state, cannot read", vol->id_str());
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    }
+
+    vol->inc_ref();
+
+#ifdef _PRERELEASE
+    if (delay_fake_io(vol)) {
+        // If we are delaying IO, we return immediately without calling vol->read
+        // and let the delay flip handle the completion later.
+        return folly::Unit();
+    }
+#endif
+
+    auto ret = vol->read(req);
+    vol->dec_ref();
+    return ret;
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
-    RELEASE_ASSERT(false, "Unmap Not implemented");
+    LOGWARN("Unmap to vol: {} not implemented", vol->id_str());
+    if (vol->is_destroying()) {
+        LOGE("Volume {} is in destroying state, cannot unmap", vol->id_str());
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    }
+
     return folly::Unit();
 }
 
+//
+// we have to allow submit_io_batch even though a volume is in destroying state, because destroy relies on outstanding
+// IOs to decrease to zero to proceed, e.g. submit_io_batch will allow outstanding io to complete;
+//
 void HomeBlocksImpl::submit_io_batch() { homestore::data_service().submit_io_batch(); }
 
 void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
@@ -204,5 +263,18 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
 
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }
+
+#ifdef _PRERELEASE
+bool HomeBlocksImpl::delay_fake_io(VolumePtr v) {
+    if (iomgr_flip::instance()->delay_flip("vol_fake_io_delay_simulation", [this, v]() mutable {
+            LOGI("Resuming fake IO delay flip is done. Do nothing ");
+            v->dec_ref();
+        })) {
+        LOGI("Slow down vol fake IO flip is enabled, scheduling to call later.");
+        return true;
+    }
+    return false;
+}
+#endif
 
 } // namespace homeblocks
