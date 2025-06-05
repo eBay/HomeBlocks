@@ -37,6 +37,7 @@ extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksAp
     auto inst = std::make_shared< HomeBlocksImpl >(std::move(application));
     inst->init_homestore();
     inst->init_cp();
+    inst->start_reaper_thread();
     return inst;
 }
 
@@ -57,6 +58,13 @@ HomeBlocksStats HomeBlocksImpl::get_stats() const {
 }
 
 HomeBlocksImpl::~HomeBlocksImpl() {
+    LOGI("Shutting down HomeBlocksImpl");
+
+    if (vol_gc_timer_hdl_ != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(vol_gc_timer_hdl_);
+        vol_gc_timer_hdl_ = iomgr::null_timer_handle;
+    }
+
     homestore::hs()->shutdown();
     homestore::HomeStore::reset_instance();
     iomanager.stop();
@@ -299,4 +307,48 @@ void HomeBlocksImpl::on_init_complete() {
 }
 
 void HomeBlocksImpl::init_cp() {}
+
+uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
+    if (SISL_OPTIONS.count("gc_timer_nsecs")) {
+        auto const n = SISL_OPTIONS["gc_timer_nsecs"].as< uint32_t >();
+        LOGINFO("Using gc_timer_nsecs option value: {}", n);
+        return n;
+    } else {
+        return HB_DYNAMIC_CONFIG(reaper_thread_timer_secs);
+    }
+}
+
+void HomeBlocksImpl::start_reaper_thread() {
+    auto const nsecs = gc_timer_nsecs();
+    LOGI("Starting volume garbage collection timer with interval: {} seconds", nsecs);
+    vol_gc_timer_hdl_ = iomanager.schedule_global_timer(
+        nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
+        [this](void*) { this->vol_gc(); }, true /* wait_to_schedule */);
+}
+
+void HomeBlocksImpl::vol_gc() {
+    LOGI("Running volume garbage collection");
+    // loop through every volume and call remove volume if volume's ref_cnt is zero;
+    std::vector< VolumePtr > vols_to_remove;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto& vol_pair : vol_map_) {
+            auto& vol = vol_pair.second;
+            LOGI("Checking volume with id: {}, is_destroying: {}, can_remove: {}, num_outstanding_reqs: {}",
+                 vol->id_str(), vol->is_destroying(), vol->can_remove(), vol->num_outstanding_reqs());
+
+            if (vol->is_destroying() && vol->can_remove()) {
+                // 1. volume has been issued with removed command before
+                // 2. no one has already started removing it
+                // 3. volume is not in use anymore (ref_cnt == 0)
+                vols_to_remove.push_back(vol);
+            }
+        }
+    }
+
+    for (auto& vol : vols_to_remove) {
+        LOGI("Garbage Collecting removed volume with id: {}", vol->id_str());
+        remove_volume(vol->id());
+    }
+}
 } // namespace homeblocks

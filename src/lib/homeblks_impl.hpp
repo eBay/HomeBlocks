@@ -60,7 +60,7 @@ private:
     std::weak_ptr< HomeBlocksApplication > _application;
     folly::Executor::KeepAlive<> executor_;
 
-    ///
+    /// Volume management
     mutable std::shared_mutex vol_lock_;
     std::map< volume_id_t, VolumePtr > vol_map_;
 
@@ -71,6 +71,9 @@ private:
     bool recovery_done_{false};
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
+
+    iomgr::io_fiber_t reaper_fiber_;
+    iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
@@ -127,7 +130,7 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
-    // VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
+    void start_reaper_thread();
 
 private:
     // Should only be called for first-time-boot
@@ -143,6 +146,17 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+
+    void vol_gc();
+
+    uint64_t gc_timer_nsecs() const;
+
+#ifdef _PRERELEASE
+    // For testing purpose only
+    // If delay flip is not set, false will be returned;
+    // If delay flip is set, it will delay the IOs for a given VolumePtr
+    bool delay_fake_io(VolumePtr vol);
+#endif
 };
 
 class HBIndexSvcCB : public homestore::IndexServiceCallbacks {
