@@ -220,7 +220,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             }
 
             rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
-            return req->result().deferValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+            return req->result().via(&folly::QueuedImmediateExecutor::instance()).thenValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
                 if (result.hasError()) {
                     auto err = result.error();
                     return folly::makeUnexpected(err);

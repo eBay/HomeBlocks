@@ -72,7 +72,7 @@ public:
     template < typename T >
     using Result = folly::Expected< T, E >;
     template < typename T >
-    using AsyncResult = folly::SemiFuture< Result< T > >;
+    using AsyncResult = folly::Future< Result< T > >;
 
     using NullResult = Result< folly::Unit >;
     using NullAsyncResult = AsyncResult< folly::Unit >;
