@@ -149,13 +149,14 @@ bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { retur
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& vol_req) {
-    if (vol->is_destroying()) {
-        LOGE("Volume {} is in destroying state, cannot write", vol->id_str());
+    if (vol->is_destroying() || is_shutting_down()) {
+        LOGE(
+            "Can't serve write, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
+            vol->id_str(), vol->is_destroying());
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
     vol->inc_ref();
-
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->write
@@ -163,7 +164,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
         return folly::Unit();
     }
 #endif
-
     auto ret = vol->write(vol_req);
     vol->dec_ref();
 
@@ -171,13 +171,13 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
-    if (vol->is_destroying()) {
-        LOGE("Volume {} is in destroying state, cannot read", vol->id_str());
+    if (vol->is_destroying() || is_shutting_down()) {
+        LOGE("Can't serve read, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
+             vol->id_str(), vol->is_destroying());
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
     vol->inc_ref();
-
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->read
@@ -185,7 +185,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         return folly::Unit();
     }
 #endif
-
     auto ret = vol->read(req);
     vol->dec_ref();
     return ret;
@@ -193,8 +192,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     LOGWARN("Unmap to vol: {} not implemented", vol->id_str());
-    if (vol->is_destroying()) {
-        LOGE("Volume {} is in destroying state, cannot unmap", vol->id_str());
+
+    if (vol->is_destroying() || is_shutting_down()) {
+        LOGE(
+            "Can't serve unmap, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
+            vol->id_str(), vol->is_destroying());
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 

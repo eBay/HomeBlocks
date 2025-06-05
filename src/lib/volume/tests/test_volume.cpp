@@ -29,6 +29,8 @@ SISL_OPTION_GROUP(test_volume_setup,
                   (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
                    "number"),
                   (gc_timer_secs, "", "gc_timer_secs", "gc timer in seconds",
+                   ::cxxopts::value< uint32_t >()->default_value("5"), "seconds"),
+                  (shutdown_timer_secs, "", "shutdown_timer_secs", "shutdown timer in seconds",
                    ::cxxopts::value< uint32_t >()->default_value("5"), "seconds"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup, homeblocks)

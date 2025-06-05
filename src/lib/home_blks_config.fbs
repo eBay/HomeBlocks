@@ -9,6 +9,9 @@ attribute "deprecated";
 table HomeBlksSettings{
     // reaper thread timer in seconds
     reaper_thread_timer_secs: uint64 = 120;
+
+    //shutdown thread timer in seconds
+    shutdown_thread_timer_secs: uint64 = 5;
 }
 
 root_type HomeBlksSettings;

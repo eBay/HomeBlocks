@@ -55,6 +55,7 @@ private:
     static constexpr uint32_t SB_FLAGS_GRACEFUL_SHUTDOWN{0x00000001};
     static constexpr uint32_t SB_FLAGS_RESTRICTED{0x00000002};
     static constexpr uint64_t MAX_VOL_IO_SIZE = 1 * Mi; // 1 MiB
+
 private:
     /// Our SvcId retrieval and SvcId->IP mapping
     std::weak_ptr< HomeBlocksApplication > _application;
@@ -72,8 +73,12 @@ private:
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
 
+    sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
+    bool shutdown_started_{false};
+    folly::Promise< folly::Unit > shutdown_promise_;
     iomgr::io_fiber_t reaper_fiber_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
+    iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
 public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
@@ -150,6 +155,17 @@ private:
     void vol_gc();
 
     uint64_t gc_timer_secs() const;
+
+    void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
+    void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
+    bool is_shutting_down() const { return shutdown_started_; }
+    bool can_shutdown() const;
+
+    bool no_outstanding_vols() const;
+
+    folly::Future< folly::Unit > shutdown_start();
+    void do_shutdown();
+    uint64_t shutdown_timer_nsecs() const;
 
 #ifdef _PRERELEASE
     // For testing purpose only
