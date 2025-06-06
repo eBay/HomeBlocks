@@ -57,13 +57,104 @@ HomeBlocksStats HomeBlocksImpl::get_stats() const {
     return {stats.total_capacity, stats.used_capacity};
 }
 
-HomeBlocksImpl::~HomeBlocksImpl() {
-    LOGI("Shutting down HomeBlocksImpl");
+folly::Future< folly::Unit > HomeBlocksImpl::shutdown_start() {
+    LOGI("Setting shutdown start flag");
+    shutdown_started_ = true;
 
-    if (vol_gc_timer_hdl_ != iomgr::null_timer_handle) {
-        iomanager.cancel_timer(vol_gc_timer_hdl_);
-        vol_gc_timer_hdl_ = iomgr::null_timer_handle;
+    auto f = shutdown_promise_.getFuture();
+
+    auto const nsecs = shutdown_timer_nsecs();
+    LOGI("Setting shutdown timer with {} seconds", nsecs);
+    // start timer thread if there are still outstanding jobs;
+    shutdown_timer_hdl_ = iomanager.schedule_global_timer(
+        nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
+        [this](void*) { this->do_shutdown(); }, true /* wait_to_schedule */);
+
+    return f;
+}
+
+uint64_t HomeBlocksImpl::shutdown_timer_nsecs() const {
+    if (SISL_OPTIONS.count("shutdown_timer_nsecs")) {
+        auto const n = SISL_OPTIONS["shutdown_timer_nsecs"].as< uint32_t >();
+        LOGINFO("Using shutdown_timer_nsecs option value: {}", n);
+        return n;
+    } else {
+        return HB_DYNAMIC_CONFIG(shutdown_thread_timer_secs);
     }
+}
+
+bool HomeBlocksImpl::no_outstanding_vols() const {
+    // check if there are no volumes with outstanding requests;
+    std::shared_lock lg(vol_lock_);
+    for (auto const& vol_pair : vol_map_) {
+        auto const& vol = vol_pair.second;
+        // 1. check if volume is under the process of being removed;
+        if (vol->is_destroying()) {
+#ifdef _PRERELEASE
+            if (crash_simulated_) {
+                LOGI("Skipping volume {} under destruction as crash simulation is enabled", vol->id_str());
+                continue; // skip volumes that are being removed due to crash simulation
+            }
+#endif
+            DEBUG_ASSERT_EQ(vol->num_outstanding_reqs(), 0,
+                            "Volume {} is being removed but has outstanding requests: {}", vol->id_str(),
+                            vol->num_outstanding_reqs());
+            LOGI("Found outstanding volume {} that is under destruction.", vol->id_str());
+            return false;
+        }
+
+        // 2. if volume is not under destruction, check if it has outstanding requests;
+        if (vol->num_outstanding_reqs() > 0) {
+            LOGI("Found outstanding volume {} that has outstanding requests: {}", vol->id_str(),
+                 vol->num_outstanding_reqs());
+            return false; // found a volume with outstanding requests
+        }
+    }
+
+    LOGI("No volumes with outstanding requests");
+    return true; // no volumes with outstanding requests
+}
+
+bool HomeBlocksImpl::can_shutdown() const {
+    // check if shutdown has started and no outstanding requests;
+    if (is_shutting_down() && no_outstanding_vols() && outstanding_reqs_.test_eq(0)) {
+        LOGI("Shutdown can proceed, outstanding requests: {}", outstanding_reqs_.get());
+        return true;
+    }
+
+    LOGI("Shutdown cannot proceed, outstanding requests: {}", outstanding_reqs_.get());
+    return false;
+}
+
+void HomeBlocksImpl::do_shutdown() {
+    LOGI("Shutdown timer triggered, checking for outstanding requests");
+    if (can_shutdown()) {
+        LOGI("No outstanding requests, proceeding with shutdown");
+
+        shutdown_promise_.setValue();
+    } else {
+        LOGI("Outstanding requests exist, will retry shutdown in {} seconds", shutdown_timer_nsecs());
+    }
+}
+
+HomeBlocksImpl::~HomeBlocksImpl() {
+    LOGI("Shutting down HomeBlocksImpl Received");
+    DEBUG_ASSERT(!is_shutting_down(), "Shutdown already started, cannot destruct HomeBlocksImpl again");
+    // set the shutdown flag so that no new requests are accepted;
+    // start timer thread if there are still outstanding jobs;
+    auto f = shutdown_start();
+
+    std::move(f).get();
+
+    // stop the timer thread
+    if (shutdown_timer_hdl_ != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(shutdown_timer_hdl_);
+        shutdown_timer_hdl_ = iomgr::null_timer_handle;
+    }
+
+    // set the shutdown flag so that no new requests are accepted;
+    sb_->set_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
+    sb_.write();
 
     homestore::hs()->shutdown();
     homestore::HomeStore::reset_instance();
@@ -351,4 +442,5 @@ void HomeBlocksImpl::vol_gc() {
         remove_volume(vol->id());
     }
 }
+
 } // namespace homeblocks

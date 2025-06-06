@@ -140,6 +140,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     auto result = rd()->alloc_blks(data_size, homestore::blk_alloc_hints{}, new_blkids);
     if (result) {
         LOGE("Failed to allocate blocks");
+        dec_ref();
         return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
     }
 
@@ -149,85 +150,94 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     data_sgs.size = data_size;
     return rd()
         ->async_write(new_blkids, data_sgs, vol_req->part_of_batch)
-        .thenValue([this, vol_req,
-                    new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
-            if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
-
-            using homestore::BlkId;
-            std::vector< BlkId > old_blkids;
-            std::unordered_map< lba_t, BlockInfo > blocks_info;
-            auto blk_size = rd()->get_blk_size();
-            auto data_size = vol_req->nlbas * blk_size;
-            auto data_buffer = vol_req->buffer;
-            lba_t start_lba = vol_req->lba;
-            for (auto& blkid : new_blkids) {
-                DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
-
-                // Split the large blkid to individual blkid having only one block because each LBA points
-                // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
-                // block which is also stored in index.
-                for (uint32_t i = 0; i < blkid.blk_count(); i++) {
-                    auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
-                    auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
-                    blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
-                    data_buffer += blk_size;
+        .thenValue(
+            [this, vol_req, new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
+                if (result) {
+                    dec_ref();
+                    return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR);
                 }
 
-                // Step 3. For range [start_lba, end_lba] in this blkid, write the values to index.
-                // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
-                // in blocks_info after write_to_index
-                lba_t end_lba = start_lba + blkid.blk_count() - 1;
-                auto status = write_to_index(start_lba, end_lba, blocks_info);
-                if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
+                using homestore::BlkId;
+                std::vector< BlkId > old_blkids;
+                std::unordered_map< lba_t, BlockInfo > blocks_info;
+                auto blk_size = rd()->get_blk_size();
+                auto data_size = vol_req->nlbas * blk_size;
+                auto data_buffer = vol_req->buffer;
+                lba_t start_lba = vol_req->lba;
+                for (auto& blkid : new_blkids) {
+                    DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
 
-                start_lba = end_lba + 1;
-            }
+                    // Split the large blkid to individual blkid having only one block because each LBA points
+                    // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
+                    // block which is also stored in index.
+                    for (uint32_t i = 0; i < blkid.blk_count(); i++) {
+                        auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
+                        auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
+                        blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                        data_buffer += blk_size;
+                    }
 
-            // Collect all old blocks to write to journal.
-            for (auto& [_, info] : blocks_info) {
-                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
-            }
+                    // Step 3. For range [start_lba, end_lba] in this blkid, write the values to index.
+                    // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
+                    // in blocks_info after write_to_index
+                    lba_t end_lba = start_lba + blkid.blk_count() - 1;
+                    auto status = write_to_index(start_lba, end_lba, blocks_info);
+                    if (!status) {
+                        dec_ref();
+                        return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+                    }
 
-            auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
-            auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
-            auto key_size = sizeof(VolJournalEntry) + csum_size + old_blkids_size;
-
-            auto req =
-                repl_result_ctx< VolumeManager::NullResult >::make(sizeof(MsgHeader) /* header size */, key_size);
-            req->vol_ptr_ = shared_from_this();
-            req->header()->msg_type = MsgType::WRITE;
-            // Store volume id for recovery path (log replay)
-            req->header()->volume_id = id();
-
-            // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
-            // New blkid's are written to journal by the homestore async_write_journal. After journal flush, on_commit
-            // will be called where we free the old blkid's and the write iscompleted.
-            VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
-            auto key_buf = req->key_buf().bytes();
-            std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
-            key_buf += sizeof(VolJournalEntry);
-
-            auto lba = vol_req->lba;
-            for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
-                std::memcpy(key_buf, &blocks_info[lba].checksum, sizeof(homestore::csum_t));
-                key_buf += sizeof(homestore::csum_t);
-                lba++;
-            }
-
-            for (auto& blkid : old_blkids) {
-                std::memcpy(key_buf, &blkid, sizeof(BlkId));
-                key_buf += sizeof(BlkId);
-            }
-
-            rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
-            return req->result().via(&folly::QueuedImmediateExecutor::instance()).thenValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                if (result.hasError()) {
-                    auto err = result.error();
-                    return folly::makeUnexpected(err);
+                    start_lba = end_lba + 1;
                 }
-                return folly::Unit();
+
+                // Collect all old blocks to write to journal.
+                for (auto& [_, info] : blocks_info) {
+                    if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+                }
+
+                auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
+                auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
+                auto key_size = sizeof(VolJournalEntry) + csum_size + old_blkids_size;
+
+                auto req =
+                    repl_result_ctx< VolumeManager::NullResult >::make(sizeof(MsgHeader) /* header size */, key_size);
+                req->vol_ptr_ = shared_from_this();
+                req->header()->msg_type = MsgType::WRITE;
+                // Store volume id for recovery path (log replay)
+                req->header()->volume_id = id();
+
+                // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
+                // New blkid's are written to journal by the homestore async_write_journal. After journal flush,
+                // on_commit will be called where we free the old blkid's and the write iscompleted.
+                VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
+                auto key_buf = req->key_buf().bytes();
+                std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
+                key_buf += sizeof(VolJournalEntry);
+
+                auto lba = vol_req->lba;
+                for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
+                    std::memcpy(key_buf, &blocks_info[lba].checksum, sizeof(homestore::csum_t));
+                    key_buf += sizeof(homestore::csum_t);
+                    lba++;
+                }
+
+                for (auto& blkid : old_blkids) {
+                    std::memcpy(key_buf, &blkid, sizeof(BlkId));
+                    key_buf += sizeof(BlkId);
+                }
+
+                rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+                return req->result()
+                    .via(&folly::QueuedImmediateExecutor::instance())
+                    .thenValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                        dec_ref();
+                        if (result.hasError()) {
+                            auto err = result.error();
+                            return folly::makeUnexpected(err);
+                        }
+                        return folly::Unit();
+                    });
             });
-        });
 }
 
 VolumeManager::Result< folly::Unit > Volume::write_to_index(lba_t start_lba, lba_t end_lba,
@@ -268,9 +278,14 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     if (auto index_resp = read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
+        dec_ref();
         return index_resp;
     }
-    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
+
+    if (read_ctx.index_kvs.empty()) {
+        dec_ref();
+        return folly::Unit();
+    }
 
     // Step 2: Consolidate the blocks by merging the contiguous blkids
     std::vector< folly::Future< std::error_code > > futs;
@@ -283,6 +298,7 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 4: verify the checksum after all the reads are done
     return folly::collectAllUnsafe(futs).thenValue(
         [this, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
+            dec_ref();
             for (auto const& err_c : vf) {
                 if (sisl_unlikely(err_c.value())) {
                     auto ec = err_c.value();

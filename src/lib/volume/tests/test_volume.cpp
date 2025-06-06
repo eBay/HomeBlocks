@@ -29,7 +29,9 @@ SISL_OPTION_GROUP(test_volume_setup,
                   (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
                    "number"),
                   (gc_timer_nsecs, "", "gc_timer_nsecs", "gc timer in seconds",
-                   ::cxxopts::value< uint32_t >()->default_value("5"), "seconds"));
+                   ::cxxopts::value< uint32_t >()->default_value("5"), "seconds"),
+                  (shutdown_timer_nsecs, "", "shutdown_timer_nsecs", "shutdown timer in seconds",
+                   ::cxxopts::value< uint32_t >()->default_value("2"), "seconds"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup, homeblocks)
 SISL_LOGGING_DECL(test_volume)
@@ -53,6 +55,41 @@ public:
 };
 
 #ifdef _PRERELEASE
+TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb->volume_manager();
+
+        uint32_t delay_sec = 6;
+        g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
+
+        auto num_vols = 1ul;
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            ASSERT_TRUE(ret);
+
+            auto vol_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is there
+            ASSERT_TRUE(vol_ptr != nullptr);
+
+            // fake a write that will be delayed;
+            vol_mgr->write(vol_ptr, nullptr);
+
+            // fake a read that will be delayed;
+            vol_mgr->read(vol_ptr, nullptr);
+        }
+    }
+
+    g_helper->remove_flip("vol_fake_io_delay_simulation");
+
+    // trigger graceful shutdown
+    g_helper->restart(2);
+}
+
 TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -106,6 +143,7 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
     g_helper->restart(2);
 }
+
 #endif
 
 TEST_F(VolumeTest, CreateDestroyVolume) {
