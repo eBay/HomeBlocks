@@ -172,6 +172,7 @@ private:
     // If delay flip is not set, false will be returned;
     // If delay flip is set, it will delay the IOs for a given VolumePtr
     bool delay_fake_io(VolumePtr vol);
+    bool crash_simulated_{false};
 #endif
 };
 

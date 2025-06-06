@@ -11,7 +11,7 @@ table HomeBlksSettings{
     reaper_thread_timer_secs: uint64 = 120;
 
     //shutdown thread timer in seconds
-    shutdown_thread_timer_secs: uint64 = 5;
+    shutdown_thread_timer_secs: uint64 = 2;
 }
 
 root_type HomeBlksSettings;

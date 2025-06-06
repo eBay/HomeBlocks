@@ -88,8 +88,25 @@ bool HomeBlocksImpl::no_outstanding_vols() const {
     std::shared_lock lg(vol_lock_);
     for (auto const& vol_pair : vol_map_) {
         auto const& vol = vol_pair.second;
+        // 1. check if volume is under the process of being removed;
+        if (vol->is_destroying()) {
+#ifdef _PRERELEASE
+            if (crash_simulated_) {
+                LOGI("Skipping volume {} under destruction as crash simulation is enabled", vol->id_str());
+                continue; // skip volumes that are being removed due to crash simulation
+            }
+#endif
+            DEBUG_ASSERT_EQ(vol->num_outstanding_reqs(), 0,
+                            "Volume {} is being removed but has outstanding requests: {}", vol->id_str(),
+                            vol->num_outstanding_reqs());
+            LOGI("Found outstanding volume {} that is under destruction.", vol->id_str());
+            return false;
+        }
+
+        // 2. if volume is not under destruction, check if it has outstanding requests;
         if (vol->num_outstanding_reqs() > 0) {
-            LOGI("Volume {} has outstanding requests: {}", vol->id_str(), vol->num_outstanding_reqs());
+            LOGI("Found outstanding volume {} that has outstanding requests: {}", vol->id_str(),
+                 vol->num_outstanding_reqs());
             return false; // found a volume with outstanding requests
         }
     }

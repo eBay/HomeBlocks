@@ -66,7 +66,15 @@ shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superb
     }
 }
 
+//
+// The reason create volume needs a ref_cnt:
+// 1. if graceful shutdow is received and visited volume map and check there is no volume being created.
+// 2. after graceful shutdown release the vol map lock, create volume arrives and successfully take the vol map lock,
+// 3. now we have a race that allow create volume to go through and graceful shutdown also happen in parallel which will
+// cause crash;
+//
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
+    inc_ref();
     auto id = vol_info.id;
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
 
@@ -74,6 +82,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
         auto lg = std::shared_lock(vol_lock_);
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
+            dec_ref();
             return folly::makeUnexpected(VolumeError::INVALID_ARG);
         }
     }
@@ -84,12 +93,18 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
         vol_map_.emplace(std::make_pair(id, vol_ptr));
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
+        dec_ref();
         return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
     }
 
+    dec_ref();
     return folly::Unit();
 }
 
+//
+// Why we don't need do ref_cnt for remove_volume:
+// vol in destroying state already indicates an outstanding volume which consumed in no_outstanding_vols() API;
+//
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
         LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
@@ -113,7 +128,10 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
             // 2. do volume destroy;
             vol_ptr->destroy();
 #ifdef _PRERELEASE
-            if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) { return folly::Unit(); }
+            if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
+                crash_simulated_ = true;
+                return folly::Unit();
+            }
 #endif
             // 3. remove volume from vol_map;
             {
@@ -164,10 +182,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
         return folly::Unit();
     }
 #endif
-    auto ret = vol->write(vol_req);
-    vol->dec_ref();
-
-    return ret;
+    return vol->write(vol_req);
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
@@ -185,9 +200,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         return folly::Unit();
     }
 #endif
-    auto ret = vol->read(req);
-    vol->dec_ref();
-    return ret;
+    return vol->read(req);
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
