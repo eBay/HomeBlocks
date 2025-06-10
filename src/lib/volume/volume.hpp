@@ -159,10 +159,13 @@ public:
 
     VolumeManager::NullAsyncResult read(const vol_interface_req_ptr& req);
 
-    bool can_remove() { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
+    bool can_remove() const { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
 
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
-    void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
+    void dec_ref(uint64_t n = 1) {
+        DEBUG_ASSERT(outstanding_reqs_.get() >= n, "Cannot decrement outstanding requests below zero");
+        outstanding_reqs_.decrement(n);
+    }
     uint64_t num_outstanding_reqs() const { return outstanding_reqs_.get(); }
 
 private:
