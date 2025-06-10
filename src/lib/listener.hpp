@@ -47,9 +47,12 @@ public:
     // destroyed;
     void on_destroy(const homestore::group_id_t& group_id) override;
 
-    // <<<<< with r1: mock apis that will never be triggered >>>>
-    void on_replace_member(const homestore::replica_member_info& member_out,
-                           const homestore::replica_member_info& member_in) override {}
+    virtual void on_start_replace_member(const homestore::replica_member_info& member_out,
+                                         const homestore::replica_member_info& member_in,
+                                         homestore::trace_id_t tid) override {}
+    void on_complete_replace_member(const homestore::replica_member_info& member_out,
+                                    const homestore::replica_member_info& member_in,
+                                    homestore::trace_id_t tid) override {}
     void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                      cintrusive< homestore::repl_req_ctx >& ctx) override {}
     void on_restart() override { LOGD("HBListener::on_restart()"); }
