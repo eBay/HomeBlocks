@@ -78,10 +78,12 @@ TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
             ASSERT_TRUE(vol_ptr != nullptr);
 
             // fake a write that will be delayed;
-            vol_mgr->write(vol_ptr, nullptr);
+            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->write(vol_ptr, req1);
 
             // fake a read that will be delayed;
-            vol_mgr->read(vol_ptr, nullptr);
+            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->read(vol_ptr, req2);
         }
     }
 
@@ -114,10 +116,12 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
             ASSERT_TRUE(vol_ptr != nullptr);
 
             // fake a write that will be delayed;
-            vol_mgr->write(vol_ptr, nullptr);
+            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->write(vol_ptr, req1);
 
             // fake a read that will be delayed;
-            vol_mgr->read(vol_ptr, nullptr);
+            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->read(vol_ptr, req2);
         }
 
         auto const s = hb->get_stats();

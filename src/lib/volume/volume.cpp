@@ -183,7 +183,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     auto result = rd()->alloc_blks(data_size, hints, new_blkids);
     if (result) {
         LOGE("Failed to allocate blocks");
-        dec_ref();
+        // dec_ref();
         return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
     }
 
@@ -196,7 +196,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
         .thenValue(
             [this, vol_req, new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
                 if (result) {
-                    dec_ref();
+                    // dec_ref();
                     return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR);
                 }
 
@@ -226,7 +226,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                     lba_t end_lba = start_lba + blkid.blk_count() - 1;
                     auto status = write_to_index(start_lba, end_lba, blocks_info);
                     if (!status) {
-                        dec_ref();
+                        // dec_ref();
                         return folly::makeUnexpected(VolumeError::INDEX_ERROR);
                     }
 
@@ -273,7 +273,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                 return req->result()
                     .via(&folly::InlineExecutor::instance())
                     .thenValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                        dec_ref();
+                        // dec_ref();
                         if (result.hasError()) {
                             auto err = result.error();
                             return folly::makeUnexpected(err);
@@ -321,12 +321,12 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     if (auto index_resp = read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
-        dec_ref();
+        // dec_ref();
         return index_resp;
     }
 
     if (read_ctx.index_kvs.empty()) {
-        dec_ref();
+        // dec_ref();
         return folly::Unit();
     }
 
@@ -341,7 +341,6 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 4: verify the checksum after all the reads are done
     return folly::collectAllUnsafe(futs).thenValue(
         [this, req, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
-            dec_ref();
             for (auto const& err_c : vf) {
                 if (sisl_unlikely(err_c.value())) {
                     auto ec = err_c.value();
