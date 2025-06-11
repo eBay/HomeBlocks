@@ -16,6 +16,8 @@ ENUM(VolumeError, uint16_t, UNKNOWN = 1, INVALID_ARG, TIMEOUT, UNKNOWN_VOLUME, U
 using lba_t = uint64_t;
 using lba_count_t = uint32_t;
 
+class Volume;
+using VolumePtr = shared< Volume >;
 struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     uint8_t* buffer{nullptr};
     lba_t lba;
@@ -23,13 +25,20 @@ struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     sisl::atomic_counter< int > refcount;
     bool part_of_batch{false};
     uint64_t request_id;
+    VolumePtr vol{nullptr}; // back refto the volume this request is associated with
 
+    // Set back reference to the volume and adding 1 ref_cnt.
+    void back_ref(VolumePtr vol_ptr);
     friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
-
+    friend void intrusive_ptr_release(vol_interface_req* req);
+#if 0
     friend void intrusive_ptr_release(vol_interface_req* req) {
-        if (req->refcount.decrement_testz()) { req->free_yourself(); }
+        if (req->refcount.decrement_testz()) {
+            req->vol->dec_ref(1);
+            req->free_yourself();
+        }
     }
-
+#endif
 public:
     vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas) :
             buffer(buf), lba(lba), nlbas(nlbas) {}
@@ -80,8 +89,6 @@ struct VolumeStats {
     }
 };
 
-class Volume;
-using VolumePtr = shared< Volume >;
 class VolumeManager : public Manager< VolumeError > {
 public:
     virtual NullAsyncResult create_volume(VolumeInfo&& volume_info) = 0;

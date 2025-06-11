@@ -133,6 +133,8 @@ public:
 
     VolumeInfoPtr info() const { return vol_info_; }
 
+    std::string to_string() { return vol_info_->to_string(); }
+
     //
     // Initialize index table for this volume and saves the index handle in the volume object;
     //

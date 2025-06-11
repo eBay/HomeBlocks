@@ -166,7 +166,7 @@ bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { retur
 
 void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
 
-VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& vol_req) {
+VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE(
             "Can't serve write, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
@@ -174,7 +174,8 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
-    vol->inc_ref();
+    req->back_ref(vol);
+    // vol->inc_ref();
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->write
@@ -182,7 +183,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
         return folly::Unit();
     }
 #endif
-    return vol->write(vol_req);
+    return vol->write(req);
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
@@ -192,7 +193,8 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
-    vol->inc_ref();
+    req->back_ref(vol);
+    // vol->inc_ref();
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->read
@@ -279,6 +281,19 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }
 
+void vol_interface_req::back_ref(VolumePtr vol_ptr) {
+    DEBUG_ASSERT(vol == nullptr, "not expecting back ref to volume when vol is already set, vol={}", vol->to_string());
+    vol = vol_ptr;
+    vol->inc_ref(1); // increase ref_cnt for the volume
+}
+
+void intrusive_ptr_release(vol_interface_req* req) {
+    if (req->refcount.decrement_testz()) {
+        req->vol->dec_ref(1);
+        req->free_yourself();
+    }
+}
+
 #ifdef _PRERELEASE
 bool HomeBlocksImpl::delay_fake_io(VolumePtr v) {
     if (iomgr_flip::instance()->delay_flip("vol_fake_io_delay_simulation", [this, v]() mutable {
@@ -286,6 +301,7 @@ bool HomeBlocksImpl::delay_fake_io(VolumePtr v) {
             v->dec_ref();
         })) {
         LOGI("Slow down vol fake IO flip is enabled, scheduling to call later.");
+        v->inc_ref();
         return true;
     }
     return false;
