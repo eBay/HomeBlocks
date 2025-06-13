@@ -54,7 +54,6 @@ public:
     }
 };
 
-#if 0
 #ifdef _PRERELEASE
 TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
     std::vector< volume_id_t > vol_ids;
@@ -102,7 +101,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
 
     g_helper->restart(2);
 }
-#if 0
+
 TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -195,7 +194,6 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
     g_helper->restart(2);
 }
-#endif
 #endif
 
 TEST_F(VolumeTest, CreateDestroyVolume) {
@@ -319,7 +317,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(2);
 }
-#endif
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     char** orig_argv = argv;
