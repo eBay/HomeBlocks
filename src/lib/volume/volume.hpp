@@ -169,6 +169,7 @@ public:
     void destroy();
 
     bool is_destroying() const { return sb_->state == vol_state::DESTROYING; }
+    bool is_destroy_started() const { return destroy_started_; }
 
     //
     // This API will be called to set the volume state and persist to disk;
@@ -187,13 +188,15 @@ public:
 
     VolumeManager::NullAsyncResult read(const vol_interface_req_ptr& req);
 
+    //
+    // if destroy_started_ is true, it means volume destroy has started and we should not call remove again;
+    // if outstanding_reqs_ is not zero, it means there are still requests outstanding and we should not call remove;
+    // destroy_started_ will be set to true when volume destroy starts processing;
+    //
     bool can_remove() const { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
 
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
-    void dec_ref(uint64_t n = 1) {
-        DEBUG_ASSERT(outstanding_reqs_.get() >= n, "Cannot decrement outstanding requests below zero");
-        outstanding_reqs_.decrement(n);
-    }
+    void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
     uint64_t num_outstanding_reqs() const { return outstanding_reqs_.get(); }
     void update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids);
 
