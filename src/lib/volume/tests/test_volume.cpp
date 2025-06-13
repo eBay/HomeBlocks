@@ -101,7 +101,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
 
     g_helper->restart(2);
 }
-#if 0
+
 TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -194,9 +194,9 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
     g_helper->restart(2);
 }
+
 #endif
-#endif
-#if 0
+
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -304,7 +304,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(2);
 }
-#endif
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
