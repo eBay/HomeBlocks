@@ -220,7 +220,7 @@ std::vector< shared< VolumeChunkSelector::HBChunk > >
 VolumeChunkSelector::allocate_init_chunks_from_pdev(uint64_t init_chunks, uint64_t total_chunks) {
     std::lock_guard lock(m_chunk_sel_mutex);
     std::vector< shared< HBChunk > > result;
-    RELEASE_ASSERT(init_chunks < total_chunks, "Invalid chunks requested");
+    RELEASE_ASSERT(init_chunks <= total_chunks, "Invalid chunks requested");
     for (auto& [pdev, pdev_chunks] : m_per_dev_chunks) {
         // Find the physical device which has enough total_chunks needed for a volume.
         if (pdev_chunks.size() >= total_chunks) {

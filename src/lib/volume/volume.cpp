@@ -217,6 +217,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                         auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
                         auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
                         blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                        // LOGT("volume write blkid={} csum={}", new_bid.to_string(), csum);
                         data_buffer += blk_size;
                     }
 
@@ -265,6 +266,16 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                     std::memcpy(key_buf, &blkid, sizeof(BlkId));
                     key_buf += sizeof(BlkId);
                 }
+
+#ifdef _PRERELEASE
+                if (iomgr_flip::instance()->test_flip("vol_write_crash_after_data_write")) {
+                    // this is to simulate crash during write where data is persisted journal is
+                    // not persisted. After recovery there is no index for.
+                    LOGINFO("Volume write crash simulation flip is set, aborting");
+                    dec_ref();
+                    return folly::Unit();
+                }
+#endif
 
                 rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
 
@@ -316,7 +327,8 @@ VolumeManager::Result< folly::Unit > Volume::write_to_index(lba_t start_lba, lba
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 1: get the blk ids from index table
-    vol_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_size = rd()->get_blk_size()};
+    vol_read_ctx read_ctx{
+        .buf = req->buffer, .start_lba = req->lba, .nlbas = req->nlbas, .blk_size = rd()->get_blk_size()};
     if (auto index_resp = read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
@@ -387,7 +399,8 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
         }
         auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), read_ctx.blk_size);
         if (checksum != value.checksum()) {
-            LOGE("crc mismatch for lba: {}, blk id {}, expected: {}, actual: {}", cur_lba, value.blkid().to_string(),
+            LOGE("crc mismatch for lba: {} start: {}, end: {} blk id {}, expected: {}, actual: {}", cur_lba,
+                 read_ctx.start_lba, (read_ctx.start_lba + read_ctx.nlbas - 1), value.blkid().to_string(),
                  value.checksum(), checksum);
             return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
         }
