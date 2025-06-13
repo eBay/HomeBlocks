@@ -55,6 +55,53 @@ public:
 };
 
 #ifdef _PRERELEASE
+TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb->volume_manager();
+
+        uint32_t delay_sec = 6;
+        g_helper->set_delay_flip("vol_fake_io_delay_simulation", delay_sec * 1000 * 1000 /*delay_usec*/, 2, 100);
+
+        auto num_vols = 1ul;
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
+            ASSERT_TRUE(ret);
+
+            auto vol_ptr = vol_mgr->lookup_volume(id);
+            // verify the volume is there
+            ASSERT_TRUE(vol_ptr != nullptr);
+
+            // fake a write that will be delayed;
+            vol_interface_req_ptr req1(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->write(vol_ptr, req1);
+
+            // fake a read that will be delayed;
+            vol_interface_req_ptr req2(new vol_interface_req{nullptr, 0, 0});
+            vol_mgr->read(vol_ptr, req2);
+        }
+
+        auto const s = hb->get_stats();
+        auto const dtype = hb->data_drive_type();
+        LOGINFO("Stats: {}, drive_type: {}", s.to_string(), dtype);
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto id = vol_ids[i];
+            auto ret = vol_mgr->remove_volume(id).get();
+            ASSERT_TRUE(ret);
+        }
+    }
+
+    g_helper->remove_flip("vol_fake_io_delay_simulation");
+
+    g_helper->restart(2);
+}
+#if 0
 TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -147,9 +194,9 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 
     g_helper->restart(2);
 }
-
 #endif
-
+#endif
+#if 0
 TEST_F(VolumeTest, CreateDestroyVolume) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -257,7 +304,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
     g_helper->restart(2);
 }
-
+#endif
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);

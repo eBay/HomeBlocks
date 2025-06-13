@@ -175,7 +175,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
     }
 
     req->back_ref(vol);
-    // vol->inc_ref();
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->write
@@ -194,7 +193,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
     }
 
     req->back_ref(vol);
-    // vol->inc_ref();
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->read

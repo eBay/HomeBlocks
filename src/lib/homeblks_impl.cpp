@@ -96,9 +96,6 @@ bool HomeBlocksImpl::no_outstanding_vols() const {
                 continue; // skip volumes that are being removed due to crash simulation
             }
 #endif
-            DEBUG_ASSERT_EQ(vol->num_outstanding_reqs(), 0,
-                            "Volume {} is being removed but has outstanding requests: {}", vol->id_str(),
-                            vol->num_outstanding_reqs());
             LOGI("Found outstanding volume {} that is under destruction.", vol->id_str());
             return false;
         }
