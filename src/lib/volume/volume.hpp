@@ -15,6 +15,7 @@
  *********************************************************************************/
 #pragma once
 #include "index.hpp"
+#include "volume_chunk_selector.hpp"
 #include "sisl/utility/enum.hpp"
 #include "sisl/utility/atomic_counter.hpp"
 #include <homeblks/volume_mgr.hpp>
@@ -87,24 +88,48 @@ private:
         volume_id_t id;
         char name[VOL_NAME_SIZE];
         vol_state state{vol_state::INIT};
+        uint64_t ordinal; // Id unique to local homeblk instance.
+        uint32_t pdev_id; // All chunks for this volume allocated from this physical dev.
+        uint32_t num_chunks;
+        // List of chunk ids allocated for this volume are stored after this.
 
-        void init(uint32_t page_sz, uint64_t sz_bytes, volume_id_t vid, std::string const& name_str) {
+        void init(uint32_t page_sz, uint64_t sz_bytes, volume_id_t vid, std::string const& name_str, uint64_t ord,
+                  uint32_t pdev, std::vector< homestore::chunk_num_t > const& chunk_ids) {
             magic = VOL_SB_MAGIC;
             version = VOL_SB_VER;
             page_size = page_sz;
             size = sz_bytes;
             id = vid;
+            ordinal = ord;
             // name will be truncated if input name is longer than VOL_NAME_SIZE;
             std::strncpy((char*)name, name_str.c_str(), VOL_NAME_SIZE - 1);
             name[VOL_NAME_SIZE - 1] = '\0';
+
+            // Store the pdev, num_chunks and chunk id's.
+            pdev_id = pdev;
+            num_chunks = chunk_ids.size();
+            auto chunk_id_ptr = get_chunk_ids_mutable();
+            for (auto& chunk_id : chunk_ids) {
+                *chunk_id_ptr = chunk_id;
+                chunk_id_ptr++;
+            }
+        }
+
+        homestore::chunk_num_t* get_chunk_ids_mutable() {
+            return r_cast< homestore::chunk_num_t* >(uintptr_cast(this) + sizeof(vol_sb_t));
+        }
+
+        const homestore::chunk_num_t* get_chunk_ids() const {
+            return r_cast< const homestore::chunk_num_t* >(reinterpret_cast< const uint8_t* >(this) + sizeof(vol_sb_t));
         }
     };
 
 public:
-    explicit Volume(VolumeInfo&& info) : sb_{VOL_META_NAME} {
-        vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name);
+    explicit Volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) :
+            sb_{VOL_META_NAME}, chunk_selector_{chunk_sel} {
+        vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
     }
-    explicit Volume(sisl::byte_view const& buf, void* cookie);
+    explicit Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel);
     Volume(Volume const& volume) = delete;
     Volume(Volume&& volume) = default;
     Volume& operator=(Volume const& volume) = delete;
@@ -113,21 +138,22 @@ public:
     virtual ~Volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
-    static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie) {
-        auto vol = std::make_shared< Volume >(buf, cookie);
+    static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel) {
+        auto vol = std::make_shared< Volume >(buf, cookie, chunk_sel);
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
     }
 
-    static VolumePtr make_volume(VolumeInfo&& info) {
-        auto vol = std::make_shared< Volume >(std::move(info));
-        auto ret = vol->init();
+    static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) {
+        auto vol = std::make_shared< Volume >(std::move(info), chunk_sel);
+        auto ret = vol->init(false /* is_recovery */);
         // in failure case, volume shared ptr will be destroyed automatically;
         return ret ? vol : nullptr;
     }
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
     volume_id_t id() const { return vol_info_->id; };
+    uint64_t ordinal() const { return vol_info_->ordinal; }
     std::string id_str() const { return boost::uuids::to_string(vol_info_->id); };
     ReplDevPtr rd() const { return rd_; }
 
@@ -167,6 +193,7 @@ public:
         outstanding_reqs_.decrement(n);
     }
     uint64_t num_outstanding_reqs() const { return outstanding_reqs_.get(); }
+    void update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids);
 
 private:
     //
@@ -175,7 +202,7 @@ private:
     // init is synchronous and will return false in case of failure to create repl dev and volume instance will be
     // destroyed automatically; if success, the repl dev will be stored in the volume object;
     //
-    bool init(bool is_recovery = false);
+    bool init(bool is_recovery);
 
     VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
 
@@ -191,6 +218,7 @@ private:
     ReplDevPtr rd_;           // replication device for this volume, which provides read/write APIs to the volume;
     VolIdxTablePtr indx_tbl_; // index table for this volume
     superblk< vol_sb_t > sb_; // meta data of the volume
+    shared< VolumeChunkSelector > chunk_selector_; // volume chunk selector.
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
     bool destroy_started_{

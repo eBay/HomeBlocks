@@ -31,6 +31,7 @@
 #include <iostream>
 #include <thread>
 #include <homeblks/home_blks.hpp>
+#include "lib/homeblks_impl.hpp"
 
 SISL_OPTION_GROUP(
     test_common_setup,
@@ -174,6 +175,8 @@ public:
         init_dev_list(true /*init_device*/);
 
         LOGINFO("Starting HomeBlocks");
+        homeblocks::HomeBlocksImpl::_hs_chunk_size = 4 * Mi;
+        set_min_chunk_size(4 * Mi);
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }
@@ -237,6 +240,20 @@ public:
         LOGDEBUG("Flip {} removed", flip_name);
     }
 #endif
+    void set_min_chunk_size(uint64_t chunk_size) {
+#ifdef _PRERELEASE
+        LOGINFO("Set minimum chunk size {}", chunk_size);
+        flip::FlipClient* fc = iomgr_flip::client_instance();
+
+        flip::FlipFrequency freq;
+        freq.set_count(2000000);
+        freq.set_percent(100);
+
+        flip::FlipCondition dont_care_cond;
+        fc->create_condition("", flip::Operator::DONT_CARE, (int)1, &dont_care_cond);
+        fc->inject_retval_flip< long >("set_minimum_chunk_size", {dont_care_cond}, freq, chunk_size);
+#endif
+    }
 
 private:
     void init_devices(bool is_file, uint64_t dev_size = 0) {

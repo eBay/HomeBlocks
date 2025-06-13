@@ -85,4 +85,6 @@ public:
     static homestore::uuid_t gen_random_uuid();
 };
 
+static constexpr uint32_t MAX_NUM_VOLUMES = 2048;
+
 } // namespace homeblocks
