@@ -200,7 +200,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
-    req->back_ref(vol);
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->write
@@ -218,7 +217,6 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
         return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
     }
 
-    req->back_ref(vol);
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->read
@@ -305,10 +303,9 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }
 
-void vol_interface_req::back_ref(VolumePtr vol_ptr) {
-    DEBUG_ASSERT(vol == nullptr, "not expecting back ref to volume when vol is already set, vol={}", vol->to_string());
-    vol = vol_ptr;
-    vol->inc_ref(1); // increase ref_cnt for the volume
+vol_interface_req::vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas, VolumePtr vol_ptr) :
+        buffer(buf), lba(lba), nlbas(nlbas), vol(vol_ptr) {
+    vol->inc_ref(1);
 }
 
 void intrusive_ptr_release(vol_interface_req* req) {

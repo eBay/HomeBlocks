@@ -140,7 +140,7 @@ public:
         test_common::Waiter waiter(1);
         auto fut = waiter.start([this, vol, start_lba, nblks, &waiter]() mutable {
             auto data = build_random_data(start_lba, nblks);
-            vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks});
+            vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
             auto vol_mgr = g_helper->inst()->volume_manager();
             vol_mgr->write(m_vol_ptr, req)
                 .via(&folly::InlineExecutor::instance())
@@ -160,7 +160,7 @@ public:
 
     auto generate_io(lba_t start_lba = 0, uint32_t nblks = 0) {
         auto data = build_random_data(start_lba, nblks);
-        vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks});
+        vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
         auto vol_mgr = g_helper->inst()->volume_manager();
         vol_mgr->write(m_vol_ptr, req)
             .via(&folly::InlineExecutor::instance())
@@ -178,7 +178,7 @@ public:
         auto sz = nlbas * m_vol_ptr->info()->page_size;
         sisl::io_blob_safe read_blob(sz, 512);
         auto buf = read_blob.bytes();
-        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas});
+        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
         auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
         if (read_resp.hasError()) { LOGERROR("Read failed with error={}", read_resp.error()); }
         RELEASE_ASSERT(!read_resp.hasError(), "Read failed with error={}", read_resp.error());

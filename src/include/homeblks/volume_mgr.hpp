@@ -27,22 +27,11 @@ struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     uint64_t request_id;
     VolumePtr vol{nullptr}; // back refto the volume this request is associated with
 
-    // Set back reference to the volume and adding 1 ref_cnt.
-    void back_ref(VolumePtr vol_ptr);
     friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
     friend void intrusive_ptr_release(vol_interface_req* req);
-#if 0
-    friend void intrusive_ptr_release(vol_interface_req* req) {
-        if (req->refcount.decrement_testz()) {
-            req->vol->dec_ref(1);
-            req->free_yourself();
-        }
-    }
-#endif
-public:
-    vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas) :
-            buffer(buf), lba(lba), nlbas(nlbas) {}
 
+public:
+    vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas, VolumePtr vol_ptr);
     virtual ~vol_interface_req() = default; // override; sisl::ObjLifeCounter should have virtual destructor
     virtual void free_yourself() { delete this; }
     lba_t end_lba() const { return lba + nlbas - 1; }
