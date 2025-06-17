@@ -53,6 +53,7 @@ Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSele
     sb_.load(buf, cookie);
     // generate volume info from sb;
     vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
+    m_state_ = sb_->state;
     LOGI("Volume superblock loaded from disk, vol_info : {}", vol_info_->to_string());
 }
 
@@ -125,6 +126,9 @@ bool Volume::init(bool is_recovery) {
              chunk_ids.size());
         // index table will be recovered via in subsequent callback with init_index_table API;
     }
+
+    // set the in memory state from superblock;
+    m_state_ = sb_->state;
     return true;
 }
 

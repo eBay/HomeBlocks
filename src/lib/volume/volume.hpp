@@ -168,8 +168,8 @@ public:
 
     void destroy();
 
-    bool is_destroying() const { return sb_->state == vol_state::DESTROYING; }
-    bool is_destroy_started() const { return destroy_started_; }
+    bool is_destroying() const { return m_state_.load() == vol_state::DESTROYING; }
+    bool is_destroy_started() const { return destroy_started_.load(); }
 
     //
     // This API will be called to set the volume state and persist to disk;
@@ -178,6 +178,7 @@ public:
         if (sb_->state != s) {
             sb_->state = s;
             sb_.write();
+            m_state_ = s;
         }
     }
 
@@ -226,8 +227,9 @@ private:
     shared< VolumeChunkSelector > chunk_selector_; // volume chunk selector.
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
-    bool destroy_started_{
+    std::atomic< bool > destroy_started_{
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
+    std::atomic< vol_state > m_state_; // in-memory sb state;
 };
 
 struct vol_repl_ctx : public homestore::repl_req_ctx {
