@@ -18,6 +18,8 @@ using lba_count_t = uint32_t;
 
 class Volume;
 using VolumePtr = shared< Volume >;
+
+// volume interface request should be freed only after IO is completed.
 struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     uint8_t* buffer{nullptr};
     lba_t lba;
@@ -25,7 +27,7 @@ struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     sisl::atomic_counter< int > refcount;
     bool part_of_batch{false};
     uint64_t request_id;
-    VolumePtr vol{nullptr}; // back refto the volume this request is associated with
+    VolumePtr vol{nullptr}; // back refto the volume this request is associated with.
 
     friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
     friend void intrusive_ptr_release(vol_interface_req* req);
