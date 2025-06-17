@@ -175,6 +175,7 @@ public:
     }
 
     void read_and_verify(lba_t start_lba, uint32_t nlbas) {
+        LOGTRACE("Reading and verifying data for volume {} from lba={} with nlbas={}", m_vol_name, start_lba, nlbas);
         auto sz = nlbas * m_vol_ptr->info()->page_size;
         sisl::io_blob_safe read_blob(sz, 512);
         auto buf = read_blob.bytes();
@@ -188,6 +189,8 @@ public:
             if (auto it = m_lba_data.find(lba); it != m_lba_data.end()) {
                 data_pattern = it->second;
                 test_common::HBTestHelper::validate_data_buf(buf, m_vol_ptr->info()->page_size, data_pattern);
+            } else {
+                test_common::HBTestHelper::validate_zeros(buf, m_vol_ptr->info()->page_size);
             }
 
             LOGDEBUG("Verify data lba={} pattern expected={} actual={}", lba, data_pattern,
@@ -198,6 +201,8 @@ public:
     void verify_all_data(uint64_t nlbas_per_io = 1) {
         auto start_lba = m_lba_data.begin()->first;
         auto max_lba = m_lba_data.rbegin()->first;
+        LOGTRACE("Verifying data for volume {} from lba={} to lba={} with nlbas_per_io={}", m_vol_name, start_lba,
+                 max_lba, nlbas_per_io);
         verify_data(start_lba, max_lba, nlbas_per_io);
     }
 

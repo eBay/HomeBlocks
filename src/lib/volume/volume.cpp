@@ -323,8 +323,6 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
         return index_resp;
     }
 
-    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
-
     // Step 2: Consolidate the blocks by merging the contiguous blkids
     std::vector< folly::Future< std::error_code > > futs;
     read_blks_list_t blks_to_read;
@@ -332,6 +330,8 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
 
     // Step 3: Submit the read requests to backend
     submit_read_to_backend(blks_to_read, req, futs);
+
+    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
 
     // Step 4: verify the checksum after all the reads are done
     return folly::collectAllUnsafe(futs).thenValue(
@@ -403,12 +403,18 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
                                     std::vector< folly::Future< std::error_code > >& futs) {
     auto* read_buf = req->buffer;
     DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
-    for (uint32_t i = 0, prev_lba = req->lba, prev_nblks = 0; i < blks_to_read.size(); ++i) {
+    uint32_t prev_lba = req->lba;
+    uint32_t prev_nblks = 0;
+    for (uint32_t i = 0; i < blks_to_read.size(); ++i) {
         auto const& [start_lba, blkids] = blks_to_read[i];
         DEBUG_ASSERT(start_lba >= prev_lba + prev_nblks, "Invalid start lba: {}, prev_lba: {}, prev_nblks: {}",
                      start_lba, prev_lba, prev_nblks);
-        auto holes_nblks = start_lba - (prev_lba + prev_nblks);
-        read_buf += (holes_nblks * rd()->get_blk_size());
+        auto holes_size = (start_lba - (prev_lba + prev_nblks)) * rd()->get_blk_size();
+        // if there are holes, fill the holes with zeros
+        if (holes_size > 0) {
+            std::memset(read_buf, 0, holes_size);
+            read_buf += holes_size;
+        }
         sisl::sg_list sgs;
         sgs.size = blkids.blk_count() * rd()->get_blk_size();
         sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = sgs.size});
@@ -417,6 +423,17 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
         prev_lba = start_lba;
         prev_nblks = blkids.blk_count();
     }
+    // if there are any holes at the end, fill them with zeros
+    if (prev_lba + prev_nblks < req->end_lba() + 1) {
+        auto holes_size = (req->end_lba() + 1 - (prev_lba + prev_nblks)) * rd()->get_blk_size();
+        if (holes_size > 0) {
+            std::memset(read_buf, 0, holes_size);
+            read_buf += holes_size;
+        }
+    }
+    DEBUG_ASSERT_EQ(read_buf - req->buffer, req->nlbas * rd()->get_blk_size(),
+                    "Read buffer size mismatch, expected: {}, actual: {}", req->nlbas * rd()->get_blk_size(),
+                    read_buf - req->buffer);
 }
 
 VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface_req_ptr& req,
