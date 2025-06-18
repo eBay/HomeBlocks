@@ -29,8 +29,8 @@ static VolumeError to_volume_error(std::error_code ec) {
 shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl) {
     if (!is_recovery) {
         index_cfg_t cfg(homestore::hs()->index_service().node_size());
-        cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
-        cfg.m_int_node_type = homestore::btree_node_type::FIXED;
+        cfg.m_leaf_node_type = btree_leaf_node_type;
+        cfg.m_int_node_type = btree_int_node_type;
 
         // create index table;
         auto uuid = hb_utils::gen_random_uuid();
@@ -44,7 +44,7 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
         indx_tbl_ = tbl;
     }
 
-    homestore::hs()->index_service().add_index_table(indx_table());
+    homestore::hs()->index_service().add_index_table(indx_tbl_->index_table());
     return indx_table();
 }
 
@@ -155,7 +155,6 @@ void Volume::destroy() {
     // 2. destroy the index table;
     if (indx_tbl_) {
         LOGI("Destroying index table for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
-        homestore::hs()->index_service().remove_index_table(indx_tbl_);
         indx_tbl_->destroy();
         indx_tbl_ = nullptr;
     }
@@ -225,7 +224,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                     // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
                     // in blocks_info after write_to_index
                     lba_t end_lba = start_lba + blkid.blk_count() - 1;
-                    auto status = write_to_index(start_lba, end_lba, blocks_info);
+                    auto status = indx_table()->write_to_index(start_lba, end_lba, blocks_info);
                     if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
 
                     start_lba = end_lba + 1;
@@ -292,42 +291,10 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             });
 }
 
-VolumeManager::Result< folly::Unit > Volume::write_to_index(lba_t start_lba, lba_t end_lba,
-                                                            std::unordered_map< lba_t, BlockInfo >& blocks_info) {
-    // Use filter callback to get the old blkid.
-    homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
-                                                          BtreeValue const& value) {
-        auto lba = r_cast< const VolumeIndexKey& >(key).key();
-        blocks_info[lba].old_blkid = r_cast< const VolumeIndexValue& >(existing_value).blkid();
-        return homestore::put_filter_decision::replace;
-    };
-
-    // Write to prefix btree with key ranging from start_lba to end_lba.
-    // For value shift() will get the blk_num and checksum for each lba.
-    IndexValueContext app_ctx{&blocks_info, start_lba};
-    const BlkId& start_blkid = blocks_info[start_lba].new_blkid;
-    VolumeIndexValue value{start_blkid, blocks_info[start_lba].checksum};
-
-    auto req = homestore::BtreeRangePutRequest< VolumeIndexKey >{
-        homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, true, VolumeIndexKey{end_lba}, true},
-        homestore::btree_put_type::UPSERT,
-        r_cast< VolumeIndexValue* >(&value),
-        r_cast< void* >(&app_ctx),
-        std::numeric_limits< uint32_t >::max() /* batch_size */,
-        filter_cb};
-    auto result = indx_table()->put(req);
-    if (result != homestore::btree_status_t::success) {
-        LOGERROR("Failed to put to index range=({},{}) error={}", start_lba, end_lba, result);
-        return folly::makeUnexpected(VolumeError::INDEX_ERROR);
-    }
-
-    return folly::Unit();
-}
-
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 1: get the blk ids from index table
     vol_read_ctx read_ctx{.vol_req = req, .blk_size = rd()->get_blk_size()};
-    if (auto index_resp = read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
+    if (auto index_resp = indx_table()->read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
         return index_resp;
@@ -444,19 +411,6 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
     DEBUG_ASSERT_EQ(read_buf - req->buffer, req->nlbas * rd()->get_blk_size(),
                     "Read buffer size mismatch, expected: {}, actual: {}", req->nlbas * rd()->get_blk_size(),
                     read_buf - req->buffer);
-}
-
-VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface_req_ptr& req,
-                                                             index_kv_list_t& index_kvs) {
-    homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
-        homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
-        homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
-    auto index_table = indx_table();
-    RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(id()));
-    if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-        return folly::makeUnexpected(VolumeError::INDEX_ERROR);
-    }
-    return folly::Unit();
 }
 
 } // namespace homeblocks
