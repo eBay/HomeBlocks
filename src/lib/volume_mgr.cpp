@@ -52,7 +52,7 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
     }
 }
 
-shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
+shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
     auto pid_str = boost::uuids::to_string(sb->parent_uuid); // parent_uuid is the volume id
     {
         auto lg = std::scoped_lock(index_lock_);
@@ -63,7 +63,7 @@ shared< VolumeIndexTable > HomeBlocksImpl::recover_index_table(homestore::superb
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
         idx_tbl_map_.emplace(pid_str, tbl);
-        return tbl;
+        return tbl->index_table();
     }
 }
 
@@ -282,7 +282,7 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
             // We ignore the existing values we got in blocks_info from index as it will be
             // same checksum, blkid we see in the journal entry.
             lba_t end_lba = start_lba + blkid.blk_count() - 1;
-            auto status = vol_ptr->write_to_index(start_lba, end_lba, blocks_info);
+            auto status = vol_ptr->indx_table()->write_to_index(start_lba, end_lba, blocks_info);
             RELEASE_ASSERT(status, "Index error during recovery");
             start_lba = end_lba + 1;
         }
