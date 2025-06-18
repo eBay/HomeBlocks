@@ -175,8 +175,8 @@ public:
         init_dev_list(true /*init_device*/);
 
         LOGINFO("Starting HomeBlocks");
-        homeblocks::HomeBlocksImpl::_hs_chunk_size = 4 * Mi;
-        set_min_chunk_size(4 * Mi);
+        homeblocks::HomeBlocksImpl::_hs_chunk_size = 128 * Mi;
+        // set_min_chunk_size(4 * Mi);
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
     }

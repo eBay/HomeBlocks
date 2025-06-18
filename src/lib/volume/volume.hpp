@@ -38,6 +38,7 @@ using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > 
 struct vol_read_ctx {
     uint8_t* buf;
     lba_t start_lba;
+    uint32_t nlbas;
     uint32_t blk_size;
     index_kv_list_t index_kvs{};
 };
