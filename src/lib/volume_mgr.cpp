@@ -57,8 +57,8 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
     {
         auto lg = std::scoped_lock(index_lock_);
         index_cfg_t cfg(homestore::hs()->index_service().node_size());
-        cfg.m_leaf_node_type = homestore::btree_node_type::PREFIX;
-        cfg.m_int_node_type = homestore::btree_node_type::FIXED;
+        cfg.m_leaf_node_type = btree_leaf_node_type;
+        cfg.m_int_node_type = btree_int_node_type;
 
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);

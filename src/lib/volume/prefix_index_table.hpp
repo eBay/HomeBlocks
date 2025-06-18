@@ -14,7 +14,9 @@ class VolumeIndexTable {
     std::shared_ptr< hs_index_table_t > hs_index_table_;
 public:
     template <typename... Args>
-    VolumeIndexTable(Args&&... args) : hs_index_table_(std::make_shared< hs_index_table_t >(std::forward<Args>(args)...)) {}
+    VolumeIndexTable(Args&&... args) : hs_index_table_(std::make_shared< hs_index_table_t >(std::forward<Args>(args)...)) {
+        LOGINFO("Created Prefix Index table, uuid {}", boost::uuids::to_string(hs_index_table_->uuid()));
+    }
 
     std::shared_ptr< hs_index_table_t > index_table() {
         return hs_index_table_;
