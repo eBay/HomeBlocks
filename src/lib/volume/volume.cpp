@@ -267,10 +267,13 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                 }
 
                 rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+
                 return req->result()
                     .via(&folly::InlineExecutor::instance())
-                    .thenValue([this](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                    .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
                         if (result.hasError()) {
+                            LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
+                                 vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
                             auto err = result.error();
                             return folly::makeUnexpected(err);
                         }
