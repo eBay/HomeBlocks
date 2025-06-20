@@ -14,26 +14,18 @@
  *
  *********************************************************************************/
 #pragma once
-#include "index.hpp"
+#include "index_table_includes.hpp"
 #include "volume_chunk_selector.hpp"
-#include "sisl/utility/enum.hpp"
 #include "sisl/utility/atomic_counter.hpp"
-#include <homeblks/volume_mgr.hpp>
-#include <homestore/homestore.hpp>
-#include <homestore/index/index_table.hpp>
-#include <homestore/replication/repl_dev.h>
 #include <homeblks/common.hpp>
 
 namespace homeblocks {
-class VolumeIndexKey;
-class VolumeIndexValue;
-using VolumeIndexTable = homestore::IndexTable< VolumeIndexKey, VolumeIndexValue >;
+
 using VolIdxTablePtr = shared< VolumeIndexTable >;
 
 using ReplDevPtr = shared< homestore::ReplDev >;
 using index_cfg_t = homestore::BtreeConfig;
 
-using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
 using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
 struct vol_read_ctx {
     vol_interface_req_ptr vol_req;
@@ -163,7 +155,7 @@ public:
     //
     // Initialize index table for this volume and saves the index handle in the volume object;
     //
-    shared< VolumeIndexTable > init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl = nullptr);
+    VolIdxTablePtr init_index_table(bool is_recovery, VolIdxTablePtr tbl = nullptr);
 
     void destroy();
 

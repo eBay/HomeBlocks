@@ -129,7 +129,7 @@ public:
     void get_volume_ids(std::vector< volume_id_t >& vol_ids) const final;
 
     // Index
-    shared< VolumeIndexTable > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
+    shared< hs_index_table_t > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
 
     // HomeStore
     void init_homestore();
