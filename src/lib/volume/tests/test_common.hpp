@@ -216,6 +216,16 @@ public:
         }
     }
 
+    static void validate_zeros(uint8_t const* buf, uint64_t size) {
+        static const uint8_t zeros[1024 * 1024] = {}; // 1 mb static zero buffer
+        while (size > 0) {
+            size_t chunk = std::min(size, sizeof(zeros));
+            RELEASE_ASSERT_EQ(memcmp(buf, zeros, chunk), 0, "Data buffer mismatch");
+            buf += chunk;
+            size -= chunk;
+        }
+    }
+
 #ifdef _PRERELEASE
     void set_flip_point(const std::string flip_name) {
         flip::FlipCondition null_cond;

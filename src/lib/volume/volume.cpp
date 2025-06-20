@@ -316,14 +316,12 @@ VolumeManager::Result< folly::Unit > Volume::write_to_index(lba_t start_lba, lba
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 1: get the blk ids from index table
-    vol_read_ctx read_ctx{.buf = req->buffer, .start_lba = req->lba, .blk_size = rd()->get_blk_size()};
+    vol_read_ctx read_ctx{.vol_req = req, .blk_size = rd()->get_blk_size()};
     if (auto index_resp = read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
         return index_resp;
     }
-
-    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
 
     // Step 2: Consolidate the blocks by merging the contiguous blkids
     std::vector< folly::Future< std::error_code > > futs;
@@ -333,9 +331,11 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     // Step 3: Submit the read requests to backend
     submit_read_to_backend(blks_to_read, req, futs);
 
+    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
+
     // Step 4: verify the checksum after all the reads are done
     return folly::collectAllUnsafe(futs).thenValue(
-        [this, req, read_ctx = std::move(read_ctx)](auto&& vf) -> VolumeManager::Result< folly::Unit > {
+        [this, read_ctx](auto&& vf) -> VolumeManager::Result< folly::Unit > {
             for (auto const& err_c : vf) {
                 if (sisl_unlikely(err_c.value())) {
                     auto ec = err_c.value();
@@ -376,8 +376,8 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
 }
 
 VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const& read_ctx) {
-    auto read_buf = read_ctx.buf;
-    for (uint64_t cur_lba = read_ctx.start_lba, i = 0; i < read_ctx.index_kvs.size();) {
+    auto read_buf = read_ctx.vol_req->buffer;
+    for (uint64_t cur_lba = read_ctx.vol_req->lba, i = 0; i < read_ctx.index_kvs.size();) {
         auto const& [key, value] = read_ctx.index_kvs[i];
         // ignore the holes
         if (cur_lba != key.key()) {
@@ -403,12 +403,18 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
                                     std::vector< folly::Future< std::error_code > >& futs) {
     auto* read_buf = req->buffer;
     DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
-    for (uint32_t i = 0, prev_lba = req->lba, prev_nblks = 0; i < blks_to_read.size(); ++i) {
+    uint32_t prev_lba = req->lba;
+    uint32_t prev_nblks = 0;
+    for (uint32_t i = 0; i < blks_to_read.size(); ++i) {
         auto const& [start_lba, blkids] = blks_to_read[i];
         DEBUG_ASSERT(start_lba >= prev_lba + prev_nblks, "Invalid start lba: {}, prev_lba: {}, prev_nblks: {}",
                      start_lba, prev_lba, prev_nblks);
-        auto holes_nblks = start_lba - (prev_lba + prev_nblks);
-        read_buf += (holes_nblks * rd()->get_blk_size());
+        auto holes_size = (start_lba - (prev_lba + prev_nblks)) * rd()->get_blk_size();
+        // if there are holes, fill the holes with zeros
+        if (holes_size > 0) {
+            std::memset(read_buf, 0, holes_size);
+            read_buf += holes_size;
+        }
         sisl::sg_list sgs;
         sgs.size = blkids.blk_count() * rd()->get_blk_size();
         sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = sgs.size});
@@ -417,6 +423,17 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
         prev_lba = start_lba;
         prev_nblks = blkids.blk_count();
     }
+    // if there are any holes at the end, fill them with zeros
+    if (prev_lba + prev_nblks < req->end_lba() + 1) {
+        auto holes_size = (req->end_lba() + 1 - (prev_lba + prev_nblks)) * rd()->get_blk_size();
+        if (holes_size > 0) {
+            std::memset(read_buf, 0, holes_size);
+            read_buf += holes_size;
+        }
+    }
+    DEBUG_ASSERT_EQ(read_buf - req->buffer, req->nlbas * rd()->get_blk_size(),
+                    "Read buffer size mismatch, expected: {}, actual: {}", req->nlbas * rd()->get_blk_size(),
+                    read_buf - req->buffer);
 }
 
 VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface_req_ptr& req,

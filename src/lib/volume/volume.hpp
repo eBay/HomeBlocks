@@ -36,8 +36,7 @@ using index_cfg_t = homestore::BtreeConfig;
 using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
 using read_blks_list_t = std::vector< std::pair< lba_t, homestore::MultiBlkId > >;
 struct vol_read_ctx {
-    uint8_t* buf;
-    lba_t start_lba;
+    vol_interface_req_ptr vol_req;
     uint32_t blk_size;
     index_kv_list_t index_kvs{};
 };
