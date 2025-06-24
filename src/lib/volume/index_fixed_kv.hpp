@@ -17,7 +17,8 @@ struct BlockInfo {
     // Checksum calculated on new data and written to new_blkid.
     homestore::BlkId new_blkid;
     homestore::BlkId old_blkid;
-    homestore::csum_t checksum;
+    homestore::csum_t new_checksum;
+    homestore::csum_t old_checksum{0};
 };
 
 class VolumeIndexKey : public homestore::BtreeKey {

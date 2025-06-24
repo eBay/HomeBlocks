@@ -157,7 +157,7 @@ public:
     }
 
     lba_t end_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
-        const VolumeIndexKey& k = (const VolumeIndexKey&)(range.end_key());
+        const VolumeIndexKey& k = (const VolumeIndexKey&)(range.end_lba());
         return k.key();
     }
 

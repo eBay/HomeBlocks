@@ -256,7 +256,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
 
                 auto lba = vol_req->lba;
                 for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
-                    std::memcpy(key_buf, &blocks_info[lba].checksum, sizeof(homestore::csum_t));
+                    std::memcpy(key_buf, &blocks_info[lba].new_checksum, sizeof(homestore::csum_t));
                     key_buf += sizeof(homestore::csum_t);
                     lba++;
                 }

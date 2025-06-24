@@ -14,7 +14,19 @@
  *
  *********************************************************************************/
 #pragma once
-#include "index_table_includes.hpp"
+
+#include <homeblks/volume_mgr.hpp>
+#include "sisl/utility/enum.hpp"
+#include <homestore/homestore.hpp>
+#include <homestore/index/index_table.hpp>
+#include <homestore/replication/repl_dev.h>
+
+#if USE_FIXED_INDEX
+#include "index_fixed_table.hpp"
+#else
+#include "index_prefix_table.hpp"
+#endif
+
 #include "volume_chunk_selector.hpp"
 #include "sisl/utility/atomic_counter.hpp"
 #include <homeblks/common.hpp>

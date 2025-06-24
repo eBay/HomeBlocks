@@ -1,6 +1,6 @@
 #pragma once
 
-#include "index_kv_fixed.hpp"
+#include "index_fixed_kv.hpp"
 
 namespace homeblocks {
 
@@ -28,7 +28,9 @@ public:
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                             BtreeValue const& value) {
             auto lba = r_cast< const VolumeIndexKey& >(key).key();
-            blocks_info[lba].old_blkid = r_cast< const VolumeIndexValue& >(existing_value).blkid();
+            auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(value);
+            blocks_info[lba].old_blkid = existing_value_vol_idx.blkid();
+            blocks_info[lba].old_checksum = existing_value_vol_idx.checksum();
             return homestore::put_filter_decision::replace;
         };
 
@@ -36,7 +38,7 @@ public:
         for (auto lba = start_lba; lba <= end_lba; ++lba) {
             VolumeIndexKey key{lba};
             auto& block_info = blocks_info[lba];
-            VolumeIndexValue value{block_info.new_blkid, block_info.checksum};
+            VolumeIndexValue value{block_info.new_blkid, block_info.new_checksum};
             auto req = homestore::BtreeSinglePutRequest{
             &key,
             &value,
@@ -46,7 +48,7 @@ public:
             auto result = hs_index_table_->put(req);
             if (result != homestore::btree_status_t::success) {
                 LOGERROR("Failed to put to index {}, error={}", lba, result);
-                // TODO: Do we rollback succesful UPSERTs?
+                rollback_write(start_lba, lba - 1, blocks_info);
                 return folly::makeUnexpected(VolumeError::INDEX_ERROR);
             }
         }
@@ -63,6 +65,26 @@ public:
             return folly::makeUnexpected(VolumeError::INDEX_ERROR);
         }
       return folly::Unit();
+    }
+
+    void rollback_write(lba_t start_lba, lba_t end_lba,
+                          std::unordered_map< lba_t, BlockInfo >& blocks_info) {
+        for (auto lba = start_lba; lba <= end_lba; ++lba) {
+            VolumeIndexKey key{lba};
+            VolumeIndexValue value;
+            if (blocks_info[lba].old_blkid.is_valid()) {
+                value = VolumeIndexValue{blocks_info[lba].old_blkid, blocks_info[lba].old_checksum};
+                auto req = homestore::BtreeSinglePutRequest{&key, &value, homestore::btree_put_type::UPSERT};   
+                if (auto result = hs_index_table_->put(req); result != homestore::btree_status_t::success) {
+                    LOGERROR("Failed to rollback lba {}, put error={}", lba, result);
+                }
+            } else {
+                auto req = homestore::BtreeSingleRemoveRequest{&key, &value};
+                if (auto result = hs_index_table_->remove(req); result != homestore::btree_status_t::success) {
+                    LOGERROR("Failed to rollback lba {}, remove error={}", lba, result);
+                }
+            }
+        }
     }
 
     void destroy() {
