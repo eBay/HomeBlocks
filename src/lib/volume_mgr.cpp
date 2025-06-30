@@ -296,9 +296,19 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     // and crash recovery.
     for (uint32_t i = 0; i < journal_entry->num_old_blks; i++) {
         BlkId old_blkid = *r_cast< const BlkId* >(key_buffer);
+        LOGT("on_write free blk {}", old_blkid);
         vol_ptr->rd()->async_free_blks(lsn, old_blkid);
         key_buffer += sizeof(BlkId);
     }
+
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_write_crash_after_journal_write")) {
+        // this is to simulate crash during write where both data and journal
+        // is persisted. After recovery log entries are replayed.
+        LOGINFO("Volume write crash simulation flip is set, aborting");
+        return;
+    }
+#endif
 
     if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
 }

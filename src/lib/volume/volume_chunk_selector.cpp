@@ -104,7 +104,7 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
 
     // TODO to remove , keep trak of number of freed and alloc blks.
     // Add chunk_selector interface to have additional functions on_alloc_blk, on_free_blk in homestore.
-    uint32_t total_blks = 0, available_blks = 0, attempts = 0;
+    uint64_t total_blks = 0, available_blks = 0;
     for (auto& chunk : volc->m_chunks) {
         if (!chunk) continue;
         total_blks += chunk->get_total_blks();
@@ -141,9 +141,11 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
             if (chunk && chunk->available_blks() > 0) { return chunk->get_internal_chunk(); }
         }
 
-        LOGI("Waiting to allocate more chunks");
+        LOGI("Waiting to allocate more chunks active={} total={}", volc->num_active_chunks.load(),
+             volc->max_num_chunks);
+        dump_chunks();
         std::this_thread::sleep_for(std::chrono::microseconds(500));
-    } while (++attempts < 100);
+    } while (true);
 
     return {};
 }
@@ -157,7 +159,7 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
     }
 
     // TODO chunk select will have on_alloc_blk, on_free_blk
-    uint32_t total_blks = 0, available_blks = 0;
+    uint64_t total_blks = 0, available_blks = 0;
     for (auto& chunk : volc->m_chunks) {
         if (!chunk) continue;
         total_blks += chunk->get_total_blks();
@@ -220,7 +222,7 @@ std::vector< shared< VolumeChunkSelector::HBChunk > >
 VolumeChunkSelector::allocate_init_chunks_from_pdev(uint64_t init_chunks, uint64_t total_chunks) {
     std::lock_guard lock(m_chunk_sel_mutex);
     std::vector< shared< HBChunk > > result;
-    RELEASE_ASSERT(init_chunks < total_chunks, "Invalid chunks requested");
+    RELEASE_ASSERT(init_chunks <= total_chunks, "Invalid chunks requested");
     for (auto& [pdev, pdev_chunks] : m_per_dev_chunks) {
         // Find the physical device which has enough total_chunks needed for a volume.
         if (pdev_chunks.size() >= total_chunks) {
