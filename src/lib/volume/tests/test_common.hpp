@@ -24,6 +24,7 @@
 #include <sisl/options/options.h>
 #include <sisl/settings/settings.hpp>
 #include <iomgr/io_environment.hpp>
+#include <iomgr/http_server.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/nil_generator.hpp>
 #include <boost/uuid/random_generator.hpp>
@@ -57,6 +58,29 @@ SISL_OPTION_GROUP(
      "number"));
 
 using namespace homeblocks;
+
+class test_http_server {
+public:
+    void get_prometheus_metrics(const Pistache::Rest::Request&, Pistache::Http::ResponseWriter response) {
+        response.send(Pistache::Http::Code::Ok, sisl::MetricsFarm::getInstance().report(sisl::ReportFormat::kTextFormat));
+    }
+
+    void start() {
+        auto http_server_ptr = ioenvironment.get_http_server();
+
+        std::vector< iomgr::http_route > routes = {
+            {Pistache::Http::Method::Get, "/metrics", Pistache::Rest::Routes::bind(&test_http_server::get_prometheus_metrics, this),
+            iomgr::url_t::safe}
+        };
+        try {
+            http_server_ptr->setup_routes(routes);
+            LOGINFO("Started http server ");
+        } catch (std::runtime_error const& e) { LOGERROR("setup routes failed, {}", e.what()) }
+
+        // start the server
+        http_server_ptr->start();
+    }
+};
 
 namespace test_common {
 

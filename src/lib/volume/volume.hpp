@@ -73,6 +73,46 @@ ENUM(vol_state, uint32_t,
      READONLY    // in read only mode;
 );
 
+class VolumeMetrics : public sisl::MetricsGroupWrapper {
+public:
+    explicit VolumeMetrics(const std::string& vol_name) :
+            sisl::MetricsGroupWrapper("Volume", vol_name) {
+        // counters
+        REGISTER_COUNTER(volume_read_count, "Total Volume read operations", "volume_op_count", {"op", "read"});
+        REGISTER_COUNTER(volume_write_count, "Total Volume write operations", "volume_op_count", {"op", "write"});
+        REGISTER_COUNTER(volume_write_size_total, "Total Volume data size written", "volume_data_size", {"op", "write"});
+        REGISTER_COUNTER(volume_read_size_total, "Total Volume data size read", "volume_data_size", {"op", "read"});
+        // gauges
+        REGISTER_GAUGE(volume_data_used_size, "Total Volume data used size");
+        // histograms
+        REGISTER_HISTOGRAM(volume_write_size_distribution, "Distribution of volume write sizes",
+                           HistogramBucketsType(OpSizeBuckets));
+        REGISTER_HISTOGRAM(volume_read_size_distribution, "Distribution of volume read sizes",
+                           HistogramBucketsType(OpSizeBuckets));
+        REGISTER_HISTOGRAM(volume_read_latency, "Volume overall read latency", "volume_op_latency", {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_write_latency, "Volume overall write latency", "volume_op_latency", {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_data_read_latency, "Volume data blocks read latency", "volume_data_op_latency",
+                           {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_data_write_latency, "Volume data blocks write latency", "volume_data_op_latency",
+                           {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_map_read_latency, "Volume mapping read latency", "volume_map_op_latency",
+                           {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_map_write_latency, "Volume mapping write latency", "volume_map_op_latency",
+                           {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
+
+        register_me_to_farm();
+        attach_gather_cb(std::bind(&VolumeMetrics::on_gather, this));
+    }
+
+    VolumeMetrics(const VolumeMetrics&) = delete;
+    VolumeMetrics(VolumeMetrics&&) noexcept = delete;
+    VolumeMetrics& operator=(const VolumeMetrics&) = delete;
+    VolumeMetrics& operator=(VolumeMetrics&&) noexcept = delete;
+    ~VolumeMetrics() { deregister_me_from_farm(); }
+
+    void on_gather();
+};
+
 class Volume : public std::enable_shared_from_this< Volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
@@ -131,6 +171,7 @@ public:
     explicit Volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) :
             sb_{VOL_META_NAME}, chunk_selector_{chunk_sel} {
         vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     }
     explicit Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel);
     Volume(Volume const& volume) = delete;
@@ -169,8 +210,9 @@ public:
     //
     VolIdxTablePtr init_index_table(bool is_recovery, VolIdxTablePtr tbl = nullptr);
 
-    void destroy();
+    bool is_online() const { return m_state_.load() == vol_state::ONLINE; }
 
+    void destroy();
     bool is_destroying() const { return m_state_.load() == vol_state::DESTROYING; }
     bool is_destroy_started() const { return destroy_started_.load(); }
 
@@ -233,6 +275,7 @@ private:
     std::atomic< bool > destroy_started_{
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
     std::atomic< vol_state > m_state_; // in-memory sb state;
+    std::unique_ptr< VolumeMetrics > metrics_;
 };
 
 struct vol_repl_ctx : public homestore::repl_req_ctx {

@@ -27,7 +27,10 @@ struct vol_interface_req : public sisl::ObjLifeCounter< vol_interface_req > {
     sisl::atomic_counter< int > refcount;
     bool part_of_batch{false};
     uint64_t request_id;
-    VolumePtr vol{nullptr}; // back refto the volume this request is associated with.
+    VolumePtr vol{nullptr}; // back ref to the volume this request is associated with.
+    Clock::time_point io_start_time; // time when the request reaches homeblks.
+    Clock::time_point data_svc_start_time; // time when the request to data service starts.
+    Clock::time_point index_start_time; // time when the request to index service starts.
 
     friend void intrusive_ptr_add_ref(vol_interface_req* req) { req->refcount.increment(1); }
     friend void intrusive_ptr_release(vol_interface_req* req);
