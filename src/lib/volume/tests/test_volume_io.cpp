@@ -14,7 +14,7 @@
  *********************************************************************************/
 
 #include <string>
-
+#include <latch>
 #include <boost/icl/interval_set.hpp>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -27,11 +27,22 @@
 #include "test_common.hpp"
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
-SISL_OPTION_GROUP(test_volume_io_setup,
-                  (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
-                   "number"),
-                  (num_blks, "", "num_blks", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("1"),
-                   "number"));
+SISL_OPTION_GROUP(
+    test_volume_io_setup,
+    (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
+    (num_blks, "", "num_blks", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("1"), "number"),
+    (vol_size, "", "vol_size_gb", "volume size", ::cxxopts::value< uint32_t >()->default_value("1"), "number"),
+    (write_num_io, "", "write_num_io", "number of IO operations", ::cxxopts::value< uint64_t >()->default_value("300"),
+     "number"),
+    (write_qdepth, "", "write_qdepth", "Max outstanding operations", ::cxxopts::value< uint32_t >()->default_value("8"),
+     "number"),
+    (read_num_io, "", "read_num_io", "number of IO operations", ::cxxopts::value< uint64_t >()->default_value("300"),
+     "number"),
+    (read_qdepth, "", "read_qdepth", "Max outstanding operations", ::cxxopts::value< uint32_t >()->default_value("8"),
+     "number"),
+    (run_time, "", "run_time", "running time in seconds", ::cxxopts::value< uint64_t >()->default_value("0"), "number"),
+    (cp_timer_ms, "", "cp_timer_ms", "cp timer in milliseconds", ::cxxopts::value< uint64_t >()->default_value("60000"),
+     "number"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks)
 SISL_LOGGING_DECL(test_volume_io)
@@ -42,13 +53,22 @@ using namespace homeblocks;
 
 class VolumeIOImpl {
 public:
-    VolumeIOImpl() { create_volume(); }
+    VolumeIOImpl() {
+        auto write_num_io = SISL_OPTIONS["write_num_io"].as< uint64_t >();
+        auto write_qdepth = SISL_OPTIONS["write_qdepth"].as< uint32_t >();
+        auto read_num_io = SISL_OPTIONS["read_num_io"].as< uint64_t >();
+        auto read_qdepth = SISL_OPTIONS["read_qdepth"].as< uint32_t >();
+        m_write_runner = std::make_shared< test_common::Runner >(write_num_io, write_qdepth);
+        m_read_runner = std::make_shared< test_common::Runner >(read_num_io, read_qdepth);
+
+        create_volume();
+    }
 
 private:
     VolumeInfo gen_vol_info(uint32_t vol_idx) {
         VolumeInfo vol_info;
         vol_info.name = "vol_" + std::to_string(vol_idx);
-        vol_info.size_bytes = 1024 * 1024 * 1024;
+        vol_info.size_bytes = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
         vol_info.page_size = 4096;
         vol_info.id = hb_utils::gen_random_uuid();
         return vol_info;
@@ -111,7 +131,7 @@ public:
         // Write upto 1-64 nblks * 4k = 256k size.
         auto info = m_vol_ptr->info();
         uint64_t page_size = info->page_size;
-        uint64_t max_blks = static_cast< uint64_t >(info->size_bytes * 0.95) / page_size;
+        uint64_t max_blks = static_cast< uint64_t >(info->size_bytes) / page_size;
         get_random_non_overlapping_lba(start_lba, nblks, max_blks);
         nblks = std::min(static_cast< uint64_t >(nblks), max_blks - static_cast< uint64_t >(start_lba));
 
@@ -135,43 +155,73 @@ public:
         return data;
     }
 
-    void generate_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true) {
+    void generate_write_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0,
+                                  bool wait = true) {
         // Generate a single io with start lba and nblks.
-        test_common::Waiter waiter(1);
-        auto fut = waiter.start([this, vol, start_lba, nblks, &waiter]() mutable {
-            auto data = build_random_data(start_lba, nblks);
-            vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
-            auto vol_mgr = g_helper->inst()->volume_manager();
-            vol_mgr->write(m_vol_ptr, req)
-                .via(&folly::InlineExecutor::instance())
-                .thenValue([this, data, req, &waiter](auto&& result) {
-                    ASSERT_FALSE(result.hasError());
-                    {
-                        std::lock_guard lock(m_mutex);
-                        m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
-                    }
-
-                    waiter.one_complete();
-                });
-        });
-
-        if (wait) { std::move(fut).get(); }
-    }
-
-    auto generate_io(lba_t start_lba = 0, uint32_t nblks = 0) {
+        auto latch = std::make_shared< std::latch >(1);
         auto data = build_random_data(start_lba, nblks);
         vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
         auto vol_mgr = g_helper->inst()->volume_manager();
         vol_mgr->write(m_vol_ptr, req)
             .via(&folly::InlineExecutor::instance())
-            .thenValue([this, req, data](auto&& result) {
+            .thenValue([this, data, req, latch](auto&& result) {
                 ASSERT_FALSE(result.hasError());
                 {
                     std::lock_guard lock(m_mutex);
                     m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
                 }
-                g_helper->runner().next_task();
+
+                latch->count_down();
             });
+
+        if (wait) { latch->wait(); }
+    }
+
+    auto generate_write_io_task(lba_t start_lba = 0, uint32_t nblks = 0) {
+        m_write_count = 0;
+        m_write_runner->set_task([this, start_lba, nblks]() mutable {
+            // Generate write IO's.
+            generate_write_io(start_lba, nblks);
+        });
+        return m_write_runner->execute();
+    }
+
+    auto generate_read_io_task(lba_t start_lba = 0, uint32_t nblks = 0) {
+        m_read_count = 0;
+        m_read_runner->set_task([this, start_lba, nblks]() mutable {
+            // Generate write IO's.
+            generate_read_io(start_lba, nblks);
+        });
+        return m_read_runner->execute();
+    }
+
+    void generate_write_io(lba_t start_lba = 0, uint32_t nblks = 0) {
+        auto data = build_random_data(start_lba, nblks);
+        vol_interface_req_ptr req(new vol_interface_req{data->bytes(), start_lba, nblks, m_vol_ptr});
+        auto vol_mgr = g_helper->inst()->volume_manager();
+        LOGDEBUG("begin write io start={} end={}", req->lba, req->lba + req->nlbas - 1);
+        vol_mgr->write(m_vol_ptr, req)
+            .via(&folly::InlineExecutor::instance())
+            .thenValue([this, req, data](auto&& result) {
+                RELEASE_ASSERT(!result.hasError(), "Write failed with error={}", result.error());
+                {
+                    std::lock_guard lock(m_mutex);
+                    m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
+                    LOGDEBUG("end write io start={} end={}", req->lba, req->lba + req->nlbas - 1);
+                }
+                m_write_count++;
+                m_write_runner->next_task();
+            });
+    }
+
+    void sync_read(lba_t start_lba, uint32_t nlbas) {
+        auto sz = nlbas * m_vol_ptr->info()->page_size;
+        sisl::io_blob_safe read_blob(sz, 512);
+        auto buf = read_blob.bytes();
+        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
+        auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
+        if (read_resp.hasError()) { LOGERROR("Read failed with error={}", read_resp.error()); }
+        RELEASE_ASSERT(!read_resp.hasError(), "Read failed with error={}", read_resp.error());
     }
 
     void read_and_verify(lba_t start_lba, uint32_t nlbas) {
@@ -198,12 +248,40 @@ public:
         }
     }
 
+    void generate_read_io(lba_t start_lba = 0, uint32_t nlbas = 0) {
+        auto info = m_vol_ptr->info();
+        uint64_t page_size = info->page_size;
+        uint64_t max_blks = static_cast< uint64_t >(info->size_bytes) / page_size;
+        get_random_non_overlapping_lba(start_lba, nlbas, max_blks);
+        sisl::io_blob_safe read_blob(nlbas * page_size, 512);
+        auto buf = read_blob.bytes();
+        vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
+        LOGDEBUG("begin read io start={} end={}", req->lba, req->lba + req->nlbas - 1);
+        auto read_resp =
+            g_helper->inst()
+                ->volume_manager()
+                ->read(m_vol_ptr, req)
+                .via(&folly::InlineExecutor::instance())
+                .thenValue([this, read_blob = std::move(read_blob), req](auto&& result) {
+                    RELEASE_ASSERT(!result.hasError(), "Read failed with error={}", result.error());
+                    {
+                        std::lock_guard lock(m_mutex);
+                        m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
+                        LOGDEBUG("end read io start={} end={}", req->lba, req->lba + req->nlbas - 1);
+                    }
+                    m_read_count++;
+                    m_read_runner->next_task();
+                });
+    }
+
     void verify_all_data(uint64_t nlbas_per_io = 1) {
         auto start_lba = m_lba_data.begin()->first;
-        auto max_lba = m_lba_data.rbegin()->first;
+        auto end_lba = m_lba_data.rbegin()->first;
         LOGTRACE("Verifying data for volume {} from lba={} to lba={} with nlbas_per_io={}", m_vol_name, start_lba,
-                 max_lba, nlbas_per_io);
-        verify_data(start_lba, max_lba, nlbas_per_io);
+                 end_lba, nlbas_per_io);
+        for (auto& [lba, _] : m_lba_data) {
+            read_and_verify(lba, nlbas_per_io);
+        }
     }
 
     void verify_data(lba_t start_lba, lba_t max_lba, uint64_t nlbas_per_io) {
@@ -216,21 +294,10 @@ public:
         LOGINFO("Verified {} lbas for volume {}", num_lbas_verified, m_vol_ptr->info()->name);
     }
 
-#ifdef _PRERELEASE
-    void set_flip_point(const std::string flip_name) {
-        flip::FlipCondition null_cond;
-        flip::FlipFrequency freq;
-        freq.set_count(1);
-        freq.set_percent(100);
-        m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
-        LOGI("Flip {} set", flip_name);
-    }
-#endif
+    uint64_t read_count() { return m_read_count.load(); }
+    uint64_t write_count() { return m_write_count.load(); }
 
 private:
-#ifdef _PRERELEASE
-    flip::FlipClient m_fc{iomgr_flip::instance()};
-#endif
     std::mutex m_mutex;
     std::string m_vol_name;
     VolumePtr m_vol_ptr;
@@ -239,6 +306,10 @@ private:
     // Mapping from lba to data patttern.
     std::map< lba_t, uint64_t > m_lba_data;
     boost::icl::interval_set< int > m_inflight_ios;
+    std::shared_ptr< test_common::Runner > m_write_runner;
+    std::shared_ptr< test_common::Runner > m_read_runner;
+    std::atomic< uint64_t > m_read_count{0};
+    std::atomic< uint64_t > m_write_count{0};
 };
 
 class VolumeIOTest : public ::testing::Test {
@@ -256,24 +327,65 @@ public:
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
-    void generate_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true) {
-        vol->generate_io_single(vol, start_lba, nblks, wait);
+    void generate_write_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0,
+                                  bool wait = true) {
+        vol->generate_write_io_single(vol, start_lba, nblks, wait);
     }
 
-    void generate_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true) {
-        // Generate a io based on num_io and qdepth with start lba and nblks.
-        std::atomic< uint64_t > count{0};
-        g_helper->runner().set_task([this, vol, start_lba, nblks, &count]() mutable {
-            if (vol == nullptr) {
-                // Get a random volume.
-                vol = m_vols_impl[rand() % m_vols_impl.size()];
-            }
-            vol->generate_io(start_lba, nblks);
-            count++;
-        });
+    uint64_t get_total_reads() {
+        uint64_t count = 0;
+        for (auto vol : m_vols_impl) {
+            count += vol->read_count();
+        }
+        return count;
+    }
 
-        if (wait) { g_helper->runner().execute().get(); }
-        LOGINFO("IO completed count={}", count.load());
+    uint64_t get_total_writes() {
+        uint64_t count = 0;
+        for (auto vol : m_vols_impl) {
+            count += vol->write_count();
+        }
+        return count;
+    }
+
+    auto generate_write_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
+                           bool wait = true) {
+        // Generate write io based on num_io and qdepth with start lba and nblks.
+        std::vector< folly::Future< folly::Unit > > futs;
+        if (vol != nullptr) {
+            futs.emplace_back(vol->generate_write_io_task(start_lba, nblks));
+        } else {
+            for (auto vol : m_vols_impl) {
+                futs.emplace_back(vol->generate_write_io_task(start_lba, nblks));
+            }
+        }
+
+        if (wait) {
+            folly::collectAll(futs).get();
+            LOGINFO("Write IO completed count={}", get_total_writes());
+        }
+
+        return futs;
+    }
+
+    auto generate_read_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
+                          bool wait = true) {
+        // Generate read io based on num_io and qdepth with start lba and nblks.
+        std::vector< folly::Future< folly::Unit > > futs;
+        if (vol != nullptr) {
+            futs.emplace_back(vol->generate_read_io_task(start_lba, nblks));
+        } else {
+            for (auto vol : m_vols_impl) {
+                futs.emplace_back(vol->generate_read_io_task(start_lba, nblks));
+            }
+        }
+
+        if (wait) {
+            folly::collectAll(futs).get();
+            LOGINFO("Read IO completed count={}", get_total_reads());
+        }
+
+        return futs;
     }
 
     void verify_all_data(shared< VolumeIOImpl > vol_impl = nullptr, uint64_t nlbas_per_io = 1) {
@@ -316,7 +428,7 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
     uint32_t num_iter = 1;
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
     for (uint32_t i = 0; i < num_iter; i++) {
-        generate_io_single(vol, start_lba, nblks);
+        generate_write_io_single(vol, start_lba, nblks);
         verify_all_data(vol);
     }
 
@@ -330,7 +442,7 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
     // Write and verify again on same LBA range to single volume multiple times.
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
     for (uint32_t i = 0; i < num_iter; i++) {
-        generate_io_single(vol, start_lba, nblks);
+        generate_write_io_single(vol, start_lba, nblks);
     }
 
     verify_all_data(vol, 30 /* nlbas_per_io */);
@@ -338,8 +450,6 @@ TEST_F(VolumeIOTest, SingleVolumeWriteData) {
     LOGINFO("SingleVolumeWriteData test done.");
 }
 
-// TODO enable this after homestore fixes in var size blk allocator with large nblks
-#if 0
 TEST_F(VolumeIOTest, SingleVolumeReadData) {
     // Write and verify fixed LBA range to single volume multiple times.
     auto vol = volume_list().back();
@@ -348,7 +458,7 @@ TEST_F(VolumeIOTest, SingleVolumeReadData) {
     uint32_t num_iter = 1;
     LOGINFO("Write and verify data with num_iter={} start={} nblks={}", num_iter, start_lba, nblks);
     for (uint32_t i = 0; i < num_iter; i++) {
-        generate_io_single(vol, start_lba, nblks);
+        generate_write_io_single(vol, start_lba, nblks);
     }
 
     vol->verify_data(300, 800, 40);
@@ -368,12 +478,11 @@ TEST_F(VolumeIOTest, SingleVolumeReadData) {
     LOGINFO("SingleVolumeRead test done.");
 }
 
-
 TEST_F(VolumeIOTest, SingleVolumeReadHoles) {
     auto vol = volume_list().back();
     uint32_t nblks = 5000;
     lba_t start_lba = 500;
-    generate_io_single(vol, start_lba, nblks);
+    generate_write_io_single(vol, start_lba, nblks);
 
     // Verify with no holes in the range
     vol->verify_data(1000, 2000, 40);
@@ -381,7 +490,7 @@ TEST_F(VolumeIOTest, SingleVolumeReadHoles) {
     start_lba = 10000;
     nblks = 50;
     for (uint32_t i = 0; i / 2 < nblks; i += 2) {
-        generate_io_single(vol, start_lba + i, 1);
+        generate_write_io_single(vol, start_lba + i, 1);
     }
 
     // Verfy with hole after each lba
@@ -390,17 +499,16 @@ TEST_F(VolumeIOTest, SingleVolumeReadHoles) {
 
     start_lba = 20000;
     for (uint32_t i = 0; i < 100; i++) {
-        if (i % 7 > 2) { generate_io_single(vol, start_lba + i, 1); }
+        if (i % 7 > 2) { generate_write_io_single(vol, start_lba + i, 1); }
     }
     // Verify with mixed holes in the range
     vol->verify_data(20000, 20100, 50);
 }
-#endif
 
 TEST_F(VolumeIOTest, MultipleVolumeWriteData) {
     LOGINFO("Write data randomly on num_vols={} num_io={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
             SISL_OPTIONS["num_io"].as< uint64_t >());
-    generate_io();
+    generate_write_io();
 
     LOGINFO("Verify data");
     verify_all_data();
@@ -411,13 +519,69 @@ TEST_F(VolumeIOTest, MultipleVolumeWriteData) {
     verify_all_data();
 
     LOGINFO("Write data randomly");
-    generate_io();
+    generate_write_io();
 
     LOGINFO("Verify data");
     verify_all_data();
 
     LOGINFO("MultipleVolumeWriteData test done.");
 }
+
+TEST_F(VolumeIOTest, LongRunningRandomIO) {
+    auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
+    LOGINFO("Long running random read and write on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
+            run_time);
+
+    uint64_t total_reads{0}, total_writes{0};
+    auto start_time = std::chrono::high_resolution_clock::now();
+    do {
+        std::vector< folly::Future< folly::Unit > > futs;
+
+        // Generate write's on all volumes with random lba and nblks on all volumes.
+        auto writes = generate_write_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
+
+        // In parallel, generate reads on all volumes with random lba and nblks on all volumes.
+        auto reads = generate_read_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
+
+        futs.insert(futs.end(), std::make_move_iterator(writes.begin()), std::make_move_iterator(writes.end()));
+        futs.insert(futs.end(), std::make_move_iterator(reads.begin()), std::make_move_iterator(reads.end()));
+        folly::collectAll(futs).get();
+
+        total_reads += get_total_reads();
+        total_writes += get_total_writes();
+        std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
+        auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+        LOGINFO("total_read={} total_write={} elapsed={}", total_reads, total_writes, elapsed_seconds);
+
+        if (elapsed_seconds >= run_time) { break; }
+    } while (true);
+}
+
+#ifdef _PRERELEASE
+TEST_F(VolumeIOTest, WriteCrash) {
+    LOGINFO("WriteCrash test started");
+
+    // Crash after writing to disk but before writing to journal.
+    // Read should return no data as there is no index.
+    g_helper->set_flip_point("vol_write_crash_after_data_write");
+
+    auto vol = volume_list().back();
+    generate_write_io_single(vol, 1000 /* start_lba */, 100 /* nblks*/);
+    restart(2);
+    // TODO read and verify zeros for no data.
+
+    // Crash after journal write. After crash, index should be recovered.
+    // Verify data after doing read.
+    g_helper->set_flip_point("vol_write_crash_after_journal_write");
+    vol = volume_list().back();
+    generate_write_io_single(vol, 2000 /* start_lba */, 100 /* nblks*/);
+    restart(2);
+
+    vol->verify_data(2000 /* start_lba */, 2100 /* max_lba */, 25 /* nlbas_per_io */);
+
+    LOGINFO("WriteCrash test done");
+}
+#endif
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
