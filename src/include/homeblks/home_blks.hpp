@@ -79,6 +79,7 @@ public:
     virtual HomeBlocksStats get_stats() const = 0;
     virtual iomgr::drive_type data_drive_type() const = 0;
     virtual uint64_t max_vol_io_size() const = 0;
+    virtual void shutdown() = 0;
 };
 
 extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksApplication >&& application);

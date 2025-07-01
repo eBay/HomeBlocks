@@ -154,5 +154,4 @@ public:
      */
     virtual void get_volume_ids(std::vector< volume_id_t >& vol_ids) const = 0;
 };
-
 } // namespace homeblocks

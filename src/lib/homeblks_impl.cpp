@@ -38,6 +38,7 @@ extern std::shared_ptr< HomeBlocks > init_homeblocks(std::weak_ptr< HomeBlocksAp
     inst->init_homestore();
     inst->init_cp();
     inst->start_reaper_thread();
+    HomeBlocksImpl::s_instance_ = inst;
     return inst;
 }
 
@@ -134,7 +135,7 @@ void HomeBlocksImpl::do_shutdown() {
     }
 }
 
-HomeBlocksImpl::~HomeBlocksImpl() {
+void HomeBlocksImpl::shutdown() {
     LOGI("Shutting down HomeBlocksImpl Received");
     DEBUG_ASSERT(!is_shutting_down(), "Shutdown already started, cannot destruct HomeBlocksImpl again");
     // set the shutdown flag so that no new requests are accepted;
@@ -156,6 +157,8 @@ HomeBlocksImpl::~HomeBlocksImpl() {
     homestore::hs()->shutdown();
     homestore::HomeStore::reset_instance();
     iomanager.stop();
+
+    reset_instance();
 }
 
 HomeBlocksImpl::HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application) :
@@ -449,4 +452,31 @@ void HomeBlocksImpl::vol_gc() {
     }
 }
 
+bool HomeBlocksImpl::fc_on() const {
+#ifdef _PRERELEASE
+    // for prerelease mode, fault containment is disabled;
+    return false;
+#endif
+    // for release mode, Fault containment is enabled by default, but can be disabled via dynamic config;
+    return HB_DYNAMIC_CONFIG(fault_containment_on);
+}
+
+void HomeBlocksImpl::exit_fc(VolumePtr& vol) { vol->state_change(vol_state::ONLINE); }
+
+void HomeBlocksImpl::fault_containment(const VolumePtr& vol, const std::string& reason) {
+    LOGI("Volume {} is in fault containment due to: {}", vol->id_str(), reason);
+    // if volume is in fault containment, we should not allow any new requests to be issued on it;
+    vol->state_change(vol_state::OFFLINE);
+#if 0
+    auto app = _application.lock();
+    // report back to application to take actions
+    if (app) {
+        app->on_volume_fault_containment(vol, reason);
+    } else {
+        LOGW("Application is not available, cannot report fault containment for volume {}", vol->id_str());
+    }
+#endif
+}
+
+shared< HomeBlocksImpl > HomeBlocksImpl::s_instance_ = nullptr;
 } // namespace homeblocks

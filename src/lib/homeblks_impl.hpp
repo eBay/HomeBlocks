@@ -77,9 +77,6 @@ private:
     shared< VolumeChunkSelector > chunk_selector_;
     std::unique_ptr< sisl::IDReserver > ordinal_reserver_;
 
-public:
-    static uint64_t _hs_chunk_size;
-
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
     bool shutdown_started_{false};
     folly::Promise< folly::Unit > shutdown_promise_;
@@ -88,9 +85,13 @@ public:
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
 public:
+    static uint64_t _hs_chunk_size;
+    static shared< HomeBlocksImpl > s_instance_;
+
+public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
 
-    ~HomeBlocksImpl() override;
+    ~HomeBlocksImpl() override = default;
     HomeBlocksImpl(const HomeBlocksImpl&) = delete;
     HomeBlocksImpl(HomeBlocksImpl&&) noexcept = delete;
     HomeBlocksImpl& operator=(const HomeBlocksImpl&) = delete;
@@ -106,6 +107,8 @@ public:
     peer_id_t our_uuid() const final { return our_uuid_; }
 
     uint64_t max_vol_io_size() const final { return MAX_VOL_IO_SIZE; }
+
+    void shutdown() final;
 
     /// VolumeManager
     NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
@@ -143,6 +146,20 @@ public:
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
     void start_reaper_thread();
+
+    void fault_containment(const VolumePtr& vol, const std::string& reason = "");
+    bool fc_on() const;
+    void exit_fc(VolumePtr& vol);
+
+public:
+    // public static APIs;
+    static shared< HomeBlocksImpl > instance() { return s_instance_; }
+    static void reset_instance() {
+        if (s_instance_) {
+            s_instance_.reset();
+            s_instance_ = nullptr;
+        }
+    }
 
 private:
     // Should only be called for first-time-boot

@@ -211,9 +211,9 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
             auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
             ASSERT_TRUE(ret);
 
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
             // verify the volume is there
-            ASSERT_TRUE(vinfo_ptr != nullptr);
+            ASSERT_TRUE(vol_ptr != nullptr);
         }
 
         auto const s = hb->get_stats();
@@ -226,9 +226,10 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
             ASSERT_TRUE(ret);
             // sleep for a while
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
+
             // verify the volume is not there
-            ASSERT_TRUE(vinfo_ptr == nullptr);
+            ASSERT_TRUE(vol_ptr == nullptr);
         }
     }
 
@@ -250,9 +251,9 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
             ASSERT_TRUE(ret);
 
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
             // verify the volume is there
-            ASSERT_TRUE(vinfo_ptr != nullptr);
+            ASSERT_TRUE(vol_ptr != nullptr);
         }
     }
 
@@ -264,9 +265,9 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         auto vol_mgr = hb->volume_manager();
 
         for (const auto& id : vol_ids) {
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
             // verify the volume is there
-            ASSERT_TRUE(vinfo_ptr != nullptr);
+            ASSERT_TRUE(vol_ptr != nullptr);
         }
     }
 
@@ -278,9 +279,9 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(ret);
             // sleep for a while
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
             // verify the volume is not there
-            ASSERT_TRUE(vinfo_ptr == nullptr);
+            ASSERT_TRUE(vol_ptr == nullptr);
         }
     }
 }
@@ -303,9 +304,11 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
             auto ret = vol_mgr->create_volume(std::move(vinfo)).get();
             ASSERT_TRUE(ret);
 
-            auto vinfo_ptr = vol_mgr->lookup_volume(id);
+            auto vol_ptr = vol_mgr->lookup_volume(id);
+            hb->fault_containment(vol, "Volume FC Simulation");
+            hb->exit_fc(vol, "Volume FC Simulation");
             // verify the volume is there
-            ASSERT_TRUE(vinfo_ptr != nullptr);
+            ASSERT_TRUE(vol_ptr != nullptr);
         }
 
         for (uint32_t i = 0; i < num_vols; ++i) {
