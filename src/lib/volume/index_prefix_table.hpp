@@ -36,7 +36,7 @@ public:
         // For value shift() will get the blk_num and checksum for each lba.
         IndexValueContext app_ctx{&blocks_info, start_lba};
         const BlkId& start_blkid = blocks_info[start_lba].new_blkid;
-        VolumeIndexValue value{start_blkid, blocks_info[start_lba].checksum};
+        VolumeIndexValue value{start_blkid, blocks_info[start_lba].new_checksum};
 
         auto req = homestore::BtreeRangePutRequest< VolumeIndexKey >{
             homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, true, VolumeIndexKey{end_lba}, true},

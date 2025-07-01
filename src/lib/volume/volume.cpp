@@ -216,7 +216,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                         auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
                         auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
                         blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
-                        LOGT("volume write blkid={} csum={}", new_bid.to_string(), csum);
+                        LOGT("volume write blkid={} csum={} lba={}", new_bid.to_string(), blocks_info[start_lba+i].new_checksum, start_lba + i);
                         data_buffer += blk_size;
                     }
 
@@ -361,6 +361,10 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
             cur_lba = key.key();
             continue;
         }
+        DEBUG_ASSERT_EQ(read_buf - read_ctx.vol_req->buffer,
+                        (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size,
+                        "Read buffer size mismatch, expected: {}, actual: {}", (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size,
+                        read_buf - read_ctx.vol_req->buffer);
         auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), read_ctx.blk_size);
         if (checksum != value.checksum()) {
             LOGE("crc mismatch for lba: {} start: {}, end: {} blk id {}, expected: {}, actual: {}", cur_lba,
@@ -392,6 +396,9 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
             std::memset(read_buf, 0, holes_size);
             read_buf += holes_size;
         }
+        DEBUG_ASSERT_EQ(read_buf - req->buffer, (start_lba - req->lba) * rd()->get_blk_size(),
+                    "Read buffer size mismatch, expected: {}, actual: {}", (start_lba - req->lba) * rd()->get_blk_size(),
+                    read_buf - req->buffer);
         sisl::sg_list sgs;
         sgs.size = blkids.blk_count() * rd()->get_blk_size();
         sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = sgs.size});

@@ -28,7 +28,7 @@ public:
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                             BtreeValue const& value) {
             auto lba = r_cast< const VolumeIndexKey& >(key).key();
-            auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(value);
+            auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(existing_value);
             blocks_info[lba].old_blkid = existing_value_vol_idx.blkid();
             blocks_info[lba].old_checksum = existing_value_vol_idx.checksum();
             return homestore::put_filter_decision::replace;
