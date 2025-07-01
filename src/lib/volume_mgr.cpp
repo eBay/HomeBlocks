@@ -188,9 +188,24 @@ void HomeBlocksImpl::update_vol_sb_cb(uint64_t volume_ordinal, const std::vector
     vol_ptr->update_vol_sb_cb(chunk_ids);
 }
 
-bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
+bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const {
+    auto lg = std::shared_lock(vol_lock_);
+    auto it = vol_map_.find(id);
+    if (it == vol_map_.end()) {
+        LOGE("Volume with id {} not found, cannot get stats", boost::uuids::to_string(id));
+        return false;
+    }
 
-void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
+    it->second->get_stats(stats);
+    return true;
+}
+
+void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {
+    auto lg = std::shared_lock(vol_lock_);
+    for (const auto& it : vol_map_) {
+        vol_ids.push_back(it.first);
+    }
+}
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     if (vol->is_destroying() || is_shutting_down()) {

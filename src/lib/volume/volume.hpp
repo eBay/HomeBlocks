@@ -57,7 +57,7 @@ struct MsgHeader {
         return fmt::format(" msg_type={}volume={}\n", enum_name(msg_type), boost::uuids::to_string(volume_id));
     }
 };
-
+#if 0
 ENUM(vol_state, uint32_t,
      INIT,       // initialized, but not ready online yet;
      ONLINE,     // online and ready to be used;
@@ -68,7 +68,7 @@ ENUM(vol_state, uint32_t,
                  // background;
      READONLY    // in read only mode;
 );
-
+#endif
 class Volume : public std::enable_shared_from_this< Volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
@@ -141,6 +141,11 @@ public:
         auto vol = std::make_shared< Volume >(buf, cookie, chunk_sel);
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
+    }
+
+    void get_stats(VolumeStats& stats) const {
+        stats.id = vol_info_->id;
+        stats.state = sb_->state;
     }
 
     static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) {

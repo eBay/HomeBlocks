@@ -72,17 +72,31 @@ struct VolumeInfo {
     }
 };
 
+ENUM(vol_state, uint32_t,
+     INIT,       // initialized, but not ready online yet;
+     ONLINE,     // online and ready to be used;
+     OFFLINE,    // offline and not ready to be used;
+     DESTROYING, // being destroyed, this state will be used for vol-destroy crash recovery;
+     DESTROYED,  // fully destroyed, currently not used,
+                 // for future use of lazy-destroy, e.g. set destroyed and move forward, let the volume be destroyed in
+                 // background;
+     READONLY    // in read only mode;
+);
+
 using VolumeInfoPtr = std::shared_ptr< VolumeInfo >;
 struct VolumeStats {
     volume_id_t id;
-
+    vol_state state;
+#if 0
+    // TODO: we don't maitain per volume stats right now, so these are not used.
+    // If there is a use case, we can enable this with support from repl dev layer;
     uint64_t used_bytes;  // total number of bytes used by all shards on this Volume;
     uint64_t avail_bytes; // total number of bytes available on this Volume;
-
     std::string to_string() {
         return fmt::format("VolumeStats: id={} used_bytes={}, avail_bytes={}", boost::uuids::to_string(id), used_bytes,
                            avail_bytes);
     }
+#endif
 };
 
 class VolumeManager : public Manager< VolumeError > {

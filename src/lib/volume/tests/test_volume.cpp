@@ -305,8 +305,6 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
             ASSERT_TRUE(ret);
 
             auto vol_ptr = vol_mgr->lookup_volume(id);
-            hb->fault_containment(vol, "Volume FC Simulation");
-            hb->exit_fc(vol, "Volume FC Simulation");
             // verify the volume is there
             ASSERT_TRUE(vol_ptr != nullptr);
         }
