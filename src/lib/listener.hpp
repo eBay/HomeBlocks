@@ -27,7 +27,7 @@ class HBListener : public homestore::ReplDevListener {
 public:
     explicit HBListener(HomeBlocksImpl* hb) : hb_(hb) {}
 
-    virtual ~HBListener() = default;
+    ~HBListener() = default;
 
     void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                    std::vector< homestore::MultiBlkId > const& blkids,
@@ -47,10 +47,9 @@ public:
     // destroyed;
     void on_destroy(const homestore::group_id_t& group_id) override;
 
-    virtual void on_start_replace_member(const homestore::replica_member_info& member_out,
-                                         const homestore::replica_member_info& member_in,
-                                         homestore::trace_id_t tid) override {}
-    void on_complete_replace_member(const homestore::replica_member_info& member_out,
+    void on_start_replace_member(const std::string& task_id, const homestore::replica_member_info& member_out,
+                                 const homestore::replica_member_info& member_in, homestore::trace_id_t tid) override {}
+    void on_complete_replace_member(const std::string& task_id, const homestore::replica_member_info& member_out,
                                     const homestore::replica_member_info& member_in,
                                     homestore::trace_id_t tid) override {}
     void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
@@ -60,18 +59,18 @@ public:
     homestore::AsyncReplResult<> create_snapshot(std::shared_ptr< homestore::snapshot_context > context) override {
         return folly::makeSemiFuture< homestore::ReplResult< folly::Unit > >(folly::Unit{});
     }
-    virtual bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override { return true; }
-    virtual std::shared_ptr< homestore::snapshot_context > last_snapshot() override { return nullptr; }
-    virtual int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
-                                  std::shared_ptr< homestore::snapshot_obj > snp_obj) override {
+    bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override { return true; }
+    std::shared_ptr< homestore::snapshot_context > last_snapshot() override { return nullptr; }
+    int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                          std::shared_ptr< homestore::snapshot_obj > snp_obj) override {
         return 0;
     }
-    virtual void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
-                                    std::shared_ptr< homestore::snapshot_obj > snp_obj) override {}
-    virtual void free_user_snp_ctx(void*& user_snp_ctx) override {}
-    virtual void on_no_space_left(homestore::repl_lsn_t lsn, homestore::chunk_num_t chunk_id) override {}
-    virtual void notify_committed_lsn(int64_t lsn) override {}
-    virtual void on_config_rollback(int64_t lsn) override {}
+    void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                            std::shared_ptr< homestore::snapshot_obj > snp_obj) override {}
+    void free_user_snp_ctx(void*& user_snp_ctx) override {}
+    void on_no_space_left(homestore::repl_lsn_t lsn, sisl::blob const& header) override {}
+    void notify_committed_lsn(int64_t lsn) override {}
+    void on_config_rollback(int64_t lsn) override {}
     // <<<<< end of r1: mockup apis >>>>>>>>>>
 
 private:

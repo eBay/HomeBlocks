@@ -51,6 +51,9 @@ struct VolumeInfo {
             name(std::move(rhs.name)),
             ordinal(rhs.ordinal) {}
 
+    VolumeInfo(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
+            id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
+
     VolumeInfo(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name, uint64_t ord) :
             id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)), ordinal(ord) {}
 
@@ -58,7 +61,7 @@ struct VolumeInfo {
     uint64_t size_bytes{0};
     uint64_t page_size{0};
     std::string name;
-    uint64_t ordinal;
+    uint64_t ordinal = 0;
 
     auto operator<=>(VolumeInfo const& rhs) const {
         return boost::uuids::hash_value(id) <=> boost::uuids::hash_value(rhs.id);
