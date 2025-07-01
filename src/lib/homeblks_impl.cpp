@@ -467,15 +467,6 @@ void HomeBlocksImpl::fault_containment(const VolumePtr& vol, const std::string& 
     LOGI("Volume {} is in fault containment due to: {}", vol->id_str(), reason);
     // if volume is in fault containment, we should not allow any new requests to be issued on it;
     vol->state_change(vol_state::OFFLINE);
-#if 0
-    auto app = _application.lock();
-    // report back to application to take actions
-    if (app) {
-        app->on_volume_fault_containment(vol, reason);
-    } else {
-        LOGW("Application is not available, cannot report fault containment for volume {}", vol->id_str());
-    }
-#endif
 }
 
 shared< HomeBlocksImpl > HomeBlocksImpl::s_instance_ = nullptr;

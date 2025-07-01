@@ -57,18 +57,7 @@ struct MsgHeader {
         return fmt::format(" msg_type={}volume={}\n", enum_name(msg_type), boost::uuids::to_string(volume_id));
     }
 };
-#if 0
-ENUM(vol_state, uint32_t,
-     INIT,       // initialized, but not ready online yet;
-     ONLINE,     // online and ready to be used;
-     OFFLINE,    // offline and not ready to be used;
-     DESTROYING, // being destroyed, this state will be used for vol-destroy crash recovery;
-     DESTROYED,  // fully destroyed, currently not used,
-                 // for future use of lazy-destroy, e.g. set destroyed and move forward, let the volume be destroyed in
-                 // background;
-     READONLY    // in read only mode;
-);
-#endif
+
 class Volume : public std::enable_shared_from_this< Volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
