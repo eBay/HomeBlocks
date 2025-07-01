@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include "volume.hpp"
+#include "lib/homeblks_impl.hpp"
 #include <homestore/replication_service.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
@@ -452,10 +453,16 @@ VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface
         homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
         homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
     auto index_table = indx_table();
-    RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(id()));
-    if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-        return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+    auto inst = HomeBlocksImpl::instance();
+    if (!index_table and inst->fc_on()) {
+        inst->fault_containment(shared_from_this());
+    } else {
+        RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(id()));
+        if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
+            return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+        }
     }
+
     return folly::Unit();
 }
 

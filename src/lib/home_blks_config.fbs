@@ -10,8 +10,11 @@ table HomeBlksSettings{
     // reaper thread timer in seconds
     reaper_thread_timer_secs: uint64 = 120;
 
-    //shutdown thread timer in seconds
+    // shutdown thread timer in seconds
     shutdown_thread_timer_secs: uint64 = 2;
+
+    // fault containment feature on/off
+    fault_containment_on: bool = true;
 }
 
 root_type HomeBlksSettings;

@@ -58,17 +58,6 @@ struct MsgHeader {
     }
 };
 
-ENUM(vol_state, uint32_t,
-     INIT,       // initialized, but not ready online yet;
-     ONLINE,     // online and ready to be used;
-     OFFLINE,    // offline and not ready to be used;
-     DESTROYING, // being destroyed, this state will be used for vol-destroy crash recovery;
-     DESTROYED,  // fully destroyed, currently not used,
-                 // for future use of lazy-destroy, e.g. set destroyed and move forward, let the volume be destroyed in
-                 // background;
-     READONLY    // in read only mode;
-);
-
 class Volume : public std::enable_shared_from_this< Volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
@@ -141,6 +130,11 @@ public:
         auto vol = std::make_shared< Volume >(buf, cookie, chunk_sel);
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
+    }
+
+    void get_stats(VolumeStats& stats) const {
+        stats.id = vol_info_->id;
+        stats.state = sb_->state;
     }
 
     static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) {
