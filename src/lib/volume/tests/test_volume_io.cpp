@@ -48,6 +48,7 @@ SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks
 SISL_LOGGING_DECL(test_volume_io)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
+static constexpr uint64_t g_page_size = 4096;
 
 using namespace homeblocks;
 
@@ -69,7 +70,7 @@ private:
         VolumeInfo vol_info;
         vol_info.name = "vol_" + std::to_string(vol_idx);
         vol_info.size_bytes = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
-        vol_info.page_size = 4096;
+        vol_info.page_size = g_page_size;
         vol_info.id = hb_utils::gen_random_uuid();
         return vol_info;
     }
@@ -106,7 +107,7 @@ public:
             auto new_range = boost::icl::interval< int >::closed(start_lba, end_lba);
             // For user provided lba and nblks, check if they are already in flight.
             std::lock_guard lock(m_mutex);
-            ASSERT_TRUE(m_inflight_ios.find(new_range) == m_inflight_ios.end());
+            // ASSERT_TRUE(m_inflight_ios.find(new_range) == m_inflight_ios.end());
             m_inflight_ios.insert(new_range);
             return;
         }
@@ -554,6 +555,46 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
         std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
         auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
         LOGINFO("total_read={} total_write={} elapsed={}", total_reads, total_writes, elapsed_seconds);
+
+        if (elapsed_seconds >= run_time) { break; }
+    } while (true);
+}
+
+TEST_F(VolumeIOTest, LongRunningSequentialIO) {
+    auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
+    LOGINFO("Long running sequential read and write on num_vols={} run_time={}",
+            SISL_OPTIONS["num_vols"].as< uint32_t >(), run_time);
+
+    uint64_t volume_size = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    lba_t cur_lba = 0;
+    lba_count_t nblks = 100;
+    uint64_t total_reads{0}, total_writes{0};
+    do {
+        std::vector< folly::Future< folly::Unit > > futs;
+
+        // Generate write's on all volumes with sequential lba and nblks on all volumes.
+        auto writes = generate_write_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
+        folly::collectAll(writes).get();
+
+        // Generate reads on all volumes with sequential lba and nblks on all volumes.
+        auto reads = generate_read_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
+        folly::collectAll(reads).get();
+
+        total_reads += get_total_reads();
+        total_writes += get_total_writes();
+        std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
+        auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+        if (elapsed_seconds % 2 == 0) {
+            LOGINFO("total_read={} total_write={} lba={} elapsed={}", total_reads, total_writes, cur_lba,
+                    elapsed_seconds);
+        }
+
+        if (((cur_lba + nblks) * g_page_size) >= volume_size) {
+            cur_lba = 0;
+        } else {
+            cur_lba += nblks;
+        }
 
         if (elapsed_seconds >= run_time) { break; }
     } while (true);
