@@ -151,6 +151,7 @@ public:
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
 
     lba_t key() const { return (uint64_cast(m_lba_base) << 32) | m_lba_offset; }
+    lba_t lba() const { return key(); }
     lba_t start_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
         const VolumeIndexKey& k = (const VolumeIndexKey&)(range.start_key());
         return k.key();

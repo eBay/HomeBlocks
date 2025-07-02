@@ -327,7 +327,7 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
     for (uint32_t i = 0, start_idx = 0; i < index_kvs.size(); ++i) {
         auto const& [key, value] = index_kvs[i];
         bool is_contiguous = (i == 0 ||
-                              (key.key() == index_kvs[i - 1].first.key() + 1 &&
+                              (key.lba() == index_kvs[i - 1].first.lba() + 1 &&
                                value.blkid().blk_num() == index_kvs[i - 1].second.blkid().blk_num() + 1 &&
                                value.blkid().chunk_num() == index_kvs[i - 1].second.blkid().chunk_num()));
         if (is_contiguous && i < index_kvs.size() - 1) {
@@ -340,12 +340,12 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
         // if the last entry is part of the contiguous block,
         // we need to account for it in the blk_count
         auto blk_count = is_contiguous ? (i - start_idx + 1) : (i - start_idx);
-        blks_to_read.emplace_back(index_kvs[start_idx].first.key(),
+        blks_to_read.emplace_back(index_kvs[start_idx].first.lba(),
                                   homestore::MultiBlkId(blk_num, blk_count, chunk_num));
         start_idx = i;
         if (!is_contiguous && i == index_kvs.size() - 1) {
             // if the last entry is not contiguous, we need to add it as well
-            blks_to_read.emplace_back(key.key(),
+            blks_to_read.emplace_back(key.lba(),
                                       homestore::MultiBlkId(value.blkid().blk_num(), 1, value.blkid().chunk_num()));
         }
     }
@@ -356,9 +356,9 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
     for (uint64_t cur_lba = read_ctx.vol_req->lba, i = 0; i < read_ctx.index_kvs.size();) {
         auto const& [key, value] = read_ctx.index_kvs[i];
         // ignore the holes
-        if (cur_lba != key.key()) {
-            read_buf += (key.key() - cur_lba) * read_ctx.blk_size;
-            cur_lba = key.key();
+        if (cur_lba != key.lba()) {
+            read_buf += (key.lba() - cur_lba) * read_ctx.blk_size;
+            cur_lba = key.lba();
             continue;
         }
         DEBUG_ASSERT_EQ(read_buf - read_ctx.vol_req->buffer,

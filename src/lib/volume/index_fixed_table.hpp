@@ -27,8 +27,9 @@ public:
         // Use filter callback to get the old blkid.
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
                                                             BtreeValue const& value) {
-            auto lba = r_cast< const VolumeIndexKey& >(key).key();
+            auto lba = r_cast< const VolumeIndexKey& >(key).lba();
             auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(existing_value);
+            LOGINFO("Filter callback for lba {}, existing value: {}", lba, existing_value_vol_idx.blkid().to_string());
             blocks_info[lba].old_blkid = existing_value_vol_idx.blkid();
             blocks_info[lba].old_checksum = existing_value_vol_idx.checksum();
             return homestore::put_filter_decision::replace;
@@ -46,8 +47,29 @@ public:
             nullptr /* existing value, not needed here */,
             filter_cb};
             auto result = hs_index_table_->put(req);
+#ifdef _PRERELEASE
+            if (iomgr_flip::instance()->test_flip("vol_index_partial_put_failure")) {
+                // this is to simulate failure after partially writing to index.
+                if (result != homestore::btree_status_t::success) {
+                    LOGWARN("Put failed with error: {}, NOT EXPECTED!", result);
+                } else if (lba > start_lba && ((lba - start_lba) >= (end_lba - start_lba) / 2)) {
+                    // simulate failure after writing to half of the index
+                    // restore the blkid at this lba to the old value
+                    LOGINFO("vol_index_partial_put_failure flip is set, aborting");
+                    value = VolumeIndexValue{blocks_info[lba].old_blkid, blocks_info[lba].old_checksum};
+                    blocks_info[lba].old_blkid = homestore::BlkId{};
+                    blocks_info[lba].old_checksum = 0;
+                    auto req1 = homestore::BtreeSinglePutRequest{&key,&value,homestore::btree_put_type::UPSERT};
+                    if (auto restore_lba_result = hs_index_table_->put(req1); restore_lba_result != homestore::btree_status_t::success) {
+                        LOGERROR("Failed to rollback lba {}, put error={}, NOT EXPECTED!", lba, restore_lba_result);
+                    }
+                    result = homestore::btree_status_t::not_supported;
+                }
+            }
+#endif
             if (result != homestore::btree_status_t::success) {
                 LOGERROR("Failed to put to index {}, error={}", lba, result);
+                // rollback the lbas for which we have already written to the index table
                 rollback_write(start_lba, lba - 1, blocks_info);
                 return folly::makeUnexpected(VolumeError::INDEX_ERROR);
             }
@@ -72,6 +94,7 @@ public:
         for (auto lba = start_lba; lba <= end_lba; ++lba) {
             VolumeIndexKey key{lba};
             VolumeIndexValue value;
+            // If old_blk_id is valid, we need to restore it, otherwise remove the entry.
             if (blocks_info[lba].old_blkid.is_valid()) {
                 value = VolumeIndexValue{blocks_info[lba].old_blkid, blocks_info[lba].old_checksum};
                 auto req = homestore::BtreeSinglePutRequest{&key, &value, homestore::btree_put_type::UPSERT};   

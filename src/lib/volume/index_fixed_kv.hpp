@@ -67,7 +67,7 @@ public:
         m_lba = other->m_lba;
     }
 
-    std::string to_string() const override { return fmt::format("{}", key()); }
+    std::string to_string() const override { return fmt::format("{}", lba()); }
 
     static uint32_t get_max_size() { return sizeof(VolumeIndexKey); }
 
@@ -80,7 +80,10 @@ public:
     bool operator<(const VolumeIndexKey& o) const { return (compare(o) < 0); }
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
 
+    // the method key() is required by BtreeKey interface
+    // add a new method lba() for better readability
     lba_t key() const { return m_lba; }
+    lba_t lba() const { return m_lba; }
 
     friend std::ostream& operator<<(std::ostream& os, const VolumeIndexKey& k) {
         os << k.to_string();
