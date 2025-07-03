@@ -122,7 +122,8 @@ private:
 };
 
 TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
-    auto chunk_sel = std::make_shared< VolumeChunkSelector >([this](uint64_t, const std::vector< chunk_num_t >&) {});
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
 
     uint32_t pdevs = 3, num_chunks_per_pdev = 20, pdev_id;
     // Add chunks to chunk selector, each chunk is 16KB, so 3 * 20 * 16KB = 960KB
@@ -154,7 +155,8 @@ TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
 }
 
 TEST_F(ChunkSelectorTest, SelectChunksTest) {
-    auto chunk_sel = std::make_shared< VolumeChunkSelector >([this](uint64_t, const std::vector< chunk_num_t >&) {});
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
     uint32_t pdevs = 3, num_chunks_per_pdev = 20, pdev_id;
     // Add chunks to chunk selector, each chunk is 16KB, so 3 * 20 * 16KB = 960KB
     add_chunks_per_pdev(chunk_sel, pdevs, num_chunks_per_pdev);
@@ -183,7 +185,7 @@ TEST_F(ChunkSelectorTest, SelectChunksTest) {
 TEST_F(ChunkSelectorTest, ResizeNumChunksTest) {
     auto latch = std::make_shared< std::latch >(1);
     auto chunk_sel = std::make_shared< VolumeChunkSelector >(
-        [latch, this](uint64_t vol_ord, const std::vector< chunk_num_t >& chunk_ids) {
+        "test", [latch, this](uint64_t vol_ord, const std::vector< chunk_num_t >& chunk_ids) {
             RELEASE_ASSERT(!chunk_ids.empty(), "Empty chunk ids");
             latch->count_down();
         });
@@ -213,7 +215,8 @@ TEST_F(ChunkSelectorTest, ResizeNumChunksTest) {
 #endif
 
 TEST_F(ChunkSelectorTest, RecoverChunksTest) {
-    auto chunk_sel = std::make_shared< VolumeChunkSelector >([this](uint64_t, const std::vector< chunk_num_t >&) {});
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
     uint32_t pdevs = 3, num_chunks_per_pdev = 20;
     // Add chunks to chunk selector, each chunk is 16KB, so 3 * 20 * 16KB = 960KB
     add_chunks_per_pdev(chunk_sel, pdevs, num_chunks_per_pdev);

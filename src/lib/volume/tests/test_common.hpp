@@ -62,16 +62,16 @@ using namespace homeblocks;
 class test_http_server {
 public:
     void get_prometheus_metrics(const Pistache::Rest::Request&, Pistache::Http::ResponseWriter response) {
-        response.send(Pistache::Http::Code::Ok, sisl::MetricsFarm::getInstance().report(sisl::ReportFormat::kTextFormat));
+        response.send(Pistache::Http::Code::Ok,
+                      sisl::MetricsFarm::getInstance().report(sisl::ReportFormat::kTextFormat));
     }
 
     void start() {
         auto http_server_ptr = ioenvironment.get_http_server();
 
         std::vector< iomgr::http_route > routes = {
-            {Pistache::Http::Method::Get, "/metrics", Pistache::Rest::Routes::bind(&test_http_server::get_prometheus_metrics, this),
-            iomgr::url_t::safe}
-        };
+            {Pistache::Http::Method::Get, "/metrics",
+             Pistache::Rest::Routes::bind(&test_http_server::get_prometheus_metrics, this), iomgr::url_t::safe}};
         try {
             http_server_ptr->setup_routes(routes);
             LOGINFO("Started http server ");

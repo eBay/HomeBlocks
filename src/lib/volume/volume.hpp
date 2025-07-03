@@ -75,12 +75,12 @@ ENUM(vol_state, uint32_t,
 
 class VolumeMetrics : public sisl::MetricsGroupWrapper {
 public:
-    explicit VolumeMetrics(const std::string& vol_name) :
-            sisl::MetricsGroupWrapper("Volume", vol_name) {
+    explicit VolumeMetrics(const std::string& vol_name) : sisl::MetricsGroupWrapper("Volume", vol_name) {
         // counters
         REGISTER_COUNTER(volume_read_count, "Total Volume read operations", "volume_op_count", {"op", "read"});
         REGISTER_COUNTER(volume_write_count, "Total Volume write operations", "volume_op_count", {"op", "write"});
-        REGISTER_COUNTER(volume_write_size_total, "Total Volume data size written", "volume_data_size", {"op", "write"});
+        REGISTER_COUNTER(volume_write_size_total, "Total Volume data size written", "volume_data_size",
+                         {"op", "write"});
         REGISTER_COUNTER(volume_read_size_total, "Total Volume data size read", "volume_data_size", {"op", "read"});
         // gauges
         REGISTER_GAUGE(volume_data_used_size, "Total Volume data used size");
@@ -89,8 +89,10 @@ public:
                            HistogramBucketsType(OpSizeBuckets));
         REGISTER_HISTOGRAM(volume_read_size_distribution, "Distribution of volume read sizes",
                            HistogramBucketsType(OpSizeBuckets));
-        REGISTER_HISTOGRAM(volume_read_latency, "Volume overall read latency", "volume_op_latency", {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
-        REGISTER_HISTOGRAM(volume_write_latency, "Volume overall write latency", "volume_op_latency", {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_read_latency, "Volume overall read latency", "volume_op_latency", {"op", "read"},
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_write_latency, "Volume overall write latency", "volume_op_latency", {"op", "write"},
+                           HistogramBucketsType(OpLatecyBuckets));
         REGISTER_HISTOGRAM(volume_data_read_latency, "Volume data blocks read latency", "volume_data_op_latency",
                            {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
         REGISTER_HISTOGRAM(volume_data_write_latency, "Volume data blocks write latency", "volume_data_op_latency",
@@ -168,12 +170,14 @@ private:
     };
 
 public:
-    explicit Volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) :
-            sb_{VOL_META_NAME}, chunk_selector_{chunk_sel} {
+    explicit Volume(VolumeInfo&& info, shared< VolumeChunkSelector > vol_chunk_sel,
+                    shared< VolumeChunkSelector > index_chunk_sel) :
+            sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
         vol_info_ = std::make_shared< VolumeInfo >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
         metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     }
-    explicit Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel);
+    explicit Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
+                    shared< VolumeChunkSelector > index_chunk_sel);
     Volume(Volume const& volume) = delete;
     Volume(Volume&& volume) = default;
     Volume& operator=(Volume const& volume) = delete;
@@ -182,14 +186,17 @@ public:
     virtual ~Volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
-    static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel) {
-        auto vol = std::make_shared< Volume >(buf, cookie, chunk_sel);
+    static VolumePtr make_volume(sisl::byte_view const& buf, void* cookie,
+                                 shared< VolumeChunkSelector > volume_chunk_sel,
+                                 shared< VolumeChunkSelector > index_chunk_sel) {
+        auto vol = std::make_shared< Volume >(buf, cookie, volume_chunk_sel, index_chunk_sel);
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
     }
 
-    static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > chunk_sel) {
-        auto vol = std::make_shared< Volume >(std::move(info), chunk_sel);
+    static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > volume_chunk_sel,
+                                 shared< VolumeChunkSelector > index_chunk_sel) {
+        auto vol = std::make_shared< Volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
         auto ret = vol->init(false /* is_recovery */);
         // in failure case, volume shared ptr will be destroyed automatically;
         return ret ? vol : nullptr;
@@ -269,7 +276,8 @@ private:
     ReplDevPtr rd_;           // replication device for this volume, which provides read/write APIs to the volume;
     VolIdxTablePtr indx_tbl_; // index table for this volume
     superblk< vol_sb_t > sb_; // meta data of the volume
-    shared< VolumeChunkSelector > chunk_selector_; // volume chunk selector.
+    shared< VolumeChunkSelector > volume_chunk_selector_; // volume chunk selector.
+    shared< VolumeChunkSelector > index_chunk_selector_;  // index chunk selector.
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
     std::atomic< bool > destroy_started_{
