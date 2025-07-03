@@ -23,7 +23,7 @@ namespace homeblocks {
 std::shared_ptr< VolumeManager > HomeBlocksImpl::volume_manager() { return shared_from_this(); }
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
-    auto vol_ptr = Volume::make_volume(buf, cookie, chunk_selector_);
+    auto vol_ptr = Volume::make_volume(buf, cookie, volume_chunk_selector_, index_chunk_selector_);
     auto id = vol_ptr->id();
 
     {
@@ -61,6 +61,12 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
         cfg.m_int_node_type = btree_int_node_type;
 
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
+        std::vector< chunk_num_t > chunk_ids(sb->get_chunk_ids(), sb->get_chunk_ids() + sb->index_num_chunks);
+        bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, 0, chunk_ids);
+        if (!success) {
+            LOGI("Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
+                 boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
+        }
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
         idx_tbl_map_.emplace(pid_str, tbl);
         return tbl->index_table();
@@ -95,7 +101,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
         }
     }
 
-    auto vol_ptr = Volume::make_volume(std::move(vol_info), chunk_selector_);
+    auto vol_ptr = Volume::make_volume(std::move(vol_info), volume_chunk_selector_, index_chunk_selector_);
     if (vol_ptr) {
         auto lg = std::scoped_lock(vol_lock_);
         vol_map_.emplace(std::make_pair(id, vol_ptr));

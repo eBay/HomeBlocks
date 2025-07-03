@@ -57,7 +57,7 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
 
 public:
     using UpdateVolSbCb = std::function< void(uint64_t ordinal, const std::vector< chunk_num_t >&) >;
-    VolumeChunkSelector(UpdateVolSbCb update_sb_cb);
+    VolumeChunkSelector(std::string module_name, UpdateVolSbCb update_sb_cb);
     ~VolumeChunkSelector() = default;
 
     // Allocate some initial set of chunks during volume or index create. The number is num_chunks_per_resize
@@ -82,13 +82,13 @@ public:
 
     std::vector< shared< VolumeChunkSelector::HBChunk > > get_chunks(uint64_t volume_ordinal);
     uint64_t num_free_chunks() const;
+    void dump_per_pdev_chunks() const;
+    void dump_chunks() const;
 
 private:
     std::vector< shared< HBChunk > > allocate_init_chunks_from_pdev(uint64_t init_chunks, uint64_t total_chunks);
     std::vector< shared< HBChunk > > allocate_resize_chunks_from_pdev(uint32_t pdev, uint64_t num_chunks);
     void resize_volume_num_chunks(homestore::blk_count_t nblks, shared< VolumeChunksInfo > volc);
-    void dump_per_pdev_chunks() const;
-    void dump_chunks() const;
 
 private:
     enum class ResizeOp {
@@ -112,6 +112,7 @@ private:
     mutable std::mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
     std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
+    std::string m_module_name;
 };
 
 } // namespace homeblocks

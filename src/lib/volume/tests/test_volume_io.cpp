@@ -158,8 +158,8 @@ public:
         return data;
     }
 
-    void generate_write_io_single(lba_t start_lba = 0, uint32_t nblks = 0,
-                                  bool wait = true, bool expect_failure = false) {
+    void generate_write_io_single(lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true,
+                                  bool expect_failure = false) {
         // Generate a single io with start lba and nblks.
         auto latch = std::make_shared< std::latch >(1);
         auto data = build_random_data(start_lba, nblks, !expect_failure /*store the generated data*/);
@@ -330,8 +330,8 @@ public:
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
-    void generate_write_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0,
-                                  bool wait = true, bool expect_failure = false) {
+    void generate_write_io_single(shared< VolumeIOImpl > vol, lba_t start_lba = 0, uint32_t nblks = 0, bool wait = true,
+                                  bool expect_failure = false) {
         vol->generate_write_io_single(start_lba, nblks, wait, expect_failure);
     }
 
@@ -604,9 +604,8 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
 TEST_F(VolumeIOTest, WriteCrash) {
     LOGINFO("WriteCrash test started");
     // define all the flips to be set
-    std::vector< std::string > flip_points = {
-        "vol_write_crash_after_data_write", "vol_write_crash_after_journal_write"
-    };
+    std::vector< std::string > flip_points = {"vol_write_crash_after_data_write",
+                                              "vol_write_crash_after_journal_write"};
 
     // Crash after writing to disk but before writing to journal.
     // Read should return no data as there is no index.
