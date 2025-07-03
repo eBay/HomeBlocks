@@ -39,7 +39,10 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
         // parent uuid is used during recovery in homeblks layer;
         LOGI("Creating index table for volume: {}, index_uuid: {}, parent_uuid: {}", vol_info_->name,
              boost::uuids::to_string(uuid), boost::uuids::to_string(id()));
-        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg);
+        uint32_t pdev_id;
+        auto chunk_ids = index_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, 0, pdev_id);
+        LOGI("index table is going to be created with {}  chunks on pdev id {}", chunk_ids.size(), pdev_id);
+        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg, ordinal(), chunk_ids, pdev_id);
     } else {
         indx_tbl_ = tbl;
     }
@@ -48,8 +51,8 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
     return indx_table();
 }
 
-Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel) :
-        sb_{VOL_META_NAME}, chunk_selector_{chunk_sel} {
+Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel, shared< VolumeChunkSelector > index_chunk_sel) :
+        sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel}  {
     sb_.load(buf, cookie);
     // generate volume info from sb;
     vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
@@ -63,7 +66,7 @@ bool Volume::init(bool is_recovery) {
 
         // Allocate initial set of chunks for the volume with thin provisioning.
         uint32_t pdev_id;
-        auto chunk_ids = chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
+        auto chunk_ids = volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
         if (chunk_ids.empty()) {
             LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));
@@ -114,7 +117,7 @@ bool Volume::init(bool is_recovery) {
         // Get the chunk id's from metablk and pass to chunk selector for recovery.
         std::vector< chunk_num_t > chunk_ids(sb_->get_chunk_ids(), sb_->get_chunk_ids() + sb_->num_chunks);
         bool success =
-            chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
+            volume_chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
         if (!success) {
             LOGI("Failed to recover chunks for volume name: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));
@@ -156,6 +159,7 @@ void Volume::destroy() {
     if (indx_tbl_) {
         LOGI("Destroying index table for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
         indx_tbl_->destroy();
+        index_chunk_selector_->release_chunks(vol_info_->ordinal);
         indx_tbl_ = nullptr;
     }
 
@@ -164,7 +168,7 @@ void Volume::destroy() {
 
     // Release all the chunk's used by the volume. Superblock is destroyed before releasing
     // chunks, so that even after crash, these chunks will be available for other volumes.
-    chunk_selector_->release_chunks(vol_info_->ordinal);
+    volume_chunk_selector_->release_chunks(vol_info_->ordinal);
 }
 
 void Volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
