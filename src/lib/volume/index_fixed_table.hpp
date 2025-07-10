@@ -29,7 +29,6 @@ public:
                                                             BtreeValue const& value) {
             auto lba = r_cast< const VolumeIndexKey& >(key).lba();
             auto& existing_value_vol_idx = r_cast< const VolumeIndexValue& >(existing_value);
-            LOGINFO("Filter callback for lba {}, existing value: {}", lba, existing_value_vol_idx.blkid().to_string());
             blocks_info[lba].old_blkid = existing_value_vol_idx.blkid();
             blocks_info[lba].old_checksum = existing_value_vol_idx.checksum();
             return homestore::put_filter_decision::replace;

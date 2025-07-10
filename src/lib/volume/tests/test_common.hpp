@@ -52,6 +52,8 @@ SISL_OPTION_GROUP(
      "true or false"),
     (enable_crash, "", "enable_crash", "enable crash", ::cxxopts::value< bool >()->default_value("0"), ""),
     (app_mem_size, "", "app_mem_size", "app memory size", ::cxxopts::value< uint64_t >()->default_value("20"),
+     "number"),
+    (hs_chunk_size_mb, "", "hs_chunk_size_mb", "hs_chunk_size_mb", ::cxxopts::value< uint64_t >()->default_value("128"),
      "number"));
 
 using namespace homeblocks;
@@ -175,7 +177,7 @@ public:
         init_dev_list(true /*init_device*/);
 
         LOGINFO("Starting HomeBlocks");
-        homeblocks::HomeBlocksImpl::_hs_chunk_size = 128 * Mi;
+        homeblocks::HomeBlocksImpl::_hs_chunk_size = SISL_OPTIONS["hs_chunk_size_mb"].as< uint64_t >() * Mi;
         // set_min_chunk_size(4 * Mi);
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
@@ -309,6 +311,7 @@ private:
     }
 
     void remove_files() {
+        if (SISL_OPTIONS.count("device_list")) { return; }
         for (const auto& fpath : dev_list_) {
             if (std::filesystem::exists(fpath)) {
                 LOGINFO("Removing file {}", fpath);
