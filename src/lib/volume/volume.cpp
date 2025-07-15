@@ -384,7 +384,14 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
 void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
                                     std::vector< folly::Future< std::error_code > >& futs) {
     auto* read_buf = req->buffer;
-    DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
+    auto inst = HomeBlocksImpl::instance();
+
+    if (read_buf == nullptr && inst->fc_on()) {
+        auto const reason = fmt::format("read_buf of volume: {} is null", this->to_string());
+        inst->fault_containment(shared_from_this(), reason);
+    } else {
+        DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
+    }
     uint32_t prev_lba = req->lba;
     uint32_t prev_nblks = 0;
     for (uint32_t i = 0; i < blks_to_read.size(); ++i) {
@@ -420,25 +427,4 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
                     "Read buffer size mismatch, expected: {}, actual: {}", req->nlbas * rd()->get_blk_size(),
                     read_buf - req->buffer);
 }
-#if 0
-VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface_req_ptr& req,
-                                                             index_kv_list_t& index_kvs) {
-    homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
-        homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
-        homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
-    auto index_table = indx_table();
-    auto inst = HomeBlocksImpl::instance();
-    if (!index_table and inst->fc_on()) {
-        auto const reason = "Index table is null for volume id: " + boost::uuids::to_string(id());
-        inst->fault_containment(shared_from_this(), reason);
-    } else {
-        RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(id()));
-        if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-            return folly::makeUnexpected(VolumeError::INDEX_ERROR);
-        }
-    }
-
-    return folly::Unit();
-}
-#endif
 } // namespace homeblocks

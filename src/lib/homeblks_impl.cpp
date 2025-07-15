@@ -474,7 +474,14 @@ bool HomeBlocksImpl::fc_on() const {
 
 void HomeBlocksImpl::exit_fc(VolumePtr& vol) { vol->state_change(vol_state::ONLINE); }
 
-void HomeBlocksImpl::fault_containment(const VolumePtr& vol, const std::string& reason) {
+void HomeBlocksImpl::fault_containment(const VolumePtr vol, const std::string& reason) {
+    if (vol == nullptr) {
+        // TODO: Put entire HB into offline;
+        assert(0);
+        LOGE("Not implemented yet:  putting HB into fault containment, reason: {}", reason);
+        return;
+    }
+
     LOGI("Volume {} is in fault containment due to: {}", vol->id_str(), reason);
     // if volume is in fault containment, we should not allow any new requests to be issued on it;
     vol->state_change(vol_state::OFFLINE);

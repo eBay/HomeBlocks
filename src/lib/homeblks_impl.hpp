@@ -148,7 +148,7 @@ public:
 
     void start_reaper_thread();
 
-    void fault_containment(const VolumePtr& vol, const std::string& reason = "");
+    void fault_containment(const VolumePtr vol, const std::string& reason = "");
     bool fc_on() const;
     void exit_fc(VolumePtr& vol);
 
@@ -222,6 +222,13 @@ public:
 
     void on_fault_containment(const homestore::FaultContainmentEvent event, void* cookie,
                               const std::string& reason) override {
+        if (event == homestore::FaultContainmentEvent::ENTER_GLOABLE) {
+            hb_->fault_containment(nullptr);
+            LOGI("Global fault containment event received, reason: {}", reason);
+            DEBUG_ASSERT(cookie == nullptr, "Global fault containment event should not have a cookie");
+            return;
+        }
+
         if (cookie == nullptr) {
             LOGW("Fault containment event received with null cookie, ignoring");
             return;
