@@ -455,7 +455,8 @@ VolumeManager::Result< folly::Unit > Volume::read_from_index(const vol_interface
     auto index_table = indx_table();
     auto inst = HomeBlocksImpl::instance();
     if (!index_table and inst->fc_on()) {
-        inst->fault_containment(shared_from_this());
+        auto const reason = "Index table is null for volume id: " + boost::uuids::to_string(id());
+        inst->fault_containment(shared_from_this(), reason);
     } else {
         RELEASE_ASSERT(index_table != nullptr, "Index table is null for volume id: {}", boost::uuids::to_string(id()));
         if (auto ret = index_table->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
