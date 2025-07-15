@@ -24,12 +24,14 @@ class HomeBlocksConan(ConanFile):
                 "fPIC": ['True', 'False'],
                 "coverage": ['True', 'False'],
                 "sanitize": ['True', 'False'],
+                "fixed_index": [True, False],
               }
     default_options = {
                 'shared': False,
                 'fPIC': True,
                 'coverage': False,
                 'sanitize': False,
+                'fixed_index': True,
             }
 
     exports_sources = ("CMakeLists.txt", "cmake/*", "src/*", "LICENSE")
@@ -80,6 +82,7 @@ class HomeBlocksConan(ConanFile):
         tc.variables["MEMORY_SANITIZER_ON"] = "OFF"
         tc.variables["CODE_COVERAGE"] = "OFF"
         tc.variables["PROJECT_VERSION"] = self.version
+        tc.variables["USE_FIXED_INDEX"] = "ON" if self.options.fixed_index else "OFF"
         if self.settings.build_type == "Debug":
             if self.options.get_safe("coverage"):
                 tc.variables['CODE_COVERAGE'] = 'ON'
