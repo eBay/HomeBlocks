@@ -27,6 +27,15 @@ elseif ((DEFINED MEMORY_SANITIZER_ON) AND (${MEMORY_SANITIZER_ON}))
 endif()
 find_package(GTest QUIET REQUIRED)
 
+# set btree type flag
+if ((DEFINED USE_FIXED_INDEX) AND (${USE_FIXED_INDEX}))
+  message(STATUS "Using fixed btree")
+  add_definitions(-DUSE_FIXED_INDEX=1)
+else()
+  message(STATUS "Using prefix btree")
+  add_definitions(-DUSE_FIXED_INDEX=0)
+endif()
+
 find_program(CCACHE_FOUND ccache QUIET)
 if (CCACHE_FOUND)
    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)

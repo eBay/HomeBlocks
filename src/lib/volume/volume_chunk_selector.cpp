@@ -144,7 +144,7 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
         LOGI("Waiting to allocate more chunks active={} total={}", volc->num_active_chunks.load(),
              volc->max_num_chunks);
         dump_chunks();
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } while (true);
 
     return {};

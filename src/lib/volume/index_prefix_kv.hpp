@@ -32,7 +32,7 @@ struct BlockInfo {
     // Checksum calculated on new data and written to new_blkid.
     homestore::BlkId new_blkid;
     homestore::BlkId old_blkid;
-    homestore::csum_t checksum;
+    homestore::csum_t new_checksum;
 };
 
 struct IndexValueContext {
@@ -151,6 +151,7 @@ public:
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
 
     lba_t key() const { return (uint64_cast(m_lba_base) << 32) | m_lba_offset; }
+    lba_t lba() const { return key(); }
     lba_t start_key(const homestore::BtreeKeyRange< VolumeIndexKey >& range) const {
         const VolumeIndexKey& k = (const VolumeIndexKey&)(range.start_key());
         return k.key();
@@ -253,7 +254,7 @@ public:
         m_blkid_suffix += n;
         auto curr_lba = ctx->start_lba + n;
         DEBUG_ASSERT(ctx->block_info->find(curr_lba) != ctx->block_info->end(), "Invalid index");
-        m_checksum = (*ctx->block_info)[curr_lba].checksum;
+        m_checksum = (*ctx->block_info)[curr_lba].new_checksum;
     }
 
     sisl::blob serialize_prefix() const override {
