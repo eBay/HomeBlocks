@@ -24,6 +24,7 @@
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/superblk_handler.hpp>
+#include <homestore/fault_cmt_service.hpp>
 #include <homeblks/home_blks.hpp>
 #include <homeblks/volume_mgr.hpp>
 #include <homeblks/common.hpp>
@@ -209,6 +210,30 @@ public:
     on_index_table_found(homestore::superblk< homestore::index_table_sb >&& sb) override {
         LOGI("Recovered index table to index service");
         return hb_->recover_index_table(std::move(sb));
+    }
+
+private:
+    HomeBlocksImpl* hb_;
+};
+
+class HBFCSvcCB : public homestore::FaultContainmentCallback {
+public:
+    HBFCSvcCB(HomeBlocksImpl* hb) : hb_(hb) {}
+
+    void on_fault_containment(const homestore::FaultContainmentEvent event, void* cookie,
+                              const std::string& reason) override {
+        if (cookie == nullptr) {
+            LOGW("Fault containment event received with null cookie, ignoring");
+            return;
+        }
+
+        auto vol_id = static_cast< volume_id_t* >(cookie);
+        auto vol = hb_->lookup_volume(*vol_id);
+        if (event == homestore::FaultContainmentEvent::ENTER) {
+            hb_->fault_containment(vol, reason);
+        } else if (event == homestore::FaultContainmentEvent::EXIT) {
+            hb_->exit_fc(vol);
+        }
     }
 
 private:
