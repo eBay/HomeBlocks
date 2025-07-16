@@ -390,7 +390,7 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
         auto const reason = fmt::format("read_buf of volume: {} is null", this->to_string());
         inst->fault_containment(shared_from_this(), reason);
     } else {
-        DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
+        RELEASE_ASSERT(read_buf != nullptr, "Read buffer is null");
     }
     uint32_t prev_lba = req->lba;
     uint32_t prev_nblks = 0;
