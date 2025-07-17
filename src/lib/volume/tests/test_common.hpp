@@ -183,6 +183,7 @@ public:
 
     void restart(uint64_t delay_secs = 0) {
         LOGINFO("Restart HomeBlocks");
+        hb_->shutdown();
         hb_.reset();
         LOGINFO("Start HomeBlocks after {} secs", delay_secs);
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
@@ -193,6 +194,7 @@ public:
 
     void teardown() {
         LOGINFO("Tearing down test.");
+        hb_->shutdown();
         hb_.reset();
         remove_files();
     }
