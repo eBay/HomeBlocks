@@ -73,6 +73,7 @@ private:
     std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
 
     bool recovery_done_{false};
+    std::mutex sb_lock_;
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
     shared< VolumeChunkSelector > chunk_selector_;
@@ -80,6 +81,8 @@ private:
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
     bool shutdown_started_{false};
+    std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
+
     folly::Promise< folly::Unit > shutdown_promise_;
     iomgr::io_fiber_t reaper_fiber_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
@@ -151,6 +154,7 @@ public:
     void fault_containment(const VolumePtr vol, const std::string& reason = "");
     bool fc_on() const;
     void exit_fc(VolumePtr& vol);
+    bool is_restricted() const { return is_restricted_.load(); }
 
 public:
     // public static APIs;

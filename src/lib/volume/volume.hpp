@@ -167,6 +167,7 @@ public:
 
     bool is_destroying() const { return m_state_.load() == vol_state::DESTROYING; }
     bool is_destroy_started() const { return destroy_started_.load(); }
+    bool is_offline() const { return m_state_.load() == vol_state::OFFLINE; }
 
     //
     // This API will be called to set the volume state and persist to disk;
@@ -226,7 +227,7 @@ private:
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
     std::atomic< bool > destroy_started_{
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
-    std::atomic< vol_state > m_state_; // in-memory sb state;
+    std::atomic< vol_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
 };
 
 struct vol_repl_ctx : public homestore::repl_req_ctx {

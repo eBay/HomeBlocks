@@ -373,6 +373,9 @@ void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cook
         // if it is a gracefuln shutdown, this flag should be set again in shutdown routine;
         sb_->clear_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
         LOGI("System was shutdown gracefully");
+    } else if (sb_->test_flag(SB_FLAGS_RESTRICTED)) {
+        is_restricted_.store(true);
+        LOGI("System is booted into restricted mode, reason: {}", sb_->flag);
     } else {
         LOGI("System experienced sudden crash since last boot");
     }
@@ -476,9 +479,12 @@ void HomeBlocksImpl::exit_fc(VolumePtr& vol) { vol->state_change(vol_state::ONLI
 
 void HomeBlocksImpl::fault_containment(const VolumePtr vol, const std::string& reason) {
     if (vol == nullptr) {
-        // TODO: Put entire HB into offline;
-        assert(0);
-        LOGE("Not implemented yet:  putting HB into fault containment, reason: {}", reason);
+        // Put entire HB into offline;
+        std::scoped_lock lg(sb_lock_);
+        sb_->set_flag(SB_FLAGS_RESTRICTED);
+        is_restricted_.store(true);
+        sb_.write();
+        LOGE("Putting HB into restricted mode, reason: {}", reason);
         return;
     }
 
