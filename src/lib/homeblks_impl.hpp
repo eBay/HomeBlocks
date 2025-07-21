@@ -73,7 +73,7 @@ private:
     std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
 
     bool recovery_done_{false};
-    std::mutex sb_lock_;
+    std::mutex sb_lock_; // this lock is only used when FC is triggered;
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
     shared< VolumeChunkSelector > chunk_selector_;
@@ -84,7 +84,6 @@ private:
     std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
 
     folly::Promise< folly::Unit > shutdown_promise_;
-    iomgr::io_fiber_t reaper_fiber_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
@@ -226,7 +225,7 @@ public:
 
     void on_fault_containment(const homestore::FaultContainmentEvent event, void* cookie,
                               const std::string& reason) override {
-        if (event == homestore::FaultContainmentEvent::ENTER_GLOABLE) {
+        if (event == homestore::FaultContainmentEvent::ENTER_GLOBAL) {
             hb_->fault_containment(nullptr);
             LOGI("Global fault containment event received, reason: {}", reason);
             DEBUG_ASSERT(cookie == nullptr, "Global fault containment event should not have a cookie");

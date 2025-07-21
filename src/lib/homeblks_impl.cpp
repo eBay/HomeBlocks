@@ -381,9 +381,7 @@ void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cook
     }
 
     ++sb_->boot_cnt;
-
     our_uuid_ = sb_->svc_id;
-
     LOGI("HomeBlks superblock loaded, boot_cnt: {}, svc_id: {}", sb_->boot_cnt, boost::uuids::to_string(our_uuid_));
 
     // avoid doing sb meta blk write in callback which will cause deadlock;
