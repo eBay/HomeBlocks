@@ -554,8 +554,12 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
         total_writes += get_total_writes();
         std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
         auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
-        LOGINFO("total_read={} total_write={} elapsed={}", total_reads, total_writes, elapsed_seconds);
-
+        static uint64_t log_pct = 0;
+        if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
+            LOGINFO("total_read={} total_write={} elapsed={}, done pct={}", total_reads, total_writes, elapsed_seconds, done_pct);
+            log_pct += 5;
+        }
+        
         if (elapsed_seconds >= run_time) { break; }
     } while (true);
 }
@@ -585,9 +589,10 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
         total_writes += get_total_writes();
         std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
         auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
-        if (elapsed_seconds % 2 == 0) {
-            LOGINFO("total_read={} total_write={} lba={} elapsed={}", total_reads, total_writes, cur_lba,
-                    elapsed_seconds);
+        static uint64_t log_pct = 0;
+        if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
+            LOGINFO("total_read={} total_write={} elapsed={}, done pct={}", total_reads, total_writes, elapsed_seconds, done_pct);
+            log_pct += 5;
         }
 
         if (((cur_lba + nblks) * g_page_size) >= volume_size) {

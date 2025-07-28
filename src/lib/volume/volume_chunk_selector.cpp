@@ -141,9 +141,9 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
             if (chunk && chunk->available_blks() > 0) { return chunk->get_internal_chunk(); }
         }
 
-        LOGI("Waiting to allocate more chunks active={} total={}", volc->num_active_chunks.load(),
+        LOGT("Waiting to allocate more chunks active={} total={}", volc->num_active_chunks.load(),
              volc->max_num_chunks);
-        dump_chunks();
+        LOGT("{}", dump_chunks());
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } while (true);
 
@@ -184,7 +184,7 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
     }
 
     // Spawn background task to create new chunks.
-    LOGI("Initiating op to resize num chunks for volume={} available={} total={}", volc->ordinal, available_blks,
+    LOGD("Initiating op to resize num chunks for volume={} available={} total={}", volc->ordinal, available_blks,
          total_blks);
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [volc, this]() mutable {
         std::string str;
@@ -213,7 +213,7 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
         // Update the number of active chunks and compelete the resize operation.
         volc->num_active_chunks = indx;
         resize_op.store(ResizeOp::Idle);
-        LOGI("Resize op done. Allocated more chunks for volume={} total={} new={} new_chunks={}", volc->ordinal,
+        LOGD("Resize op done. Allocated more chunks for volume={} total={} new={} new_chunks={}", volc->ordinal,
              volc->num_active_chunks.load(), chunks.size(), str);
     });
 }
@@ -359,18 +359,20 @@ void VolumeChunkSelector::dump_per_pdev_chunks() const {
     }
 }
 
-void VolumeChunkSelector::dump_chunks() const {
+std::string VolumeChunkSelector::dump_chunks() const {
     std::lock_guard lock(m_chunk_sel_mutex);
+    std::string str;
     for (uint32_t i = 0; i < m_volume_chunks.size(); i++) {
         if (!m_volume_chunks[i]) { continue; }
-        std::string str;
+        fmt::format_to(std::back_inserter(str), "volume={} num_chunks={} chunks=", i, m_volume_chunks[i]->m_chunks.size());
         for (const auto& chunk : m_volume_chunks[i]->m_chunks) {
             if (!chunk) { continue; }
             fmt::format_to(std::back_inserter(str), "{}({}/{}) ", chunk->get_chunk_id(), chunk->available_blks(),
                            chunk->get_total_blks());
         }
-        LOGI("volume={} num_chunks={} chunks={}", i, m_volume_chunks[i]->m_chunks.size(), str);
+        fmt::format_to(std::back_inserter(str), "\n");
     }
+    return str;
 }
 
 } // namespace homeblocks

@@ -88,7 +88,7 @@ private:
     std::vector< shared< HBChunk > > allocate_resize_chunks_from_pdev(uint32_t pdev, uint64_t num_chunks);
     void resize_volume_num_chunks(homestore::blk_count_t nblks, shared< VolumeChunksInfo > volc);
     void dump_per_pdev_chunks() const;
-    void dump_chunks() const;
+    std::string dump_chunks() const;
 
 private:
     enum class ResizeOp {
