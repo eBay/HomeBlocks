@@ -1,0 +1,80 @@
+pipeline {
+    agent { label 'sds-builder-v5' }
+    triggers {
+          cron('TZ=US/Pacific\nH H(0-2) * * *')
+    }
+
+    environment {
+        ORG = 'sds'
+        ECR_URL = 'hub.tess.io'
+        ARTIFACTORY_PASS = credentials('ARTIFACTORY_PASS')
+        CONAN_USER = 'oss'
+        failed_stage = ""
+    }
+    stages {
+        stage('Adjust Version') {
+            steps {
+                script {
+                    sh(script: "sed -Ei 's,version = .*\"([[:digit:]]+\\.[[:digit:]]+\\.[[:digit:]]+).*,version = \"\\1-${env.BUILD_NUMBER}\",' conanfile.py")
+                }
+            }
+        }
+        stage('Get Version') {
+            steps {
+                script {
+                    PROJECT = sh(script: "grep -m 1 'name =' conanfile.py | awk '{print \$3}' | tr -d '\n' | tr -d '\"'", returnStdout: true)
+                    VER = sh(script: "grep -m 1 ' version =' conanfile.py | awk '{print \$3}' | tr -d '\n' | tr -d '\"'", returnStdout: true)
+                    NIGHTLY_TAG = "main-nightly-debug-4.0"
+                    ECR_PATH = "${ECR_URL}/${ORG}/${PROJECT}"
+                    CONAN_FLAGS="--name ${PROJECT} --user ${CONAN_USER} --channel ${NIGHTLY_TAG}"
+                    failed_stage = ""
+                }
+            }
+        }
+        stage('Build') {
+            failFast true
+            stages {
+                stage('Adjust Tag for Master') {
+                    steps {
+                        sh(script: "sed -Ei 's,version = .*\"([[:digit:]]+\\.[[:digit:]]+\\.[[:digit:]]+).*,version = \"\\1-${env.BUILD_NUMBER}\",' conanfile.py")
+                    }
+                }
+                stage("Build") {
+                    steps {
+                        sh '''
+                            hostname
+                            echo $NODE_NAME
+                            conan create --build missing -s:h build_type=Debug -o ${PROJECT}/*:sanitize=True ${CONAN_FLAGS} .
+
+                            find /home/jenkins -type f -wholename '*/test_volume_io' -exec cp {} .jenkins/test_volume_io \\;
+                            find /home/jenkins -type f -wholename '*/test_scripts/io_test.py' -exec install -Dm755 {} .jenkins/io_test.py \\;
+                            find /home/jenkins -type f -wholename '*/test_scripts/long_running.py' -exec install -Dm755 {} .jenkins/long_running.py \\;
+                        '''
+                    }
+                    post {
+                        failure {
+                            script {
+                                sh "find . -name *_log -print | xargs tar cif logs.tar"
+                                failed_stage = "Build"
+                            }
+                            archiveArtifacts artifacts: "logs.tar", fingerprint: true
+                        }
+                    }
+                }
+                stage("Image") {
+                    steps {
+                        withDockerRegistry([credentialsId: 'sds-sds', url: "https://${ECR_URL}"]) {
+                            sh "docker build -t ${ECR_PATH}:${NIGHTLY_TAG} .jenkins/"
+                            retry(3) {
+                                sh "docker push ${ECR_PATH}:${NIGHTLY_TAG}"
+                            }
+                        }
+                    }
+                    post {
+                        failure { script { failed_stage = "Image" } }
+                    }
+                }
+            }
+        }
+   }
+}

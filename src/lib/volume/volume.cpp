@@ -53,6 +53,7 @@ Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSele
     sb_.load(buf, cookie);
     // generate volume info from sb;
     vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
+    metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     m_state_ = sb_->state;
     LOGI("Volume superblock loaded from disk, vol_info : {}", vol_info_->to_string());
 }
@@ -177,6 +178,7 @@ void Volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
 }
 
 VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_req) {
+    vol_req->io_start_time = Clock::now();
     // Step 1. Allocate new blkids. Homestore might return multiple blkid's pointing
     // to different contigious memory locations.
     auto data_size = vol_req->nlbas * rd()->get_blk_size();
@@ -188,8 +190,10 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
         LOGE("Failed to allocate blocks");
         return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
     }
+    COUNTER_INCREMENT(*metrics_, volume_write_count, 1);
 
     // Step 2. Write the data to those allocated blkids.
+    vol_req->data_svc_start_time = Clock::now();
     sisl::sg_list data_sgs;
     data_sgs.iovs.emplace_back(iovec{.iov_base = vol_req->buffer, .iov_len = data_size});
     data_sgs.size = data_size;
@@ -198,7 +202,8 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
         .thenValue(
             [this, vol_req, new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
                 if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
-
+                HISTOGRAM_OBSERVE(*metrics_, volume_data_write_latency, get_elapsed_time_us(vol_req->data_svc_start_time));
+                vol_req->index_start_time = Clock::now();
                 using homestore::BlkId;
                 std::vector< BlkId > old_blkids;
                 std::unordered_map< lba_t, BlockInfo > blocks_info;
@@ -229,6 +234,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
 
                     start_lba = end_lba + 1;
                 }
+                HISTOGRAM_OBSERVE(*metrics_, volume_map_write_latency, get_elapsed_time_us(vol_req->index_start_time));
 
                 // Collect all old blocks to write to journal.
                 for (auto& [_, info] : blocks_info) {
@@ -286,12 +292,17 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                             auto err = result.error();
                             return folly::makeUnexpected(err);
                         }
+                        auto write_size = vol_req->nlbas * rd()->get_blk_size();
+                        COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
+                        HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
+                        HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
                         return folly::Unit();
                     });
             });
 }
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
+    req->io_start_time = Clock::now();
     // Step 1: get the blk ids from index table
     vol_read_ctx read_ctx{.vol_req = req, .blk_size = rd()->get_blk_size()};
     if (auto index_resp = indx_table()->read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
@@ -299,6 +310,8 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
              boost::uuids::to_string(id()), index_resp.error());
         return index_resp;
     }
+    HISTOGRAM_OBSERVE(*metrics_, volume_map_read_latency, get_elapsed_time_us(req->io_start_time));
+    COUNTER_INCREMENT(*metrics_, volume_read_count, 1);
 
     // Step 2: Consolidate the blocks by merging the contiguous blkids
     std::vector< folly::Future< std::error_code > > futs;
@@ -306,6 +319,7 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     generate_blkids_to_read(read_ctx.index_kvs, blks_to_read);
 
     // Step 3: Submit the read requests to backend
+    req->data_svc_start_time = Clock::now();
     submit_read_to_backend(blks_to_read, req, futs);
 
     if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
@@ -318,6 +332,7 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
                 return folly::makeUnexpected(to_volume_error(ec));
             }
         }
+        HISTOGRAM_OBSERVE(*metrics_, volume_data_read_latency, get_elapsed_time_us(read_ctx.vol_req->data_svc_start_time));
         // verify the checksum and return
         return verify_checksum(read_ctx);
     });
@@ -377,6 +392,10 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
         ++i;
         ++cur_lba;
     }
+    auto read_size = read_ctx.vol_req->nlbas * read_ctx.blk_size;
+    COUNTER_INCREMENT(*metrics_, volume_read_size_total, read_size);
+    HISTOGRAM_OBSERVE(*metrics_, volume_read_size_distribution, read_size);
+    HISTOGRAM_OBSERVE(*metrics_, volume_read_latency, get_elapsed_time_us(read_ctx.vol_req->io_start_time));
     return folly::Unit();
 }
 
@@ -418,6 +437,11 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
     DEBUG_ASSERT_EQ(read_buf - req->buffer, req->nlbas * rd()->get_blk_size(),
                     "Read buffer size mismatch, expected: {}, actual: {}", req->nlbas * rd()->get_blk_size(),
                     read_buf - req->buffer);
+}
+
+// Note: Metrics scrapping can happen at any point after volume instance is created and registered with metrics farm;
+void VolumeMetrics::on_gather() {
+    
 }
 
 } // namespace homeblocks

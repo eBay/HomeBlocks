@@ -48,6 +48,7 @@ SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks
 SISL_LOGGING_DECL(test_volume_io)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
+std::unique_ptr< test_http_server > g_http_server;
 static constexpr uint64_t g_page_size = 4096;
 
 using namespace homeblocks;
@@ -679,6 +680,8 @@ int main(int argc, char* argv[]) {
 
     g_helper = std::make_unique< test_common::HBTestHelper >("test_volume_io", args, orig_argv);
     g_helper->setup();
+    g_http_server = std::make_unique< test_http_server >();
+    g_http_server->start();
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();
 
