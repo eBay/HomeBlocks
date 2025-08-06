@@ -171,7 +171,7 @@ class HBTestHelper {
         std::list< device_info_t > devices() const override {
             std::list< device_info_t > devs;
             for (const auto& dev : helper_.dev_list()) {
-                devs.emplace_back(dev, DevType::HDD);
+                devs.emplace_back(dev);
             }
             return devs;
         }
@@ -192,7 +192,7 @@ public:
 
     void setup() {
         sisl::logging::SetLogger(test_name_);
-        sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");
+        spdlog::set_pattern("[%D %T.%e] [%n] [%^%l%$] [%t] %v");
 
         // init svc_id_
         svc_id_ = boost::uuids::random_generator()();
