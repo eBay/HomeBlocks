@@ -39,7 +39,11 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
         // parent uuid is used during recovery in homeblks layer;
         LOGI("Creating index table for volume: {}, index_uuid: {}, parent_uuid: {}", vol_info_->name,
              boost::uuids::to_string(uuid), boost::uuids::to_string(id()));
-        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg);
+        uint32_t pdev_id;
+        auto chunk_ids = index_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, 0, pdev_id);
+        LOGI("index table is going to be created with {}  chunks on pdev id {}", chunk_ids.size(), pdev_id);
+        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg, ordinal(),
+                                                         chunk_ids, pdev_id);
     } else {
         indx_tbl_ = tbl;
     }
@@ -48,8 +52,9 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
     return indx_table();
 }
 
-Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > chunk_sel) :
-        sb_{VOL_META_NAME}, chunk_selector_{chunk_sel} {
+Volume::Volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
+               shared< VolumeChunkSelector > index_chunk_sel) :
+        sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
     sb_.load(buf, cookie);
     // generate volume info from sb;
     vol_info_ = std::make_shared< VolumeInfo >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
@@ -64,7 +69,8 @@ bool Volume::init(bool is_recovery) {
 
         // Allocate initial set of chunks for the volume with thin provisioning.
         uint32_t pdev_id;
-        auto chunk_ids = chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
+        auto chunk_ids =
+            volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
         if (chunk_ids.empty()) {
             LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));
@@ -115,7 +121,7 @@ bool Volume::init(bool is_recovery) {
         // Get the chunk id's from metablk and pass to chunk selector for recovery.
         std::vector< chunk_num_t > chunk_ids(sb_->get_chunk_ids(), sb_->get_chunk_ids() + sb_->num_chunks);
         bool success =
-            chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
+            volume_chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
         if (!success) {
             LOGI("Failed to recover chunks for volume name: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));
@@ -156,7 +162,9 @@ void Volume::destroy() {
     // 2. destroy the index table;
     if (indx_tbl_) {
         LOGI("Destroying index table for volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
+        // table superblk deletes in destroy(), hence it is safe to release chunks afterwards
         indx_tbl_->destroy();
+        index_chunk_selector_->release_chunks(vol_info_->ordinal);
         indx_tbl_ = nullptr;
     }
 
@@ -165,7 +173,7 @@ void Volume::destroy() {
 
     // Release all the chunk's used by the volume. Superblock is destroyed before releasing
     // chunks, so that even after crash, these chunks will be available for other volumes.
-    chunk_selector_->release_chunks(vol_info_->ordinal);
+    volume_chunk_selector_->release_chunks(vol_info_->ordinal);
 }
 
 void Volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
@@ -199,106 +207,107 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     data_sgs.size = data_size;
     return rd()
         ->async_write(new_blkids, data_sgs, vol_req->part_of_batch)
-        .thenValue(
-            [this, vol_req, new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
-                if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
-                HISTOGRAM_OBSERVE(*metrics_, volume_data_write_latency, get_elapsed_time_us(vol_req->data_svc_start_time));
-                vol_req->index_start_time = Clock::now();
-                using homestore::BlkId;
-                std::vector< BlkId > old_blkids;
-                std::unordered_map< lba_t, BlockInfo > blocks_info;
-                auto blk_size = rd()->get_blk_size();
-                auto data_size = vol_req->nlbas * blk_size;
-                auto data_buffer = vol_req->buffer;
-                lba_t start_lba = vol_req->lba;
-                for (auto& blkid : new_blkids) {
-                    DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
+        .thenValue([this, vol_req,
+                    new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
+            if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
+            HISTOGRAM_OBSERVE(*metrics_, volume_data_write_latency, get_elapsed_time_us(vol_req->data_svc_start_time));
+            vol_req->index_start_time = Clock::now();
+            using homestore::BlkId;
+            std::vector< BlkId > old_blkids;
+            std::unordered_map< lba_t, BlockInfo > blocks_info;
+            auto blk_size = rd()->get_blk_size();
+            auto data_size = vol_req->nlbas * blk_size;
+            auto data_buffer = vol_req->buffer;
+            lba_t start_lba = vol_req->lba;
+            for (auto& blkid : new_blkids) {
+                DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
 
-                    // Split the large blkid to individual blkid having only one block because each LBA points
-                    // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
-                    // block which is also stored in index.
-                    for (uint32_t i = 0; i < blkid.blk_count(); i++) {
-                        auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
-                        auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
-                        blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
-                        LOGT("volume write blkid={} csum={} lba={}", new_bid.to_string(), blocks_info[start_lba+i].new_checksum, start_lba + i);
-                        data_buffer += blk_size;
-                    }
-
-                    // Step 3. For range [start_lba, end_lba] in this blkid, write the values to index.
-                    // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
-                    // in blocks_info after write_to_index
-                    lba_t end_lba = start_lba + blkid.blk_count() - 1;
-                    auto status = indx_table()->write_to_index(start_lba, end_lba, blocks_info);
-                    if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
-
-                    start_lba = end_lba + 1;
-                }
-                HISTOGRAM_OBSERVE(*metrics_, volume_map_write_latency, get_elapsed_time_us(vol_req->index_start_time));
-
-                // Collect all old blocks to write to journal.
-                for (auto& [_, info] : blocks_info) {
-                    if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+                // Split the large blkid to individual blkid having only one block because each LBA points
+                // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
+                // block which is also stored in index.
+                for (uint32_t i = 0; i < blkid.blk_count(); i++) {
+                    auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
+                    auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
+                    blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
+                    LOGT("volume write blkid={} csum={} lba={}", new_bid.to_string(),
+                         blocks_info[start_lba + i].new_checksum, start_lba + i);
+                    data_buffer += blk_size;
                 }
 
-                auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
-                auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
-                auto key_size = sizeof(VolJournalEntry) + csum_size + old_blkids_size;
+                // Step 3. For range [start_lba, end_lba] in this blkid, write the values to index.
+                // Should there be any overwritten on existing lbas, old blocks to be freed will be collected
+                // in blocks_info after write_to_index
+                lba_t end_lba = start_lba + blkid.blk_count() - 1;
+                auto status = indx_table()->write_to_index(start_lba, end_lba, blocks_info);
+                if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
 
-                auto req =
-                    repl_result_ctx< VolumeManager::NullResult >::make(sizeof(MsgHeader) /* header size */, key_size);
-                req->vol_ptr_ = shared_from_this();
-                req->header()->msg_type = MsgType::WRITE;
-                // Store volume id for recovery path (log replay)
-                req->header()->volume_id = id();
+                start_lba = end_lba + 1;
+            }
+            HISTOGRAM_OBSERVE(*metrics_, volume_map_write_latency, get_elapsed_time_us(vol_req->index_start_time));
 
-                // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
-                // New blkid's are written to journal by the homestore async_write_journal. After journal flush,
-                // on_commit will be called where we free the old blkid's and the write iscompleted.
-                VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
-                auto key_buf = req->key_buf().bytes();
-                std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
-                key_buf += sizeof(VolJournalEntry);
+            // Collect all old blocks to write to journal.
+            for (auto& [_, info] : blocks_info) {
+                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+            }
 
-                auto lba = vol_req->lba;
-                for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
-                    std::memcpy(key_buf, &blocks_info[lba].new_checksum, sizeof(homestore::csum_t));
-                    key_buf += sizeof(homestore::csum_t);
-                    lba++;
-                }
+            auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
+            auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
+            auto key_size = sizeof(VolJournalEntry) + csum_size + old_blkids_size;
 
-                for (auto& blkid : old_blkids) {
-                    std::memcpy(key_buf, &blkid, sizeof(BlkId));
-                    key_buf += sizeof(BlkId);
-                }
+            auto req =
+                repl_result_ctx< VolumeManager::NullResult >::make(sizeof(MsgHeader) /* header size */, key_size);
+            req->vol_ptr_ = shared_from_this();
+            req->header()->msg_type = MsgType::WRITE;
+            // Store volume id for recovery path (log replay)
+            req->header()->volume_id = id();
+
+            // Step 4. Store lba, nlbas, list of checksum of each blk, list of old blkids as key in the journal.
+            // New blkid's are written to journal by the homestore async_write_journal. After journal flush,
+            // on_commit will be called where we free the old blkid's and the write iscompleted.
+            VolJournalEntry hb_key{vol_req->lba, vol_req->nlbas, static_cast< uint16_t >(old_blkids.size())};
+            auto key_buf = req->key_buf().bytes();
+            std::memcpy(key_buf, &hb_key, sizeof(VolJournalEntry));
+            key_buf += sizeof(VolJournalEntry);
+
+            auto lba = vol_req->lba;
+            for (lba_count_t count = 0; count < vol_req->nlbas; count++) {
+                std::memcpy(key_buf, &blocks_info[lba].new_checksum, sizeof(homestore::csum_t));
+                key_buf += sizeof(homestore::csum_t);
+                lba++;
+            }
+
+            for (auto& blkid : old_blkids) {
+                std::memcpy(key_buf, &blkid, sizeof(BlkId));
+                key_buf += sizeof(BlkId);
+            }
 
 #ifdef _PRERELEASE
-                if (iomgr_flip::instance()->test_flip("vol_write_crash_after_data_write")) {
-                    // this is to simulate crash during write where data is persisted journal is
-                    // not persisted. After recovery there is no index for.
-                    LOGINFO("Volume write crash simulation flip is set, aborting");
-                    return folly::Unit();
-                }
+            if (iomgr_flip::instance()->test_flip("vol_write_crash_after_data_write")) {
+                // this is to simulate crash during write where data is persisted journal is
+                // not persisted. After recovery there is no index for.
+                LOGINFO("Volume write crash simulation flip is set, aborting");
+                return folly::Unit();
+            }
 #endif
 
-                rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+            rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
 
-                return req->result()
-                    .via(&folly::InlineExecutor::instance())
-                    .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                        if (result.hasError()) {
-                            LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
-                                 vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
-                            auto err = result.error();
-                            return folly::makeUnexpected(err);
-                        }
-                        auto write_size = vol_req->nlbas * rd()->get_blk_size();
-                        COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
-                        HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
-                        HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
-                        return folly::Unit();
-                    });
-            });
+            return req->result()
+                .via(&folly::InlineExecutor::instance())
+                .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                    if (result.hasError()) {
+                        LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
+                             vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
+                        auto err = result.error();
+                        return folly::makeUnexpected(err);
+                    }
+                    auto write_size = vol_req->nlbas * rd()->get_blk_size();
+                    COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
+                    HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
+                    HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
+                    return folly::Unit();
+                });
+        });
 }
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
@@ -332,7 +341,8 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
                 return folly::makeUnexpected(to_volume_error(ec));
             }
         }
-        HISTOGRAM_OBSERVE(*metrics_, volume_data_read_latency, get_elapsed_time_us(read_ctx.vol_req->data_svc_start_time));
+        HISTOGRAM_OBSERVE(*metrics_, volume_data_read_latency,
+                          get_elapsed_time_us(read_ctx.vol_req->data_svc_start_time));
         // verify the checksum and return
         return verify_checksum(read_ctx);
     });
@@ -376,10 +386,9 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
             cur_lba = key.lba();
             continue;
         }
-        DEBUG_ASSERT_EQ(read_buf - read_ctx.vol_req->buffer,
-                        (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size,
-                        "Read buffer size mismatch, expected: {}, actual: {}", (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size,
-                        read_buf - read_ctx.vol_req->buffer);
+        DEBUG_ASSERT_EQ(read_buf - read_ctx.vol_req->buffer, (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size,
+                        "Read buffer size mismatch, expected: {}, actual: {}",
+                        (cur_lba - read_ctx.vol_req->lba) * read_ctx.blk_size, read_buf - read_ctx.vol_req->buffer);
         auto checksum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(read_buf), read_ctx.blk_size);
         if (checksum != value.checksum()) {
             LOGE("crc mismatch for lba: {} start: {}, end: {} blk id {}, expected: {}, actual: {}", cur_lba,
@@ -416,8 +425,8 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
             read_buf += holes_size;
         }
         DEBUG_ASSERT_EQ(read_buf - req->buffer, (start_lba - req->lba) * rd()->get_blk_size(),
-                    "Read buffer size mismatch, expected: {}, actual: {}", (start_lba - req->lba) * rd()->get_blk_size(),
-                    read_buf - req->buffer);
+                        "Read buffer size mismatch, expected: {}, actual: {}",
+                        (start_lba - req->lba) * rd()->get_blk_size(), read_buf - req->buffer);
         sisl::sg_list sgs;
         sgs.size = blkids.blk_count() * rd()->get_blk_size();
         sgs.iovs.emplace_back(iovec{.iov_base = read_buf, .iov_len = sgs.size});
@@ -440,8 +449,6 @@ void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const 
 }
 
 // Note: Metrics scrapping can happen at any point after volume instance is created and registered with metrics farm;
-void VolumeMetrics::on_gather() {
-    
-}
+void VolumeMetrics::on_gather() {}
 
 } // namespace homeblocks

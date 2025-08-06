@@ -75,7 +75,6 @@ public:
 
     static uint32_t get_fixed_size() { return sizeof(VolumeIndexKey); }
 
-    
     /////////////////// Local methods for helping tests //////////////////
     bool operator<(const VolumeIndexKey& o) const { return (compare(o) < 0); }
     bool operator==(const VolumeIndexKey& other) const { return (compare(other) == 0); }
@@ -101,28 +100,22 @@ public:
 class VolumeIndexValue : public homestore::BtreeValue {
 private:
 #pragma pack(1)
-    // Store blkid and checksum as the value. 
+    // Store blkid and checksum as the value.
     BlkId m_blkid;
     homestore::csum_t m_checksum;
 #pragma pack()
 
 public:
-    VolumeIndexValue(const BlkId& base_blkid, homestore::csum_t csum) : 
-            homestore::BtreeValue(),
-            m_blkid(base_blkid),
-            m_checksum(csum) {}
+    VolumeIndexValue(const BlkId& base_blkid, homestore::csum_t csum) :
+            homestore::BtreeValue(), m_blkid(base_blkid), m_checksum(csum) {}
     VolumeIndexValue(const BlkId& base_blkid) : VolumeIndexValue(base_blkid, 0) {}
     VolumeIndexValue() = default;
     VolumeIndexValue(const VolumeIndexValue& other) :
-            homestore::BtreeValue(),
-            m_blkid(other.m_blkid),
-            m_checksum(other.m_checksum) {}
+            homestore::BtreeValue(), m_blkid(other.m_blkid), m_checksum(other.m_checksum) {}
     VolumeIndexValue(const sisl::blob& b, bool copy) : homestore::BtreeValue() { this->deserialize(b, copy); }
     virtual ~VolumeIndexValue() = default;
 
-    homestore::BlkId blkid() const {
-        return m_blkid;
-    }
+    homestore::BlkId blkid() const { return m_blkid; }
 
     homestore::csum_t checksum() const { return m_checksum; }
 

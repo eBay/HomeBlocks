@@ -12,21 +12,21 @@ using hs_index_table_t = homestore::IndexTable< VolumeIndexKey, VolumeIndexValue
 
 class VolumeIndexTable {
     std::shared_ptr< hs_index_table_t > hs_index_table_;
+
 public:
-    template <typename... Args>
-    VolumeIndexTable(Args&&... args) : hs_index_table_(std::make_shared< hs_index_table_t >(std::forward<Args>(args)...)) {
+    template < typename... Args >
+    VolumeIndexTable(Args&&... args) :
+            hs_index_table_(std::make_shared< hs_index_table_t >(std::forward< Args >(args)...)) {
         LOGINFO("Created Prefix Index table, uuid {}", boost::uuids::to_string(hs_index_table_->uuid()));
     }
 
-    std::shared_ptr< hs_index_table_t > index_table() {
-        return hs_index_table_;
-    }
-    
+    std::shared_ptr< hs_index_table_t > index_table() { return hs_index_table_; }
+
     VolumeManager::Result< folly::Unit > write_to_index(lba_t start_lba, lba_t end_lba,
                                                         std::unordered_map< lba_t, BlockInfo >& blocks_info) {
         // Use filter callback to get the old blkid.
         homestore::put_filter_cb_t filter_cb = [&blocks_info](BtreeKey const& key, BtreeValue const& existing_value,
-                                                            BtreeValue const& value) {
+                                                              BtreeValue const& value) {
             auto lba = r_cast< const VolumeIndexKey& >(key).key();
             blocks_info[lba].old_blkid = r_cast< const VolumeIndexValue& >(existing_value).blkid();
             return homestore::put_filter_decision::replace;
@@ -54,15 +54,14 @@ public:
         return folly::Unit();
     }
 
-    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req,
-                                                             index_kv_list_t& index_kvs) {
+    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs) {
         homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
             homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
             homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
         if (auto ret = hs_index_table_->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
             return folly::makeUnexpected(VolumeError::INDEX_ERROR);
         }
-      return folly::Unit();
+        return folly::Unit();
     }
 
     void destroy() {

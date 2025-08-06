@@ -273,17 +273,24 @@ void HomeBlocksImpl::init_homestore() {
 
     RELEASE_ASSERT(device_info.size() != 0, "No supported devices found!");
 
-    chunk_selector_ = std::make_shared< VolumeChunkSelector >(
-        [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
+    volume_chunk_selector_ = std::make_shared< VolumeChunkSelector >(
+        "volume", [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
             update_vol_sb_cb(volume_ordinal, chunk_ids);
         });
+    LOGI("Initialize index chunk selector");
+    index_chunk_selector_ = std::make_shared< VolumeChunkSelector >(
+        "index", [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
+            // Todo: decide it later whether needed for index
+        });
+
     using namespace homestore;
     // Note: timeline_consistency doesn't matter as we are using solo repl dev;
     auto repl_app =
         std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this, _application);
     bool need_format = homestore::hs()
-                           ->with_index_service(std::make_unique< HBIndexSvcCB >(this))
-                           .with_repl_data_service(repl_app, chunk_selector_) // custom volume chunk selector
+                           ->with_index_service(std::make_unique< HBIndexSvcCB >(this),
+                                                index_chunk_selector_)               // custom index chunk selector
+                           .with_repl_data_service(repl_app, volume_chunk_selector_) // custom volume chunk selector
                            .start(hs_input_params{.devices = device_info, .app_mem_size = app_mem_size},
                                   [this]() { register_metablk_cb(); });
     if (need_format) {
@@ -299,7 +306,11 @@ void HomeBlocksImpl::init_homestore() {
                 {HS_SERVICE::LOG,
                  hs_format_params{
                      .dev_type = HSDevType::Fast, .size_pct = 45.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
-                {HS_SERVICE::INDEX, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 45.0}},
+                {HS_SERVICE::INDEX,
+                 hs_format_params{.dev_type = HSDevType::Fast,
+                                  .size_pct = 45.0,
+                                  .num_chunks = 100,
+                                  .chunk_sel_type = chunk_selector_type_t::CUSTOM}},
                 {HS_SERVICE::REPLICATION,
                  hs_format_params{.dev_type = HSDevType::Data,
                                   .size_pct = 95.0,
@@ -315,7 +326,11 @@ void HomeBlocksImpl::init_homestore() {
                 {HS_SERVICE::META, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
                 {HS_SERVICE::LOG,
                  hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
-                {HS_SERVICE::INDEX, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
+                {HS_SERVICE::INDEX,
+                 hs_format_params{.dev_type = run_on_type,
+                                  .size_pct = 5.0,
+                                  .num_chunks = 100,
+                                  .chunk_sel_type = chunk_selector_type_t::CUSTOM}},
                 {HS_SERVICE::REPLICATION,
                  hs_format_params{.dev_type = run_on_type,
                                   .size_pct = 75.0,

@@ -18,7 +18,8 @@
 
 namespace homeblocks {
 
-VolumeChunkSelector::VolumeChunkSelector(UpdateVolSbCb update_sb_cb) : m_update_vol_sb_cb(update_sb_cb) {
+VolumeChunkSelector::VolumeChunkSelector(std::string module, UpdateVolSbCb update_sb_cb) :
+        m_update_vol_sb_cb(update_sb_cb), m_module_name(module) {
     m_volume_chunks.resize(MAX_NUM_VOLUMES);
 }
 
@@ -30,7 +31,7 @@ void VolumeChunkSelector::add_chunk(homestore::cshared< Chunk >& chunk) {
     auto pdev_id = homestore::VChunk(chunk).get_pdev_id();
     m_all_chunks.emplace(chunk_id, vol_chunk);
     m_per_dev_chunks[pdev_id].emplace(chunk_id, vol_chunk);
-    LOGDEBUG("Adding chunk id to selector {}", chunk_id);
+    LOGDEBUG("Adding chunk id {} to selector {}", chunk_id, m_module_name);
 }
 
 std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size,
@@ -59,8 +60,13 @@ std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t vo
 
     auto volc = std::make_shared< VolumeChunksInfo >();
     volc->ordinal = volume_ordinal;
-    volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
-    volc->num_active_chunks = std::min(volc->max_num_chunks, static_cast< uint64_t >(num_chunks_per_vol_init));
+    if (volume_size != 0) {
+        volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
+        volc->num_active_chunks = std::min(volc->max_num_chunks, static_cast< uint64_t >(num_chunks_per_vol_init));
+    } else {
+        volc->max_num_chunks = 10;
+        volc->num_active_chunks = 2;
+    }
 
     // We lazily allocate active chunks and add to chunk vector.
     // Initially we create num_chunks_per_vol_init active chunks.
@@ -88,7 +94,8 @@ std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t vo
         fmt::format_to(std::back_inserter(str), "{} ", chunk->get_chunk_id());
     }
 
-    LOGI("Allocating initial num_chunks={} for volume={} chunks={}", chunk_ids.size(), volume_ordinal, str);
+    LOGI("Allocating initial module={} num_chunks={} for volume={} chunks={}", m_module_name, chunk_ids.size(),
+         volume_ordinal, str);
     return chunk_ids;
 }
 
@@ -184,8 +191,8 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
     }
 
     // Spawn background task to create new chunks.
-    LOGD("Initiating op to resize num chunks for volume={} available={} total={}", volc->ordinal, available_blks,
-         total_blks);
+    LOGD("Initiating op to resize num chunks for module={} volume={} available={} total={}", m_module_name,
+         volc->ordinal, available_blks, total_blks);
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [volc, this]() mutable {
         std::string str;
         auto num_chunks_to_alloc = std::min(static_cast< uint64_t >(num_chunks_per_resize),
@@ -213,8 +220,8 @@ void VolumeChunkSelector::resize_volume_num_chunks(homestore::blk_count_t nblks,
         // Update the number of active chunks and compelete the resize operation.
         volc->num_active_chunks = indx;
         resize_op.store(ResizeOp::Idle);
-        LOGD("Resize op done. Allocated more chunks for volume={} total={} new={} new_chunks={}", volc->ordinal,
-             volc->num_active_chunks.load(), chunks.size(), str);
+        LOGI("Resize op done. Allocated more chunks for volume={} total={} new={} new_chunks={}", m_module_name,
+             volc->ordinal, volc->num_active_chunks.load(), chunks.size(), str);
     });
 }
 
@@ -267,7 +274,11 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     volc = std::make_shared< VolumeChunksInfo >();
     volc->ordinal = volume_ordinal;
     volc->pdev = pdev;
-    volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
+    if (volume_size != 0) {
+        volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
+    } else {
+        volc->max_num_chunks = 10;
+    }
     volc->num_active_chunks = chunk_ids.size();
     volc->m_chunks.resize(volc->max_num_chunks);
     m_volume_chunks[volume_ordinal] = volc;
@@ -364,7 +375,8 @@ std::string VolumeChunkSelector::dump_chunks() const {
     std::string str;
     for (uint32_t i = 0; i < m_volume_chunks.size(); i++) {
         if (!m_volume_chunks[i]) { continue; }
-        fmt::format_to(std::back_inserter(str), "volume={} num_chunks={} chunks=", i, m_volume_chunks[i]->m_chunks.size());
+        fmt::format_to(std::back_inserter(str), "volume={} num_chunks={} chunks=", i,
+                       m_volume_chunks[i]->m_chunks.size());
         for (const auto& chunk : m_volume_chunks[i]->m_chunks) {
             if (!chunk) { continue; }
             fmt::format_to(std::back_inserter(str), "{}({}/{}) ", chunk->get_chunk_id(), chunk->available_blks(),
