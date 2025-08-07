@@ -42,7 +42,8 @@ SISL_OPTION_GROUP(
      "number"),
     (run_time, "", "run_time", "running time in seconds", ::cxxopts::value< uint64_t >()->default_value("0"), "number"),
     (cp_timer_ms, "", "cp_timer_ms", "cp timer in milliseconds", ::cxxopts::value< uint64_t >()->default_value("60000"),
-     "number"));
+     "number"),
+    (read_verify, "", "read_verify", "Read and verify all data in long running tests", ::cxxopts::value< bool >()->default_value("false"), "true or false"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks)
 SISL_LOGGING_DECL(test_volume_io)
@@ -562,6 +563,16 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
             log_pct += 5;
         }
 
+        if (elapsed_seconds >= run_time) {
+            LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes, elapsed_seconds);
+            if (SISL_OPTIONS["read_verify"].as< bool >()) {
+                LOGINFO("Verifying all data written so far");
+                verify_all_data();
+                LOGINFO("Read verification done");
+            }
+            break;
+        }
+
         if (elapsed_seconds >= run_time) { break; }
     } while (true);
 }
@@ -604,7 +615,15 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
             cur_lba += nblks;
         }
 
-        if (elapsed_seconds >= run_time) { break; }
+        if (elapsed_seconds >= run_time) { 
+            LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes, elapsed_seconds);
+            if (SISL_OPTIONS["read_verify"].as< bool >()) {
+                LOGINFO("Verifying all data written so far");
+                verify_all_data();
+                LOGINFO("Read verification done");
+            }
+            break;
+        }
     } while (true);
 }
 
