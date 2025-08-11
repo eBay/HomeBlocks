@@ -50,6 +50,7 @@ SISL_LOGGING_DECL(test_volume_io)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
 std::unique_ptr< test_http_server > g_http_server;
+std::shared_ptr< test_common::io_fiber_pool > g_io_fiber_pool;
 static constexpr uint64_t g_page_size = 4096;
 
 using namespace homeblocks;
@@ -61,8 +62,8 @@ public:
         auto write_qdepth = SISL_OPTIONS["write_qdepth"].as< uint32_t >();
         auto read_num_io = SISL_OPTIONS["read_num_io"].as< uint64_t >();
         auto read_qdepth = SISL_OPTIONS["read_qdepth"].as< uint32_t >();
-        m_write_runner = std::make_shared< test_common::Runner >(write_num_io, write_qdepth);
-        m_read_runner = std::make_shared< test_common::Runner >(read_num_io, read_qdepth);
+        m_write_runner = std::make_shared< test_common::Runner >(write_num_io, write_qdepth, g_io_fiber_pool);
+        m_read_runner = std::make_shared< test_common::Runner >(read_num_io, read_qdepth, g_io_fiber_pool);
 
         create_volume();
     }
@@ -702,6 +703,9 @@ int main(int argc, char* argv[]) {
     g_helper->setup();
     g_http_server = std::make_unique< test_http_server >();
     g_http_server->start();
+    if (SISL_OPTIONS["num_io_reactors"].as< uint32_t >() > 0) {
+        g_io_fiber_pool = std::make_shared< test_common::io_fiber_pool >(SISL_OPTIONS["num_io_reactors"].as< uint32_t >());
+    }
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();
 
