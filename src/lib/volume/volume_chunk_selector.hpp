@@ -61,7 +61,8 @@ public:
     ~VolumeChunkSelector() = default;
 
     // Allocate some initial set of chunks during volume or index create. The number is num_chunks_per_resize
-    std::vector< chunk_num_t > allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size, uint32_t& pdev_id);
+    std::vector< chunk_num_t > allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size, uint32_t& pdev_id,
+                                                    bool lazy_alloc = true);
 
     // Called during destroy of volume or index.
     void release_chunks(uint64_t volume_ordinal);
