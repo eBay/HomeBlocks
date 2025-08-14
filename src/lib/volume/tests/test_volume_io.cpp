@@ -43,6 +43,9 @@ SISL_OPTION_GROUP(
     (run_time, "", "run_time", "running time in seconds", ::cxxopts::value< uint64_t >()->default_value("0"), "number"),
     (cp_timer_ms, "", "cp_timer_ms", "cp timer in milliseconds", ::cxxopts::value< uint64_t >()->default_value("60000"),
      "number"),
+    (io_size_kb, "", "io_size_kb", "Write size in kb", ::cxxopts::value< uint32_t >(), "number"),
+    (io_size_kb_range, "", "io_size_kb_range", "Write size range in kb", ::cxxopts::value< std::vector< uint32_t > >(),
+     "number"),
     (read_verify, "", "read_verify", "Read and verify all data in long running tests", ::cxxopts::value< bool >()->default_value("false"), "true or false"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks)
@@ -119,7 +122,21 @@ public:
             // Generate lba which are not overlapped with the inflight ios, otherwise
             // we cant decide which io completed last and cant verify the data.
             start_lba = rand() % max_blks;
-            nblks = std::max(1, rand() % 64);
+            if (SISL_OPTIONS.count("io_size_kb")) {
+                auto io_size_kb_opt = SISL_OPTIONS["io_size_kb"].as< uint32_t >();
+                ASSERT_EQ(io_size_kb_opt % 4, 0);
+                nlbas = io_size_kb_opt / 4;
+            } else if (SISL_OPTIONS.count("io_size_kb_range")) {
+                auto lb = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[0];
+                auto ub = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[1];
+                ASSERT_TRUE(ub > lb);
+                ASSERT_EQ(lb % 4, 0);
+                ASSERT_EQ(ub % 4, 0);
+                auto lb_blks = lb / 4, ub_blks = ub / 4;
+                nblks = (rand() % (ub_blks - lb_blks + 1)) + lb_blks;
+            } else {
+                nblks = rand() % 64 + 1; // 1-64 blocks
+            }
             lba_t end_lba = start_lba + nblks - 1;
             auto new_range = boost::icl::interval< int >::closed(start_lba, end_lba);
             std::lock_guard lock(m_mutex);

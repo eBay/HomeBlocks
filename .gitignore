@@ -6,6 +6,9 @@
 build
 test_package/build
 nosanitize/**
+.jenkins/test_volume_io
+.jenkins/io_test.py
+.jenkins/long_running.py
 
 # Settings generated files and build files
 generated/**
