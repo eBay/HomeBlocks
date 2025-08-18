@@ -25,6 +25,13 @@ static VolumeError to_volume_error(std::error_code ec) {
     }
 }
 
+uint64_t Volume::get_index_size() {
+    // Get approximate index size based on volume size. additional space for interior nodes.
+    const int32_t index_kv_size = 32;
+    uint64_t index_size = (vol_info_->size_bytes / vol_info_->page_size) * index_kv_size * 3;
+    return index_size;
+}
+
 // this API will be called by volume manager after volume sb is recovered and volume is created;
 shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< VolumeIndexTable > tbl) {
     if (!is_recovery) {
@@ -37,13 +44,15 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
 
         // user_sb_size is not currently enabled in homestore;
         // parent uuid is used during recovery in homeblks layer;
-        LOGI("Creating index table for volume: {}, index_uuid: {}, parent_uuid: {}", vol_info_->name,
-             boost::uuids::to_string(uuid), boost::uuids::to_string(id()));
+        auto index_size = get_index_size();
+        LOGI("Creating index table for volume: {}, index_uuid: {}, parent_uuid: {} index_size: {}", vol_info_->name,
+             boost::uuids::to_string(uuid), boost::uuids::to_string(id()), index_size);
         uint32_t pdev_id;
-        auto chunk_ids = index_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, 0, pdev_id);
-        LOGI("index table is going to be created with {}  chunks on pdev id {}", chunk_ids.size(), pdev_id);
-        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /*parent uuid*/, 0 /*user_sb_size*/, cfg, ordinal(),
-                                                         chunk_ids, pdev_id);
+        auto chunk_ids = index_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, index_size, pdev_id,
+                                                                     false /* lazy alloc */);
+        LOGI("index table is going to be created with {} chunks on pdev id {}", chunk_ids.size(), pdev_id);
+        indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /* parent uuid */, 0 /* user_sb_size */, cfg,
+                                                         ordinal(), chunk_ids, pdev_id, index_size);
     } else {
         indx_tbl_ = tbl;
     }

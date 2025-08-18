@@ -35,7 +35,7 @@ void VolumeChunkSelector::add_chunk(homestore::cshared< Chunk >& chunk) {
 }
 
 std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size,
-                                                                     uint32_t& pdev_id) {
+                                                                     uint32_t& pdev_id, bool lazy_alloc) {
     RELEASE_ASSERT(volume_ordinal < m_volume_chunks.size(), "Invalid ordinal for volume {}", volume_ordinal);
     if (m_volume_chunks[volume_ordinal] != nullptr) {
         LOGW("Already allocated chunks for volume={}", volume_ordinal);
@@ -60,12 +60,12 @@ std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t vo
 
     auto volc = std::make_shared< VolumeChunksInfo >();
     volc->ordinal = volume_ordinal;
-    if (volume_size != 0) {
-        volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
-        volc->num_active_chunks = std::min(volc->max_num_chunks, static_cast< uint64_t >(num_chunks_per_vol_init));
-    } else {
-        volc->max_num_chunks = 10;
-        volc->num_active_chunks = 2;
+    volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
+    volc->num_active_chunks = std::min(volc->max_num_chunks, static_cast< uint64_t >(num_chunks_per_vol_init));
+
+    if (!lazy_alloc) {
+        // If its not lazy alloc, we precreate all the chunks.
+        volc->num_active_chunks = volc->max_num_chunks;
     }
 
     // We lazily allocate active chunks and add to chunk vector.
@@ -274,11 +274,8 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     volc = std::make_shared< VolumeChunksInfo >();
     volc->ordinal = volume_ordinal;
     volc->pdev = pdev;
-    if (volume_size != 0) {
-        volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
-    } else {
-        volc->max_num_chunks = 10;
-    }
+    volc->max_num_chunks = std::max(1UL, (volume_size + chunk_size - 1) / chunk_size);
+
     volc->num_active_chunks = chunk_ids.size();
     volc->m_chunks.resize(volc->max_num_chunks);
     m_volume_chunks[volume_ordinal] = volc;

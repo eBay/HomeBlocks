@@ -216,6 +216,7 @@ public:
     // Initialize index table for this volume and saves the index handle in the volume object;
     //
     VolIdxTablePtr init_index_table(bool is_recovery, VolIdxTablePtr tbl = nullptr);
+    uint64_t get_index_size();
 
     bool is_online() const { return m_state_.load() == vol_state::ONLINE; }
 
