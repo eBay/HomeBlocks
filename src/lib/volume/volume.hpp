@@ -62,17 +62,6 @@ struct MsgHeader {
     }
 };
 
-ENUM(vol_state, uint32_t,
-     INIT,       // initialized, but not ready online yet;
-     ONLINE,     // online and ready to be used;
-     OFFLINE,    // offline and not ready to be used;
-     DESTROYING, // being destroyed, this state will be used for vol-destroy crash recovery;
-     DESTROYED,  // fully destroyed, currently not used,
-                 // for future use of lazy-destroy, e.g. set destroyed and move forward, let the volume be destroyed in
-                 // background;
-     READONLY    // in read only mode;
-);
-
 class VolumeMetrics : public sisl::MetricsGroupWrapper {
 public:
     explicit VolumeMetrics(const std::string& vol_name) : sisl::MetricsGroupWrapper("Volume", vol_name) {
@@ -193,6 +182,10 @@ public:
         auto ret = vol->init(true /*is_recovery*/);
         return ret ? vol : nullptr;
     }
+    void get_stats(VolumeStats& stats) const {
+        stats.id = vol_info_->id;
+        stats.state = sb_->state;
+    }
 
     static VolumePtr make_volume(VolumeInfo&& info, shared< VolumeChunkSelector > volume_chunk_sel,
                                  shared< VolumeChunkSelector > index_chunk_sel) {
@@ -223,6 +216,7 @@ public:
     void destroy();
     bool is_destroying() const { return m_state_.load() == vol_state::DESTROYING; }
     bool is_destroy_started() const { return destroy_started_.load(); }
+    bool is_offline() const { return m_state_.load() == vol_state::OFFLINE; }
 
     //
     // This API will be called to set the volume state and persist to disk;
@@ -283,7 +277,7 @@ private:
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0}; // number of outstanding requests
     std::atomic< bool > destroy_started_{
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
-    std::atomic< vol_state > m_state_; // in-memory sb state;
+    std::atomic< vol_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
 };
 

@@ -24,6 +24,7 @@
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/superblk_handler.hpp>
+#include <homestore/fault_cmt_service.hpp>
 #include <homeblks/home_blks.hpp>
 #include <homeblks/volume_mgr.hpp>
 #include <homeblks/common.hpp>
@@ -72,26 +73,29 @@ private:
     std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
 
     bool recovery_done_{false};
+    std::mutex sb_lock_; // this lock is only used when FC is triggered;
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
     shared< VolumeChunkSelector > volume_chunk_selector_;
     shared< VolumeChunkSelector > index_chunk_selector_;
     std::unique_ptr< sisl::IDReserver > ordinal_reserver_;
 
-public:
-    static uint64_t _hs_chunk_size;
-
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
     bool shutdown_started_{false};
+    std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
+
     folly::Promise< folly::Unit > shutdown_promise_;
-    iomgr::io_fiber_t reaper_fiber_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
 public:
+    static uint64_t _hs_chunk_size;
+    static shared< HomeBlocksImpl > s_instance_;
+
+public:
     explicit HomeBlocksImpl(std::weak_ptr< HomeBlocksApplication >&& application);
 
-    ~HomeBlocksImpl() override;
+    ~HomeBlocksImpl() override = default;
     HomeBlocksImpl(const HomeBlocksImpl&) = delete;
     HomeBlocksImpl(HomeBlocksImpl&&) noexcept = delete;
     HomeBlocksImpl& operator=(const HomeBlocksImpl&) = delete;
@@ -107,6 +111,8 @@ public:
     peer_id_t our_uuid() const final { return our_uuid_; }
 
     uint64_t max_vol_io_size() const final { return MAX_VOL_IO_SIZE; }
+
+    void shutdown() final;
 
     /// VolumeManager
     NullAsyncResult create_volume(VolumeInfo&& vol_info) final;
@@ -144,6 +150,21 @@ public:
                   const std::vector< homestore::MultiBlkId >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
     void start_reaper_thread();
+
+    void fault_containment(const VolumePtr vol, const std::string& reason = "");
+    bool fc_on() const;
+    void exit_fc(VolumePtr& vol);
+    bool is_restricted() const { return is_restricted_.load(); }
+
+public:
+    // public static APIs;
+    static shared< HomeBlocksImpl > instance() { return s_instance_; }
+    static void reset_instance() {
+        if (s_instance_) {
+            s_instance_.reset();
+            s_instance_ = nullptr;
+        }
+    }
 
 private:
     // Should only be called for first-time-boot
@@ -193,6 +214,37 @@ public:
     on_index_table_found(homestore::superblk< homestore::index_table_sb >&& sb) override {
         LOGI("Recovered index table to index service");
         return hb_->recover_index_table(std::move(sb));
+    }
+
+private:
+    HomeBlocksImpl* hb_;
+};
+
+class HBFCSvcCB : public homestore::FaultContainmentCallback {
+public:
+    HBFCSvcCB(HomeBlocksImpl* hb) : hb_(hb) {}
+
+    void on_fault_containment(const homestore::FaultContainmentEvent event, void* cookie,
+                              const std::string& reason) override {
+        if (event == homestore::FaultContainmentEvent::ENTER_GLOBAL) {
+            hb_->fault_containment(nullptr);
+            LOGI("Global fault containment event received, reason: {}", reason);
+            DEBUG_ASSERT(cookie == nullptr, "Global fault containment event should not have a cookie");
+            return;
+        }
+
+        if (cookie == nullptr) {
+            LOGW("Fault containment event received with null cookie, ignoring");
+            return;
+        }
+
+        auto vol_id = static_cast< volume_id_t* >(cookie);
+        auto vol = hb_->lookup_volume(*vol_id);
+        if (event == homestore::FaultContainmentEvent::ENTER) {
+            hb_->fault_containment(vol, reason);
+        } else if (event == homestore::FaultContainmentEvent::EXIT) {
+            hb_->exit_fc(vol);
+        }
     }
 
 private:
