@@ -81,6 +81,11 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 // cause crash;
 //
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
+    if (is_restricted()) {
+        LOGE("Can't serve volume create, System is in restricted mode.");
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    }
+
     inc_ref();
     auto id = vol_info.id;
 
@@ -121,6 +126,20 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 // vol in destroying state already indicates an outstanding volume which consumed in no_outstanding_vols() API;
 //
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
+    if (is_restricted()) {
+        LOGE("Can't serve volume remove, System is in restricted mode.");
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    }
+
+    auto vol = lookup_volume(id);
+    if (vol == nullptr) {
+        LOGE("Volume with id {} not found, cannot remove", boost::uuids::to_string(id));
+        return folly::makeUnexpected(VolumeError::INVALID_ARG);
+    } else if (vol->is_offline()) {
+        LOGE("Volume {} is offline, cannot remove", vol->id_str());
+        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+    }
+
     LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
         // 1. get the volume ptr from the map;
@@ -194,11 +213,34 @@ void HomeBlocksImpl::update_vol_sb_cb(uint64_t volume_ordinal, const std::vector
     vol_ptr->update_vol_sb_cb(chunk_ids);
 }
 
-bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const { return true; }
+bool HomeBlocksImpl::get_stats(volume_id_t id, VolumeStats& stats) const {
+    auto lg = std::shared_lock(vol_lock_);
+    auto it = vol_map_.find(id);
+    if (it == vol_map_.end()) {
+        LOGE("Volume with id {} not found, cannot get stats", boost::uuids::to_string(id));
+        return false;
+    }
 
-void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {}
+    it->second->get_stats(stats);
+    return true;
+}
+
+void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {
+    auto lg = std::shared_lock(vol_lock_);
+    for (const auto& it : vol_map_) {
+        vol_ids.push_back(it.first);
+    }
+}
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req) {
+    if (is_restricted()) {
+        LOGE("Can't serve write, System is in restricted mode.");
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    } else if (vol->is_offline()) {
+        LOGE("Can't serve write, Volume {} is offline.", vol->id_str());
+        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+    }
+
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE(
             "Can't serve write, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
@@ -217,6 +259,14 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
 }
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
+    if (is_restricted()) {
+        LOGE("Can't serve read, System is in restricted mode.");
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    } else if (vol->is_offline()) {
+        LOGE("Can't serve read, Volume {} is offline.", vol->id_str());
+        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+    }
+
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE("Can't serve read, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
              vol->id_str(), vol->is_destroying());
@@ -235,6 +285,14 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const 
 
 VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     LOGWARN("Unmap to vol: {} not implemented", vol->id_str());
+
+    if (is_restricted()) {
+        LOGE("Can't serve unmap, System is in restricted mode.");
+        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+    } else if (vol->is_offline()) {
+        LOGE("Can't serve unmap, Volume {} is offline.", vol->id_str());
+        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+    }
 
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE(

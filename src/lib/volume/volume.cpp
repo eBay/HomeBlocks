@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include "volume.hpp"
+#include "lib/homeblks_impl.hpp"
 #include <homestore/replication_service.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
@@ -420,7 +421,14 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
 void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
                                     std::vector< folly::Future< std::error_code > >& futs) {
     auto* read_buf = req->buffer;
-    DEBUG_ASSERT(read_buf != nullptr, "Read buffer is null");
+    auto inst = HomeBlocksImpl::instance();
+
+    if (read_buf == nullptr && inst->fc_on()) {
+        auto const reason = fmt::format("read_buf of volume: {} is null", this->to_string());
+        inst->fault_containment(shared_from_this(), reason);
+    } else {
+        RELEASE_ASSERT(read_buf != nullptr, "Read buffer is null");
+    }
     uint32_t prev_lba = req->lba;
     uint32_t prev_nblks = 0;
     for (uint32_t i = 0; i < blks_to_read.size(); ++i) {
