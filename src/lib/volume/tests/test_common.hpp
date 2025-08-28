@@ -47,6 +47,7 @@ SISL_OPTION_GROUP(
      ::cxxopts::value< int >()->default_value("-1"), "number"),
     (num_io, "", "num_io", "number of IO operations", ::cxxopts::value< uint64_t >()->default_value("300"), "number"),
     (qdepth, "", "qdepth", "Max outstanding operations", ::cxxopts::value< uint32_t >()->default_value("8"), "number"),
+    (num_io_reactors, "", "num_io_reactors", "number of IO reactors", ::cxxopts::value< uint32_t >()->default_value("0"), "number"),
     (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"),
     (flip_list, "", "flip_list", "btree flip list", ::cxxopts::value< std::vector< std::string > >(), "flips [...]"),
     (use_file, "", "use_file", "use file instead of real drive", ::cxxopts::value< bool >()->default_value("false"),
@@ -84,6 +85,40 @@ public:
 
 namespace test_common {
 
+struct io_fiber_pool {
+    std::vector< iomgr::io_fiber_t > io_fibers_;
+    io_fiber_pool(uint32_t num_io_reactors) {
+        struct Context {
+            std::condition_variable cv;
+            std::mutex mtx;
+            uint32_t thread_cnt{0};
+        };
+        auto ctx = std::make_shared< Context >();
+        for (uint32_t i{0}; i < num_io_reactors; ++i) {
+        iomanager.create_reactor("homeblks_long_running_io" + std::to_string(i), iomgr::INTERRUPT_LOOP, 1u,
+                                 [this, ctx](bool is_started) {
+                                     if (is_started) {
+                                         {
+                                             std::unique_lock< std::mutex > lk{ctx->mtx};
+                                             io_fibers_.push_back(iomanager.iofiber_self());
+                                             ++(ctx->thread_cnt);
+                                         }
+                                         ctx->cv.notify_one();
+                                     }
+                                 });
+        }
+        {
+            std::unique_lock< std::mutex > lk{ctx->mtx};
+            ctx->cv.wait(lk, [&ctx, num_io_reactors]() { return ctx->thread_cnt == num_io_reactors; });
+        }
+        LOGINFO("Created {} IO reactors", io_fibers_.size());
+    }
+
+    void run_task(uint32_t idx, std::function< void(void) > const& task) {
+        iomanager.run_on_forget(io_fibers_[idx], task);
+    }
+};
+
 struct Runner {
     uint64_t total_tasks_{0};
     uint32_t qdepth_{8};
@@ -91,11 +126,12 @@ struct Runner {
     std::atomic< uint64_t > completed_tasks_{0};
     std::function< void(void) > task_;
     folly::Promise< folly::Unit > comp_promise_;
+    std::shared_ptr< io_fiber_pool > io_fiber_pool_;
 
-    Runner(uint64_t num_tasks, uint32_t qd = 8) : total_tasks_{num_tasks}, qdepth_{qd} {
+    Runner(uint64_t num_tasks, uint32_t qd = 8, std::shared_ptr< io_fiber_pool > const& g_io_fiber_pool = nullptr) : total_tasks_{num_tasks}, qdepth_{qd}, io_fiber_pool_{g_io_fiber_pool} {
         if (total_tasks_ < (uint64_t)qdepth_) { total_tasks_ = qdepth_; }
     }
-    Runner() : Runner{SISL_OPTIONS["num_io"].as< uint64_t >(), SISL_OPTIONS["qdepth"].as< uint32_t >()} {}
+    Runner() : Runner{SISL_OPTIONS["num_io"].as< uint64_t >(), SISL_OPTIONS["qdepth"].as< uint32_t >(), nullptr} {}
     Runner(const Runner&) = delete;
     Runner& operator=(const Runner&) = delete;
 
@@ -125,7 +161,15 @@ struct Runner {
 
     void run_task() {
         ++issued_tasks_;
-        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, task_);
+        if (io_fiber_pool_) {
+            static std::atomic<uint32_t> idx{0};
+            static const uint32_t max_idx{SISL_OPTIONS["num_io_reactors"].as< uint32_t >()};
+            uint32_t io_idx = (idx.fetch_add(1) % max_idx);
+            // run the task on the next io_fiber
+            io_fiber_pool_->run_task(io_idx, task_);
+        } else {
+            iomanager.run_on_forget(iomgr::reactor_regex::random_worker, task_);
+        }
     }
 };
 
@@ -164,14 +208,13 @@ class HBTestHelper {
             return false;
         }
         uint32_t threads() const override {
-            // return SISL_OPTIONS["num_threads"].as< uint32_t >();
-            return 2;
+            return SISL_OPTIONS["num_threads"].as< uint32_t >();
         }
 
         std::list< device_info_t > devices() const override {
             std::list< device_info_t > devs;
             for (const auto& dev : helper_.dev_list()) {
-                devs.emplace_back(dev, DevType::HDD);
+                devs.emplace_back(dev);
             }
             return devs;
         }
@@ -192,7 +235,7 @@ public:
 
     void setup() {
         sisl::logging::SetLogger(test_name_);
-        sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");
+        spdlog::set_pattern("[%D %T.%e] [%n] [%^%l%$] [%t] %v");
 
         // init svc_id_
         svc_id_ = boost::uuids::random_generator()();

@@ -255,10 +255,11 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             }
             HISTOGRAM_OBSERVE(*metrics_, volume_map_write_latency, get_elapsed_time_us(vol_req->index_start_time));
 
-            // Collect all old blocks to write to journal.
-            for (auto& [_, info] : blocks_info) {
-                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
-            }
+                vol_req->journal_start_time = Clock::now();
+                // Collect all old blocks to write to journal.
+                for (auto& [_, info] : blocks_info) {
+                    if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+                }
 
             auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
             auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
@@ -300,24 +301,25 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             }
 #endif
 
-            rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+                rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
 
-            return req->result()
-                .via(&folly::InlineExecutor::instance())
-                .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                    if (result.hasError()) {
-                        LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
-                             vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
-                        auto err = result.error();
-                        return folly::makeUnexpected(err);
-                    }
-                    auto write_size = vol_req->nlbas * rd()->get_blk_size();
-                    COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
-                    HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
-                    HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
-                    return folly::Unit();
-                });
-        });
+                return req->result()
+                    .via(&folly::InlineExecutor::instance())
+                    .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
+                        if (result.hasError()) {
+                            LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
+                                 vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
+                            auto err = result.error();
+                            return folly::makeUnexpected(err);
+                        }
+                        HISTOGRAM_OBSERVE(*metrics_, volume_journal_write_latency, get_elapsed_time_us(vol_req->journal_start_time));
+                        auto write_size = vol_req->nlbas * rd()->get_blk_size();
+                        COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
+                        HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
+                        HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
+                        return folly::Unit();
+                    });
+            });
 }
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {

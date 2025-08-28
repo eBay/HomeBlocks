@@ -8,8 +8,7 @@ RUN set -eux; \
     sed -i 's/master/latest/g' /etc/apt/sources.list; \
     apt-get update; \
     apt-get upgrade -y; \
-    apt-get install iputils-ping; \
-    apt-get install net-tools; \
+    apt-get install --no-install-recommends -y iputils-ping net-tools fio iperf3; \
     rm -rf /var/lib/apt/lists/*;
 
 
