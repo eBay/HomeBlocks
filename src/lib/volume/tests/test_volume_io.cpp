@@ -44,19 +44,49 @@ SISL_OPTION_GROUP(
     (cp_timer_ms, "", "cp_timer_ms", "cp timer in milliseconds", ::cxxopts::value< uint64_t >()->default_value("60000"),
      "number"),
     (io_size_kb, "", "io_size_kb", "Write size in kb", ::cxxopts::value< uint32_t >(), "number"),
+    (write_pct, "", "write_pct", "Write percentage", ::cxxopts::value< uint32_t >()->default_value("50"), "number"),
     (io_size_kb_range, "", "io_size_kb_range", "Write size range in kb", ::cxxopts::value< std::vector< uint32_t > >(),
+     "number"),
+    (io_size_kb_values, "", "io_size_kb_values", "Write size values in kb", ::cxxopts::value< std::vector< uint32_t > >(),
+     "number"),
+    (io_size_kb_weights, "", "io_size_kb_weights", "Write size weights in kb", ::cxxopts::value< std::vector< uint32_t > >(),
      "number"),
     (read_verify, "", "read_verify", "Read and verify all data in long running tests", ::cxxopts::value< bool >()->default_value("false"), "true or false"));
 
-SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks)
+SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks, config)
 SISL_LOGGING_DECL(test_volume_io)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
 std::unique_ptr< test_http_server > g_http_server;
 std::shared_ptr< test_common::io_fiber_pool > g_io_fiber_pool;
 static constexpr uint64_t g_page_size = 4096;
+static std::random_device g_rd;
+static std::mt19937 g_gen(g_rd());
 
 using namespace homeblocks;
+
+static void get_random_nblks(uint32_t& nblks) {
+    if (SISL_OPTIONS.count("io_size_kb")) {
+        auto io_size_kb_opt = SISL_OPTIONS["io_size_kb"].as< uint32_t >();
+        ASSERT_EQ(io_size_kb_opt % 4, 0);
+        nblks = io_size_kb_opt / 4;
+    } else if (SISL_OPTIONS.count("io_size_kb_range")) {
+        auto lb = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[0];
+        auto ub = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[1];
+        ASSERT_TRUE(ub > lb);
+        ASSERT_EQ(lb % 4, 0);
+        ASSERT_EQ(ub % 4, 0);
+        auto lb_blks = lb / 4, ub_blks = ub / 4;
+        nblks = (rand() % (ub_blks - lb_blks + 1)) + lb_blks;
+    } else if (SISL_OPTIONS.count("io_size_kb_values")) {
+        auto& values = SISL_OPTIONS["io_size_kb_values"].as< std::vector< uint32_t > >();
+        auto& weights = SISL_OPTIONS["io_size_kb_weights"].as< std::vector< uint32_t > >();
+        std::discrete_distribution<> dist(weights.begin(), weights.end());
+        nblks = values[dist(g_gen)] / 4;
+    } else {
+        nblks = rand() % 64 + 1; // 1-64 blocks
+    }
+}
 
 class VolumeIOImpl {
 public:
@@ -122,21 +152,7 @@ public:
             // Generate lba which are not overlapped with the inflight ios, otherwise
             // we cant decide which io completed last and cant verify the data.
             start_lba = rand() % max_blks;
-            if (SISL_OPTIONS.count("io_size_kb")) {
-                auto io_size_kb_opt = SISL_OPTIONS["io_size_kb"].as< uint32_t >();
-                ASSERT_EQ(io_size_kb_opt % 4, 0);
-                nlbas = io_size_kb_opt / 4;
-            } else if (SISL_OPTIONS.count("io_size_kb_range")) {
-                auto lb = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[0];
-                auto ub = SISL_OPTIONS["io_size_kb_range"].as< std::vector< uint32_t > >()[1];
-                ASSERT_TRUE(ub > lb);
-                ASSERT_EQ(lb % 4, 0);
-                ASSERT_EQ(ub % 4, 0);
-                auto lb_blks = lb / 4, ub_blks = ub / 4;
-                nblks = (rand() % (ub_blks - lb_blks + 1)) + lb_blks;
-            } else {
-                nblks = rand() % 64 + 1; // 1-64 blocks
-            }
+            get_random_nblks(nblks);
             lba_t end_lba = start_lba + nblks - 1;
             auto new_range = boost::icl::interval< int >::closed(start_lba, end_lba);
             std::lock_guard lock(m_mutex);
@@ -341,6 +357,7 @@ public:
         for (uint32_t i = 0; i < SISL_OPTIONS["num_vols"].as< uint32_t >(); i++) {
             m_vols_impl.emplace_back(std::make_shared< VolumeIOImpl >());
         }
+        ASSERT_LE(SISL_OPTIONS["write_pct"].as< uint32_t >(), 100);
     }
 
     void TearDown() override {
@@ -411,6 +428,16 @@ public:
         return futs;
     }
 
+    auto generate_random_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
+                           bool wait = true) {
+        auto r_no = get_random_number< uint32_t >(1, 100);
+        if (r_no <= SISL_OPTIONS["write_pct"].as< uint32_t >()) {
+            return generate_write_io(vol, start_lba, nblks, wait);
+        } else {
+            return generate_read_io(vol, start_lba, nblks, wait);
+        }
+    }
+
     void verify_all_data(shared< VolumeIOImpl > vol_impl = nullptr, uint64_t nlbas_per_io = 1) {
         if (vol_impl) {
             vol_impl->verify_all_data(nlbas_per_io);
@@ -433,14 +460,13 @@ public:
 
     template < typename T >
     T get_random_number(T min, T max) {
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
         std::uniform_int_distribution< T > dis(min, max);
-        return dis(gen);
+        return dis(g_gen);
     }
 
 private:
     std::vector< shared< VolumeIOImpl > > m_vols_impl;
+    std::vector< uint32_t > m_io_weights;
 };
 
 TEST_F(VolumeIOTest, SingleVolumeWriteData) {
@@ -590,8 +616,6 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
             }
             break;
         }
-
-        if (elapsed_seconds >= run_time) { break; }
     } while (true);
 }
 
@@ -640,6 +664,75 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
                 verify_all_data();
                 LOGINFO("Read verification done");
             }
+            break;
+        }
+    } while (true);
+}
+
+TEST_F(VolumeIOTest, PerfRandomIo) {
+    auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
+    LOGINFO("Performance random ios on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
+            run_time);
+
+    // create a distribution based on write_pct
+
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    do {
+        std::vector< folly::Future< folly::Unit > > futs;
+
+        // Generate write's on all volumes with random lba and nblks on all volumes.
+        auto ios = generate_random_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
+        futs.insert(futs.end(), std::make_move_iterator(ios.begin()), std::make_move_iterator(ios.end()));
+        folly::collectAll(futs).get();
+        std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
+        auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+        static uint64_t log_pct = 0;
+        if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
+            LOGINFO("elapsed={}, done pct={}", elapsed_seconds, done_pct);
+            log_pct += 5;
+        }
+
+        if (elapsed_seconds >= run_time) {
+            LOGINFO("elapsed={}, done pct=100", elapsed_seconds);
+            break;
+        }
+    } while (true);
+}
+
+TEST_F(VolumeIOTest, PerfSequentialIo) {
+    auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
+    LOGINFO("Performance sequential ios on num_vols={} run_time={}",
+            SISL_OPTIONS["num_vols"].as< uint32_t >(), run_time);
+
+    uint64_t volume_size = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    lba_t cur_lba = 0;
+    lba_count_t nblks;
+    do {
+        get_random_nblks(nblks);
+        std::vector< folly::Future< folly::Unit > > futs;
+
+        // Generate write's on all volumes with sequential lba and nblks on all volumes.
+        auto ios = generate_random_io(nullptr /* vol */, cur_lba /* start_lba */, nblks, false /* wait */);
+        folly::collectAll(ios).get();
+
+        std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
+        auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+        static uint64_t log_pct = 0;
+        if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
+            LOGINFO("elapsed={}, done pct={}", elapsed_seconds, done_pct);
+            log_pct += 5;
+        }
+
+        if (((cur_lba + nblks) * g_page_size) >= volume_size) {
+            cur_lba = 0;
+        } else {
+            cur_lba += nblks;
+        }
+
+        if (elapsed_seconds >= run_time) {
+            LOGINFO("elapsed={}, done pct=100", elapsed_seconds);
             break;
         }
     } while (true);
@@ -711,7 +804,7 @@ int main(int argc, char* argv[]) {
     }
 
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks, config);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
     parsed_argc = 1;
     auto f = ::folly::Init(&parsed_argc, &argv, true);

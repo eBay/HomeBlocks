@@ -90,6 +90,8 @@ public:
                            {"op", "read"}, HistogramBucketsType(OpLatecyBuckets));
         REGISTER_HISTOGRAM(volume_map_write_latency, "Volume mapping write latency", "volume_map_op_latency",
                            {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(volume_journal_write_latency, "Volume journal write latency", "volume_journal_op_latency",
+                           {"op", "write"}, HistogramBucketsType(OpLatecyBuckets));
 
         register_me_to_farm();
         attach_gather_cb(std::bind(&VolumeMetrics::on_gather, this));
