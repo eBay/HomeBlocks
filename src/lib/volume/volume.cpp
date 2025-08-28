@@ -51,6 +51,11 @@ shared< VolumeIndexTable > Volume::init_index_table(bool is_recovery, shared< Vo
         uint32_t pdev_id;
         auto chunk_ids = index_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, index_size, pdev_id,
                                                                      false /* lazy alloc */);
+        if (chunk_ids.empty()) {
+            LOGE("Couldnt find chunks for index creation for volume: {}", vol_info_->name);
+            return nullptr;
+        }
+
         LOGI("index table is going to be created with {} chunks on pdev id {}", chunk_ids.size(), pdev_id);
         indx_tbl_ = std::make_shared< VolumeIndexTable >(uuid, id() /* parent uuid */, 0 /* user_sb_size */, cfg,
                                                          ordinal(), chunk_ids, pdev_id, index_size);
@@ -105,7 +110,10 @@ bool Volume::init(bool is_recovery) {
         rd_ = ret.value();
 
         // 2. create the index table;
-        init_index_table(false /*is_recovery*/);
+        if (!init_index_table(false /*is_recovery*/)) {
+            LOGE("Failed to create index for volume: {}", vol_info_->name);
+            return false;
+        }
 
         // 3. mark state as online;
         state_change(vol_state::ONLINE);
