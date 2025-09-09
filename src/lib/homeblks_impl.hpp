@@ -35,6 +35,11 @@ namespace homeblocks {
 
 class Volume;
 
+struct hs_chunk_size_cfg_t {
+    uint64_t index;
+    uint64_t data;
+};
+
 class HomeBlocksImpl : public HomeBlocks, public VolumeManager, public std::enable_shared_from_this< HomeBlocksImpl > {
     struct homeblks_sb_t {
         uint64_t magic;
@@ -89,7 +94,7 @@ private:
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
 
 public:
-    static uint64_t _hs_chunk_size;
+    // static uint64_t _hs_chunk_size;
     static shared< HomeBlocksImpl > s_instance_;
 
 public:
@@ -155,6 +160,7 @@ public:
     bool fc_on() const;
     void exit_fc(VolumePtr& vol);
     bool is_restricted() const { return is_restricted_.load(); }
+    hs_chunk_size_cfg_t get_chunk_size() const;
 
 public:
     // public static APIs;
