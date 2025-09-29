@@ -15,6 +15,12 @@ table HomeBlksSettings{
 
     // fault containment feature on/off
     fault_containment_on: bool = true;
+
+    // homestore index service chunk size;
+    hs_index_chunk_size_mb: uint32 = 2048;
+
+    // homestore dataservice chunk size;
+    hs_data_chunk_size_mb: uint32 = 2048;
 }
 
 root_type HomeBlksSettings;

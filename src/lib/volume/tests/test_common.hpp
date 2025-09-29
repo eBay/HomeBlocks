@@ -47,7 +47,8 @@ SISL_OPTION_GROUP(
      ::cxxopts::value< int >()->default_value("-1"), "number"),
     (num_io, "", "num_io", "number of IO operations", ::cxxopts::value< uint64_t >()->default_value("300"), "number"),
     (qdepth, "", "qdepth", "Max outstanding operations", ::cxxopts::value< uint32_t >()->default_value("8"), "number"),
-    (num_io_reactors, "", "num_io_reactors", "number of IO reactors", ::cxxopts::value< uint32_t >()->default_value("0"), "number"),
+    (num_io_reactors, "", "num_io_reactors", "number of IO reactors",
+     ::cxxopts::value< uint32_t >()->default_value("0"), "number"),
     (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"),
     (flip_list, "", "flip_list", "btree flip list", ::cxxopts::value< std::vector< std::string > >(), "flips [...]"),
     (use_file, "", "use_file", "use file instead of real drive", ::cxxopts::value< bool >()->default_value("false"),
@@ -55,8 +56,10 @@ SISL_OPTION_GROUP(
     (enable_crash, "", "enable_crash", "enable crash", ::cxxopts::value< bool >()->default_value("0"), ""),
     (app_mem_size, "", "app_mem_size", "app memory size", ::cxxopts::value< uint64_t >()->default_value("20"),
      "number"),
-    (hs_chunk_size_mb, "", "hs_chunk_size_mb", "hs_chunk_size_mb", ::cxxopts::value< uint64_t >()->default_value("128"),
-     "number"));
+    (index_chunk_size_mb, "", "index_chunk_size_mb", "index_chunk_size_mb",
+     ::cxxopts::value< uint32_t >()->default_value("128"), "number"),
+    (data_chunk_size_mb, "", "data_chunk_size_mb", "data_chunk_size_mb",
+     ::cxxopts::value< uint32_t >()->default_value("128"), "number"));
 
 using namespace homeblocks;
 
@@ -95,17 +98,17 @@ struct io_fiber_pool {
         };
         auto ctx = std::make_shared< Context >();
         for (uint32_t i{0}; i < num_io_reactors; ++i) {
-        iomanager.create_reactor("homeblks_long_running_io" + std::to_string(i), iomgr::INTERRUPT_LOOP, 1u,
-                                 [this, ctx](bool is_started) {
-                                     if (is_started) {
-                                         {
-                                             std::unique_lock< std::mutex > lk{ctx->mtx};
-                                             io_fibers_.push_back(iomanager.iofiber_self());
-                                             ++(ctx->thread_cnt);
+            iomanager.create_reactor("homeblks_long_running_io" + std::to_string(i), iomgr::INTERRUPT_LOOP, 1u,
+                                     [this, ctx](bool is_started) {
+                                         if (is_started) {
+                                             {
+                                                 std::unique_lock< std::mutex > lk{ctx->mtx};
+                                                 io_fibers_.push_back(iomanager.iofiber_self());
+                                                 ++(ctx->thread_cnt);
+                                             }
+                                             ctx->cv.notify_one();
                                          }
-                                         ctx->cv.notify_one();
-                                     }
-                                 });
+                                     });
         }
         {
             std::unique_lock< std::mutex > lk{ctx->mtx};
@@ -128,7 +131,8 @@ struct Runner {
     folly::Promise< folly::Unit > comp_promise_;
     std::shared_ptr< io_fiber_pool > io_fiber_pool_;
 
-    Runner(uint64_t num_tasks, uint32_t qd = 8, std::shared_ptr< io_fiber_pool > const& g_io_fiber_pool = nullptr) : total_tasks_{num_tasks}, qdepth_{qd}, io_fiber_pool_{g_io_fiber_pool} {
+    Runner(uint64_t num_tasks, uint32_t qd = 8, std::shared_ptr< io_fiber_pool > const& g_io_fiber_pool = nullptr) :
+            total_tasks_{num_tasks}, qdepth_{qd}, io_fiber_pool_{g_io_fiber_pool} {
         if (total_tasks_ < (uint64_t)qdepth_) { total_tasks_ = qdepth_; }
     }
     Runner() : Runner{SISL_OPTIONS["num_io"].as< uint64_t >(), SISL_OPTIONS["qdepth"].as< uint32_t >(), nullptr} {}
@@ -162,7 +166,7 @@ struct Runner {
     void run_task() {
         ++issued_tasks_;
         if (io_fiber_pool_) {
-            static std::atomic<uint32_t> idx{0};
+            static std::atomic< uint32_t > idx{0};
             static const uint32_t max_idx{SISL_OPTIONS["num_io_reactors"].as< uint32_t >()};
             uint32_t io_idx = (idx.fetch_add(1) % max_idx);
             // run the task on the next io_fiber
@@ -207,9 +211,7 @@ class HBTestHelper {
             // return SISL_OPTIONS["spdk"].as< bool >();
             return false;
         }
-        uint32_t threads() const override {
-            return SISL_OPTIONS["num_threads"].as< uint32_t >();
-        }
+        uint32_t threads() const override { return SISL_OPTIONS["num_threads"].as< uint32_t >(); }
 
         std::list< device_info_t > devices() const override {
             std::list< device_info_t > devs;
@@ -244,7 +246,7 @@ public:
         init_dev_list(true /*init_device*/);
 
         LOGINFO("Starting HomeBlocks");
-        homeblocks::HomeBlocksImpl::_hs_chunk_size = SISL_OPTIONS["hs_chunk_size_mb"].as< uint64_t >() * Mi;
+        // homeblocks::HomeBlocksImpl::_hs_chunk_size = SISL_OPTIONS["hs_chunk_size_mb"].as< uint64_t >() * Mi;
         // set_min_chunk_size(4 * Mi);
         app_ = std::make_shared< HBTestApplication >(*this);
         hb_ = init_homeblocks(std::weak_ptr< HBTestApplication >(app_));
