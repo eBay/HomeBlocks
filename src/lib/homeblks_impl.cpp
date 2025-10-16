@@ -221,6 +221,8 @@ public:
 
     homestore::replica_id_t get_my_repl_id() const override { return hb_->our_uuid(); }
 
+    uint32_t get_my_repl_svc_port() const { return 0; }
+
     void destroy_repl_dev_listener(homestore::group_id_t gid) override {
         LOGI("Destroying repl dev listener for group_id {}", boost::uuids::to_string(gid));
     }
