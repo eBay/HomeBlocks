@@ -47,11 +47,14 @@ SISL_OPTION_GROUP(
     (write_pct, "", "write_pct", "Write percentage", ::cxxopts::value< uint32_t >()->default_value("50"), "number"),
     (io_size_kb_range, "", "io_size_kb_range", "Write size range in kb", ::cxxopts::value< std::vector< uint32_t > >(),
      "number"),
-    (io_size_kb_values, "", "io_size_kb_values", "Write size values in kb", ::cxxopts::value< std::vector< uint32_t > >(),
-     "number"),
-    (io_size_kb_weights, "", "io_size_kb_weights", "Write size weights in kb", ::cxxopts::value< std::vector< uint32_t > >(),
-     "number"),
-    (read_verify, "", "read_verify", "Read and verify all data in long running tests", ::cxxopts::value< bool >()->default_value("false"), "true or false"));
+    (io_size_kb_values, "", "io_size_kb_values", "Write size values in kb",
+     ::cxxopts::value< std::vector< uint32_t > >(), "number"),
+    (io_size_kb_weights, "", "io_size_kb_weights", "Write size weights in kb",
+     ::cxxopts::value< std::vector< uint32_t > >(), "number"),
+    (num_restarts, "", "num_restarts", "number of restarts during long running tests",
+     ::cxxopts::value< uint32_t >()->default_value("0"), "number"),
+    (read_verify, "", "read_verify", "Read and verify all data in long running tests",
+     ::cxxopts::value< bool >()->default_value("false"), "true or false"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks, config)
 SISL_LOGGING_DECL(test_volume_io)
@@ -429,7 +432,7 @@ public:
     }
 
     auto generate_random_io(shared< VolumeIOImpl > vol = nullptr, lba_t start_lba = 0, uint32_t nblks = 0,
-                           bool wait = true) {
+                            bool wait = true) {
         auto r_no = get_random_number< uint32_t >(1, 100);
         if (r_no <= SISL_OPTIONS["write_pct"].as< uint32_t >()) {
             return generate_write_io(vol, start_lba, nblks, wait);
@@ -578,45 +581,51 @@ TEST_F(VolumeIOTest, MultipleVolumeWriteData) {
 
 TEST_F(VolumeIOTest, LongRunningRandomIO) {
     auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
-    LOGINFO("Long running random read and write on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
-            run_time);
+    auto const num_restarts = SISL_OPTIONS["num_restarts"].as< uint32_t >();
+    LOGINFO("Long running random read and write on num_vols={} run_time={}, num_restarts={}",
+            SISL_OPTIONS["num_vols"].as< uint32_t >(), run_time, num_restarts);
 
-    uint64_t total_reads{0}, total_writes{0};
-    auto start_time = std::chrono::high_resolution_clock::now();
-    do {
-        std::vector< folly::Future< folly::Unit > > futs;
+    for (uint32_t restarted_cnt = 0; restarted_cnt <= num_restarts; restarted_cnt++) {
+        uint64_t total_reads{0}, total_writes{0};
+        auto start_time = std::chrono::high_resolution_clock::now();
+        do {
+            std::vector< folly::Future< folly::Unit > > futs;
 
-        // Generate write's on all volumes with random lba and nblks on all volumes.
-        auto writes = generate_write_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
+            // Generate write's on all volumes with random lba and nblks on all volumes.
+            auto writes = generate_write_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
 
-        // In parallel, generate reads on all volumes with random lba and nblks on all volumes.
-        auto reads = generate_read_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
+            // In parallel, generate reads on all volumes with random lba and nblks on all volumes.
+            auto reads = generate_read_io(nullptr /* vol */, 0 /* start_lba */, 0 /* nblks */, false /* wait */);
 
-        futs.insert(futs.end(), std::make_move_iterator(writes.begin()), std::make_move_iterator(writes.end()));
-        futs.insert(futs.end(), std::make_move_iterator(reads.begin()), std::make_move_iterator(reads.end()));
-        folly::collectAll(futs).get();
+            futs.insert(futs.end(), std::make_move_iterator(writes.begin()), std::make_move_iterator(writes.end()));
+            futs.insert(futs.end(), std::make_move_iterator(reads.begin()), std::make_move_iterator(reads.end()));
+            folly::collectAll(futs).get();
 
-        total_reads += get_total_reads();
-        total_writes += get_total_writes();
-        std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
-        auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
-        static uint64_t log_pct = 0;
-        if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
-            LOGINFO("total_read={} total_write={} elapsed={}, done pct={}", total_reads, total_writes, elapsed_seconds,
-                    done_pct);
-            log_pct += 5;
-        }
-
-        if (elapsed_seconds >= run_time) {
-            LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes, elapsed_seconds);
-            if (SISL_OPTIONS["read_verify"].as< bool >()) {
-                LOGINFO("Verifying all data written so far");
-                verify_all_data();
-                LOGINFO("Read verification done");
+            total_reads += get_total_reads();
+            total_writes += get_total_writes();
+            std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
+            auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+            static uint64_t log_pct = 0;
+            if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
+                LOGINFO("total_read={} total_write={} elapsed={}, done pct={}", total_reads, total_writes,
+                        elapsed_seconds, done_pct);
+                log_pct += 5;
             }
-            break;
-        }
-    } while (true);
+
+            if (elapsed_seconds >= run_time) {
+                LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes,
+                        elapsed_seconds);
+                if (SISL_OPTIONS["read_verify"].as< bool >()) {
+                    LOGINFO("Verifying all data written so far");
+                    verify_all_data();
+                    LOGINFO("Read verification done");
+                }
+                break;
+            }
+        } while (true);
+
+        restart(5);
+    }
 }
 
 TEST_F(VolumeIOTest, LongRunningSequentialIO) {
@@ -657,8 +666,9 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
             cur_lba += nblks;
         }
 
-        if (elapsed_seconds >= run_time) { 
-            LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes, elapsed_seconds);
+        if (elapsed_seconds >= run_time) {
+            LOGINFO("total_read={} total_write={} elapsed={}, done pct=100", total_reads, total_writes,
+                    elapsed_seconds);
             if (SISL_OPTIONS["read_verify"].as< bool >()) {
                 LOGINFO("Verifying all data written so far");
                 verify_all_data();
@@ -671,11 +681,9 @@ TEST_F(VolumeIOTest, LongRunningSequentialIO) {
 
 TEST_F(VolumeIOTest, PerfRandomIo) {
     auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
-    LOGINFO("Performance random ios on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
-            run_time);
+    LOGINFO("Performance random ios on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(), run_time);
 
     // create a distribution based on write_pct
-
 
     auto start_time = std::chrono::high_resolution_clock::now();
     do {
@@ -702,8 +710,8 @@ TEST_F(VolumeIOTest, PerfRandomIo) {
 
 TEST_F(VolumeIOTest, PerfSequentialIo) {
     auto run_time = SISL_OPTIONS["run_time"].as< uint64_t >();
-    LOGINFO("Performance sequential ios on num_vols={} run_time={}",
-            SISL_OPTIONS["num_vols"].as< uint32_t >(), run_time);
+    LOGINFO("Performance sequential ios on num_vols={} run_time={}", SISL_OPTIONS["num_vols"].as< uint32_t >(),
+            run_time);
 
     uint64_t volume_size = SISL_OPTIONS["vol_size_gb"].as< uint32_t >() * Gi;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -769,6 +777,7 @@ TEST_F(VolumeIOTest, WriteCrash) {
         g_helper->remove_flip(flip);
     }
 
+    generate_write_io_single(vol, 1000 /* start_lba */, 100 /* nblks*/);
     LOGINFO("WriteCrash test done");
 }
 
@@ -814,7 +823,8 @@ int main(int argc, char* argv[]) {
     g_http_server = std::make_unique< test_http_server >();
     g_http_server->start();
     if (SISL_OPTIONS["num_io_reactors"].as< uint32_t >() > 0) {
-        g_io_fiber_pool = std::make_shared< test_common::io_fiber_pool >(SISL_OPTIONS["num_io_reactors"].as< uint32_t >());
+        g_io_fiber_pool =
+            std::make_shared< test_common::io_fiber_pool >(SISL_OPTIONS["num_io_reactors"].as< uint32_t >());
     }
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();
