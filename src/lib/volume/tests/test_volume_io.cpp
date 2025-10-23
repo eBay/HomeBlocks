@@ -605,6 +605,11 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
             total_writes += get_total_writes();
             std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
             auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
+            if (elapsed_seconds > 120) {
+                // log read write count every 2 mins;
+                LOGINFO("total_read={} total_write={} elapsed={}", total_reads, total_writes, elapsed_seconds);
+            }
+
             static uint64_t log_pct = 0;
             if (auto done_pct = (run_time > 0) ? (elapsed_seconds * 100) / run_time : 100; done_pct > log_pct) {
                 LOGINFO("total_read={} total_write={} elapsed={}, done pct={}", total_reads, total_writes,
