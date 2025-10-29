@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "3.0.6"
+    version = "4.0.0"
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
     topics = ("ebay")
@@ -42,13 +42,12 @@ class HomeBlocksConan(ConanFile):
             raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
 
     def build_requirements(self):
-        self.test_requires("gtest/1.14.0")
+        self.test_requires("gtest/1.17.0")
 
     def requirements(self):
-        self.requires("homestore/[^6.20]@oss/master", transitive_headers=True)
-        self.requires("iomgr/[^11.3]@oss/master", transitive_headers=True)
-        self.requires("sisl/[^12.4.7]@oss/master", transitive_headers=True)
-        self.requires("lz4/1.9.4", override=True)
+        self.requires("homestore/[^7.0]@oss/master", transitive_headers=True)
+        self.requires("iomgr/[^12.0]@oss/master", transitive_headers=True)
+        self.requires("sisl/[^13.0]@oss/master", transitive_headers=True)
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
