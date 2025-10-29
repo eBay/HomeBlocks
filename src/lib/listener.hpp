@@ -15,7 +15,11 @@
  *********************************************************************************/
 #pragma once
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #include <folly/futures/Future.h>
+#pragma GCC diagnostic pop
 #include <homestore/replication/repl_dev.h>
 #include "homeblks_impl.hpp"
 
