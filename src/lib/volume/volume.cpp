@@ -239,6 +239,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             lba_t start_lba = vol_req->lba;
             for (auto& blkid : new_blkids) {
                 DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
+                LOGT("volume write blkid={} lba={}", blkid.to_integer(), start_lba);
 
                 // Split the large blkid to individual blkid having only one block because each LBA points
                 // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
