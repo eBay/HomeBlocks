@@ -64,11 +64,11 @@ class HomeBlocksConan(ConanFile):
             self.folders.build = join("build", str(self.settings.build_type))
         self.folders.generators = join(self.folders.build, "generators")
 
-        self.cpp.source.components["homestore"].includedirs = ["src/include"]
+        self.cpp.source.includedirs = ["src/include"]
 
-        self.cpp.build.components["homestore"].libdirs = ["src/lib/volume"]
+        self.cpp.build.libdirs = ["src/lib/volume"]
 
-        self.cpp.package.components["homestore"].libs = ["homeblocks_volume"]
+        self.cpp.package.libs = ["homeblocks_volume"]
         self.cpp.package.includedirs = ["include"] # includedirs is already set to 'include' by
         self.cpp.package.libdirs = ["lib"]
 
@@ -113,15 +113,10 @@ class HomeBlocksConan(ConanFile):
         copy(self, "*.h*", join(self.source_folder, "src", "include"), join(self.package_folder, "include"), keep_path=True)
 
     def package_info(self):
-        self.cpp_info.components["homestore"].libs = ["homeblocks_volume"]
-        self.cpp_info.components["homestore"].requires = ["homestore::homestore", "iomgr::iomgr", "sisl::sisl"]
-        self.cpp_info.components["homeblocks"].requires = ["homestore"]
-
-        if self.settings.os == "Linux":
-            #self.cpp_info.components["homestore"].system_libs.append("pthread")
-            self.cpp_info.components["memory"].system_libs.append("pthread")
         if  self.options.sanitize:
-            self.cpp_info.components["memory"].sharedlinkflags.append("-fsanitize=address")
-            self.cpp_info.components["memory"].exelinkflags.append("-fsanitize=address")
-            self.cpp_info.components["memory"].sharedlinkflags.append("-fsanitize=undefined")
-            self.cpp_info.components["memory"].exelinkflags.append("-fsanitize=undefined")
+            self.cpp_info.sharedlinkflags.append("-fsanitize=address")
+            self.cpp_info.exelinkflags.append("-fsanitize=address")
+            self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
+            self.cpp_info.exelinkflags.append("-fsanitize=undefined")
+        elif self.options.coverage == 'True':
+            self.cpp_info.libs.append('gcov')
