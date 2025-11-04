@@ -15,6 +15,7 @@
  *********************************************************************************/
 #include "volume.hpp"
 #include "lib/homeblks_impl.hpp"
+#include "lib/home_blks_config.hpp"
 #include <homestore/replication_service.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
@@ -85,7 +86,7 @@ bool Volume::init(bool is_recovery) {
         // Allocate initial set of chunks for the volume with thin provisioning.
         uint32_t pdev_id;
         auto chunk_ids =
-            volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
+            volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id, HB_DYNAMIC_CONFIG(volume_lazy_alloc_blks_on));
         if (chunk_ids.empty()) {
             LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));
