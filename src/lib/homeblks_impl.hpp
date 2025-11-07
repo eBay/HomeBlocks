@@ -78,6 +78,7 @@ private:
     std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
 
     bool recovery_done_{false};
+    bool gracefully_shutdown_{false};
     std::mutex sb_lock_; // this lock is only used when FC is triggered;
     superblk< homeblks_sb_t > sb_;
     peer_id_t our_uuid_;
@@ -161,6 +162,7 @@ public:
     void exit_fc(VolumePtr& vol);
     bool is_restricted() const { return is_restricted_.load(); }
     hs_chunk_size_cfg_t get_chunk_size() const;
+    bool is_graceful_shutdown() const { return gracefully_shutdown_; }
 
 public:
     // public static APIs;
