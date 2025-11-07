@@ -313,6 +313,12 @@ void HomeBlocksImpl::submit_io_batch() { homestore::data_service().submit_io_bat
 void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                               const std::vector< homestore::MultiBlkId >& new_blkids,
                               cintrusive< homestore::repl_req_ctx >& ctx) {
+
+    // We are not expecting log reply for a graceful restart;
+    // if we are in recovery path, we must be recovering from a crash.
+    DEBUG_ASSERT(ctx != nullptr || !is_graceful_shutdown(),
+                 "repl ctx is null (recovery path) in graceful shutdown scenario, this is not expected!");
+
     repl_result_ctx< VolumeManager::NullResult >* repl_ctx{nullptr};
     if (ctx) { repl_ctx = boost::static_pointer_cast< repl_result_ctx< VolumeManager::NullResult > >(ctx).get(); }
     auto msg_header = r_cast< MsgHeader* >(const_cast< uint8_t* >(header.cbytes()));
