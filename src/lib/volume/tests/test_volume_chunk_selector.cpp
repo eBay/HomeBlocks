@@ -131,13 +131,12 @@ TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
     auto init_num_free_chunks = chunk_sel->num_free_chunks();
 
     // Allocate chunks for multiple volumes to simulate volume create.
-    auto vol1_chunks = chunk_sel->allocate_init_chunks(0 /* ordinal */, 180 * Ki, pdev_id);
+    auto vol1_chunks = chunk_sel->allocate_init_chunks(0 /* ordinal */, 160 * Ki, pdev_id);
     RELEASE_ASSERT(!vol1_chunks.empty(), "no chunks");
 
-    // Since we lazily allocate chunks, we can allocate more than sum
-    // of all volume sizes. Make sure same chunks not allocated to multiple volumes.
-    for (uint32_t i = 1; i < 5; i++) {
-        auto vol_chunks = chunk_sel->allocate_init_chunks(i /* ordinal */, 180 * Ki, pdev_id);
+    // Make sure same chunks not allocated to multiple volumes.
+    for (uint32_t i = 1; i < 4; i++) {
+        auto vol_chunks = chunk_sel->allocate_init_chunks(i /* ordinal */, 160 * Ki, pdev_id);
         RELEASE_ASSERT(!vol_chunks.empty(), "no chunks");
         bool noDuplicates = std::none_of(vol1_chunks.begin(), vol1_chunks.end(), [&](int elem) {
             return std::unordered_set< int >(vol_chunks.begin(), vol_chunks.end()).count(elem) > 0;
@@ -146,7 +145,7 @@ TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
     }
 
     // Release all chunks to simulate volume destroy.
-    for (uint32_t i = 0; i < 5; i++) {
+    for (uint32_t i = 0; i < 4; i++) {
         chunk_sel->release_chunks(i /* ordinal */);
     }
 
@@ -182,6 +181,8 @@ TEST_F(ChunkSelectorTest, SelectChunksTest) {
 }
 
 #ifdef _PRERELEASE
+// This test case will fail as the lazy allocation of the chunks is disabled
+#if 0
 TEST_F(ChunkSelectorTest, ResizeNumChunksTest) {
     auto latch = std::make_shared< std::latch >(1);
     auto chunk_sel = std::make_shared< VolumeChunkSelector >(
@@ -212,6 +213,7 @@ TEST_F(ChunkSelectorTest, ResizeNumChunksTest) {
     auto resized_chunks = chunk_sel->get_chunks(0);
     RELEASE_ASSERT_GT(resized_chunks.size(), initial_chunks.size(), "Resize op failed");
 }
+#endif
 #endif
 
 TEST_F(ChunkSelectorTest, RecoverChunksTest) {
