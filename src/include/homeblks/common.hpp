@@ -15,10 +15,10 @@
  *********************************************************************************/
 #pragma once
 
+#include <expected>
+
 #include <boost/uuid/uuid.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include <folly/Expected.h>
-#include <folly/Unit.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -74,12 +74,12 @@ template < class E >
 class Manager {
 public:
     template < typename T >
-    using Result = folly::Expected< T, E >;
+    using Result = std::expected< T, E >;
     template < typename T >
     using AsyncResult = folly::Future< Result< T > >;
 
-    using NullResult = Result< folly::Unit >;
-    using NullAsyncResult = AsyncResult< folly::Unit >;
+    using NullResult = Result< void >;
+    using NullAsyncResult = AsyncResult< void >;
 
     virtual ~Manager() = default;
 };

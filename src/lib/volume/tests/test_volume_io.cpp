@@ -207,7 +207,7 @@ public:
         vol_mgr->write(m_vol_ptr, req)
             .via(&folly::InlineExecutor::instance())
             .thenValue([this, data, req, latch, expect_failure](auto&& result) {
-                ASSERT_EQ(result.hasError(), expect_failure);
+                ASSERT_EQ(!result.has_value(), expect_failure);
                 {
                     std::lock_guard lock(m_mutex);
                     m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
@@ -245,7 +245,7 @@ public:
         vol_mgr->write(m_vol_ptr, req)
             .via(&folly::InlineExecutor::instance())
             .thenValue([this, req, data](auto&& result) {
-                RELEASE_ASSERT(!result.hasError(), "Write failed with error={}", result.error());
+                RELEASE_ASSERT(result.has_value(), "Write failed with error={}", result.error());
                 {
                     std::lock_guard lock(m_mutex);
                     m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
@@ -262,8 +262,8 @@ public:
         auto buf = read_blob.bytes();
         vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
         auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
-        if (read_resp.hasError()) { LOGERROR("Read failed with error={}", read_resp.error()); }
-        RELEASE_ASSERT(!read_resp.hasError(), "Read failed with error={}", read_resp.error());
+        if (!read_resp.has_value()) { LOGERROR("Read failed with error={}", read_resp.error()); }
+        RELEASE_ASSERT(read_resp.has_value(), "Read failed with error={}", read_resp.error());
     }
 
     void read_and_verify(lba_t start_lba, uint32_t nlbas) {
@@ -273,8 +273,8 @@ public:
         auto buf = read_blob.bytes();
         vol_interface_req_ptr req(new vol_interface_req{buf, start_lba, nlbas, m_vol_ptr});
         auto read_resp = g_helper->inst()->volume_manager()->read(m_vol_ptr, req).get();
-        if (read_resp.hasError()) { LOGERROR("Read failed with error={}", read_resp.error()); }
-        RELEASE_ASSERT(!read_resp.hasError(), "Read failed with error={}", read_resp.error());
+        if (!read_resp.has_value()) { LOGERROR("Read failed with error={}", read_resp.error()); }
+        RELEASE_ASSERT(read_resp.has_value(), "Read failed with error={}", read_resp.error());
         auto read_sz = m_vol_ptr->info()->page_size;
         for (auto lba = start_lba; lba < start_lba + nlbas; lba++, buf += read_sz) {
             uint64_t data_pattern = 0;
@@ -305,7 +305,7 @@ public:
                 ->read(m_vol_ptr, req)
                 .via(&folly::InlineExecutor::instance())
                 .thenValue([this, read_blob = std::move(read_blob), req](auto&& result) {
-                    RELEASE_ASSERT(!result.hasError(), "Read failed with error={}", result.error());
+                    RELEASE_ASSERT(result.has_value(), "Read failed with error={}", result.error());
                     {
                         std::lock_guard lock(m_mutex);
                         m_inflight_ios.erase(boost::icl::interval< int >::closed(req->lba, req->lba + req->nlbas - 1));
