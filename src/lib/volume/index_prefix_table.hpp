@@ -48,7 +48,7 @@ public:
         auto result = hs_index_table_->put(req);
         if (result != homestore::btree_status_t::success) {
             LOGERROR("Failed to put to index range=({},{}) error={}", start_lba, end_lba, result);
-            return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(VolumeError::INDEX_ERROR);
         }
 
         return folly::Unit();
@@ -59,7 +59,7 @@ public:
             homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
             homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
         if (auto ret = hs_index_table_->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-            return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(VolumeError::INDEX_ERROR);
         }
         return folly::Unit();
     }

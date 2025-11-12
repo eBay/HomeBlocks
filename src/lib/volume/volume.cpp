@@ -214,7 +214,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     auto result = rd()->alloc_blks(data_size, hints, new_blkids);
     if (result) {
         LOGE("Failed to allocate blocks");
-        return folly::makeUnexpected(VolumeError::NO_SPACE_LEFT);
+        return std::unexpected(VolumeError::NO_SPACE_LEFT);
     }
     COUNTER_INCREMENT(*metrics_, volume_write_count, 1);
 
@@ -227,7 +227,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
         ->async_write(new_blkids, data_sgs, vol_req->part_of_batch)
         .thenValue([this, vol_req,
                     new_blkids = std::move(new_blkids)](auto&& result) -> VolumeManager::NullAsyncResult {
-            if (result) { return folly::makeUnexpected(VolumeError::DRIVE_WRITE_ERROR); }
+            if (result) { return std::unexpected(VolumeError::DRIVE_WRITE_ERROR); }
             HISTOGRAM_OBSERVE(*metrics_, volume_data_write_latency, get_elapsed_time_us(vol_req->data_svc_start_time));
             vol_req->index_start_time = Clock::now();
             using homestore::BlkId;
@@ -257,17 +257,17 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                 // in blocks_info after write_to_index
                 lba_t end_lba = start_lba + blkid.blk_count() - 1;
                 auto status = indx_table()->write_to_index(start_lba, end_lba, blocks_info);
-                if (!status) { return folly::makeUnexpected(VolumeError::INDEX_ERROR); }
+                if (!status) { return std::unexpected(VolumeError::INDEX_ERROR); }
 
                 start_lba = end_lba + 1;
             }
             HISTOGRAM_OBSERVE(*metrics_, volume_map_write_latency, get_elapsed_time_us(vol_req->index_start_time));
 
-                vol_req->journal_start_time = Clock::now();
-                // Collect all old blocks to write to journal.
-                for (auto& [_, info] : blocks_info) {
-                    if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
-                }
+            vol_req->journal_start_time = Clock::now();
+            // Collect all old blocks to write to journal.
+            for (auto& [_, info] : blocks_info) {
+                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+            }
 
             auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;
             auto old_blkids_size = sizeof(BlkId) * old_blkids.size();
@@ -305,39 +305,40 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                 // this is to simulate crash during write where data is persisted journal is
                 // not persisted. After recovery there is no index for.
                 LOGINFO("Volume write crash simulation flip is set, aborting");
-                return folly::Unit();
+                return VolumeManager::NullResult();
             }
 #endif
 
-                rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
+            rd()->async_write_journal(new_blkids, req->cheader_buf(), req->ckey_buf(), data_size, req);
 
-                return req->result()
-                    .via(&folly::InlineExecutor::instance())
-                    .thenValue([this, vol_req](const auto&& result) -> folly::Expected< folly::Unit, VolumeError > {
-                        if (result.hasError()) {
-                            LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
-                                 vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
-                            auto err = result.error();
-                            return folly::makeUnexpected(err);
-                        }
-                        HISTOGRAM_OBSERVE(*metrics_, volume_journal_write_latency, get_elapsed_time_us(vol_req->journal_start_time));
-                        auto write_size = vol_req->nlbas * rd()->get_blk_size();
-                        COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
-                        HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
-                        HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
-                        return folly::Unit();
-                    });
-            });
+            return req->result()
+                .via(&folly::InlineExecutor::instance())
+                .thenValue([this, vol_req](const auto&& result) -> std::expected< void, VolumeError > {
+                    if (!result.has_value()) {
+                        LOGE("Failed to write to journal for volume: {}, lba: {}, nlbas: {}, error: {}",
+                             vol_info_->name, vol_req->lba, vol_req->nlbas, result.error());
+                        auto err = result.error();
+                        return std::unexpected(err);
+                    }
+                    HISTOGRAM_OBSERVE(*metrics_, volume_journal_write_latency,
+                                      get_elapsed_time_us(vol_req->journal_start_time));
+                    auto write_size = vol_req->nlbas * rd()->get_blk_size();
+                    COUNTER_INCREMENT(*metrics_, volume_write_size_total, write_size);
+                    HISTOGRAM_OBSERVE(*metrics_, volume_write_size_distribution, write_size);
+                    HISTOGRAM_OBSERVE(*metrics_, volume_write_latency, get_elapsed_time_us(vol_req->io_start_time));
+                    return {};
+                });
+        });
 }
 
 VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     req->io_start_time = Clock::now();
     // Step 1: get the blk ids from index table
     vol_read_ctx read_ctx{.vol_req = req, .blk_size = rd()->get_blk_size()};
-    if (auto index_resp = indx_table()->read_from_index(req, read_ctx.index_kvs); index_resp.hasError()) {
+    if (auto index_resp = indx_table()->read_from_index(req, read_ctx.index_kvs); !index_resp.has_value()) {
         LOGE("Failed to read from index table for range=[{}, {}], volume id: {}, error: {}", req->lba, req->end_lba(),
              boost::uuids::to_string(id()), index_resp.error());
-        return index_resp;
+        return VolumeManager::NullResult();
     }
     HISTOGRAM_OBSERVE(*metrics_, volume_map_read_latency, get_elapsed_time_us(req->io_start_time));
     COUNTER_INCREMENT(*metrics_, volume_read_count, 1);
@@ -351,14 +352,14 @@ VolumeManager::NullAsyncResult Volume::read(const vol_interface_req_ptr& req) {
     req->data_svc_start_time = Clock::now();
     submit_read_to_backend(blks_to_read, req, futs);
 
-    if (read_ctx.index_kvs.empty()) { return folly::Unit(); }
+    if (read_ctx.index_kvs.empty()) { return VolumeManager::NullResult(); }
 
     // Step 4: verify the checksum after all the reads are done
-    return folly::collectAllUnsafe(futs).thenValue([this, read_ctx](auto&& vf) -> VolumeManager::Result< folly::Unit > {
+    return folly::collectAllUnsafe(futs).thenValue([this, read_ctx](auto&& vf) -> VolumeManager::NullResult {
         for (auto const& err_c : vf) {
             if (sisl_unlikely(err_c.value())) {
                 auto ec = err_c.value();
-                return folly::makeUnexpected(to_volume_error(ec));
+                return std::unexpected(to_volume_error(ec));
             }
         }
         HISTOGRAM_OBSERVE(*metrics_, volume_data_read_latency,
@@ -396,7 +397,7 @@ void Volume::generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks
     }
 }
 
-VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const& read_ctx) {
+VolumeManager::NullResult Volume::verify_checksum(vol_read_ctx const& read_ctx) {
     auto read_buf = read_ctx.vol_req->buffer;
     for (uint64_t cur_lba = read_ctx.vol_req->lba, i = 0; i < read_ctx.index_kvs.size();) {
         auto const& [key, value] = read_ctx.index_kvs[i];
@@ -414,7 +415,7 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
             LOGE("crc mismatch for lba: {} start: {}, end: {} blk id {}, expected: {}, actual: {}", cur_lba,
                  read_ctx.vol_req->lba, read_ctx.vol_req->end_lba(), value.blkid().to_string(), value.checksum(),
                  checksum);
-            return folly::makeUnexpected(VolumeError::CRC_MISMATCH);
+            return std::unexpected(VolumeError::CRC_MISMATCH);
         }
 
         read_buf += read_ctx.blk_size;
@@ -425,7 +426,7 @@ VolumeManager::Result< folly::Unit > Volume::verify_checksum(vol_read_ctx const&
     COUNTER_INCREMENT(*metrics_, volume_read_size_total, read_size);
     HISTOGRAM_OBSERVE(*metrics_, volume_read_size_distribution, read_size);
     HISTOGRAM_OBSERVE(*metrics_, volume_read_latency, get_elapsed_time_us(read_ctx.vol_req->io_start_time));
-    return folly::Unit();
+    return {};
 }
 
 void Volume::submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,

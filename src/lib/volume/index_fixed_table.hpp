@@ -67,21 +67,21 @@ public:
                 LOGERROR("Failed to put to index {}, error={}", lba, result);
                 // rollback the lbas for which we have already written to the index table
                 rollback_write(start_lba, lba - 1, blocks_info);
-                return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+                return std::unexpected(VolumeError::INDEX_ERROR);
             }
         }
 
         return folly::Unit();
     }
 
-    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs) {
+    VolumeManager::NullResult read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs) {
         homestore::BtreeQueryRequest< VolumeIndexKey > qreq{
             homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{req->lba}, VolumeIndexKey{req->end_lba()}},
             homestore::BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY};
         if (auto ret = hs_index_table_->query(qreq, index_kvs); ret != homestore::btree_status_t::success) {
-            return folly::makeUnexpected(VolumeError::INDEX_ERROR);
+            return std::unexpected(VolumeError::INDEX_ERROR);
         }
-        return folly::Unit();
+        return {};
     }
 
     void rollback_write(lba_t start_lba, lba_t end_lba, std::unordered_map< lba_t, BlockInfo >& blocks_info) {
