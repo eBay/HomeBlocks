@@ -121,7 +121,7 @@ jobs:
       with:
         repository: eBay/HomeStore
         path: import/homestore
-        ref: master
+        ref: stable/v6.x
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load HomeStore Cache
