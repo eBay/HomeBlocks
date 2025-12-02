@@ -83,7 +83,7 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_info) {
     if (is_restricted()) {
         LOGE("Can't serve volume create, System is in restricted mode.");
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     }
 
     inc_ref();
@@ -96,13 +96,13 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
         vol_info.ordinal = ordinal_reserver_->reserve();
         if (vol_info.ordinal >= MAX_NUM_VOLUMES) {
             LOGE("No space to create volume with id: {}", boost::uuids::to_string(id));
-            return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
+            return std::unexpected(VolumeError::INTERNAL_ERROR);
         }
 
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
             dec_ref();
-            return folly::makeUnexpected(VolumeError::INVALID_ARG);
+            return std::unexpected(VolumeError::INVALID_ARG);
         }
     }
 
@@ -114,11 +114,11 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
         dec_ref();
-        return folly::makeUnexpected(VolumeError::INTERNAL_ERROR);
+        return std::unexpected(VolumeError::INTERNAL_ERROR);
     }
 
     dec_ref();
-    return folly::Unit();
+    return NullResult();
 }
 
 //
@@ -128,16 +128,16 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::create_volume(VolumeInfo&& vol_in
 VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     if (is_restricted()) {
         LOGE("Can't serve volume remove, System is in restricted mode.");
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     }
 
     auto vol = lookup_volume(id);
     if (vol == nullptr) {
         LOGE("Volume with id {} not found, cannot remove", boost::uuids::to_string(id));
-        return folly::makeUnexpected(VolumeError::INVALID_ARG);
+        return std::unexpected(VolumeError::INVALID_ARG);
     } else if (vol->is_offline()) {
         LOGE("Volume {} is offline, cannot remove", vol->id_str());
-        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+        return std::unexpected(VolumeError::VOLUME_OFFLINE);
     }
 
     LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
@@ -150,7 +150,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
                 vol_ptr = it->second;
             } else {
                 LOGWARN("Volume with id {} not found, cannot remove", boost::uuids::to_string(id));
-                return folly::Unit();
+                return NullResult();
             }
         }
 
@@ -164,7 +164,7 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
 #ifdef _PRERELEASE
             if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
                 crash_simulated_ = true;
-                return folly::Unit();
+                return NullResult();
             }
 #endif
             // 3. remove volume from vol_map;
@@ -185,10 +185,10 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::remove_volume(const volume_id_t& 
             }
         }
         // Volume Destructor will be called after vol_ptr goes out of scope;
-        return folly::Unit();
+        return NullResult();
     });
 
-    return folly::Unit();
+    return NullResult();
 }
 
 VolumePtr HomeBlocksImpl::lookup_volume(const volume_id_t& id) {
@@ -235,24 +235,24 @@ void HomeBlocksImpl::get_volume_ids(std::vector< volume_id_t >& vol_ids) const {
 VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     if (is_restricted()) {
         LOGE("Can't serve write, System is in restricted mode.");
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     } else if (vol->is_offline()) {
         LOGE("Can't serve write, Volume {} is offline.", vol->id_str());
-        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+        return std::unexpected(VolumeError::VOLUME_OFFLINE);
     }
 
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE(
             "Can't serve write, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
             vol->id_str(), vol->is_destroying());
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     }
 
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->write
         // and let the delay flip handle the completion later.
-        return folly::Unit();
+        return NullResult();
     }
 #endif
     return vol->write(req);
@@ -261,23 +261,23 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::write(const VolumePtr& vol, const
 VolumeManager::NullAsyncResult HomeBlocksImpl::read(const VolumePtr& vol, const vol_interface_req_ptr& req) {
     if (is_restricted()) {
         LOGE("Can't serve read, System is in restricted mode.");
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     } else if (vol->is_offline()) {
         LOGE("Can't serve read, Volume {} is offline.", vol->id_str());
-        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+        return std::unexpected(VolumeError::VOLUME_OFFLINE);
     }
 
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE("Can't serve read, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
              vol->id_str(), vol->is_destroying());
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     }
 
 #ifdef _PRERELEASE
     if (delay_fake_io(vol)) {
         // If we are delaying IO, we return immediately without calling vol->read
         // and let the delay flip handle the completion later.
-        return folly::Unit();
+        return NullResult();
     }
 #endif
     return vol->read(req);
@@ -288,20 +288,20 @@ VolumeManager::NullAsyncResult HomeBlocksImpl::unmap(const VolumePtr& vol, const
 
     if (is_restricted()) {
         LOGE("Can't serve unmap, System is in restricted mode.");
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     } else if (vol->is_offline()) {
         LOGE("Can't serve unmap, Volume {} is offline.", vol->id_str());
-        return folly::makeUnexpected(VolumeError::VOLUME_OFFLINE);
+        return std::unexpected(VolumeError::VOLUME_OFFLINE);
     }
 
     if (vol->is_destroying() || is_shutting_down()) {
         LOGE(
             "Can't serve unmap, Volume {} is_destroying: {} is either in destroying state or System is shutting down. ",
             vol->id_str(), vol->is_destroying());
-        return folly::makeUnexpected(VolumeError::UNSUPPORTED_OP);
+        return std::unexpected(VolumeError::UNSUPPORTED_OP);
     }
 
-    return folly::Unit();
+    return NullResult();
 }
 
 //
@@ -380,7 +380,7 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     }
 #endif
 
-    if (repl_ctx) { repl_ctx->promise_.setValue(folly::Unit()); }
+    if (repl_ctx) { repl_ctx->promise_.setValue(NullResult()); }
 }
 
 vol_interface_req::vol_interface_req(uint8_t* const buf, const uint64_t lba, const uint32_t nlbas, VolumePtr vol_ptr) :

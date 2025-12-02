@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "4.0.2"
+    version = "5.0.2"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -53,7 +53,7 @@ class HomeBlocksConan(ConanFile):
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
-            check_min_cppstd(self, 20)
+            check_min_cppstd(self, 23)
 
     def layout(self):
         self.folders.source = "."
