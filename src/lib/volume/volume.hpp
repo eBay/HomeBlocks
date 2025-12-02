@@ -259,14 +259,14 @@ private:
     //
     bool init(bool is_recovery);
 
-    VolumeManager::Result< folly::Unit > verify_checksum(vol_read_ctx const& read_ctx);
+    VolumeManager::NullResult verify_checksum(vol_read_ctx const& read_ctx);
 
     void submit_read_to_backend(read_blks_list_t const& blks_to_read, const vol_interface_req_ptr& req,
                                 std::vector< folly::Future< std::error_code > >& futs);
 
     void generate_blkids_to_read(const index_kv_list_t& index_kvs, read_blks_list_t& blks_to_read);
 
-    VolumeManager::Result< folly::Unit > read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs);
+    VolumeManager::NullResult read_from_index(const vol_interface_req_ptr& req, index_kv_list_t& index_kvs);
 
 private:
     VolumeInfoPtr vol_info_;  // volume info

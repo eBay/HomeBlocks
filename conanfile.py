@@ -52,7 +52,7 @@ class HomeBlocksConan(ConanFile):
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
-            check_min_cppstd(self, 20)
+            check_min_cppstd(self, 23)
 
     def layout(self):
         self.folders.source = "."
