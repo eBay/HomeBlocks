@@ -422,6 +422,7 @@ void HomeBlocksImpl::on_hb_meta_blk_found(sisl::byte_view const& buf, void* cook
     if (sb_->test_flag(SB_FLAGS_GRACEFUL_SHUTDOWN)) {
         // if it is a gracefuln shutdown, this flag should be set again in shutdown routine;
         sb_->clear_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
+        gracefully_shutdown_ = true;
         LOGI("System was shutdown gracefully");
     } else if (sb_->test_flag(SB_FLAGS_RESTRICTED)) {
         is_restricted_.store(true);
