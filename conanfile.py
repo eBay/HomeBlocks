@@ -48,7 +48,7 @@ class HomeBlocksConan(ConanFile):
         self.requires("homestore/[^6.20]@oss/master", transitive_headers=True)
         self.requires("iomgr/[^11.3]@oss/master", transitive_headers=True)
         self.requires("sisl/[^12.4.7]@oss/master", transitive_headers=True)
-        self.requires("lz4/1.9.4", override=True)
+        self.requires("lz4/1.10.0", override=True)
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
