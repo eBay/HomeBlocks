@@ -48,15 +48,6 @@ pipeline {
             }
         }
 
-        stage('Tag Stable Build') {
-            when { branch "${STABLE_BRANCH}" }
-            steps {
-                script {
-                    TAG = "${VER}@"
-                }
-            }
-        }
-
         stage("Compile") {
             steps {
                 sh "conan build -s:h compiler.cppstd=23 ${BUILD_MISSING} -s:h build_type=Debug -o ${PROJECT}/*:sanitize=True ${CONAN_FLAGS} . ; \
