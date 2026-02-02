@@ -56,6 +56,9 @@ public:
     void on_complete_replace_member(const std::string& task_id, const homestore::replica_member_info& member_out,
                                     const homestore::replica_member_info& member_in,
                                     homestore::trace_id_t tid) override {}
+    void on_clean_replace_member_task(const std::string& task_id, const homestore::replica_member_info& member_out,
+                                      const homestore::replica_member_info& member_in,
+                                      homestore::trace_id_t tid) override {}
     void on_remove_member(const homestore::replica_id_t&, homestore::trace_id_t) override {}
     void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                      cintrusive< homestore::repl_req_ctx >& ctx) override {}
