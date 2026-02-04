@@ -363,11 +363,20 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
     }
 
     // Free all the old blkids. This happens for both normal writes
-    // and crash recovery.
+    // and crash recovery. During recovery we also if it has been alloced,
+    // because we could have stale log entries which have old blkid's
+    // which may be already freed.
     for (uint32_t i = 0; i < journal_entry->num_old_blks; i++) {
         BlkId old_blkid = *r_cast< const BlkId* >(key_buffer);
-        LOGT("on_write free blk {}", old_blkid);
-        vol_ptr->rd()->async_free_blks(lsn, old_blkid);
+        if (repl_ctx == nullptr) {
+            if (homestore::hs()->data_service().is_blk_alloced(old_blkid)) {
+                LOGT("on_write free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
+                homestore::hs()->data_service().free_blk_now(old_blkid);
+            }
+        } else {
+            LOGT("on_write free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
+            homestore::hs()->data_service().free_blk_now(old_blkid);
+        }
         key_buffer += sizeof(BlkId);
     }
 
