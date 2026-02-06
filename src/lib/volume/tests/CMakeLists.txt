@@ -33,5 +33,5 @@ target_link_libraries(test_volume_chunk_selector
 )
 
 add_test(NAME VolumeTest COMMAND test_volume --gc_timer_nsecs=3 --index_chunk_size_mb=128 --data_chunk_size_mb=128)
-add_test(NAME VolumeIOTest COMMAND test_volume_io --index_chunk_size_mb=128 --data_chunk_size_mb=128 --gtest_filter=-VolumeIOTest.LongRunningRandomIO:VolumeIOTest.WriteCrash:VolumeIOTest.IndexPutFailure) # FIXME: turn on after io issue is fixed;
+add_test(NAME VolumeIOTest COMMAND test_volume_io --index_chunk_size_mb=128 --data_chunk_size_mb=128)
 add_test(NAME VolumeChunkSelectorTest COMMAND test_volume_chunk_selector)
