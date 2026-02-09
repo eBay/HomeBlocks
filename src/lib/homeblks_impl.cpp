@@ -352,7 +352,7 @@ void HomeBlocksImpl::init_homestore() {
                 {HS_SERVICE::META, hs_format_params{.dev_type = HSDevType::Fast, .size_pct = 9.0}},
                 {HS_SERVICE::LOG,
                  hs_format_params{
-                     .dev_type = HSDevType::Fast, .size_pct = 45.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
+                     .dev_type = HSDevType::Fast, .size_pct = 45.0, .num_chunks = 0, .chunk_size = HB_DYNAMIC_CONFIG(hs_journal_chunk_size_mb) * Mi}},
                 {HS_SERVICE::INDEX,
                  hs_format_params{.dev_type = HSDevType::Fast,
                                   .size_pct = 45.0,
@@ -373,7 +373,7 @@ void HomeBlocksImpl::init_homestore() {
             homestore::hs()->format_and_start({
                 {HS_SERVICE::META, hs_format_params{.dev_type = run_on_type, .size_pct = 5.0}},
                 {HS_SERVICE::LOG,
-                 hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .num_chunks = 0, .chunk_size = 32 * Mi}},
+                 hs_format_params{.dev_type = run_on_type, .size_pct = 10.0, .num_chunks = 0, .chunk_size = HB_DYNAMIC_CONFIG(hs_journal_chunk_size_mb) * Mi}},
                 {HS_SERVICE::INDEX,
                  hs_format_params{.dev_type = run_on_type,
                                   .size_pct = 5.0,

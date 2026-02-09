@@ -144,8 +144,8 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
             if (*volc->m_next_chunk_index >= num_active_chunks) { *volc->m_next_chunk_index = 0; }
 
             auto chunk = volc->m_chunks[*volc->m_next_chunk_index];
-            *volc->m_next_chunk_index = ((*volc->m_next_chunk_index) + 1);
             if (chunk && chunk->available_blks() > 0) { return chunk->get_internal_chunk(); }
+            *volc->m_next_chunk_index = ((*volc->m_next_chunk_index) + 1);
         }
 
         LOGT("Waiting to allocate more chunks active={} total={}", volc->num_active_chunks.load(),

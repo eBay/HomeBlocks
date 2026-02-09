@@ -21,6 +21,9 @@ table HomeBlksSettings{
 
     // homestore dataservice chunk size;
     hs_data_chunk_size_mb: uint32 = 2048;
+
+    // homestore Logstore chunk size;
+    hs_journal_chunk_size_mb: uint32 = 2048;
 }
 
 root_type HomeBlksSettings;
