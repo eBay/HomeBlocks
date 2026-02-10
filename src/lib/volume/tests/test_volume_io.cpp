@@ -767,6 +767,7 @@ TEST_F(VolumeIOTest, WriteCrash) {
     auto vol = volume_list().back();
     generate_write_io_single(vol, 1000 /* start_lba */, 100 /* nblks*/);
     restart(2);
+    LOGINFO("First restart done");
     // TODO read and verify zeros for no data.
 
     // Crash after journal write. After crash, index should be recovered.
@@ -775,15 +776,17 @@ TEST_F(VolumeIOTest, WriteCrash) {
     vol = volume_list().back();
     generate_write_io_single(vol, 2000 /* start_lba */, 100 /* nblks*/);
     restart(2);
+    LOGINFO("Second restart done");
 
     vol->verify_data(2000 /* start_lba */, 2100 /* max_lba */, 25 /* nlbas_per_io */);
-
+    LOGINFO("Verify data done");
     // remove the flip points
     for (auto& flip : flip_points) {
         g_helper->remove_flip(flip);
     }
 
     generate_write_io_single(vol, 1000 /* start_lba */, 100 /* nblks*/);
+    LOGINFO("Verify data done");
     LOGINFO("WriteCrash test done");
 }
 
