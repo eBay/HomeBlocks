@@ -213,7 +213,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
     std::vector< homestore::MultiBlkId > new_blkids;
     auto result = rd()->alloc_blks(data_size, hints, new_blkids);
     if (result) {
-        LOGE("Failed to allocate blocks");
+        LOGE("Failed to allocate blocks data_size={}", data_size);
         return std::unexpected(VolumeError::NO_SPACE_LEFT);
     }
     COUNTER_INCREMENT(*metrics_, volume_write_count, 1);
@@ -239,7 +239,7 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             lba_t start_lba = vol_req->lba;
             for (auto& blkid : new_blkids) {
                 DEBUG_ASSERT_EQ(blkid.num_pieces(), 1, "Multiple blkid pieces");
-                LOGT("volume write blkid={} lba={}", blkid.to_integer(), start_lba);
+                LOGT("volume write blkid={} start_lba={}", blkid.to_string(), start_lba);
 
                 // Split the large blkid to individual blkid having only one block because each LBA points
                 // to a blkid containing single blk which is stored in index value. Calculate the checksum for each
@@ -248,8 +248,8 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
                     auto new_bid = BlkId{blkid.blk_num() + i, 1 /* nblks */, blkid.chunk_num()};
                     auto csum = crc16_t10dif(init_crc_16, static_cast< unsigned char* >(data_buffer), blk_size);
                     blocks_info.emplace(start_lba + i, BlockInfo{new_bid, BlkId{}, csum});
-                    LOGT("volume write blkid={} csum={} lba={}", new_bid.to_string(),
-                         blocks_info[start_lba + i].new_checksum, start_lba + i);
+                    LOGT("volume write blkid={} csum={} start_lba={} lba={}", new_bid.to_string(),
+                         blocks_info[start_lba + i].new_checksum, start_lba, start_lba + i);
                     data_buffer += blk_size;
                 }
 
@@ -267,7 +267,10 @@ VolumeManager::NullAsyncResult Volume::write(const vol_interface_req_ptr& vol_re
             vol_req->journal_start_time = Clock::now();
             // Collect all old blocks to write to journal.
             for (auto& [_, info] : blocks_info) {
-                if (info.old_blkid.is_valid()) { old_blkids.emplace_back(info.old_blkid); }
+                if (info.old_blkid.is_valid()) {
+                    LOGT("volume write start_lba={} old blkids={}", vol_req->lba, info.old_blkid.to_string());
+                    old_blkids.emplace_back(info.old_blkid);
+                }
             }
 
             auto csum_size = sizeof(homestore::csum_t) * vol_req->nlbas;

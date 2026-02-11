@@ -370,12 +370,14 @@ void HomeBlocksImpl::on_write(int64_t lsn, const sisl::blob& header, const sisl:
         BlkId old_blkid = *r_cast< const BlkId* >(key_buffer);
         if (repl_ctx == nullptr) {
             if (homestore::hs()->data_service().is_blk_alloced(old_blkid)) {
-                LOGT("on_write free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
+                LOGT("volume write on commit free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
                 homestore::hs()->data_service().free_blk_now(old_blkid);
             }
         } else {
-            LOGT("on_write free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
-            homestore::hs()->data_service().free_blk_now(old_blkid);
+            if (homestore::hs()->data_service().is_blk_alloced(old_blkid)) {
+                LOGT("volume write on commit free blk {} start_lba {}", old_blkid, journal_entry->start_lba);
+                vol_ptr->rd()->async_free_blks(lsn, old_blkid);
+            }
         }
         key_buffer += sizeof(BlkId);
     }
