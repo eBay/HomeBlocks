@@ -84,27 +84,27 @@ jobs:
       if: ${{ inputs.testing == 'False' }}
 
     - name: Setup Conan
-      uses: ebay/sisl/.github/actions/setup_conan2@master
+      uses: ebay/sisl/.github/actions/setup_conan2@stable/v13.x
       with:
         platform: ${{ inputs.platform }}
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load HomeBlocks Cache
       id: restore-cache
-      uses: eBay/sisl/.github/actions/load_conan2@master
+      uses: eBay/sisl/.github/actions/load_conan2@stable/v13.x
       with:
         testing: ${{ inputs.testing }}
         key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
 
     - name: Load Sisl Cache
-      uses: eBay/sisl/.github/actions/load_conan2@master
+      uses: eBay/sisl/.github/actions/load_conan2@stable/v13.x
       with:
         load_any: 'True'
         key_prefix: SislDeps13-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load IOMgr Cache
-      uses: eBay/sisl/.github/actions/load_conan2@master
+      uses: eBay/sisl/.github/actions/load_conan2@stable/v13.x
       with:
         load_any: 'True'
         key_prefix: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-False
@@ -115,16 +115,15 @@ jobs:
       with:
         repository: eBay/nuraft_mesg
         path: import/nuraft_mesg
-        ref: main
+        ref: stable/v4.x
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load NuRaftMesg Cache
-      uses: eBay/sisl/.github/actions/load_conan2@master
+      uses: eBay/sisl/.github/actions/load_conan2@stable/v13.x
       with:
         testing: 'False'
         path: import/nuraft_mesg
         key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
-        fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Retrieve Dependencies HomeStore
@@ -132,16 +131,15 @@ jobs:
       with:
         repository: eBay/HomeStore
         path: import/homestore
-        ref: master
+        ref: stable/v7.x
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Load HomeStore Cache
-      uses: eBay/sisl/.github/actions/load_conan2@master
+      uses: eBay/sisl/.github/actions/load_conan2@stable/v13.x
       with:
         testing: 'False'
         path: import/homestore
         key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-False
-        fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
 
@@ -149,8 +147,8 @@ jobs:
       run: |
         sudo apt-get install -y python3-pyelftools libaio-dev
         python -m pip install pyelftools
-        conan export --user oss --channel master import/homestore
-        conan export --user oss --channel main import/nuraft_mesg
+        conan export import/homestore
+        conan export import/nuraft_mesg
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Create and Test Package
@@ -170,7 +168,7 @@ jobs:
       if: ${{ inputs.testing == 'True' && inputs.tooling != 'Coverage' }}
 
     - name: Save Conan Cache
-      uses: eBay/sisl/.github/actions/store_conan2@master
+      uses: eBay/sisl/.github/actions/store_conan2@stable/v13.x
       with:
         key_prefix: HomeBlocksDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
       if: ${{ github.event_name != 'pull_request' && steps.restore-cache.outputs.cache-hit != 'true' && inputs.tooling != 'Coverage'}}
