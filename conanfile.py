@@ -3,13 +3,14 @@ from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake, cmake_layout
 from conan.tools.files import copy
+import os
 from os.path import join
 
 required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "5.0.6"
+    version = "5.1.0"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -46,9 +47,9 @@ class HomeBlocksConan(ConanFile):
         self.test_requires("gtest/1.17.0")
 
     def requirements(self):
-        self.requires("homestore/[^7.1]@oss/master", transitive_headers=True)
-        self.requires("iomgr/[^12.0]@oss/master", transitive_headers=True)
-        self.requires("sisl/[^13.0]@oss/master", transitive_headers=True)
+        self.requires("homestore/[^7.5]", transitive_headers=True)
+        self.requires("iomgr/[^12.0]", transitive_headers=True)
+        self.requires("sisl/[^13.2]", transitive_headers=True)
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
@@ -98,6 +99,8 @@ class HomeBlocksConan(ConanFile):
         cmake.configure()
         cmake.build()
         if not self.conf.get("tools.build:skip_test", default=False):
+            jobs = self.conf.get("tools.build:jobs", default=3)
+            os.environ["CTEST_PARALLEL_LEVEL"] = str(jobs)
             cmake.test()
 
     def package(self):
