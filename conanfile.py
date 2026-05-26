@@ -2,8 +2,8 @@ from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake, cmake_layout
+from conan.tools.env import Environment
 from conan.tools.files import copy
-import os
 from os.path import join
 
 required_conan_version = ">=1.60.0"
@@ -100,8 +100,10 @@ class HomeBlocksConan(ConanFile):
         cmake.build()
         if not self.conf.get("tools.build:skip_test", default=False):
             jobs = self.conf.get("tools.build:jobs", default=3)
-            os.environ["CTEST_PARALLEL_LEVEL"] = str(jobs)
-            cmake.test()
+            env = Environment()
+            env.define("CTEST_PARALLEL_LEVEL", str(jobs))
+            with env.vars(self).apply():
+                cmake.test()
 
     def package(self):
         lib_dir = join(self.package_folder, "lib")
