@@ -97,13 +97,15 @@ jobs:
       run: |
         requested_ref="${{ inputs.branch }}"
         fallback_ref="${{ github.ref }}"
+        repo_url="${{ github.server_url }}/${{ github.repository }}"
 
-        if [[ "${requested_ref}" == refs/* ]]; then
+        if [[ "${requested_ref}" == refs/* ]] && git check-ref-format "${requested_ref}"; then
           checkout_ref="${requested_ref}"
-        elif git ls-remote --exit-code --heads https://github.com/eBay/HomeBlocks "${requested_ref}" >/dev/null 2>&1; then
+        elif git check-ref-format "refs/heads/${requested_ref}" && \
+             git ls-remote --exit-code --heads "${repo_url}" "${requested_ref}" >/dev/null 2>&1; then
           checkout_ref="${requested_ref}"
         else
-          echo "::warning::Requested branch '${requested_ref}' was not found in eBay/HomeBlocks; falling back to '${fallback_ref}'."
+          echo "::warning::Requested branch/ref '${requested_ref}' is invalid or was not found in ${{ github.repository }}; falling back to '${fallback_ref}'."
           checkout_ref="${fallback_ref}"
         fi
 
