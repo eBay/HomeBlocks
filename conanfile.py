@@ -44,7 +44,8 @@ class HomeBlocksConan(ConanFile):
             raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
 
     def build_requirements(self):
-        self.test_requires("gtest/1.17.0")
+        self.test_requires("gtest/[^1.17]")
+        self.test_requires("ublkpp/[^0.32]@oss/dev")
 
     def requirements(self):
         self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)

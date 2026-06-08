@@ -51,7 +51,6 @@ SISL_OPTION_GROUP(
     (qdepth, "", "qdepth", "Max outstanding operations", ::cxxopts::value< uint32_t >()->default_value("8"), "number"),
     (num_io_reactors, "", "num_io_reactors", "number of IO reactors",
      ::cxxopts::value< uint32_t >()->default_value("0"), "number"),
-    (spdk, "", "spdk", "spdk", ::cxxopts::value< bool >()->default_value("false"), "true or false"),
     (flip_list, "", "flip_list", "btree flip list", ::cxxopts::value< std::vector< std::string > >(), "flips [...]"),
     (use_file, "", "use_file", "use file instead of real drive", ::cxxopts::value< bool >()->default_value("false"),
      "true or false"),

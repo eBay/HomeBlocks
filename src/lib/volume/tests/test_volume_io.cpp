@@ -54,7 +54,7 @@ SISL_OPTION_GROUP(
     (read_verify, "", "read_verify", "Read and verify all data in long running tests",
      ::cxxopts::value< bool >()->default_value("false"), "true or false"));
 
-SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, homeblocks, config)
+SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_io_setup, config)
 SISL_LOGGING_DECL(test_volume_io)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
@@ -825,7 +825,7 @@ int main(int argc, char* argv[]) {
     }
 
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, homeblocks, config);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_io_setup, config);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 
     g_helper = std::make_unique< test_common::HBTestHelper >("test_volume_io", args, orig_argv);

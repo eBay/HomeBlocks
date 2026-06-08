@@ -31,6 +31,7 @@ and checkpoint machinery. The public surface is one header and a handful of coro
 - [Using HomeBlocks](#-using-homeblocks)
 - [Development](#%EF%B8%8F-development)
 - [Testing](#-testing)
+  - [Exercising a volume as a block device (ublk)](#exercising-a-volume-as-a-real-block-device-ublk)
 - [Dependencies](#-dependencies)
 - [License](#-license)
 
@@ -240,6 +241,65 @@ build/Debug/src/lib/volume/tests/test_volume_chunk_selector
 > Size test devices so the data/index **chunk size** fits — the defaults are large; pass
 > `--data_chunk_size_mb` / `--index_chunk_size_mb` for small backing files, otherwise the volume's chunk pool
 > comes up empty and `create_volume` fails.
+
+### Exercising a volume as a real block device (ublk)
+
+Beyond the gtest suite, `src/test/` ships a small adapter that exposes a HomeBlocks volume as a Linux
+[ublk](https://docs.kernel.org/block/ublk.html) device (`/dev/ublkbN`) — so you can point **standard block
+tooling** (`fio`, `dd`, `mkfs`, `mount`) straight at the data path. The `homeblk_ublk` CLI brings up an instance,
+creates (or recovers) a volume, and serves its I/O on HomeBlocks' iomgr reactors via
+[ublkpp](https://github.com/eBay/ublkpp). It is built as part of the normal test build (ublkpp is a
+`test_requires`), landing at `build/Debug/src/test/homeblk_ublk`.
+
+**Prerequisites:** a `ublk_drv`-capable kernel (≥ 5.19; `sudo modprobe ublk_drv` if `/dev/ublk-control` is
+missing) and **root** — the control device is root-only.
+
+```bash
+# Bring up HomeBlocks on a backing device and expose a 1 GiB volume.
+# --create_device makes the backing store a file of --dev_size_mb (handy for a quick try); omit it to use an
+# existing file or raw block device -- which HomeBlocks will FORMAT, destroying its current contents.
+sudo build/Debug/src/test/homeblk_ublk \
+  --device /var/tmp/hb.dev --create_device --dev_size_mb 8192 \
+  --vol_size_mb 1024 --data_chunk_size_mb 512 --index_chunk_size_mb 256 \
+  --num_threads 4 -c
+# -> prints "homeblocks volume exposed at: /dev/ublkbN" and stays running until Ctrl-C.
+```
+
+| Option | Meaning |
+|---|---|
+| `--device <path>[,...]` | HomeBlocks backing device(s). **Formatted on use — existing contents are destroyed.** |
+| `--create_device` / `--dev_size_mb` | Create the backing path(s) as files of the given size first. |
+| `--vol_id <uuid>` | Volume to expose — recovered if it already exists, else created (default: random). |
+| `--vol_size_mb` / `--page_size` | Volume size and logical block size (default 4096) when creating. |
+| `--num_threads` | HomeBlocks iomgr reactor count. |
+| `--data_chunk_size_mb` / `--index_chunk_size_mb` | HomeStore chunk sizing (see the note below). |
+| `--device_id <n>` | ublk device id: `-1` to assign one, `>=0` to recover a kernel-preserved device. |
+
+In another terminal, drive I/O at the printed device. All raw I/O is `O_DIRECT` with the volume's page size as
+the logical block size, so keep it block-aligned (`--direct=1 bs=4k`):
+
+```bash
+DEV=/dev/ublkbN
+
+# integrity: write + read-back CRC verify
+sudo fio --name=v --filename=$DEV --direct=1 --rw=randwrite --bs=4k --size=512M \
+  --ioengine=io_uring --iodepth=32 --verify=crc32c --verify_fatal=1
+
+# a real filesystem round-trip
+sudo mkfs.ext4 -F $DEV && sudo mount $DEV /mnt && sudo cp -r some/files /mnt && sudo umount /mnt
+```
+
+**Tear down** by `Ctrl-C`-ing `homeblk_ublk` — but **`umount` any filesystem first**: clean shutdown removes the
+ublk device, which blocks until it is unmounted. Volume data persists in the backing device; re-expose it later
+with the same `--vol_id` and **without** `--create_device`.
+
+> **Sizing matters for sustained writes.** HomeBlocks is copy-on-write, so sustained *random overwrite* churns
+> HomeStore's free-block allocator and checkpoint. Give the volume **many data chunks** (a smaller
+> `--data_chunk_size_mb` relative to the volume) and enough `--num_threads`, or per-chunk contention surfaces as
+> throughput dips and latency spikes. For a disk-free benchmark, back it with a ramdisk
+> (`sudo modprobe brd rd_nr=1 rd_size=$((12*1024*1024))` → `--device /dev/ram0`, no `--create_device`). One fio
+> gotcha: `--verify` with `--numjobs>1` over a *shared* range reports false mismatches (writers overwrite each
+> other's blocks) — give each job a disjoint `--offset_increment` region, or use a single writer.
 
 ## 📦 Dependencies
 

@@ -31,7 +31,7 @@ SISL_OPTION_GROUP(test_volume_setup,
                   (shutdown_timer_nsecs, "", "shutdown_timer_nsecs", "shutdown timer in seconds",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "seconds"));
 
-SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup, homeblocks)
+SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup)
 SISL_LOGGING_DECL(test_volume)
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
@@ -318,7 +318,7 @@ int main(int argc, char* argv[]) {
     }
 
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup, homeblocks);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 
     g_helper = std::make_unique< test_common::HBTestHelper >("test_volume", args, orig_argv);

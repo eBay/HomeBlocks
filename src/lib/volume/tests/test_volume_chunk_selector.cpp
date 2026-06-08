@@ -14,7 +14,7 @@ SISL_OPTION_GROUP(test_volume_chunk_selector,
                   (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
                    "number"));
 
-SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_chunk_selector, homeblocks)
+SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_chunk_selector)
 SISL_LOGGING_DECL(test_volume_chunk_selector)
 
 using namespace homeblocks;
@@ -235,7 +235,7 @@ TEST_F(ChunkSelectorTest, RecoverChunksTest) {
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_chunk_selector, homeblocks);
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_chunk_selector);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
     sisl::logging::SetLogger("test_volume_chunk_selector");
     sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");

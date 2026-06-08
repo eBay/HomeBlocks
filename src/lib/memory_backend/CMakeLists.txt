@@ -19,4 +19,4 @@ target_link_libraries(memory_test
     ${COMMON_TEST_DEPS}
     -rdynamic
 )
-add_test(NAME MemoryTestCPU COMMAND memory_test -csv error --executor cpu)
+add_test(NAME MemoryTestCPU COMMAND memory_test -csv error)

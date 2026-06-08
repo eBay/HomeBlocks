@@ -65,7 +65,7 @@ jobs:
 
   HomeStoreDeps:
     needs: [IOMgrDeps, NuraftMesgDeps]
-    uses: eBay/homestore/.github/workflows/build_dependencies.yml@stable/v7.x
+    uses: eBay/homestore/.github/workflows/build_dependencies.yml@dev/v8.x
     with:
       branch: stable/v7.x
       platform: ${{ inputs.platform }}
