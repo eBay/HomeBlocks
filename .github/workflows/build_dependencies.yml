@@ -112,6 +112,11 @@ jobs:
           checkout_ref="${fallback_ref}"
         fi
 
+        if [[ -z "${checkout_ref}" ]]; then
+          echo "::error::Unable to resolve a valid checkout ref."
+          exit 1
+        fi
+
         echo "checkout_ref=${checkout_ref}" >> "${GITHUB_OUTPUT}"
 
     - name: Retrieve Code
