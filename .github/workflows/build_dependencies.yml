@@ -99,7 +99,10 @@ jobs:
         fallback_ref="${{ github.ref }}"
         repo_url="${{ github.server_url }}/${{ github.repository }}"
 
-        if [[ "${requested_ref}" == refs/* ]] && git check-ref-format "${requested_ref}"; then
+        if [[ -z "${requested_ref}" ]]; then
+          echo "::warning::No branch/ref was provided; falling back to '${fallback_ref}'."
+          checkout_ref="${fallback_ref}"
+        elif [[ "${requested_ref}" == refs/* ]] && git check-ref-format "${requested_ref}"; then
           checkout_ref="${requested_ref}"
         elif git check-ref-format "refs/heads/${requested_ref}" && \
              git ls-remote --exit-code --heads "${repo_url}" "${requested_ref}" >/dev/null 2>&1; then
