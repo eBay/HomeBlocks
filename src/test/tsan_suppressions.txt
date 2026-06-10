@@ -1,0 +1,36 @@
+# TSAN suppressions for known false positives in homeblocks' dependency stack.
+#
+# All lock-order-inversions here are the GCC 13 coroutine resume mutex (an internal
+# unique_lock<mutex> inside coroutine_handle<>::resume()) interacting with sisl::when_all's
+# nested start_detached fan-out.  The same cycle (M0 = global coroutine mutex) appears in
+# every report; there is no homeblocks lock involved.
+#
+# All data races are stdexec / std::future / spdlog / sisl-metrics interactions whose
+# synchronization is invisible to TSAN.
+
+# --- lock-order-inversions ---------------------------------------------------
+
+# GCC 13 coroutine_handle::resume() internal mutex vs sisl::when_all nested scheduling
+deadlock:fan_run_one
+
+# --- data races --------------------------------------------------------------
+
+# GCC 13 std::future/_State_baseV2 state touched concurrently by stdexec completion
+race:std::__future_base::_State_baseV2
+race:std::promise
+
+# stdexec type-erased sender/scheduler storage (stdexec memory-model-correct, TSAN blind)
+race:exec::__any::__immovable_storage
+race:exec::__any::__rec::__ref
+race:exec::__any::__storage
+race:stdexec::inplace_stop
+
+# spdlog / fmtlib log buffer (iomgr synchronizes log-path, TSAN cannot track it)
+race:fmt::v12::basic_memory_buffer
+
+# sisl metrics global registry (sisl's registry mutex is not visible to TSAN)
+race:homeblocks::VolumeMetrics::VolumeMetrics
+
+# iomgr timer lambda registration — iomgr synchronizes these across the schedule/fire boundary
+race:homeblocks::HomeBlocksImpl::start_reaper_thread
+race:homeblocks::HomeBlocksImpl::shutdown_start

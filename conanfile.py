@@ -110,6 +110,9 @@ class HomeBlocksConan(ConanFile):
             jobs = self.conf.get("tools.build:jobs", default=3)
             env = Environment()
             env.define("CTEST_PARALLEL_LEVEL", str(jobs))
+            if self.options.get_safe("sanitize") == "thread":
+                suppression_file = join(self.source_folder, "src", "test", "tsan_suppressions.txt")
+                env.define("TSAN_OPTIONS", f"suppressions={suppression_file}:second_deadlock_stack=1")
             with env.vars(self).apply():
                 cmake.test()
 
