@@ -13,28 +13,55 @@
 # GCC 13 coroutine_handle::resume() internal mutex vs sisl::when_all nested scheduling
 deadlock:fan_run_one
 
+# iomgr/homestore internal mutex ordering during init — TSAN sees the homeblocks
+# call site but the mutexes are all iomgr-owned; false positive from test restarts
+# creating new HomeBlocksImpl instances (TSAN's lock-order graph persists across
+# object lifetimes and confuses mutexes from separate instances).
+deadlock:homeblocks::init_homeblocks
+
 # --- data races --------------------------------------------------------------
 
-# GCC 13 std::future/_State_baseV2 state touched concurrently by stdexec completion
+# GCC 13 std::future/_State_baseV2 state touched concurrently by stdexec completion.
+# Entries without wildcards: exact/substring match for short names.
+# Entries with wildcards: glob match for template-instantiated long names
+# (_M_ptr(), swap, _Sp_counted_base release, etc. all embed __future_base in args).
 race:std::__future_base::_State_baseV2
 race:std::promise
+race:*__future_base*
+race:*_Sp_counted_base*
 
-# stdexec type-erased sender/scheduler storage (stdexec memory-model-correct, TSAN blind)
+# stdexec type-erased sender/scheduler storage (stdexec memory-model-correct, TSAN blind).
+# Glob forms are required because TSAN matches against the full demangled name including
+# all template arguments (e.g. exec::__any::__immovable_storage<vtable, alloc, 48ul, ...>::__t).
 race:exec::__any::__immovable_storage
 race:exec::__any::__rec::__ref
 race:exec::__any::__storage
-race:stdexec::inplace_stop
+race:*exec::__any*
 
-# spdlog / fmtlib log buffer (iomgr synchronizes log-path, TSAN cannot track it)
+# stdexec stop-token (inplace_stop_source/token/callback — memory-model-correct, TSAN blind).
+# Glob form covers _Optional_payload_base<inplace_stop_callback<...>> and
+# __atomic_base<unsigned char>::load() triggered by inplace_stop_source destructor.
+race:stdexec::inplace_stop
+race:*inplace_stop*
+
+# spdlog / fmtlib log buffer (iomgr synchronizes log-path, TSAN cannot track it).
+# basic_memory_buffer and detail::buffer<char>::append are both spdlog formatting paths.
 race:fmt::v12::basic_memory_buffer
+race:*fmt::v12*
+
+# std::basic_string races inside spdlog formatting (same root cause as fmt races above).
+race:*basic_string*
 
 # sisl metrics global registry (sisl's registry mutex is not visible to TSAN)
 race:homeblocks::VolumeMetrics::VolumeMetrics
 
 # iomgr run_on_forget / _run_forget — lambda alloc vs free races across reactor handoff;
-# iomgr synchronizes the lifetime but the coroutine + reactor boundary is TSAN-opaque
+# iomgr synchronizes the lifetime but the coroutine + reactor boundary is TSAN-opaque.
+# operator new/delete appear at frame #0 when the lambda object straddles reactor handoff.
 race:run_on_forget
 race:iomgr::IOManager::_run_forget
+race:*tsan_new_delete*
+race:*_Function_base*
 
 # homestore BtreeNode concurrent access — node-level write lock is homestore-internal
 # and invisible to TSAN; no homeblocks lock involved
