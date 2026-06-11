@@ -31,6 +31,25 @@ race:fmt::v12::basic_memory_buffer
 # sisl metrics global registry (sisl's registry mutex is not visible to TSAN)
 race:homeblocks::VolumeMetrics::VolumeMetrics
 
-# iomgr timer lambda registration — iomgr synchronizes these across the schedule/fire boundary
-race:homeblocks::HomeBlocksImpl::start_reaper_thread
-race:homeblocks::HomeBlocksImpl::shutdown_start
+# iomgr run_on_forget / _run_forget — lambda alloc vs free races across reactor handoff;
+# iomgr synchronizes the lifetime but the coroutine + reactor boundary is TSAN-opaque
+race:run_on_forget
+race:iomgr::IOManager::_run_forget
+
+# homestore BtreeNode concurrent access — node-level write lock is homestore-internal
+# and invisible to TSAN; no homeblocks lock involved
+race:homestore::BtreeNode
+
+# homestore log group / replication journal — homestore-internal async dispatch;
+# synchronization across log_group.cpp and common.cpp is TSAN-opaque
+race:homestore::LogGroup::add_record
+race:homestore::repl_req_ctx::create_journal_entry
+
+# homestore IndexTable node read — same btree locking invisibility as BtreeNode above
+race:homestore::IndexTable
+
+# stdexec exec::__task move / await_transform (memory-model-correct, TSAN blind)
+race:exec::__task::basic_task
+
+# stdexec run_loop scheduler storage construction (memory-model-correct, TSAN blind)
+race:stdexec::__loop::run_loop

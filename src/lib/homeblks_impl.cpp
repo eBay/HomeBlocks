@@ -60,7 +60,7 @@ home_blocks_stats HomeBlocksImpl::get_stats() const {
 
 std::future< void > HomeBlocksImpl::shutdown_start() {
     LOGI("Setting shutdown start flag");
-    shutdown_started_ = true;
+    shutdown_started_.test_and_set();
 
     auto f = shutdown_promise_.get_future();
 

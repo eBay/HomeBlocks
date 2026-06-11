@@ -15,6 +15,7 @@
  *********************************************************************************/
 
 #pragma once
+#include <atomic>
 #include <future>
 #include <map>
 #include <string>
@@ -90,7 +91,7 @@ private:
     std::unique_ptr< sisl::IDReserver > ordinal_reserver_;
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
-    bool shutdown_started_{false};
+    std::atomic_flag shutdown_started_{};
     std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
 
     std::promise< void > shutdown_promise_;
@@ -150,7 +151,7 @@ public:
     bool fc_on() const;
     void exit_fc(volume_handle& vol);
     bool is_restricted() const { return is_restricted_.load(); }
-    bool is_shutting_down() const { return shutdown_started_; }
+    bool is_shutting_down() const { return shutdown_started_.test(); }
     hs_chunk_size_cfg_t get_chunk_size() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
 
