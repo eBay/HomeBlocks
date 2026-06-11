@@ -63,6 +63,14 @@ race:iomgr::IOManager::_run_forget
 race:*tsan_new_delete*
 race:*_Function_base*
 
+# iomgr file-descriptor reuse across test restarts: TSAN tracks fd numbers as a single
+# resource across their lifetime.  When fd N is closed in test 1 and the OS recycles N
+# for a different device in test 2, TSAN conflates the two.  iomgr joins all threads
+# before restarting (confirmed by "All IO threads have stopped" in the logs), so there
+# is no concurrent access — just fd-number aliasing between separate test cases.
+race:iomgr::IODevice::close
+race:iomgr::IOReactorEPoll::remove_iodev_impl
+
 # homestore BtreeNode concurrent access — node-level write lock is homestore-internal
 # and invisible to TSAN; no homeblocks lock involved
 race:homestore::BtreeNode
