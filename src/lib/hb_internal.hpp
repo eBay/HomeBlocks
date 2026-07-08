@@ -46,9 +46,6 @@ constexpr uint64_t Gi = Ki * Mi;
 
 namespace homeblocks {
 
-using lba_t = uint64_t;
-using lba_count_t = uint32_t;
-
 template < class T >
 using shared = std::shared_ptr< T >;
 template < class T >

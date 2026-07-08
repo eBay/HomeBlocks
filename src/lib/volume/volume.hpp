@@ -112,6 +112,11 @@ public:
     void on_gather();
 };
 
+// The CRAFT per-replica backend a memory-mode volume delegates its data plane to (defined in
+// craft/craft_replica.hpp; only src/lib/craft needs the full type, so a forward decl here keeps
+// volume.hpp free of that include). HomeStore-free.
+class craft_replica;
+
 class volume : public std::enable_shared_from_this< volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
@@ -181,6 +186,19 @@ public:
     volume& operator=(volume const& volume) = delete;
     volume& operator=(volume&& volume) = default;
 
+    // Tag + constructor for the in-memory CRAFT reference model (src/lib/craft/memory). Builds a
+    // HomeStore-free volume whose CRAFT data plane is served by `backend`; skips all HomeStore setup
+    // (no repl_dev / index table / superblk write / chunk selectors / metrics). rd() and the index
+    // paths must not be used on such a volume -- only the CRAFT free functions, which route to
+    // craft_backend().
+    struct mem_craft_tag {};
+    explicit volume(volume_info&& info, shared< craft_replica > backend, mem_craft_tag) :
+            sb_{VOL_META_NAME}, craft_backend_{std::move(backend)} {
+        vol_info_ =
+            std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        m_state_ = volume_state::ONLINE;
+    }
+
     virtual ~volume() = default;
 
     // static APIs exposed to HomeBlks Implementation Layer;
@@ -209,6 +227,10 @@ public:
     uint64_t ordinal() const { return vol_info_->ordinal; }
     std::string id_str() const { return boost::uuids::to_string(vol_info_->id); };
     const ReplDevPtr& rd() const { return rd_; }
+
+    // The CRAFT per-replica backend for a memory-mode volume (null for HomeStore-backed volumes).
+    // The CRAFT free functions in home_blocks.hpp route here.
+    craft_replica* craft_backend() const { return craft_backend_.get(); }
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -284,6 +306,7 @@ private:
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
     std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
+    shared< craft_replica > craft_backend_{nullptr}; // CRAFT per-replica backend (memory-mode volumes only)
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

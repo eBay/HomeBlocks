@@ -1,5 +1,9 @@
 cmake_minimum_required (VERSION 3.11)
 
+# These tests exercise the legacy byte-based async_read/async_write, now [[deprecated]] in favor of
+# the CRAFT overloads. Demote (not silence) the warning so it stays visible without failing -Werror.
+add_flags("-Wno-error=deprecated-declarations")
+
 add_executable(test_volume)
 target_sources(test_volume PRIVATE
     test_volume.cpp

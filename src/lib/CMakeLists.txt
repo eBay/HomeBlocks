@@ -27,8 +27,6 @@ settings_gen_cpp(
 	home_blks_config.fbs
   )
 
-#add_subdirectory(homestore_backend)
-#add_subdirectory(memory_backend)
 add_subdirectory(craft)
 add_subdirectory(volume)
 add_subdirectory(tests)

@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../hb_internal.hpp"
+#include "craft_replica.hpp" // internal CRAFT types (CraftPartitionState, JournalSlot) + the craft_replica interface
 #include <homestore/replication/repl_dev.hpp>
 
 #include <atomic>
@@ -25,44 +26,10 @@
 namespace homeblocks {
 
 // ─── wire-protocol types ──────────────────────────────────────────────────────
-
-// Network address of a replica returned by login().
-struct replica_endpoint {
-    peer_id_t   id;
-    std::string addr; // "host:port"
-};
-
-// Per-partition in-memory state. Authoritative in memory; recovered from
-// journal + superblock on restart.
-struct CraftPartitionState {
-    int64_t  commit_lsn      {-1}; // highest committed dLSN (applied to LBA index)
-    int64_t  last_append_lsn {-1}; // highest appended dLSN (may be uncommitted)
-    uint64_t client_token    {0};  // token from the last successful InternalLogin
-    uint64_t term            {0};  // current RAFT term
-};
-
-// Returned by get_lsns() / get_rs_commit_lsn().
-struct LSNPair {
-    int64_t commit_lsn;
-    int64_t last_append_lsn;
-};
-
-// Returned by login().
-struct LoginResult {
-    std::vector< replica_endpoint > members;
-    int64_t  dLSN; // starting LSN for new I/O
-    uint64_t term;
-};
-
-// One journal slot, returned by fetch_data(). is_empty == true means the LSN
-// never reached any replica and the data fields are invalid.
-struct JournalSlot {
-    int64_t     lsn;
-    bool        is_empty{false};
-    lba_t       lba{0};
-    lba_count_t len{0};
-    sisl::sg_list data;
-};
+//
+// replica_endpoint, CraftPartitionState, LSNPair, LoginResult, and JournalSlot are defined once in
+// <homeblks/craft_types.hpp> (HomeStore-free), pulled in via hb_internal.hpp, and shared by both
+// this production class and the in-memory reference model.
 
 // ─── journal backend abstraction ─────────────────────────────────────────────
 //

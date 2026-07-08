@@ -1,8 +1,9 @@
 cmake_minimum_required (VERSION 3.11)
 
 # Test-only ublk adapter. Relax pedantic/unused-parameter for the kernel UAPI headers (ublk_cmd.h,
-# ublksrv.h) pulled in transitively via ublkpp; keep -Werror/-Wall/-Wextra.
-add_flags("-Wno-pedantic -Wno-unused-parameter")
+# ublksrv.h) pulled in transitively via ublkpp; keep -Werror/-Wall/-Wextra. Demote (not silence) the
+# deprecation warning: homeblk_disk.cpp still calls the legacy async_read/async_write on purpose.
+add_flags("-Wno-pedantic -Wno-unused-parameter -Wno-error=deprecated-declarations")
 
 # ublkpp is a test_requires; if it isn't available (e.g. a tests-disabled build) skip the adapter+CLI.
 find_package(UblkPP QUIET)

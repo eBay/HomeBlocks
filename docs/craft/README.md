@@ -40,14 +40,18 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **InternalLogin** | A RAFT log entry type. On apply, stores the new `client_token` and enforces single-writer exclusivity. |
 | **Missing** | A dLSN slot that a replica knows about (from a peer or from the RAFT log) but has not yet received data for. |
 | **Empty** | A dLSN proven never quorum-durable, declared by the leader; a permanent no-op the commit skips. |
-| **all_zeros (zero write)** | A payload-free write naming just an LBA range (the WRITE_ZEROES / discard-to-zero op). Takes a dLSN and merges like any write; allocates nothing and unmaps its range on apply. |
+| **zero write (all_zeros)** | A payload-free write naming just a byte range (WRITE_ZEROES / discard-to-zero), signaled by an **empty `sisl::sg_list`** (no `all_zeros` flag). Takes a dLSN and merges like any write; allocates nothing and unmaps its range on apply, reading back as a hole. |
 | **hole** | A read sub-range with no data (never written, zero-written, or an all-zero region collapsed at read time). Returned as a marker, read as zeros; **not** the same as `Missing`. |
+| **client_hdr** | The session + watermark fields stamped on every client IO: `{term, commit_lsn, all_committed_lsn}` (see the commit note below). |
+| **lba_size** | The volume block size in bytes, returned by `login`; the client aligns every byte `addr`/`len` to it and presents the geometry to the filesystem. |
+| **io_extent** | One sub-range of a read's sparse layout, in **bytes**: `{addr, len, hole}` — carries no bytes (they are in the caller's buffer). |
 
 ## Key design properties
 
 - **Single writer**: only one client at a time owns a partition (enforced by `InternalLogin` RAFT entry).
 - **Leaderless data path**: after login, the RAFT leader has no special role for writes or reads.
-- **Client drives commit**: replicas apply to the index only when told (via `commit` / `keep_alive`), strictly in dLSN order at the contiguous frontier. Readability is per-write and does not wait: appended entries are served from the journal-tail overlay (no index write on the read path).
+- **Client drives commit (piggybacked, no standalone verb)**: the client stamps its `commit_lsn` on every write / read / keep_alive (`client_hdr`); replicas apply to the index strictly in dLSN order at the contiguous frontier. `keep_alive` is the dedicated carrier (commit + watchdog reset, term-fenced). Readability is per-write and does not wait: appended entries are served from the journal-tail overlay (no index write on the read path).
+- **Byte-based, one buffer type**: `addr`/`len` are byte offsets/lengths (block-aligned to `lba_size`); `sisl::sg_list` is the single caller-owned buffer both ways (an **empty** write buffer is a zero write). A read fills the caller's buffer in place and returns a sparse `io_extent` layout (data vs holes).
 - **Client-routed reads**: reads are unicast, chosen by LBA-overlap against the client's per-replica Missing map (plus `Synced ≥ L`, the login dLSN). The read path never fetches from a peer; fetch is resync-only.
 - **Merge key, not serialization**: overlapping writes need no ordering; highest dLSN per LBA wins on every replica.
 - **Thin from the start**: a write may be `all_zeros` (WRITE_ZEROES) with no payload; reads return sparse results (data extents + holes), and the server collapses all-zero reads to holes, so reads and resync stay thin. A hole is not `Missing`.
