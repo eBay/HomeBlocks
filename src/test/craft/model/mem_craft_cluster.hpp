@@ -56,36 +56,36 @@ public:
     status run_logout(MemCraftReplica* caller, uint64_t term);
 
     // ── membership / routing (consulted by the replicas' client-facing ops) ──
-    peer_id_t   leader() const;
-    bool        is_up(peer_id_t id) const;
-    bool        write_allowed(peer_id_t id) const; // false => this write is dropped (sub-quorum)
+    peer_id_t leader() const;
+    bool is_up(peer_id_t id) const;
+    bool write_allowed(peer_id_t id) const; // false => this write is dropped (sub-quorum)
     std::size_t member_count() const { return members_.size(); }
 
     // ── fault injection (tests / CLI) ──
-    void set_up(peer_id_t id, bool up);                    // bring a replica down / back up
-    void force_subquorum(std::vector< peer_id_t > keep);   // subsequent writes land ONLY on `keep`
+    void set_up(peer_id_t id, bool up);                  // bring a replica down / back up
+    void force_subquorum(std::vector< peer_id_t > keep); // subsequent writes land ONLY on `keep`
     void clear_faults();
     void set_leader(peer_id_t id);
 
 private:
     std::vector< MemCraftReplica* > live_replicas_locked() const; // requires mu_ held
-    static std::size_t              quorum(std::size_t n) { return n / 2 + 1; }
+    static std::size_t quorum(std::size_t n) { return n / 2 + 1; }
 
-    std::vector< replica_endpoint >                                   members_;
-    std::unordered_map< peer_id_t, MemCraftReplica*, uuid_hash >      by_id_;
-    peer_id_t                                                         leader_{};
-    uint64_t                                                          term_{0};
-    uint32_t                                                          lba_size_{0}; // volume block size (bytes)
-    std::unordered_set< peer_id_t, uuid_hash >                        down_;
-    std::optional< std::unordered_set< peer_id_t, uuid_hash > >       write_keep_;
-    mutable std::mutex                                                mu_;
+    std::vector< replica_endpoint > members_;
+    std::unordered_map< peer_id_t, MemCraftReplica*, uuid_hash > by_id_;
+    peer_id_t leader_{};
+    uint64_t term_{0};
+    uint32_t lba_size_{0}; // volume block size (bytes)
+    std::unordered_set< peer_id_t, uuid_hash > down_;
+    std::optional< std::unordered_set< peer_id_t, uuid_hash > > write_keep_;
+    mutable std::mutex mu_;
 };
 
 // An N-replica in-process group with NO volumes attached -- the model layer used directly by unit
 // tests (and the core of make_memory_replica_set, which additionally wraps each replica in a
 // volume_handle). HomeStore-free.
 struct MemReplicaGroup {
-    std::shared_ptr< MemTransport >                   net;
+    std::shared_ptr< MemTransport > net;
     std::vector< std::shared_ptr< MemCraftReplica > > replicas; // index 0 is the default leader
 };
 MemReplicaGroup make_mem_replica_group(volume_id_t vol_id, uint32_t n = 3, uint32_t page_size = 4096);

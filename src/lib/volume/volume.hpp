@@ -194,8 +194,7 @@ public:
     struct mem_craft_tag {};
     explicit volume(volume_info&& info, shared< craft_replica > backend, mem_craft_tag) :
             sb_{VOL_META_NAME}, craft_backend_{std::move(backend)} {
-        vol_info_ =
-            std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        vol_info_ = std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
         m_state_ = volume_state::ONLINE;
     }
 

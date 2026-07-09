@@ -35,21 +35,21 @@ namespace homeblocks {
 // Per-partition CRAFT state (internal to a replica implementation). Authoritative in memory; the
 // production impl recovers it from the journal + superblock on restart (the reference model does not).
 struct CraftPartitionState {
-    int64_t  commit_lsn      {-1}; // contiguous committed prefix (== Synced)
-    int64_t  last_append_lsn {-1}; // highest appended dLSN (may be uncommitted)
-    uint64_t client_token    {0};  // token from the last successful InternalLogin
-    uint64_t term            {0};  // current session term
+    int64_t commit_lsn{-1};      // contiguous committed prefix (== Synced)
+    int64_t last_append_lsn{-1}; // highest appended dLSN (may be uncommitted)
+    uint64_t client_token{0};    // token from the last successful InternalLogin
+    uint64_t term{0};            // current session term
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; not client-facing). Four-way:
 // data (is_empty=false, all_zeros=false), zero write (all_zeros=true, no data), Empty (is_empty=true),
 // or omitted from the response (not-present-here).
 struct JournalSlot {
-    int64_t       lsn{-1};
-    bool          is_empty{false};
-    bool          all_zeros{false};
-    lba_t         lba{0};
-    lba_count_t   len{0};
+    int64_t lsn{-1};
+    bool is_empty{false};
+    bool all_zeros{false};
+    lba_t lba{0};
+    lba_count_t len{0};
     sisl::sg_list data{};
 };
 
@@ -79,8 +79,8 @@ public:
     // caller-owned `dest` buffer in place (scatter-gather; data sub-ranges get bytes, holes get zeros) and
     // returns the sparse layout (data vs holes). Advances the frontier to hdr.commit_lsn. STALE_TERM on
     // term mismatch.
-    virtual async_result< std::vector< io_extent > > read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
-                                                          uint64_t len, sisl::sg_list dest) = 0;
+    virtual async_result< std::vector< io_extent > > read(client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
+                                                          sisl::sg_list dest) = 0;
 
     // Advance the frontier toward hdr.commit_lsn + reset the client-liveness watchdog -- which is WHY
     // it is term-fenced: a stale client must not be able to keep the session alive. Returns the

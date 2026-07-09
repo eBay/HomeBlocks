@@ -40,7 +40,7 @@ using lba_count_t = uint32_t;
 // Network address of a replica, as returned in login()'s member list.
 struct replica_endpoint {
     boost::uuids::uuid id; // == peer_id_t
-    std::string        addr; // "host:port"
+    std::string addr;      // "host:port"
 };
 
 // {commit_lsn, last_append_lsn} snapshot -- returned by get_lsns() / keep_alive().
@@ -60,8 +60,8 @@ struct LSNPair {
 //  - all_committed_lsn: the client-computed set-wide min commit_lsn; floors journal reclaim. -1 = unknown.
 struct client_hdr {
     uint64_t term{0};
-    int64_t  commit_lsn{-1};
-    int64_t  all_committed_lsn{-1};
+    int64_t commit_lsn{-1};
+    int64_t all_committed_lsn{-1};
 };
 
 // Returned by login(): the replica set, the starting dLSN for new I/O, the session term, and the block
@@ -73,10 +73,10 @@ struct client_hdr {
 // finds the matching handle by id and retries login there. `term > 0` always means a successful login.
 struct LoginResult {
     std::vector< replica_endpoint > members;
-    int64_t            dLSN{-1};        // starting (per-partition) LSN for new I/O
-    uint64_t           term{0};         // 0 == NOT_LEADER redirect; >0 == session term
-    uint32_t           lba_size{0};     // block size in bytes (alignment unit for addr/len)
-    boost::uuids::uuid leader_hint{};   // non-nil iff this is a redirect (term==0); retry login there
+    int64_t dLSN{-1};                 // starting (per-partition) LSN for new I/O
+    uint64_t term{0};                 // 0 == NOT_LEADER redirect; >0 == session term
+    uint32_t lba_size{0};             // block size in bytes (alignment unit for addr/len)
+    boost::uuids::uuid leader_hint{}; // non-nil iff this is a redirect (term==0); retry login there
 };
 
 // One sub-range of a contiguous IO's sparse layout, in BYTES: a data extent (hole=false) or a hole
@@ -87,7 +87,7 @@ struct LoginResult {
 struct io_extent {
     uint64_t addr{0}; // byte offset into the volume
     uint64_t len{0};  // byte length
-    bool     hole{false};
+    bool hole{false};
 };
 
 // CRAFT-specific failures, registered as a std::error_condition enum (mirrors volume_error) so they
@@ -104,9 +104,7 @@ ENUM(craft_error, uint16_t,
 class craft_error_category : public std::error_category {
 public:
     const char* name() const noexcept override { return "homeblocks.craft"; }
-    std::string message(int ev) const override {
-        return std::string{enum_name(static_cast< craft_error >(ev))};
-    }
+    std::string message(int ev) const override { return std::string{enum_name(static_cast< craft_error >(ev))}; }
 };
 inline std::error_category const& craft_error_category_inst() noexcept {
     static craft_error_category inst;

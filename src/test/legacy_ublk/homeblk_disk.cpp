@@ -54,8 +54,7 @@ static async_status run_hb_io(volume_handle vol, uint64_t addr, sisl::sg_list sg
         LOGWARN("homeblk_disk: direct msg_ring post returned {}; retrying via a worker reactor", r);
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [queue_ring_fd, state_ud, result]() {
             if (auto const r2 = iomanager.post_msg_ring(queue_ring_fd, state_ud, result); r2 != 0) {
-                LOGERROR("homeblk_disk: msg_ring post failed on worker reactor ({}); IO {:#x} may stall", r2,
-                         state_ud);
+                LOGERROR("homeblk_disk: msg_ring post failed on worker reactor ({}); IO {:#x} may stall", r2, state_ud);
             }
         });
     }

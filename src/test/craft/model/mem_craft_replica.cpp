@@ -59,8 +59,7 @@ async_status MemCraftReplica::logout(client_hdr hdr) {
     }
     co_return net_ ? net_->run_logout(this, hdr.term) : ok();
 }
-async_status MemCraftReplica::write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                                    sisl::sg_list data) {
+async_status MemCraftReplica::write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) {
     co_return do_write(hdr, dlsn, addr, len, std::move(data));
 }
 async_result< std::vector< io_extent > > MemCraftReplica::read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
@@ -77,8 +76,7 @@ async_status MemCraftReplica::truncate(int64_t lsn) { co_return do_truncate(lsn)
 
 // ── synchronous cores ──
 
-status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                                 sisl::sg_list data) {
+status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) {
     if (net_ && !net_->is_up(ep_.id)) return fail(craft_error::REPLICA_DOWN);
     if (net_ && !net_->write_allowed(ep_.id)) return fail(craft_error::REPLICA_DOWN); // sub-quorum drop
     // byte-based API: addr/len must be block-aligned (the model works in page_size blocks internally).
@@ -94,9 +92,7 @@ status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, ui
     slot.len = static_cast< lba_count_t >(len / page_size_); // byte length -> block count
     slot.all_zeros = (data.size == 0); // empty sg_list => zero write (WRITE_ZEROES); no all_zeros flag
     if (!slot.all_zeros) {
-        if (data.size != len) {
-            return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
-        }
+        if (data.size != len) { return std::unexpected(std::make_error_condition(std::errc::invalid_argument)); }
         slot.bytes = own_bytes(data); // own_bytes iterates all iovecs
     }
     journal_[dlsn] = std::move(slot);
@@ -106,15 +102,13 @@ status MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint64_t addr, ui
 }
 
 result< std::vector< io_extent > > MemCraftReplica::do_read(client_hdr hdr, int64_t read_lsn, uint64_t addr,
-                                                           uint64_t len, sisl::sg_list dest) {
+                                                            uint64_t len, sisl::sg_list dest) {
     if (net_ && !net_->is_up(ep_.id)) return fail(craft_error::REPLICA_DOWN);
     // byte-based API: addr/len block-aligned; dest is a single contiguous buffer covering [addr,addr+len)
     if (addr % page_size_ != 0 || len % page_size_ != 0 || len == 0) {
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
     }
-    if (dest.size < len) {
-        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
-    }
+    if (dest.size < len) { return std::unexpected(std::make_error_condition(std::errc::invalid_argument)); }
     std::lock_guard< std::mutex > g{mu_};
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
     apply_up_to(hdr.commit_lsn); // piggybacked commit: advance the frontier opportunistically
@@ -207,7 +201,7 @@ MemCraftReplica::MemJournalSlot const* MemCraftReplica::highest_slot_le(lba_t x,
 
 std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, uint64_t len,
                                                      sisl::sg_list const& dest) {
-    lba_t const       lba0 = addr / page_size_;
+    lba_t const lba0 = addr / page_size_;
     lba_count_t const nblk = static_cast< lba_count_t >(len / page_size_);
     std::vector< io_extent > layout;
 
@@ -216,9 +210,9 @@ std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, u
     auto sg_write = [&](uint8_t const* src, std::size_t n) {
         while (n > 0 && iov_idx < dest.iovs.size()) {
             auto const& iov = dest.iovs[iov_idx];
-            std::size_t avail    = iov.iov_len - iov_off;
+            std::size_t avail = iov.iov_len - iov_off;
             std::size_t to_write = std::min(n, avail);
-            auto*       dst      = static_cast< uint8_t* >(iov.iov_base) + iov_off;
+            auto* dst = static_cast< uint8_t* >(iov.iov_base) + iov_off;
             if (src) {
                 std::memcpy(dst, src, to_write);
                 src += to_write;
@@ -227,7 +221,10 @@ std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, u
             }
             n -= to_write;
             iov_off += to_write;
-            if (iov_off == iov.iov_len) { ++iov_idx; iov_off = 0; }
+            if (iov_off == iov.iov_len) {
+                ++iov_idx;
+                iov_off = 0;
+            }
         }
     };
 

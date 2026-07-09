@@ -28,6 +28,7 @@ target_link_libraries(${PROJECT_NAME}_craft_mem PRIVATE ${COMMON_DEPS})
 add_library(craft_client OBJECT)
 target_sources(craft_client PRIVATE
     client/craft_client.cpp
+    client/dlsn_tracker.cpp
 )
 target_link_libraries(craft_client ${COMMON_DEPS})
 
@@ -53,6 +54,25 @@ target_include_directories(test_craft_memory SYSTEM PRIVATE
     $<TARGET_PROPERTY:iomgr::iomgr,INTERFACE_INCLUDE_DIRECTORIES>
 )
 add_test(NAME CraftMemoryModelTest COMMAND test_craft_memory)
+
+# dLSN tracker unit test: drives reserve/resolve directly (no replicas, no model), so every branch of the
+# read-horizon rule is deterministic. Like test_craft_memory it links WITHOUT homestore::homestore.
+add_executable(test_craft_dlsn_tracker)
+target_sources(test_craft_dlsn_tracker PRIVATE
+    tests/test_dlsn_tracker.cpp
+    tests/craft_test_main.cpp
+    client/dlsn_tracker.cpp
+)
+target_link_libraries(test_craft_dlsn_tracker
+    sisl::sisl
+    GTest::gmock
+    -rdynamic
+)
+target_include_directories(test_craft_dlsn_tracker SYSTEM PRIVATE
+    $<TARGET_PROPERTY:homestore::homestore,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:iomgr::iomgr,INTERFACE_INCLUDE_DIRECTORIES>
+)
+add_test(NAME CraftDlsnTrackerTest COMMAND test_craft_dlsn_tracker)
 
 # End-to-end test: drives the model through the PUBLIC volume_handle API via create_memory_volume. This
 # one DOES link HomeStore (through libhomeblocks + volume). mem_craft_volume.cpp is compiled directly

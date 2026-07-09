@@ -97,11 +97,14 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
     // Drive the cold path WITHOUT holding mu_ (each replica call takes only its own lock).
     // Phase 1: GetRSCommitLSN -> rs_commit_lsn = max(quorum.last_append_lsn).
     int64_t rs = -1;
-    for (auto* r : live) rs = std::max(rs, r->peek_lsns().last_append_lsn);
+    for (auto* r : live)
+        rs = std::max(rs, r->peek_lsns().last_append_lsn);
     // Phase 2: SyncRSCommitLSN(rs) applied to all live members.
-    for (auto* r : live) r->cold_apply_sync(rs, client_token);
+    for (auto* r : live)
+        r->cold_apply_sync(rs, client_token);
     // Phase 3: InternalLogin(token, term+1) applied to all live members.
-    for (auto* r : live) r->cold_apply_login(client_token, nt);
+    for (auto* r : live)
+        r->cold_apply_login(client_token, nt);
     // Phase 4: truncate any stale tail above rs.
     for (auto* r : live) {
         if (r->peek_lsns().last_append_lsn > rs) r->cold_truncate_above(rs);
@@ -118,7 +121,8 @@ status MemTransport::run_logout(MemCraftReplica* caller, uint64_t term) {
         live = live_replicas_locked();
     }
     // InternalLogout: clear the session on all live replicas. Term was already checked by the caller.
-    for (auto* r : live) r->cold_apply_logout();
+    for (auto* r : live)
+        r->cold_apply_logout();
     return ok();
 }
 

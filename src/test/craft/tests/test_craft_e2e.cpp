@@ -29,7 +29,7 @@
 
 #include <homeblks/home_blocks.hpp>
 
-#include "coro_helpers.hpp"
+#include "craft_test_util.hpp"
 #include "model/mem_craft_volume.hpp"
 
 // libhomeblocks defines the `homeblocks` log module in homeblks_impl.o, but this test never odr-uses
@@ -41,26 +41,10 @@ SISL_OPTIONS_ENABLE(logging)
 
 using namespace homeblocks;
 
+using namespace homeblocks::craft::test;
+
 namespace {
-constexpr uint32_t PAGE = 512;
 constexpr uint64_t TOKEN = 0xABCDEFULL;
-
-constexpr uint64_t blk(uint64_t n) { return n * uint64_t{PAGE}; } // block index/count -> byte offset/length
-
-// The per-IO client header: session term + commit watermark to piggyback (-1 = don't advance).
-client_hdr chdr(uint64_t term, int64_t commit = -1) { return client_hdr{term, commit, -1}; }
-
-template < class T >
-auto rg(T&& t) {
-    return detail::sync_get(std::forward< T >(t));
-}
-sisl::sg_list one_iov(std::vector< uint8_t >& b) {
-    sisl::sg_list s;
-    s.size = b.size();
-    s.iovs.push_back(iovec{b.data(), b.size()});
-    return s;
-}
-std::vector< uint8_t > page_of(uint8_t f) { return std::vector< uint8_t >(PAGE, f); }
 
 volume_info mk_info() {
     volume_info vi;
@@ -112,8 +96,8 @@ TEST(CraftMemE2E, LoginOnFollowerReturnsLeaderHint) {
     auto set = craft::make_memory_replica_set(mk_info(), 3);
     auto lr = rg(login(set.handles[1], TOKEN));
     ASSERT_TRUE(lr.has_value());
-    EXPECT_EQ(lr->term, 0u);                             // term==0 signals redirect
-    EXPECT_EQ(lr->leader_hint, set.net->leader());       // hint points at the current leader
+    EXPECT_EQ(lr->term, 0u);                       // term==0 signals redirect
+    EXPECT_EQ(lr->leader_hint, set.net->leader()); // hint points at the current leader
 }
 
 // a zero write (empty buffer) reads back as a hole through the public API.

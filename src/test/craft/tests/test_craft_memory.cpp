@@ -32,45 +32,27 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <gtest/gtest.h>
 
-#include "coro_helpers.hpp"
+#include "craft_test_util.hpp"
 #include "model/mem_craft_cluster.hpp"
 
 using namespace homeblocks;
 using namespace homeblocks::craft;
 
-namespace {
-constexpr uint32_t PAGE = 512;
-constexpr uint64_t TOKEN = 0xC0FFEEULL;
-constexpr int64_t  NO_COMMIT = -1; // commit_lsn sentinel: don't advance the frontier
+using namespace homeblocks::craft::test;
 
-constexpr uint64_t blk(uint64_t n) { return n * uint64_t{PAGE}; } // block index/count -> byte offset/length
+namespace {
+constexpr uint64_t TOKEN = 0xC0FFEEULL;
+constexpr int64_t NO_COMMIT = -1; // commit_lsn sentinel: don't advance the frontier
 
 volume_id_t new_vol() { return boost::uuids::random_generator()(); }
-
-// The per-IO client header: session term + the commit watermark to piggyback (-1 = don't advance).
-client_hdr chdr(uint64_t term, int64_t commit = NO_COMMIT) { return client_hdr{term, commit, /*all_committed*/ -1}; }
-
-// A one-iovec sg_list over `buf` (which must outlive the call).
-sisl::sg_list one_iov(std::vector< uint8_t >& buf) {
-    sisl::sg_list s;
-    s.size = buf.size();
-    s.iovs.push_back(iovec{buf.data(), buf.size()});
-    return s;
-}
-std::vector< uint8_t > page_of(uint8_t fill, uint32_t n = PAGE) { return std::vector< uint8_t >(n, fill); }
-
-template < class Task >
-auto rg(Task&& t) {
-    return detail::sync_get(std::forward< Task >(t));
-}
 
 // Read `nblk` blocks starting at block `lba`, at horizon H (optionally piggybacking commit), into a
 // fresh dest buffer pre-filled with 0xEE (so a hole read proves the model actually zeroed it).
 struct read_out {
-    bool                     ok{false};
-    std::error_condition     err{};
+    bool ok{false};
+    std::error_condition err{};
     std::vector< io_extent > layout; // which byte sub-ranges were data vs holes
-    std::vector< uint8_t >   data;    // the filled dest buffer
+    std::vector< uint8_t > data;     // the filled dest buffer
 };
 read_out rd(MemCraftReplica& r, uint64_t term, int64_t H, uint64_t lba, uint64_t nblk, int64_t commit = NO_COMMIT) {
     std::vector< uint8_t > dest(nblk * PAGE, 0xEE);
@@ -103,8 +85,8 @@ TEST(CraftMemModel, LoginOnFollowerReturnsLeaderHint) {
     auto g = make_mem_replica_group(new_vol(), 3, PAGE);
     auto lr = rg(g.replicas[1]->login(TOKEN));
     ASSERT_TRUE(lr.has_value());
-    EXPECT_EQ(lr->term, 0u);                             // term==0 signals redirect
-    EXPECT_EQ(lr->leader_hint, g.replicas[0]->id());     // replica 0 is the default leader
+    EXPECT_EQ(lr->term, 0u);                         // term==0 signals redirect
+    EXPECT_EQ(lr->leader_hint, g.replicas[0]->id()); // replica 0 is the default leader
 }
 
 // 2. broadcast a write, advance the frontier via keep_alive, read it back.
@@ -240,8 +222,9 @@ TEST(CraftMemModel, CommitPiggybacksOnWrite) {
     auto [term, dl] = login_ok(g);
     auto& r = *g.replicas[0];
     auto b0 = page_of(0x11), b1 = page_of(0x22);
-    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(5), blk(1), one_iov(b0))).has_value());              // no commit yet
-    ASSERT_TRUE(rg(r.write(chdr(term, /*commit_lsn*/ 0), 1, blk(6), blk(1), one_iov(b1))).has_value()); // rides commit 0
+    ASSERT_TRUE(rg(r.write(chdr(term), 0, blk(5), blk(1), one_iov(b0))).has_value()); // no commit yet
+    ASSERT_TRUE(
+        rg(r.write(chdr(term, /*commit_lsn*/ 0), 1, blk(6), blk(1), one_iov(b1))).has_value()); // rides commit 0
 
     auto ls = rg(r.get_lsns());
     ASSERT_TRUE(ls.has_value());

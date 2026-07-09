@@ -45,20 +45,21 @@
 #include "craft_client.hpp"
 #include "coro_helpers.hpp" // homeblocks::detail::sync_get
 
-SISL_OPTION_GROUP(
-    craft_ublk,
-    (vol_id, "", "vol_id", "Volume UUID to expose (random if unset)", ::cxxopts::value< std::string >(), "<uuid>"),
-    (vol_size_mb, "", "vol_size_mb", "Volume size in MB", ::cxxopts::value< uint64_t >()->default_value("1024"),
-     "<mb>"),
-    (page_size, "", "page_size", "Volume logical block / page size in bytes",
-     ::cxxopts::value< uint32_t >()->default_value("4096"), "<bytes>"),
-    (replicas, "", "replicas", "Number of in-memory CRAFT replicas in the set",
-     ::cxxopts::value< uint32_t >()->default_value("1"), "<n>"),
-    (max_io_size_mb, "", "max_io_size_mb", "Largest single transfer in MB",
-     ::cxxopts::value< uint32_t >()->default_value("1"), "<mb>"),
-    (num_threads, "", "num_threads", "iomgr reactor count", ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
-    (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
-     ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
+SISL_OPTION_GROUP(craft_ublk,
+                  (vol_id, "", "vol_id", "Volume UUID to expose (random if unset)", ::cxxopts::value< std::string >(),
+                   "<uuid>"),
+                  (vol_size_mb, "", "vol_size_mb", "Volume size in MB",
+                   ::cxxopts::value< uint64_t >()->default_value("1024"), "<mb>"),
+                  (page_size, "", "page_size", "Volume logical block / page size in bytes",
+                   ::cxxopts::value< uint32_t >()->default_value("4096"), "<bytes>"),
+                  (replicas, "", "replicas", "Number of in-memory CRAFT replicas in the set",
+                   ::cxxopts::value< uint32_t >()->default_value("1"), "<n>"),
+                  (max_io_size_mb, "", "max_io_size_mb", "Largest single transfer in MB",
+                   ::cxxopts::value< uint32_t >()->default_value("1"), "<mb>"),
+                  (num_threads, "", "num_threads", "iomgr reactor count",
+                   ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
+                  (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
+                   ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
 
 // `homeblocks` is a logging module. The in-memory model + public API live in libhomeblocks, but we never
 // call init_homeblocks (no HomeStore), so the static archive does not pull in the module's definition --
@@ -134,8 +135,12 @@ int main(int argc, char* argv[]) {
         info.name = fmt::format("craft_{}", boost::uuids::to_string(vid).substr(0, 8));
         info.repl_mode = replication_mode::CRAFT;
 
+        // ublk's outstanding-IO bound (one tag per in-flight IO) sizes the client's shadow-scan tripwire.
+        auto const max_inflight = static_cast< uint32_t >(SISL_OPTIONS["nr_hw_queues"].as< uint16_t >()) *
+            static_cast< uint32_t >(SISL_OPTIONS["qdepth"].as< uint16_t >());
+
         auto set = craft::make_memory_replica_set(std::move(info), replicas);
-        auto client = std::make_shared< craft::craft_client >(std::move(set.handles));
+        auto client = std::make_shared< craft::craft_client >(std::move(set.handles), 0, max_inflight);
 
         auto login_res = detail::sync_get(client->login(random_token()));
         if (!login_res) {
@@ -143,8 +148,7 @@ int main(int argc, char* argv[]) {
             iomanager.stop();
             return EIO;
         }
-        LOGINFO("CRAFT login ok: {} replica(s), term={}, lba_size={}", replicas, client->term(),
-                client->lba_size());
+        LOGINFO("CRAFT login ok: {} replica(s), term={}, lba_size={}", replicas, client->term(), client->lba_size());
 
         auto disk = std::make_shared< ublk::CraftUblkDisk >(client, vid, capacity, page_size, max_tx);
         auto run = ublkpp::ublkpp_tgt::run(vid, std::move(disk), SISL_OPTIONS["device_id"].as< int32_t >());

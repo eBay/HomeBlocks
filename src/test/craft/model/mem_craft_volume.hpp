@@ -43,8 +43,8 @@ volume_handle create_memory_volume(volume_info info, std::shared_ptr< MemCraftRe
 // independently. This helper is just a harness loop over create_memory_volume (orchestration, outside
 // the CRAFT protocol); `info` supplies the volume id / page_size / size.
 struct MemReplicaHandles {
-    std::vector< volume_handle >    handles; // one per replica device; the client drives each separately
-    std::shared_ptr< MemTransport > net;     // in-process network + cold path + faults (no production analog)
+    std::vector< volume_handle > handles; // one per replica device; the client drives each separately
+    std::shared_ptr< MemTransport > net;  // in-process network + cold path + faults (no production analog)
 };
 MemReplicaHandles make_memory_replica_set(volume_info info, uint32_t n = 3);
 

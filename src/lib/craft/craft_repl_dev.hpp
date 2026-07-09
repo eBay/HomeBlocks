@@ -39,10 +39,9 @@ namespace homeblocks {
 
 class CraftJournalBackend {
 public:
-    virtual async_status             write_slot(int64_t lsn, lba_t lba, lba_count_t len,
-                                                sisl::sg_list data) = 0;
-    virtual async_result<JournalSlot> read_slot(int64_t lsn) = 0;
-    virtual async_status             truncate_to(int64_t lsn) = 0;
+    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data) = 0;
+    virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
+    virtual async_status truncate_to(int64_t lsn) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -64,14 +63,12 @@ public:
 
     // Append data to the journal at the client-assigned LSN slot. Zero-copy;
     // does NOT apply data to the LBA index.
-    async_status write(uint64_t term, int64_t lsn,
-                       lba_t lba, lba_count_t len, sisl::sg_list data);
+    async_status write(uint64_t term, int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data);
 
     // read_lsn is the horizon H: serve the latest version <= H for the range,
     // from the LBA index if applied or from the journal-tail overlay if only
     // Appended (no index write on the read path). Never fetches from a peer.
-    async_result< sisl::sg_list > read(uint64_t term, int64_t read_lsn,
-                                       lba_t lba, lba_count_t len);
+    async_result< sisl::sg_list > read(uint64_t term, int64_t read_lsn, lba_t lba, lba_count_t len);
 
     // Advance the contiguous commit watermark toward lsn: apply present entries
     // strictly in dLSN order (skip Empty), reclaim superseded blocks. Best-effort:
@@ -119,34 +116,35 @@ private:
 
         // ── no-ops ────────────────────────────────────────────────────────
         bool on_pre_commit(int64_t, const sisl::blob&, const sisl::blob&,
-                           cintrusive< homestore::repl_req_ctx >&) override { return true; }
+                           cintrusive< homestore::repl_req_ctx >&) override {
+            return true;
+        }
         void on_error(homestore::ReplServiceError, const sisl::blob&, const sisl::blob&,
                       cintrusive< homestore::repl_req_ctx >&) override {}
         homestore::result< homestore::blk_alloc_hints >
-        get_blk_alloc_hints(sisl::blob const&, uint32_t,
-                            cintrusive< homestore::repl_req_ctx >&) override {
+        get_blk_alloc_hints(sisl::blob const&, uint32_t, cintrusive< homestore::repl_req_ctx >&) override {
             return homestore::blk_alloc_hints{};
         }
         void on_destroy(const homestore::group_id_t&) override {}
         void on_start_replace_member(const std::string&, const homestore::replica_member_info&,
-                                     const homestore::replica_member_info&,
-                                     homestore::trace_id_t) override {}
+                                     const homestore::replica_member_info&, homestore::trace_id_t) override {}
         void on_complete_replace_member(const std::string&, const homestore::replica_member_info&,
-                                        const homestore::replica_member_info&,
-                                        homestore::trace_id_t) override {}
+                                        const homestore::replica_member_info&, homestore::trace_id_t) override {}
         void on_clean_replace_member_task(const std::string&, const homestore::replica_member_info&,
-                                          const homestore::replica_member_info&,
-                                          homestore::trace_id_t) override {}
+                                          const homestore::replica_member_info&, homestore::trace_id_t) override {}
         void on_remove_member(const homestore::replica_id_t&, homestore::trace_id_t) override {}
         void on_rollback(int64_t, const sisl::blob&, const sisl::blob&,
                          cintrusive< homestore::repl_req_ctx >&) override {}
         void on_restart() override {}
-        homestore::async_status
-        create_snapshot(std::shared_ptr< homestore::snapshot_context >) override { co_return homestore::ok(); }
+        homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context >) override {
+            co_return homestore::ok();
+        }
         bool apply_snapshot(std::shared_ptr< homestore::snapshot_context >) override { return true; }
         std::shared_ptr< homestore::snapshot_context > last_snapshot() override { return nullptr; }
-        int  read_snapshot_obj(std::shared_ptr< homestore::snapshot_context >,
-                               std::shared_ptr< homestore::snapshot_obj >) override { return 0; }
+        int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context >,
+                              std::shared_ptr< homestore::snapshot_obj >) override {
+            return 0;
+        }
         void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context >,
                                 std::shared_ptr< homestore::snapshot_obj >) override {}
         void free_user_snp_ctx(void*&) override {}
@@ -162,14 +160,14 @@ private:
     void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
-    volume_id_t                  vol_id_;
+    volume_id_t vol_id_;
     unique< CraftJournalBackend > journal_;
-    CraftPartitionState          state_;
-    std::set< int64_t >          missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    std::mutex                   missing_mu_;
-    bool                         login_in_progress_{false};
-    std::mutex                   login_mu_;
-    CraftRaftListener            raft_listener_;
+    CraftPartitionState state_;
+    std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
+    std::mutex missing_mu_;
+    bool login_in_progress_{false};
+    std::mutex login_mu_;
+    CraftRaftListener raft_listener_;
 };
 
 } // namespace homeblocks

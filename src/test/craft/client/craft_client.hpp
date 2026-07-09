@@ -14,43 +14,39 @@
  *********************************************************************************/
 #pragma once
 
-// craft_client: a minimal reference CRAFT client over the PUBLIC volume_handle API. It owns the
-// client-side CRAFT work -- assign a per-partition dLSN to each write, broadcast the write to every
-// replica handle, tally quorum, advance the commit frontier, and route reads at a horizon. It is built
-// for N replicas and exercised here at n=1 (a single in-memory replica), where quorum is 1 so every ack
-// commits.
+// craft_client: a reference CRAFT client over the PUBLIC volume_handle API -- assign a per-partition dLSN
+// to each write, broadcast it, tally quorum, advance the commit frontier, pick a safe horizon per read.
 //
-// It is deliberately transport-agnostic: it calls ONLY the public free functions (login / async_write /
-// async_read / keep_alive) against volume_handles, never the model internals. That is the whole point --
-// today the CLI hands it in-memory handles (make_memory_replica_set); the plan is to later hand it
-// network-shim handles that marshal the same calls to a remote server. Swapping the handle is the only
-// change; this client and the ublk driver above it do not move. So this is the real client, not throwaway.
+// It calls ONLY the public free functions (login / async_write / async_read / keep_alive) against
+// volume_handles, never the model internals, so swapping in a network shim is the only change needed.
+// All dLSN bookkeeping lives in dlsn_tracker. See README.md.
 
-#include <atomic>
 #include <cstdint>
-#include <mutex>
-#include <set>
+#include <optional>
+#include <system_error>
 #include <vector>
 
 #include <homeblks/home_blocks.hpp>
+
+#include "dlsn_tracker.hpp"
 
 namespace homeblocks::craft {
 
 class craft_client {
 public:
-    // One volume_handle per replica device (index `leader` is the login target / the only member at n=1).
-    explicit craft_client(std::vector< volume_handle > replicas, uint32_t leader = 0);
+    // One volume_handle per replica device. `leader` is where login is attempted first. `max_inflight` is
+    // the caller's IO concurrency bound; it only sizes the tracker's winner-scan tripwire.
+    explicit craft_client(std::vector< volume_handle > replicas, uint32_t leader = 0, uint32_t max_inflight = 128);
 
-    // Establish the session against the leader; stores term / lba_size and seeds the dLSN counter.
-    // Resolves to an error if login fails or (unexpectedly at n=1) redirects to another leader.
+    // Establish the session, following NOT_LEADER redirects.
     async_status login(uint64_t client_token);
 
-    // Broadcast a write to all replicas at a fresh dLSN; commit advances once quorum acks. Empty `data`
-    // (size 0) is a zero write. Resolves to the byte count written, or the first replica error / NO_QUORUM.
+    // Broadcast a write at a fresh dLSN; commit advances once quorum acks. Empty `data` is a zero write.
+    // A sub-quorum write leaves its slot unresolved, which pins the commit frontier -- as CRAFT requires.
     async_result< size_t > write(uint64_t addr, uint64_t len, sisl::sg_list data);
 
-    // Unicast read at horizon H = highest acked dLSN. Fills `dest` in place (data bytes; holes -> zeros).
-    // Resolves to the byte count (the sparse layout is consumed here; the caller's buffer is fully filled).
+    // Fills `dest` in place (data bytes; holes -> zeros) and resolves to the byte count. Splits into
+    // parallel sub-reads when blocks in the range need different horizons.
     async_result< size_t > read(uint64_t addr, uint64_t len, sisl::sg_list dest);
 
     // The dedicated commit carrier: advance the leader's frontier + reset its watchdog (keep_alive).
@@ -58,26 +54,28 @@ public:
 
     uint32_t lba_size() const { return lba_size_; }
     uint64_t term() const { return term_; }
-    int64_t  commit_lsn() const { return commit_.load(std::memory_order_acquire); }
-    int64_t  read_horizon() const { return highest_acked_.load(std::memory_order_acquire); }
+    int64_t commit_lsn() const { return tracker_.frontier(); }
+    int64_t read_horizon() const { return tracker_.read_horizon(); }
+    // Test hook: how many reads paid for the per-block winner pass.
+    uint64_t winner_scans() const { return tracker_.winner_scans(); }
 
 private:
-    client_hdr  make_hdr() const;   // {term_, commit_frontier, commit_frontier}
-    void        on_acked(int64_t dlsn); // record a quorum-acked dLSN -> advance frontier + read horizon
+    // The set-wide min commit_lsn floors journal reclaim on every replica. Our own frontier is an UPPER
+    // bound on it, never the min, so sending that would let a replica reclaim journal a lagging peer still
+    // needs. -1 (unknown) until a broadcast keep_alive can compute the real minimum.
+    static constexpr int64_t k_all_committed_unknown = -1;
+
+    client_hdr make_hdr() const;
     std::size_t quorum() const { return replicas_.size() / 2 + 1; }
+    // The two guards every IO opens with; nullopt means the IO may proceed.
+    std::optional< std::error_condition > precheck(uint64_t addr, uint64_t len) const;
 
     std::vector< volume_handle > replicas_;
-    uint32_t                     leader_{0};
-    uint64_t                     term_{0};
-    uint32_t                     lba_size_{0};
+    uint32_t leader_{0};
+    uint64_t term_{0};
+    uint32_t lba_size_{0};
 
-    std::atomic< int64_t > next_dlsn_{0};      // next dLSN to assign (seeded from login dLSN + 1)
-    std::atomic< int64_t > highest_acked_{-1}; // read horizon: highest quorum-acked dLSN
-    std::atomic< int64_t > commit_{-1};        // contiguous committed frontier (lock-free mirror of frontier_)
-
-    mutable std::mutex  mu_;
-    std::set< int64_t > acked_pending_; // acked dLSNs not yet folded into the contiguous frontier
-    int64_t             frontier_{-1};  // contiguous acked prefix (guarded by mu_)
+    dlsn_tracker tracker_;
 };
 
 } // namespace homeblocks::craft

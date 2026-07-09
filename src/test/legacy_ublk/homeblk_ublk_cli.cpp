@@ -42,30 +42,29 @@
 #include "homeblk_disk.hpp"
 #include "coro_helpers.hpp" // homeblocks::detail::sync_get
 
-SISL_OPTION_GROUP(
-    homeblk_ublk,
-    (vol_id, "", "vol_id", "Volume UUID to expose (recovered if it exists, else created)",
-     ::cxxopts::value< std::string >(), "<uuid>"),
-    (vol_size_mb, "", "vol_size_mb", "Volume size in MB (when creating)",
-     ::cxxopts::value< uint64_t >()->default_value("1024"), "<mb>"),
-    (page_size, "", "page_size", "Volume logical block / page size in bytes",
-     ::cxxopts::value< uint32_t >()->default_value("4096"), "<bytes>"),
-    (device, "", "device", "homeblocks backing device(s)", ::cxxopts::value< std::vector< std::string > >(),
-     "<path>[,<path>...]"),
-    (create_device, "", "create_device", "Create the backing device(s) as files of --dev_size_mb",
-     ::cxxopts::value< bool >()->default_value("false"), ""),
-    (dev_size_mb, "", "dev_size_mb", "Size of each created backing file in MB",
-     ::cxxopts::value< uint64_t >()->default_value("8192"), "<mb>"),
-    (num_threads, "", "num_threads", "homeblocks iomgr reactor count",
-     ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
-    (app_mem_size_mb, "", "app_mem_size_mb", "homeblocks memory budget in MB",
-     ::cxxopts::value< uint64_t >()->default_value("4096"), "<mb>"),
-    (data_chunk_size_mb, "", "data_chunk_size_mb", "homeblocks data chunk size in MB (for small devices)",
-     ::cxxopts::value< uint32_t >(), "<mb>"),
-    (index_chunk_size_mb, "", "index_chunk_size_mb", "homeblocks index chunk size in MB (for small devices)",
-     ::cxxopts::value< uint32_t >(), "<mb>"),
-    (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
-     ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
+SISL_OPTION_GROUP(homeblk_ublk,
+                  (vol_id, "", "vol_id", "Volume UUID to expose (recovered if it exists, else created)",
+                   ::cxxopts::value< std::string >(), "<uuid>"),
+                  (vol_size_mb, "", "vol_size_mb", "Volume size in MB (when creating)",
+                   ::cxxopts::value< uint64_t >()->default_value("1024"), "<mb>"),
+                  (page_size, "", "page_size", "Volume logical block / page size in bytes",
+                   ::cxxopts::value< uint32_t >()->default_value("4096"), "<bytes>"),
+                  (device, "", "device", "homeblocks backing device(s)",
+                   ::cxxopts::value< std::vector< std::string > >(), "<path>[,<path>...]"),
+                  (create_device, "", "create_device", "Create the backing device(s) as files of --dev_size_mb",
+                   ::cxxopts::value< bool >()->default_value("false"), ""),
+                  (dev_size_mb, "", "dev_size_mb", "Size of each created backing file in MB",
+                   ::cxxopts::value< uint64_t >()->default_value("8192"), "<mb>"),
+                  (num_threads, "", "num_threads", "homeblocks iomgr reactor count",
+                   ::cxxopts::value< uint32_t >()->default_value("2"), "<n>"),
+                  (app_mem_size_mb, "", "app_mem_size_mb", "homeblocks memory budget in MB",
+                   ::cxxopts::value< uint64_t >()->default_value("4096"), "<mb>"),
+                  (data_chunk_size_mb, "", "data_chunk_size_mb", "homeblocks data chunk size in MB (for small devices)",
+                   ::cxxopts::value< uint32_t >(), "<mb>"),
+                  (index_chunk_size_mb, "", "index_chunk_size_mb",
+                   "homeblocks index chunk size in MB (for small devices)", ::cxxopts::value< uint32_t >(), "<mb>"),
+                  (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
+                   ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
 
 // `homeblocks` is a logging module (SISL_LOGGING_INIT below), NOT an options group, so it does not
 // appear here. homeblocks reads its tunables (data/index_chunk_size_mb) out of the homeblk_ublk group.

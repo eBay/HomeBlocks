@@ -111,8 +111,7 @@ struct volume_info {
     auto operator==(volume_info const& rhs) const { return id == rhs.id; }
     std::string to_string() const {
         return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={}",
-                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal,
-                           enum_name(repl_mode));
+                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode));
     }
 };
 
@@ -186,9 +185,8 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // zeros -- and returns the sparse layout (which byte sub-ranges were data vs holes; the thin/hole info).
 // Served from the index or the journal-tail overlay; never fetches from a peer. Advances the frontier to
 // hdr.commit_lsn (piggybacked commit). std::errc::invalid_argument if addr/len are misaligned.
-[[nodiscard]] async_result< std::vector< io_extent > > async_read(volume_handle const& vol, client_hdr hdr,
-                                                                  int64_t read_lsn, uint64_t addr, uint64_t len,
-                                                                  sisl::sg_list dest);
+[[nodiscard]] async_result< std::vector< io_extent > >
+async_read(volume_handle const& vol, client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest);
 
 // Advance the frontier toward hdr.commit_lsn (best-effort; stalls below the first hole) and reset the
 // client-liveness watchdog (hence it is term-fenced). hdr.all_committed_lsn floors journal reclaim.

@@ -43,8 +43,8 @@ static constexpr uint32_t k_sector_shift = 9;
 // by value so they live in the coroutine frame (a worker-reactor closure's captures would dangle across awaits).
 static async_status run_craft_io(std::shared_ptr< craft::craft_client > client, bool is_read, uint64_t addr,
                                  uint64_t len, sisl::sg_list sgs, int queue_ring_fd, uint64_t state_ud) {
-    auto const res = is_read ? co_await client->read(addr, len, std::move(sgs))
-                             : co_await client->write(addr, len, std::move(sgs));
+    auto const res =
+        is_read ? co_await client->read(addr, len, std::move(sgs)) : co_await client->write(addr, len, std::move(sgs));
     int result;
     if (res.has_value()) {
         result = static_cast< int >(res.value());
@@ -104,8 +104,8 @@ CraftUblkDisk::CraftUblkDisk(std::shared_ptr< craft::craft_client > client, volu
     // cut (the op is also rejected defensively in async_iov). TODO: thin zero-write mapping.
     p.types &= ~UBLK_PARAM_TYPE_DISCARD;
 
-    LOGINFO("CraftUblkDisk [vol={}] sectors={} lbs={} max_sectors={} term={}", _id_str, p.basic.dev_sectors,
-            page_size, p.basic.max_sectors, _client->term());
+    LOGINFO("CraftUblkDisk [vol={}] sectors={} lbs={} max_sectors={} term={}", _id_str, p.basic.dev_sectors, page_size,
+            p.basic.max_sectors, _client->term());
 }
 
 CraftUblkDisk::~CraftUblkDisk() = default;
@@ -146,10 +146,15 @@ ublkpp::disk_task< int > CraftUblkDisk::async_iov(ublksrv_queue const* q, ublk_i
 
     // Launch the CRAFT client op ON a worker reactor -- it co_awaits the public CRAFT API (async storage /
     // network completions run on reactors), then posts its result straight back to THIS queue's ring.
-    iomanager.run_on_forget(iomgr::reactor_regex::random_worker,
-                            [client = _client, is_read, addr, len, sgs = std::move(sgs), queue_ring_fd, state_ud]() {
-                                detail::detach(run_craft_io(client, is_read, addr, len, sgs, queue_ring_fd, state_ud));
-                            });
+    // `mutable` + move: run_on_forget invokes this exactly once, and run_craft_io takes both by value (a
+    // reference would dangle across its awaits), so moving out of the captures leaves exactly one sg_list
+    // and one shared_ptr ref per IO instead of two.
+    iomanager.run_on_forget(
+        iomgr::reactor_regex::random_worker,
+        [client = _client, is_read, addr, len, sgs = std::move(sgs), queue_ring_fd, state_ud]() mutable {
+            detail::detach(
+                run_craft_io(std::move(client), is_read, addr, len, std::move(sgs), queue_ring_fd, state_ud));
+        });
 
     co_return co_await *state;
 }
