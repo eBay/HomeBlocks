@@ -54,6 +54,7 @@ class HomeBlocksConan(ConanFile):
         self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)
         self.requires("iomgr/[^13.0]@oss/dev", transitive_headers=True)
         self.requires("sisl/[^14.6]@oss/dev", transitive_headers=True)
+        self.requires("craft_client/0.1.0@oss/dev", transitive_headers=True) # the extracted CRAFT wire + client + reference
 
     def validate(self):
         if self.info.settings.compiler.cppstd:

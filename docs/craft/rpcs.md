@@ -188,9 +188,9 @@ The transport layer for NubloxProto RPCs is decided by the **CRAFT-1 spike** (SD
 dependency). `CraftConnector` is transport-agnostic: it will dispatch via whatever channel CRAFT-1
 selects (likely gRPC or a custom framing over TCP). Server-to-server RPCs use the same transport.
 
-During development, before CRAFT-1 lands, the calls are exercised in-process: the
-[in-memory reference model](../../src/test/craft/model/) implements the same per-replica surface
-(`craft_replica`) behind a `volume_handle`, with `MemTransport` standing in for the network. It is a
+During development, before CRAFT-1 lands, the calls are exercised in-process: the in-memory reference
+model in the `craft_client` package (`craft::MemCraftReplica`, `<craft/mem/cluster.hpp>`) implements the
+same per-replica surface (`craft_replica`), with `craft::MemTransport` standing in for the network. It is a
 stand-in, not a shortcut. It serializes each request at issue, and it completes every reply on one of the
 addressed replica's own server threads, never inline with the submit, so the client is exercised against
 the execution model a real transport will impose: replies arrive on a foreign thread, out of order, and a

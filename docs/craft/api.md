@@ -1,12 +1,17 @@
 # HomeBlocks CRAFT C++ API
 
-The CRAFT client-facing surface is a set of **free functions over a `volume_handle`** in the public
-header `home_blocks.hpp` (parallel to the existing `async_read`/`async_write` block ops, which are now
-`[[deprecated]]`). **One `volume_handle` == one replica device**: in production each is a different
-server; the client holds one handle per member and does the CRAFT work itself (assign `dLSN`,
-broadcast the write to every member, tally quorum, route the read to one member). The calls dispatch
-through an internal per-replica interface, `craft_replica`, which both the production `CraftReplDev`
-and the in-memory reference model (`src/test/craft/model/`) implement independently.
+The CRAFT surface HomeBlocks declares is a set of **free functions over a `volume_handle`** in the
+public header `home_blocks.hpp` (parallel to the legacy `async_read`/`async_write` block ops, now
+`[[deprecated]]`). **One `volume_handle` == one replica device**: these are the CRAFT ops issued against
+a SINGLE replica (login, the client-assigned write, the horizon read, the commit carrier), dispatched
+through the per-replica interface `craft_replica` -- implemented by the homestore-backed `CraftReplDev`.
+
+The CRAFT *client* that assigns each write its `dLSN`, broadcasts to every member, tallies quorum, and
+routes reads now lives in the standalone **`craft_client`** package (namespace `craft`), decoupled from
+`volume_handle` and driving `craft::craft_replica` backends directly; its ublk driver is in **`ublkpp`**
+(`craft_disk`) and its in-memory reference model + reference server in `craft_client`. So these free
+functions are HomeBlocks' *declaration* of the per-replica surface: until a `CraftReplDev` backend is
+wired to a volume they have no backend and return `std::errc::not_supported`.
 
 All methods are async/coroutine-style (`async_result<T>` / `async_status`) matching the existing
 HomeBlocks convention.
@@ -59,8 +64,8 @@ struct CraftPartitionState {
 };
 ```
 
-Authoritative in memory; recovered from the journal + superblock on restart (the reference model does
-not persist it).
+Authoritative in memory; recovered from the journal + superblock on restart (the in-memory reference
+model, now in `craft_client`, does not persist it).
 
 ---
 
@@ -141,7 +146,7 @@ the old client fail with `craft_error::STALE_TERM`. Returns `craft_error::NOT_LE
 ### `keep_alive`
 
 ```cpp
-async_result<LSNPair> keep_alive(volume_handle const& vol, client_hdr hdr);
+async_result<lsn_pair> keep_alive(volume_handle const& vol, client_hdr hdr);
 ```
 
 The dedicated carrier for CRAFT's commit: advance the contiguous commit watermark toward
@@ -167,8 +172,8 @@ These are on the `craft_replica` backend, not the public client surface.
 ### `get_lsns` / `get_rs_commit_lsn`
 
 ```cpp
-async_result<LSNPair> get_lsns();           // local snapshot of {commit_lsn, last_append_lsn}
-async_result<LSNPair> get_rs_commit_lsn();  // alias; used by the login leader's GetRSCommitLSN broadcast
+async_result<lsn_pair> get_lsns();           // local snapshot of {commit_lsn, last_append_lsn}
+async_result<lsn_pair> get_rs_commit_lsn();  // alias; used by the login leader's GetRSCommitLSN broadcast
 ```
 
 Peer-to-peer; not a client-facing free function. The login leader polls all replicas via
@@ -213,8 +218,7 @@ The CRAFT free functions supersede the legacy byte block ops (now `[[deprecated]
 | — | `login`, `keep_alive` (commit carrier), `get_lsns` |
 
 The commit watermark rides on these calls (`client_hdr::commit_lsn`); there is no separate `commit`
-call. Each handle is **one replica device**, never an aggregate / "whole volume" handle: the client
-holds one handle per member and advances their commits independently (just like the protocol). A handle
-comes from `create_volume` per server in production, or per-replica `create_memory_volume` for the
-in-memory reference model (`make_memory_replica_set` is a test harness that loops it and wires the
-in-process fabric).
+call. Each handle is **one replica device**, never an aggregate / "whole volume" handle. A handle comes
+from `create_volume` (production, once a homestore `CraftReplDev` backend is wired to it). The in-memory
+reference model that used to back a handle in-process moved to the `craft_client` package
+(`craft::MemCraftReplica`), so there is no in-tree memory volume here anymore.

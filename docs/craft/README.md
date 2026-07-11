@@ -19,8 +19,8 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | [protocol.md](protocol.md) | Pointer to the canonical [CRAFT Design](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design) wiki page |
 | [api.md](api.md) | HomeBlocks C++ CRAFT API (`CraftReplDev` methods) |
 | [rpcs.md](rpcs.md) | All 8 RPCs (client↔server and server↔server) |
-| [wire.md](wire.md) | On-wire byte encoding of the client RPCs (transport-agnostic message + TCP binding) |
-| [transport.md](transport.md) | TCP transport binding behavior: lifecycle, admission/auth, deadlines, reconnect |
+| wire.md | On-wire byte encoding of the client RPCs — **moved to the `craft_client` repo** (`docs/wire.md`), which now owns the wire protocol. |
+| transport.md | TCP transport binding behavior — **moved to the `craft_client` repo** (`docs/transport.md`). |
 | [states.md](states.md) | Pointer to the canonical wiki page (slot states, read eligibility) |
 | [subtasks.md](subtasks.md) | Implementation sub-task breakdown (SDSTOR-22382 children) |
 

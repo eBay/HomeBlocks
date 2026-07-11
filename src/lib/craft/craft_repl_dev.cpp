@@ -25,17 +25,17 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
 // ─── get_lsns / get_rs_commit_lsn ────────────────────────────────────────────
 // These are real: they just snapshot the in-memory partition state.
 
-async_result< LSNPair > CraftReplDev::get_lsns(volume_id_t /* vol_id */) {
-    co_return LSNPair{state_.commit_lsn, state_.last_append_lsn};
+async_result< craft::lsn_pair > CraftReplDev::get_lsns(volume_id_t /* vol_id */) {
+    co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
 
-async_result< LSNPair > CraftReplDev::get_rs_commit_lsn() {
-    co_return LSNPair{state_.commit_lsn, state_.last_append_lsn};
+async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn() {
+    co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
 
 // ─── stubs (S2–S7 will implement these) ──────────────────────────────────────
 
-async_result< LoginResult > CraftReplDev::login(uint64_t /* client_token */, volume_id_t /* vol_id */) {
+async_result< craft::LoginResult > CraftReplDev::login(uint64_t /* client_token */, volume_id_t /* vol_id */) {
     LOGW("CraftReplDev::login not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
@@ -52,12 +52,12 @@ async_result< sisl::sg_list > CraftReplDev::read(uint64_t /* term */, int64_t /*
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< LSNPair > CraftReplDev::commit(uint64_t /* term */, int64_t /* lsn */) {
+async_result< craft::lsn_pair > CraftReplDev::commit(uint64_t /* term */, int64_t /* lsn */) {
     LOGW("CraftReplDev::commit not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< LSNPair > CraftReplDev::keep_alive(int64_t /* commit_lsn */, int64_t /* all_committed_lsn */) {
+async_result< craft::lsn_pair > CraftReplDev::keep_alive(int64_t /* commit_lsn */, int64_t /* all_committed_lsn */) {
     LOGW("CraftReplDev::keep_alive not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }

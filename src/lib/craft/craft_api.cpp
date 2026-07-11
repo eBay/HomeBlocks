@@ -31,33 +31,34 @@ craft_replica* craft_backend_of(volume_handle const& v) { return v ? v->craft_ba
 auto no_craft_backend() { return std::unexpected(std::make_error_condition(std::errc::not_supported)); }
 } // namespace
 
-async_result< LoginResult > login(volume_handle const& vol, uint64_t client_token) {
+async_result< craft::LoginResult > login(volume_handle const& vol, uint64_t client_token) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->login(client_token);
 }
 
-async_status logout(volume_handle const& vol, client_hdr hdr) {
+async_status logout(volume_handle const& vol, craft::client_hdr hdr) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->logout(hdr);
 }
 
-async_status async_write(volume_handle const& vol, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+async_status async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                          sisl::sg_list data) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->write(hdr, dlsn, addr, len, std::move(data));
 }
 
-async_result< std::vector< io_extent > > async_read(volume_handle const& vol, client_hdr hdr, int64_t read_lsn,
-                                                    uint64_t addr, uint64_t len, sisl::sg_list dest) {
+async_result< std::vector< craft::io_extent > > async_read(volume_handle const& vol, craft::client_hdr hdr,
+                                                           int64_t read_lsn, uint64_t addr, uint64_t len,
+                                                           sisl::sg_list dest) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->read(hdr, read_lsn, addr, len, std::move(dest));
 }
 
-async_result< LSNPair > keep_alive(volume_handle const& vol, client_hdr hdr) {
+async_result< craft::lsn_pair > keep_alive(volume_handle const& vol, craft::client_hdr hdr) {
     auto* b = craft_backend_of(vol);
     if (!b) co_return no_craft_backend();
     co_return co_await b->keep_alive(hdr);

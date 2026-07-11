@@ -36,7 +36,7 @@
 #include <sisl/utility/enum.hpp>
 #include <homestore/error.hpp> // result / async_result / status / ok
 
-#include <homeblks/craft_types.hpp> // client-facing CRAFT types (LoginResult, LSNPair, io_extent, client_hdr, craft_error); HomeStore-free
+#include <craft/types.hpp> // the CRAFT client-facing vocab, used qualified: craft::LoginResult / client_hdr / io_extent / lsn_pair / craft_error (HomeStore-free)
 
 // Declares the homeblocks logging module so consumers can wire its log level into their own logging init. The
 // per-call LOG* shorthand macros are internal (lib/hb_internal.hpp) and intentionally not exposed here.
@@ -156,28 +156,28 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // The calls a CRAFT client issues against ONE replica. The client owns the CRAFT work: it assigns a
 // per-partition dLSN to each write, broadcasts async_write to every member itself, tallies quorum,
 // and routes async_read (carrying the horizon `read_lsn` = H) to one eligible member. The handle
-// comes from create_volume (production, later) or create_memory_volume (the in-memory reference
-// model in src/test/craft/model). Unlike the byte-based legacy API above, these are LBA-based and
-// carry the session `term` and client-assigned `dLSN` / `read_lsn` that CRAFT defines. Errors ride
-// craft_error (e.g. STALE_TERM, NOT_LEADER). See docs/craft/api.md and the CRAFT-Design wiki.
-// Note: login() returns a LoginResult redirect (term==0) on NOT_LEADER, not a craft_error.
+// comes from create_volume (production, once a homestore CRAFT backend is wired). Like the legacy API
+// above these are byte-based (addr/len are absolute bytes, block-aligned to lba_size), but they carry the
+// session `term` and client-assigned `dLSN` / `read_lsn` that CRAFT defines. Errors ride
+// craft::craft_error (e.g. STALE_TERM, NOT_LEADER). See docs/craft/api.md and the CRAFT-Design wiki.
+// Note: login() returns a craft::LoginResult redirect (term==0) on NOT_LEADER, not a craft::craft_error.
 
 // Establishes the session; returns members, starting dLSN, and term. A follower returns a redirect
-// LoginResult (term==0, leader_hint set) -- not an error -- so the client can retry the right replica.
+// craft::LoginResult (term==0, leader_hint set) -- not an error -- so the client can retry the right replica.
 // Other failures (NO_QUORUM, REPLICA_DOWN) are returned as errors.
-[[nodiscard]] async_result< LoginResult > login(volume_handle const& vol, uint64_t client_token);
+[[nodiscard]] async_result< craft::LoginResult > login(volume_handle const& vol, uint64_t client_token);
 
 // Explicit session teardown. Term-fenced; leader propagates InternalLogout to all live replicas so
 // subsequent IOs from the old client fail with STALE_TERM. Returns NOT_LEADER on a follower.
-[[nodiscard]] async_status logout(volume_handle const& vol, client_hdr hdr);
+[[nodiscard]] async_status logout(volume_handle const& vol, craft::client_hdr hdr);
 
 // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length and must be
-// aligned to the volume's lba_size (from LoginResult), else std::errc::invalid_argument. `data` is a
+// aligned to the volume's lba_size (from craft::LoginResult), else std::errc::invalid_argument. `data` is a
 // caller-owned (iomgr) buffer: EMPTY data (size 0) is a zero write (WRITE_ZEROES / unmap; reads back as
 // a hole); non-empty data is a data write of exactly `len` bytes -- so the empty buffer, not a flag,
 // signals a zero write. Not applied to the index directly; `hdr.commit_lsn` rides along and advances the
 // frontier best-effort in dLSN order (CRAFT's piggybacked commit). STALE_TERM if hdr.term != session term.
-[[nodiscard]] async_status async_write(volume_handle const& vol, client_hdr hdr, int64_t dlsn, uint64_t addr,
+[[nodiscard]] async_status async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn, uint64_t addr,
                                        uint64_t len, sisl::sg_list data);
 
 // Read the latest version <= `read_lsn` (horizon H) for [addr, addr+len) (BYTE offset/length, aligned to
@@ -185,14 +185,16 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // zeros -- and returns the sparse layout (which byte sub-ranges were data vs holes; the thin/hole info).
 // Served from the index or the journal-tail overlay; never fetches from a peer. Advances the frontier to
 // hdr.commit_lsn (piggybacked commit). std::errc::invalid_argument if addr/len are misaligned.
-[[nodiscard]] async_result< std::vector< io_extent > >
-async_read(volume_handle const& vol, client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest);
+[[nodiscard]] async_result< std::vector< craft::io_extent > > async_read(volume_handle const& vol,
+                                                                         craft::client_hdr hdr, int64_t read_lsn,
+                                                                         uint64_t addr, uint64_t len,
+                                                                         sisl::sg_list dest);
 
 // Advance the frontier toward hdr.commit_lsn (best-effort; stalls below the first hole) and reset the
 // client-liveness watchdog (hence it is term-fenced). hdr.all_committed_lsn floors journal reclaim.
 // Returns the achieved {commit_lsn, last_append_lsn}. The dedicated commit carrier; write/read piggyback
 // it too, so there is no standalone commit() verb.
-[[nodiscard]] async_result< LSNPair > keep_alive(volume_handle const& vol, client_hdr hdr);
+[[nodiscard]] async_result< craft::lsn_pair > keep_alive(volume_handle const& vol, craft::client_hdr hdr);
 
 // ============================================= home_blocks =============================================
 

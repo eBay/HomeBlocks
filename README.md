@@ -135,7 +135,6 @@ HomeBlocks/
 │   ├── hb_internal.hpp          # internal prelude (LOG* macros, size constants, aliases) -- not installed
 │   └── tests/                   # gtest unit + I/O tests
 ├── src/test/
-│   ├── craft/                   # CRAFT reference client + its ublk driver, and the in-memory replica model
 │   └── legacy_ublk/             # homeblk_ublk, over the deprecated block API
 └── conanfile.py
 ```
@@ -349,18 +348,14 @@ with the same `--vol_id` and **without** `--create_device`.
 > gotcha: `--verify` with `--numjobs>1` over a *shared* range reports false mismatches (writers overwrite each
 > other's blocks) -- give each job a disjoint `--offset_increment` region, or use a single writer.
 
-#### `craft_ublk`: the same trick for CRAFT
+#### CRAFT over ublk via ublkpp
 
-`homeblk_ublk` drives a volume through the block API. A sibling CLI, `craft_ublk`
-(`build/Debug/src/test/craft/craft_ublk`), drives one through the **CRAFT** API instead -- login,
-dLSN-stamped broadcast writes, horizon reads -- against an N-replica set that lives entirely in process.
-It needs no backing device and no HomeStore, so `sudo craft_ublk --replicas 3` is enough to point `fio` at a
-quorum-replicated volume and watch the commit frontier advance over its REST endpoint.
-
-It exists to validate the client and its I/O path, not to measure anything: the in-process replica set stands in
-for a network, and its throughput is a property of that stand-in rather than of CRAFT. See
-[`src/test/craft/client/README.md`](src/test/craft/client/README.md) for the driver, the client, and what a real
-transport will have to provide.
+`homeblk_ublk` drives a volume through the block API. Driving one through the **CRAFT** API instead --
+login, dLSN-stamped broadcast writes, horizon reads, against a quorum-replicated volume -- now lives
+outside this repo: it is [ublkpp](https://github.com/eBay/ublkpp)'s `craft_disk` driver, built on the
+standalone [craft_client](https://github.com/szmyd/craft_client) package. craft_client also ships a
+reference replica server (`craft_reference_tcp_srv`) to drive it against. The CRAFT reference client, wire
+codec, and in-memory replica model all reside in craft_client.
 
 ## 📦 Dependencies
 

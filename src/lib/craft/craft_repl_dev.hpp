@@ -27,9 +27,9 @@ namespace homeblocks {
 
 // ─── wire-protocol types ──────────────────────────────────────────────────────
 //
-// replica_endpoint, CraftPartitionState, LSNPair, LoginResult, and JournalSlot are defined once in
-// <homeblks/craft_types.hpp> (HomeStore-free), pulled in via hb_internal.hpp, and shared by both
-// this production class and the in-memory reference model.
+// craft::replica_endpoint, craft::lsn_pair, and craft::LoginResult (the CRAFT client-facing vocab) come from the
+// craft_client package's <craft/types.hpp> (HomeStore-free), pulled in via hb_internal.hpp. CraftPartitionState
+// and JournalSlot are this production class's own types.
 
 // ─── journal backend abstraction ─────────────────────────────────────────────
 //
@@ -59,7 +59,7 @@ public:
 
     // Full login sequence (leader-only). Serialized: at most one in-flight
     // login per partition at a time.
-    async_result< LoginResult > login(uint64_t client_token, volume_id_t vol_id);
+    async_result< craft::LoginResult > login(uint64_t client_token, volume_id_t vol_id);
 
     // Append data to the journal at the client-assigned LSN slot. Zero-copy;
     // does NOT apply data to the LBA index.
@@ -74,20 +74,20 @@ public:
     // strictly in dLSN order (skip Empty), reclaim superseded blocks. Best-effort:
     // stalls below the first Missing hole (pauses apply/reclaim only, never
     // reads). Returns the achieved {commit_lsn, last_append_lsn}.
-    async_result< LSNPair > commit(uint64_t term, int64_t lsn);
+    async_result< craft::lsn_pair > commit(uint64_t term, int64_t lsn);
 
     // Same as commit + reset the client-timeout watchdog. all_committed_lsn is
     // the client-computed set-wide min commit_lsn; journal may be reclaimed below
     // min(all_committed_lsn, checkpointed apply frontier).
-    async_result< LSNPair > keep_alive(int64_t commit_lsn, int64_t all_committed_lsn);
+    async_result< craft::lsn_pair > keep_alive(int64_t commit_lsn, int64_t all_committed_lsn);
 
     // ── internal / peer API ────────────────────────────────────────────────
 
     // Return {commit_lsn, last_append_lsn} for the local partition.
-    async_result< LSNPair > get_lsns(volume_id_t vol_id);
+    async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);
 
     // Alias of get_lsns exposed to peer servers during GetRSCommitLSN broadcast.
-    async_result< LSNPair > get_rs_commit_lsn();
+    async_result< craft::lsn_pair > get_rs_commit_lsn();
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn.
     async_status truncate(int64_t lsn);

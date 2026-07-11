@@ -14,90 +14,16 @@
  *********************************************************************************/
 #pragma once
 
-// The per-replica CRAFT server surface -- one replica device of a partition. This is the internal
-// contract behind a CRAFT-mode volume_handle: `volume` delegates its CRAFT data-plane calls to a
-// `craft_replica`, and the public CRAFT free functions in home_blocks.hpp resolve a volume_handle to
-// its backend and call these methods 1:1. The in-memory reference model (MemCraftReplica) implements
-// this now; a production HomeStore-backed CraftReplDev can implement/adapt it later, independently.
-//
-// HomeStore-free: only home_blocks.hpp (which pulls the header-only homestore/error.hpp aliases) and
-// std/sisl. Do NOT include the storage engine here.
+// The craft_replica interface + its peer-only types now live in the standalone `craft_client` package
+// (namespace `craft`). This is a thin re-export shim so homeblocks' backend (CraftReplDev) and volume glue keep
+// referring to `homeblocks::craft_replica` / `JournalSlot` / `CraftPartitionState` unchanged. The interface's
+// async_result<T> == homeblocks' `using homestore::async_result` (both sisl::async::result<T>), so a
+// homeblocks-held craft_replica interoperates with zero conversion.
 
-#include <cstdint>
-#include <vector>
-
-#include <homeblks/home_blocks.hpp> // async_result/async_status + client-facing CRAFT types (LoginResult, io_extent, ...)
+#include <craft/replica.hpp>
 
 namespace homeblocks {
-
-// ── internal / peer-only data types (deliberately NOT on the public client surface) ──
-
-// Per-partition CRAFT state (internal to a replica implementation). Authoritative in memory; the
-// production impl recovers it from the journal + superblock on restart (the reference model does not).
-struct CraftPartitionState {
-    int64_t commit_lsn{-1};      // contiguous committed prefix (== Synced)
-    int64_t last_append_lsn{-1}; // highest appended dLSN (may be uncommitted)
-    uint64_t client_token{0};    // token from the last successful InternalLogin
-    uint64_t term{0};            // current session term
-};
-
-// One journal slot returned by fetch_data() (server-to-server resync; not client-facing). Four-way:
-// data (is_empty=false, all_zeros=false), zero write (all_zeros=true, no data), Empty (is_empty=true),
-// or omitted from the response (not-present-here).
-struct JournalSlot {
-    int64_t lsn{-1};
-    bool is_empty{false};
-    bool all_zeros{false};
-    lba_t lba{0};
-    lba_count_t len{0};
-    sisl::sg_list data{};
-};
-
-class craft_replica {
-public:
-    virtual ~craft_replica() = default;
-
-    // ── client-facing (what a CRAFT client issues against this one replica) ──
-
-    // Login: run the session-establishment sequence. A follower returns LoginResult{term=0, leader_hint}
-    // (not an error) so the client can redirect; craft_error::NO_QUORUM / REPLICA_DOWN are errors.
-    virtual async_result< LoginResult > login(uint64_t client_token) = 0;
-
-    // Explicit logout. Term-fenced; leader propagates InternalLogout to all live replicas so subsequent
-    // IOs with the old term fail with STALE_TERM. Returns craft_error::NOT_LEADER on a follower.
-    virtual async_status logout(client_hdr hdr) = 0;
-
-    // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length, aligned to
-    // the volume's lba_size (else std::errc::invalid_argument). `data` is a caller-owned (iomgr) buffer:
-    // empty (size 0) => a zero write (WRITE_ZEROES / unmap; `len` is the range); non-empty => a data
-    // write of exactly `len` bytes (scatter-gather, any iovec count). Does NOT apply to the index; the
-    // frontier is advanced by hdr.commit_lsn (piggybacked commit). craft_error::STALE_TERM if
-    // hdr.term != the session term.
-    virtual async_status write(client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len, sisl::sg_list data) = 0;
-
-    // Latest version <= read_lsn (horizon H) for [addr, addr+len) (BYTE offset/length, aligned). Fills the
-    // caller-owned `dest` buffer in place (scatter-gather; data sub-ranges get bytes, holes get zeros) and
-    // returns the sparse layout (data vs holes). Advances the frontier to hdr.commit_lsn. STALE_TERM on
-    // term mismatch.
-    virtual async_result< std::vector< io_extent > > read(client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
-                                                          sisl::sg_list dest) = 0;
-
-    // Advance the frontier toward hdr.commit_lsn + reset the client-liveness watchdog -- which is WHY
-    // it is term-fenced: a stale client must not be able to keep the session alive. Returns the
-    // achieved {commit_lsn, last_append_lsn}. No standalone commit verb; keep_alive is its carrier.
-    virtual async_result< LSNPair > keep_alive(client_hdr hdr) = 0;
-
-    // ── peer-facing (server-to-server; driven by the cold path / resync, never by a client) ──
-
-    // Snapshot {commit_lsn, last_append_lsn} for this replica -- used by the leader during
-    // GetRSCommitLSN polls and SyncRSCommitLSN rounds; identical to what keep_alive returns.
-    virtual async_result< LSNPair > get_lsns() = 0;
-    virtual async_result< LSNPair > get_rs_commit_lsn() = 0;
-    virtual async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) = 0;
-    virtual async_status truncate(int64_t lsn) = 0;
-
-    // This replica's endpoint id (for routing / membership).
-    virtual peer_id_t id() const = 0;
-};
-
+using craft::craft_replica;
+using craft::CraftPartitionState;
+using craft::JournalSlot;
 } // namespace homeblocks

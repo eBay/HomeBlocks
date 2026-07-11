@@ -61,4 +61,10 @@ using superblk = homestore::superblk< T >;
 
 static constexpr uint32_t MAX_NUM_VOLUMES = 2048;
 
+// The volume's internal LBA index units (homestore block address / count). CRAFT is byte-addressed (addr/len are
+// absolute bytes, block-aligned to lba_size); these are the index's block units -- INTERNAL, never on the public
+// API. Identical to the retired craft:: aliases, so an LBA meeting a byte range interops seamlessly.
+using lba_t = uint64_t;
+using lba_count_t = uint32_t;
+
 } // namespace homeblocks

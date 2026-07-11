@@ -1,19 +1,16 @@
 cmake_minimum_required (VERSION 3.11)
 
-# Test-local, non-shipped code, grouped so each piece can be dropped as a unit:
-#   craft/       -- the CRAFT reference model + reference client + CRAFT ublk driver + their tests.
-#                   (model = throwaway once production CRAFT lands; client/driver graduate to src/lib.)
+# Test-local, non-shipped code:
 #   legacy_ublk/ -- the original ublk driver over the deprecated volume block API (drop with that API).
+# (The CRAFT reference model + client + ublk driver moved out to the craft_client and ublkpp packages;
+#  homeblocks now only declares the volume_handle CRAFT API and the homestore-backed CraftReplDev.)
 #
-# ublkpp (a test_requires) backs BOTH ublk drivers; detect it once here and let the subdirs gate their
-# ublk targets on UblkPP_FOUND (inherited into the child scopes). The CRAFT model + client + their unit
-# tests need no ublk device, so craft/ is always added; only the ublk driver targets are gated.
+# ublkpp (a test_requires) backs the ublk driver; detect it once here and gate the ublk target on
+# UblkPP_FOUND (inherited into the child scope).
 find_package(UblkPP QUIET)
 if (NOT UblkPP_FOUND)
-    message(STATUS "ublkpp not found; the ublk drivers (craft_ublk / homeblk_ublk) will be skipped")
+    message(STATUS "ublkpp not found; the ublk driver will be skipped")
 endif()
-
-add_subdirectory(craft)
 
 if (UblkPP_FOUND)
     add_subdirectory(legacy_ublk)
