@@ -9,6 +9,7 @@ target_link_libraries(${PROJECT_NAME}_craft
     ${COMMON_DEPS}
 )
 
-# The in-memory CRAFT reference model is NOT part of the shipped library. It (and the reference client
-# + ublk driver that drive it) live under src/test/craft, so the whole thing can be dropped when the
-# production CRAFT path lands. Only the client-facing API impl above (craft_api.cpp) ships here.
+# This is the CRAFT BACKEND -- the far side of the wire. craft_api.cpp defines the public per-replica surface
+# (the volume_handle free functions) and craft_repl_dev.cpp is the engine behind it. The CRAFT client, the wire
+# codec, the in-memory reference model and the reference server all live in the standalone craft_client package;
+# the ublk driver lives in ublkpp. None of them are built or linked here.

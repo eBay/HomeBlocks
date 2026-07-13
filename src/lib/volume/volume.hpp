@@ -35,6 +35,7 @@
 
 #include "volume_chunk_selector.hpp"
 #include "io_req.hpp"
+#include "craft/craft_repl_dev.hpp" // CraftReplDev: the volume's CRAFT backend (complete type -- held by value in a shared<>)
 #include "sisl/utility/atomic_counter.hpp"
 
 namespace homeblocks {
@@ -111,15 +112,6 @@ public:
 
     void on_gather();
 };
-
-// The CRAFT per-replica backend a craft volume delegates its data plane to (none wired yet). It lives in the
-// standalone craft_client package (craft::craft_replica); forward-declared here so volume.hpp stays free of
-// the interface include. HomeStore-free.
-} // namespace homeblocks
-namespace craft {
-class craft_replica;
-}
-namespace homeblocks {
 
 class volume : public std::enable_shared_from_this< volume > {
 public:
@@ -219,10 +211,12 @@ public:
     std::string id_str() const { return boost::uuids::to_string(vol_info_->id); };
     const ReplDevPtr& rd() const { return rd_; }
 
-    // The CRAFT per-replica backend; null until a homestore-backed craft volume is wired (the public CRAFT
-    // verbs then return not_supported, see craft_api.cpp).
-    // The CRAFT free functions in home_blocks.hpp route here.
-    craft::craft_replica* craft_backend() const { return craft_backend_.get(); }
+    // The CRAFT per-replica backend: the volume's own CraftReplDev, which the public CRAFT free functions in
+    // home_blocks.hpp forward to 1:1 (see craft_api.cpp). Null on a non-CRAFT volume and until a CRAFT volume is
+    // wired -- those verbs then return not_supported. HomeBlocks is the CRAFT *backend*, so this is a concrete
+    // engine object, NOT a craft::craft_replica: that interface is the CLIENT's view of a member and belongs on
+    // the far side of the wire.
+    CraftReplDev* craft_dev() const { return craft_dev_.get(); }
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -298,7 +292,7 @@ private:
         false}; // indicates if volume destroy has started, avoid destroy to be executed more than once.
     std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
-    shared< craft::craft_replica > craft_backend_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
+    shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

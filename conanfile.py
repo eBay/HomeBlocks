@@ -10,7 +10,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "6.0.1"
+    version = "6.0.2"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -53,8 +53,8 @@ class HomeBlocksConan(ConanFile):
     def requirements(self):
         self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)
         self.requires("iomgr/[^13.0]@oss/dev", transitive_headers=True)
-        self.requires("sisl/[^14.6]@oss/dev", transitive_headers=True)
-        self.requires("craft_client/0.1.0@oss/dev", transitive_headers=True) # the extracted CRAFT wire + client + reference
+        self.requires("sisl/[^14.8]@oss/dev", transitive_headers=True)
+        self.requires("craft_client/0.3.0@oss/dev", transitive_headers=True) # the extracted CRAFT wire + client + reference
 
     def validate(self):
         if self.info.settings.compiler.cppstd:

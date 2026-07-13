@@ -15,7 +15,6 @@
 #pragma once
 
 #include "../hb_internal.hpp"
-#include "craft_replica.hpp" // internal CRAFT types (CraftPartitionState, JournalSlot) + the craft_replica interface
 #include <homestore/replication/repl_dev.hpp>
 
 #include <atomic>
@@ -25,11 +24,37 @@
 
 namespace homeblocks {
 
-// ─── wire-protocol types ──────────────────────────────────────────────────────
+// ─── CRAFT vocabulary vs. this backend's own state ───────────────────────────
 //
-// craft::replica_endpoint, craft::lsn_pair, and craft::LoginResult (the CRAFT client-facing vocab) come from the
-// craft_client package's <craft/types.hpp> (HomeStore-free), pulled in via hb_internal.hpp. CraftPartitionState
-// and JournalSlot are this production class's own types.
+// The client-facing vocab (craft::client_hdr, craft::lsn_pair, craft::LoginResult, craft::read_result,
+// craft::resolution_result, craft::io_extent, craft::craft_error) comes from the craft_client package's <craft/types.hpp> -- HomeStore-free,
+// pulled in via hb_internal.hpp. That is the ONLY thing HomeBlocks takes from craft_client: the vocabulary the
+// wire is defined in. HomeBlocks is the CRAFT *backend* -- the far side of the wire -- so it implements no
+// craft_replica and never constructs a CRAFT client (there is no make_client anywhere in this repo).
+//
+// CraftPartitionState and JournalSlot below are this backend's OWN state, in its own BLOCK units (lba_t /
+// lba_count_t): neither crosses the client wire. The reference model in craft_client keeps its own copies for
+// exactly the same reason -- two independent replica implementations, one shared wire.
+
+// Per-partition CRAFT state. Authoritative in memory; recovered from the journal + superblock on restart.
+struct CraftPartitionState {
+    int64_t commit_lsn{-1};      // contiguous committed prefix (== Synced)
+    int64_t last_append_lsn{-1}; // highest appended dLSN (may be uncommitted)
+    uint64_t client_token{0};    // token from the last successful InternalLogin
+    uint64_t term{0};            // current session term
+};
+
+// One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
+// data (is_empty=false, all_zeros=false), zero write (all_zeros=true, no data), Empty (is_empty=true), or
+// omitted from the response (not-present-here).
+struct JournalSlot {
+    int64_t lsn{-1};
+    bool is_empty{false};
+    bool all_zeros{false};
+    lba_t lba{0};
+    lba_count_t len{0};
+    sisl::sg_list data{};
+};
 
 // ─── journal backend abstraction ─────────────────────────────────────────────
 //
@@ -56,27 +81,43 @@ public:
     ~CraftReplDev() = default;
 
     // ── client-facing ──────────────────────────────────────────────────────
+    //
+    // These are 1:1 with the public CRAFT free functions over a volume_handle (home_blocks.hpp), which are in turn
+    // 1:1 with the wire ops -- so a CRAFT server (CraftConnector) decodes a request and forwards it here with
+    // nothing to translate. Hence their shape: BYTE-addressed (addr/len are absolute byte offsets, block-aligned to
+    // the volume's lba_size; the byte<->block conversion is confined INSIDE this class, which owns the index), and
+    // every op carries the wire's craft::client_hdr -- {term, commit_lsn, all_committed_lsn}. The term FENCES the
+    // op (craft_error::STALE_TERM on mismatch); commit_lsn is the piggybacked commit that advances the frontier.
+    // There is no standalone commit verb on the wire: every IO is its carrier.
 
-    // Full login sequence (leader-only). Serialized: at most one in-flight
-    // login per partition at a time.
-    async_result< craft::LoginResult > login(uint64_t client_token, volume_id_t vol_id);
+    // Full login sequence (leader-only): the RAFT leader assigns the session TERM and returns it here -- a server
+    // forwards LOGIN, it does not mint terms. Serialized: at most one in-flight login per partition. A follower
+    // returns craft::LoginResult{term=0, leader_hint} (a redirect, NOT an error) so the client can retry.
+    async_result< craft::LoginResult > login(uint64_t client_token);
 
-    // Append data to the journal at the client-assigned LSN slot. Zero-copy;
-    // does NOT apply data to the LBA index. The ack returns the achieved
-    // {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT
-    // IO response piggybacks the watermarks (the wire's write_rsp), so any
-    // round-trip refreshes the client's model of this member.
-    async_result< craft::lsn_pair > write(uint64_t term, int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data);
+    // Explicit end of session. Term-fenced; the leader propagates InternalLogout so subsequent IO at the old term
+    // is rejected STALE_TERM. craft_error::NOT_LEADER on a follower.
+    async_status logout(craft::client_hdr hdr);
 
-    // read_lsn is the horizon H: serve the latest version <= H for the range,
-    // from the LBA index if applied or from the journal-tail overlay if only
-    // Appended (no index write on the read path). Never fetches from a peer.
-    // Fills the caller-owned `dest` buffer in place (data -> bytes, holes ->
-    // zeros) and returns craft::read_result: the sparse layout (extents in
-    // BYTES -- the byte<->block conversion stays confined here) plus the
-    // piggybacked {commit_lsn, last_append_lsn}.
-    async_result< craft::read_result > read(uint64_t term, int64_t read_lsn, lba_t lba, lba_count_t len,
+    // Append data at the client-assigned dLSN. Zero-copy; does NOT apply to the LBA index (hdr.commit_lsn drives
+    // that). An EMPTY `data` is a zero write (WRITE_ZEROES/unmap over [addr, addr+len)). The ack returns the
+    // achieved {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
+    // watermarks (the wire's write_rsp), so any round-trip refreshes the client's model of this member.
+    async_result< craft::lsn_pair > write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+                                          sisl::sg_list data);
+
+    // read_lsn is the horizon H: serve the latest version <= H for [addr, addr+len), from the LBA index if applied
+    // or from the journal-tail overlay if only Appended (no index write on the read path). Never fetches from a
+    // peer. Fills the caller-owned `dest` in place (data -> bytes, holes -> zeros) and returns craft::read_result:
+    // the sparse layout (which byte sub-ranges were data vs holes) plus the piggybacked watermarks.
+    async_result< craft::read_result > read(craft::client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
                                             sisl::sg_list dest);
+
+    // Advance the frontier toward hdr.commit_lsn + reset the client-liveness watchdog -- which is WHY it is
+    // term-fenced: a deposed client must not be able to keep its session alive. hdr.all_committed_lsn is the
+    // client-computed set-wide min commit_lsn; the journal may be reclaimed below
+    // min(all_committed_lsn, checkpointed apply frontier). Returns the achieved watermarks.
+    async_result< craft::lsn_pair > keep_alive(craft::client_hdr hdr);
 
     // The client-requested resolution round (the wire's RESOLVE; the design's
     // client-request SyncRSCommitLSN trigger). LEADER-only: resolve every
@@ -88,20 +129,9 @@ public:
     // peer channels exist, may forward to its leader). Returns the Empty
     // verdicts <= upto; a late write into an Empty-verdicted slot is REJECTED
     // (reconciliation: Empty beats data). Term-fenced.
-    async_result< craft::resolution_result > request_resolution(uint64_t term, int64_t upto);
+    async_result< craft::resolution_result > request_resolution(craft::client_hdr hdr, int64_t upto);
 
-    // Advance the contiguous commit watermark toward lsn: apply present entries
-    // strictly in dLSN order (skip Empty), reclaim superseded blocks. Best-effort:
-    // stalls below the first Missing hole (pauses apply/reclaim only, never
-    // reads). Returns the achieved {commit_lsn, last_append_lsn}.
-    async_result< craft::lsn_pair > commit(uint64_t term, int64_t lsn);
-
-    // Same as commit + reset the client-timeout watchdog. all_committed_lsn is
-    // the client-computed set-wide min commit_lsn; journal may be reclaimed below
-    // min(all_committed_lsn, checkpointed apply frontier).
-    async_result< craft::lsn_pair > keep_alive(int64_t commit_lsn, int64_t all_committed_lsn);
-
-    // ── internal / peer API ────────────────────────────────────────────────
+    // ── internal / peer API (server-to-server; NEVER reachable over the client wire) ──
 
     // Return {commit_lsn, last_append_lsn} for the local partition.
     async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);

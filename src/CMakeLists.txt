@@ -10,8 +10,9 @@ find_package(homestore QUIET REQUIRED)
 find_package(sisl QUIET REQUIRED)
 find_package(craft_client QUIET REQUIRED) # the extracted CRAFT wire + client + reference
 
-# The product links only the header-only vocab + craft_replica interface (craft_types). Tests that need the
-# in-memory reference model / cluster server add craft_client::craft_reference themselves.
+# HomeBlocks is the CRAFT *backend*, so it takes exactly one thing from craft_client: the header-only vocabulary
+# the wire is defined in (craft_types -- client_hdr, lsn_pair, read_result, craft_error). Not the client, not the
+# craft_replica interface, not the codec. A CRAFT server (CraftConnector) will add craft_client::craft_wire.
 list(APPEND COMMON_DEPS homestore::homestore sisl::sisl craft_client::craft_types)
 
 list(APPEND COMMON_TEST_DEPS

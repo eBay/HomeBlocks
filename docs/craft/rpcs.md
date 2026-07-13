@@ -218,14 +218,31 @@ entry during the login sequence.
 
 ## RPC Transport
 
-The transport layer for NubloxProto RPCs is decided by the **CRAFT-1 spike** (SDSTOR-22297
-dependency). `CraftConnector` is transport-agnostic: it will dispatch via whatever channel CRAFT-1
-selects (likely gRPC or a custom framing over TCP). Server-to-server RPCs use the same transport.
+**The client plane is decided; the peer plane is not.** These are two different questions and they were
+previously answered as one.
 
-During development, before CRAFT-1 lands, the calls are exercised in-process: the in-memory reference
-model in the `craft_client` package (`craft::MemCraftReplica`, `<craft/mem/cluster.hpp>`) implements the
-same per-replica surface (`craft_replica`), with `craft::MemTransport` standing in for the network. It is a
-stand-in, not a shortcut. It serializes each request at issue, and it completes every reply on one of the
-addressed replica's own server threads, never inline with the submit, so the client is exercised against
-the execution model a real transport will impose: replies arrive on a foreign thread, out of order, and a
-write may be acked by a quorum while stragglers are still in flight.
+- **Client plane** (a CRAFT client ↔ a replica: LOGIN / WRITE / READ / KEEPALIVE / LOGOUT / RESOLVE).
+  Settled by the CRAFT-1 spike: a packed binary wire over TCP/io_uring, specified in
+  [craft_client/docs/wire.md](https://github.com/szmyd/craft_client) with opcodes **1–14** allocated and a
+  reference client + server that pass it end to end. `CraftConnector` terminates *this* wire.
+- **Peer plane** (a replica ↔ a replica: `GetRSCommitLSN` / `fetch_data` / `truncate`, driven as a side effect
+  of applying a `SyncRSCommitLSN` or `InternalLogin` RAFT entry). **Not specified.** No opcode is allocated for
+  it — `craft::wire::op` stops at 14 — so it is deferred at the *wire*, not merely at the transport. It need not
+  ride the same channel as the client plane: these calls are node-to-node, and HomeBlocks may prefer its existing
+  inter-node RPC. See `craft_client/docs/peer-plane.md` for the interface (`craft_peer`) and what remains.
+
+Note the asymmetry this creates, because it is easy to get backwards: HomeBlocks is **both ends** of the peer
+plane (it initiates on RAFT commit *and* serves peers) but **only the far end** of the client plane (it never
+builds a CRAFT client).
+
+Before that lands, the wire is exercised **entirely inside the `craft_client` package**, not here: its
+in-memory reference model (`craft::MemCraftReplica`) stands in for a HomeBlocks replica, and its reference
+TCP server (`craft::net::craft_tcp_server`) stands in for `CraftConnector` -- so the client, the codec and
+the server are all driven end-to-end with no storage engine. `CraftConnector` is the piece that replaces
+that reference server: same wire, same handlers, but resolving a `volume_handle` and calling the HomeBlocks
+CRAFT free functions ([api.md](api.md)) instead of the reference model.
+
+The model is a stand-in, not a shortcut. It completes every reply on a thread other than the submitter's,
+never inline, so the client is exercised against the execution model a real transport imposes: replies
+arrive on a foreign thread, out of order, and a write may be acked by a quorum while stragglers are still
+in flight.

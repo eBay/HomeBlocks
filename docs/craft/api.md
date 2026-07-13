@@ -3,15 +3,31 @@
 The CRAFT surface HomeBlocks declares is a set of **free functions over a `volume_handle`** in the
 public header `home_blocks.hpp` (parallel to the legacy `async_read`/`async_write` block ops, now
 `[[deprecated]]`). **One `volume_handle` == one replica device**: these are the CRAFT ops issued against
-a SINGLE replica (login, the client-assigned write, the horizon read, the commit carrier), dispatched
-through the per-replica interface `craft_replica` -- implemented by the homestore-backed `CraftReplDev`.
+a SINGLE replica (login, the client-assigned write, the horizon read, the commit carrier). Each forwards
+1:1 to that volume's homestore-backed `CraftReplDev` -- nothing to translate, because `CraftReplDev`'s
+client-facing verbs are already the wire's shape: byte-addressed (`addr`/`len` are absolute byte offsets,
+block-aligned to `lba_size`) and carrying the wire's `craft::client_hdr` on every op.
 
-The CRAFT *client* that assigns each write its `dLSN`, broadcasts to every member, tallies quorum, and
-routes reads now lives in the standalone **`craft_client`** package (namespace `craft`), decoupled from
-`volume_handle` and driving `craft::craft_replica` backends directly; its ublk driver is in **`ublkpp`**
-(`craft_disk`) and its in-memory reference model + reference server in `craft_client`. So these free
-functions are HomeBlocks' *declaration* of the per-replica surface: until a `CraftReplDev` backend is
-wired to a volume they have no backend and return `std::errc::not_supported`.
+## HomeBlocks is the CRAFT *backend* -- the far side of the wire
+
+This is the whole of HomeBlocks' role in CRAFT, and it is worth stating flatly because the alternative is
+the natural assumption:
+
+- HomeBlocks **never constructs a CRAFT client.** `make_client` appears nowhere in this repo, and no class
+  here implements `craft::craft_replica` -- that interface is the *client's* view of a member and lives on
+  the near side of the wire, implemented only by a transport proxy or by the reference model.
+- The CRAFT **client** (dLSN assignment, quorum broadcast, read routing) lives in the standalone
+  **`craft_client`** package, its ublk driver in **`ublkpp`** (`craft_disk`), and the in-memory reference
+  model + reference server in `craft_client`.
+- A CRAFT **server** (the planned `CraftConnector`) terminates the wire, looks up the volume the control
+  layer told it to expose, enforces admission, and then calls **exactly these free functions** with the
+  handle. So this page is the per-replica surface a transport binds to.
+- HomeBlocks' only dependency on `craft_client` is `craft_types` -- the header-only vocabulary the wire is
+  defined in (`client_hdr`, `lsn_pair`, `read_result`, `io_extent`, `craft_error`, `LoginResult`). Not the
+  client, not the `craft_replica` interface, not the codec.
+
+Until a `CraftReplDev` is wired to a volume, these functions have no backend and return
+`std::errc::not_supported`.
 
 All methods are async/coroutine-style (`async_result<T>` / `async_status`) matching the existing
 HomeBlocks convention.
@@ -201,7 +217,8 @@ Term-fenced (`STALE_TERM`).
 
 ## Internal / peer & RAFT-entry API
 
-These are on the `craft_replica` backend, not the public client surface.
+These are on `CraftReplDev` directly, not on the public `volume_handle` surface: they are server-to-server
+verbs and never cross the client wire, so no CRAFT server exposes them.
 
 ### `get_lsns` / `get_rs_commit_lsn`
 
