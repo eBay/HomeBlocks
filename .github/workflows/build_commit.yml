@@ -37,6 +37,19 @@ jobs:
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
+  CraftClientDeps:
+    needs: SislDeps
+    if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') && github.event_name != 'pull_request' }}
+    uses: szmyd/craft_client/.github/workflows/build_dependencies.yml@dev/v0.x
+    with:
+      branch: dev/v0.x
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      compiler: ${{ inputs.compiler }}
+      conan-channel: ${{ inputs.conan-channel }}
+      tooling: None
+
   NuraftMesgDeps:
     needs: SislDeps
     uses: eBay/nuraft_mesg/.github/workflows/build_dependencies.yml@dev/v5.x
@@ -64,7 +77,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
 
   UblkppDeps:
-    needs: SislDeps
+    needs: CraftClientDeps
     uses: szmyd/ublkpp/.github/workflows/build_dependencies.yml@main
     with:
       branch: main

@@ -158,6 +158,15 @@ jobs:
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
+    - name: Load CraftClient Cache
+      uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
+      with:
+        testing: 'False'
+        path: import/craft_client
+        key_prefix: CraftClientDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
+        fail_on_cache_miss: false
+      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
+
     - name: Load IOMgr Cache
       uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
       with:
@@ -194,6 +203,14 @@ jobs:
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
+    - name: Retrieve CraftClient
+      uses: actions/checkout@v4
+      with:
+        repository: szmyd/craft_client
+        path: import/craft_client
+        ref: dev/v0.x
+      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
+
     - name: Retrieve Dependencies
       uses: actions/checkout@v4
       with:
@@ -217,6 +234,9 @@ jobs:
         sudo rm -rf /usr/lib/llvm*
         sudo rm -rf /usr/lib/jvm
         sudo rm -rf /usr/lib/google-cloud-sdk
+        pushd import/craft_client
+        conan export --user oss --channel ${{ inputs.conan-channel }} .
+        popd
         pushd import/ublkpp
         ./prepare_v2.sh
         conan export --user oss --channel ${{ inputs.conan-channel }}
