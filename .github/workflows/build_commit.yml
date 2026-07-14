@@ -91,6 +91,7 @@ jobs:
 
   HomeBlocksDeps:
     needs: [HomeStoreDeps, UblkppDeps]
+    if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') }}
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: ${{ github.ref }}

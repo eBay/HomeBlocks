@@ -179,9 +179,8 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // frontier best-effort in dLSN order (CRAFT's piggybacked commit). STALE_TERM if hdr.term != session term.
 // The ack returns the replica's achieved {commit_lsn, last_append_lsn}: every CRAFT IO response piggybacks
 // the watermarks, so any round-trip refreshes the client's per-member model without a keep_alive.
-[[nodiscard]] async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr,
-                                                          int64_t dlsn, uint64_t addr, uint64_t len,
-                                                          sisl::sg_list data);
+[[nodiscard]] async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn,
+                                                          uint64_t addr, uint64_t len, sisl::sg_list data);
 
 // Read the latest version <= `read_lsn` (horizon H) for [addr, addr+len) (BYTE offset/length, aligned to
 // lba_size). Fills the caller-owned `dest` buffer in place -- data sub-ranges get their bytes, holes get

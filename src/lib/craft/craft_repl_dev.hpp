@@ -27,10 +27,11 @@ namespace homeblocks {
 // ─── CRAFT vocabulary vs. this backend's own state ───────────────────────────
 //
 // The client-facing vocab (craft::client_hdr, craft::lsn_pair, craft::LoginResult, craft::read_result,
-// craft::resolution_result, craft::io_extent, craft::craft_error) comes from the craft_client package's <craft/types.hpp> -- HomeStore-free,
-// pulled in via hb_internal.hpp. That is the ONLY thing HomeBlocks takes from craft_client: the vocabulary the
-// wire is defined in. HomeBlocks is the CRAFT *backend* -- the far side of the wire -- so it implements no
-// craft_replica and never constructs a CRAFT client (there is no make_client anywhere in this repo).
+// craft::resolution_result, craft::io_extent, craft::craft_error) comes from the craft_client package's
+// <craft/types.hpp> -- HomeStore-free, pulled in via hb_internal.hpp. That is the ONLY thing HomeBlocks takes from
+// craft_client: the vocabulary the wire is defined in. HomeBlocks is the CRAFT *backend* -- the far side of the wire --
+// so it implements no craft_replica and never constructs a CRAFT client (there is no make_client anywhere in this
+// repo).
 //
 // CraftPartitionState and JournalSlot below are this backend's OWN state, in its own BLOCK units (lba_t /
 // lba_count_t): neither crosses the client wire. The reference model in craft_client keeps its own copies for
