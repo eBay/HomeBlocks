@@ -147,10 +147,37 @@ async_status CraftReplDev::logout(craft::client_hdr /* hdr */) {
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr /* hdr */, int64_t /* dlsn */,
-                                                    uint64_t /* addr */, uint64_t /* len */, sisl::sg_list /* data */) {
-    LOGW("CraftReplDev::write not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr,
+                                                    uint64_t len, sisl::sg_list data) {
+    if (hdr.term != state_.term) {
+        LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
+        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+    }
+
+    {
+        std::lock_guard lock{missing_mu_};
+        for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap)
+            missing_lsns_.insert(gap);
+        if ((dlsn > state_.last_append_lsn) || missing_lsns_.contains(dlsn))
+            missing_lsns_.insert(dlsn);
+        state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
+    }
+
+    auto res = co_await journal_->write_slot(dlsn, static_cast< lba_t >(addr),
+                                             static_cast< lba_count_t >(len), std::move(data));
+    if (!res) {
+        LOGE("write_slot failed dlsn={} addr={} len={}: {}", dlsn, addr, len, res.error().message());
+        co_return std::unexpected(res.error());
+    }
+
+    craft::lsn_pair snapshot;
+    {
+        std::lock_guard lock{missing_mu_};
+        missing_lsns_.erase(dlsn);
+        snapshot = {state_.commit_lsn, state_.last_append_lsn};
+    }
+    LOGT("write ok dlsn={} addr={} len={}", dlsn, addr, len);
+    co_return snapshot;
 }
 
 async_result< craft::read_result > CraftReplDev::read(craft::client_hdr /* hdr */, int64_t /* read_lsn */,
