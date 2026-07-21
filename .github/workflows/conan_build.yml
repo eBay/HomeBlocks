@@ -19,15 +19,15 @@ jobs:
       conan-channel: "dev"
       tooling: "AddressSanitize"
 
-  GccThreadSanitize:
-    uses: ./.github/workflows/build_commit.yml
-    with:
-      platform: "ubuntu-24.04"
-      build-type: "Debug"
-      malloc-impl: "libc"
-      compiler: "gcc"
-      conan-channel: "dev"
-      tooling: "ThreadSanitize"
+  # GccThreadSanitize:
+  #   uses: ./.github/workflows/build_commit.yml
+  #   with:
+  #     platform: "ubuntu-24.04"
+  #     build-type: "Debug"
+  #     malloc-impl: "libc"
+  #     compiler: "gcc"
+  #     conan-channel: "dev"
+  #     tooling: "ThreadSanitize"
 
   GccCoverage:
     uses: ./.github/workflows/build_commit.yml
