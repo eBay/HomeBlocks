@@ -53,7 +53,7 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
 
-    async_status write_slot(int64_t, lba_t, lba_count_t, sisl::sg_list) override {
+    async_status write_slot(int64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 

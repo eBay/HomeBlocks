@@ -45,7 +45,7 @@ public:
     bool should_fail{false};
     int64_t truncated_to{INT64_MIN};
 
-    async_status write_slot(int64_t, lba_t, lba_count_t, sisl::sg_list) override {
+    async_status write_slot(int64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 

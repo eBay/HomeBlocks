@@ -70,7 +70,8 @@ struct JournalSlot {
 
 class CraftJournalBackend {
 public:
-    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data) = 0;
+    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len,
+                                   homestore::multi_blk_id blkid, bool all_zeros) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
     // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
@@ -116,7 +117,7 @@ public:
     // achieved {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
     // watermarks (the wire's write_rsp), so any round-trip refreshes the client's model of this member.
     async_result< craft::lsn_pair > write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                                          sisl::sg_list data);
+                                          sisl::sg_list data, bool all_zeros = false);
 
     // read_lsn is the horizon H: serve the latest version <= H for [addr, addr+len), from the LBA index if applied
     // or from the journal-tail overlay if only Appended (no index write on the read path). Never fetches from a

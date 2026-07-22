@@ -68,7 +68,8 @@ using volume_handle = std::shared_ptr< volume >;
 // ride result<T> while staying branchable: if (r.error() == volume_error::CRC_MISMATCH) { ... }. Anything with a
 // standard equivalent (invalid arg, no space, io error, unsupported op, ...) is returned as
 // std::make_error_condition(std::errc::*) directly rather than duplicated here.
-ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM);
+ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM,
+     EMPTY_SLOT);
 
 ENUM(volume_state, uint32_t,
      INIT,       // created, not yet online

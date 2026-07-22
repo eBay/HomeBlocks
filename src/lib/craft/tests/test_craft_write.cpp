@@ -41,9 +41,13 @@ namespace {
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
+    std::set< int64_t > fail_lsns; // write_slot returns io_error for these lsns
 
-    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list) override {
-        slots[lsn] = JournalSlot{lsn, false, false, lba, len, {}};
+    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len,
+                            homestore::multi_blk_id /* blkid */, bool all_zeros) override {
+        if (fail_lsns.count(lsn))
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        slots[lsn] = JournalSlot{lsn, false, all_zeros, lba, len, {}};
         co_return ok();
     }
 
@@ -70,9 +74,9 @@ protected:
         dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
     }
 
-    auto do_write(uint64_t term, int64_t lsn) {
+    auto do_write(uint64_t term, int64_t lsn, bool all_zeros = false) {
         return homeblocks::detail::sync_get(
-            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}));
+            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}, all_zeros));
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -120,6 +124,35 @@ TEST_F(CraftWriteTest, TermRejection) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
     EXPECT_EQ(journal_->slot_count(), 0u);
     EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// all_zeros=true skips data allocation; journal slot is marked all_zeros.
+TEST_F(CraftWriteTest, AllZerosWrite) {
+    auto r = do_write(0, 0, /*all_zeros=*/true);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->last_append_lsn, 0);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+    ASSERT_TRUE(journal_->has_slot(0));
+    EXPECT_TRUE(journal_->slots[0].all_zeros);
+}
+
+// A failed write_slot must leave the lsn in missing_lsns_ (pre-insert invariant).
+TEST_F(CraftWriteTest, WriteSlotFails_LsnRemainsInMissing) {
+    journal_->fail_lsns.insert(0);
+    auto r = do_write(0, 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(dev_->is_missing(0));
+    EXPECT_EQ(journal_->slot_count(), 0u);
+}
+
+// A write into an Empty-verdicted slot is permanently rejected (Empty beats data).
+TEST_F(CraftWriteTest, EmptySlotRejectsWrite) {
+    dev_->seed_empty({5});
+    auto r = do_write(0, 5);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::EMPTY_SLOT));
+    EXPECT_EQ(journal_->slot_count(), 0u);
+    EXPECT_FALSE(dev_->is_missing(5));
 }
 
 } // namespace
