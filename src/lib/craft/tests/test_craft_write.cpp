@@ -43,10 +43,9 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::set< int64_t > fail_lsns; // write_slot returns io_error for these lsns
 
-    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len,
-                            homestore::multi_blk_id /* blkid */, bool all_zeros) override {
-        if (fail_lsns.count(lsn))
-            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
+                            bool all_zeros) override {
+        if (fail_lsns.count(lsn)) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] = JournalSlot{lsn, false, all_zeros, lba, len, {}};
         co_return ok();
     }
@@ -143,6 +142,7 @@ TEST_F(CraftWriteTest, WriteSlotFails_LsnRemainsInMissing) {
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(dev_->is_missing(0));
     EXPECT_EQ(journal_->slot_count(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), 0); // last_append_lsn is set before write_slot; not rolled back on failure
 }
 
 // A write into an Empty-verdicted slot is permanently rejected (Empty beats data).
@@ -167,8 +167,8 @@ TEST_F(CraftWriteTest, EmptyVerdictClearsMissingEntry) {
 
     // S5 verdicts lsn=5 Empty: must be evicted from missing_lsns_.
     dev_->seed_empty({5});
-    EXPECT_FALSE(dev_->is_missing(5));       // gap resolved
-    EXPECT_TRUE(dev_->is_empty_slot(5));     // permanently empty
+    EXPECT_FALSE(dev_->is_missing(5));   // gap resolved
+    EXPECT_TRUE(dev_->is_empty_slot(5)); // permanently empty
 
     // A late write to lsn=5 is still rejected with EMPTY_SLOT.
     auto r5 = do_write(0, 5);
@@ -211,6 +211,65 @@ TEST_F(CraftWriteTest, OutOfOrderWritesLargerGap) {
     ASSERT_TRUE(do_write(0, 1).has_value());
     ASSERT_TRUE(do_write(0, 3).has_value());
     EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// A retry of an already-written dlsn returns success idempotently without a second write_slot call.
+// Invariant: after a successful write, dlsn is absent from missing_lsns_; a second write with the
+// same dlsn must not violate the pre-insert invariant by calling write_slot without a prior insert.
+TEST_F(CraftWriteTest, DuplicateWriteIsIdempotent) {
+    ASSERT_TRUE(do_write(0, 0).has_value());
+    EXPECT_EQ(journal_->slot_count(), 1u);
+    EXPECT_FALSE(dev_->is_missing(0));
+
+    // Retry same dlsn (ACK-loss scenario): must return success without dispatching a second write_slot.
+    auto r2 = do_write(0, 0);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(journal_->slot_count(), 1u); // write_slot not called again
+    EXPECT_FALSE(dev_->is_missing(0));
+}
+
+// The gap loop must not re-introduce Empty-verdicted LSNs into missing_lsns_.
+// Without this filter, an Empty-resolved gap stalls commit advancement just like a real missing entry.
+TEST_F(CraftWriteTest, GapLoopSkipsEmptyVerdicts) {
+    dev_->seed_empty({3});
+    ASSERT_FALSE(dev_->is_missing(3));
+
+    // Writing dlsn=5 on a fresh device triggers the gap loop for lsns 0-4; lsn=3 is Empty-verdicted.
+    auto r5 = do_write(0, 5);
+    ASSERT_TRUE(r5.has_value());
+    // lsn=3 must NOT have been re-inserted — it is Empty-resolved, not a gap.
+    EXPECT_FALSE(dev_->is_missing(3));
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_EQ(dev_->missing_count(), 4u); // gaps {0,1,2,4}; lsn=3 is Empty, lsn=5 written
+    EXPECT_TRUE(dev_->is_missing(0));
+    EXPECT_TRUE(dev_->is_missing(1));
+    EXPECT_TRUE(dev_->is_missing(2));
+    EXPECT_TRUE(dev_->is_missing(4));
+    EXPECT_FALSE(dev_->is_missing(5)); // successfully written
+}
+
+// Cap fencepost from a seeded non-initial state: verify the > (not >=) boundary and that Guard 1
+// (overflow protection when dlsn is near INT64_MAX) fires correctly too.
+TEST_F(CraftWriteTest, GapCapFenceposts) {
+    dev_->seed_lsns(1'000'000, {});
+
+    // gap = 1,000,001 (one over cap) → rejected; state unchanged.
+    ASSERT_FALSE(do_write(0, 2'000'001).has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 1'000'000);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+
+    // Substantially over cap → also rejected.
+    ASSERT_FALSE(do_write(0, 3'000'000).has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 1'000'000);
+
+    // Guard 1: dlsn near INT64_MAX triggers the overflow-safe guard before the subtraction.
+    ASSERT_FALSE(do_write(0, INT64_MAX).has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 1'000'000);
+
+    // Small gap (2) from the seeded state → accepted; only 1 gap entry created.
+    ASSERT_TRUE(do_write(0, 1'000'002).has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 1'000'002);
+    EXPECT_EQ(dev_->missing_count(), 1u); // gap: 1,000,001
 }
 
 } // namespace

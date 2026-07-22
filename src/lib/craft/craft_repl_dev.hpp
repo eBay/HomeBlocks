@@ -70,8 +70,8 @@ struct JournalSlot {
 
 class CraftJournalBackend {
 public:
-    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len,
-                                   homestore::multi_blk_id blkid, bool all_zeros) = 0;
+    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+                                    bool all_zeros) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
     // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
@@ -195,7 +195,8 @@ public:
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
     // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
     void seed_commit_lsn(int64_t commit);
-    // Seeds the Empty-verdict set; does not affect missing_lsns_. Clears any prior seeded empties.
+    // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
+    // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
 #endif
 

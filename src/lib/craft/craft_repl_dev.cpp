@@ -29,8 +29,8 @@ public:
     explicit HomeStoreCraftJournalBackend(shared< homestore::home_log_store > logstore) :
             logstore_{std::move(logstore)} {}
 
-    async_status write_slot(int64_t lsn, lba_t /* lba */, lba_count_t /* len */,
-                            homestore::multi_blk_id /* blkid */, bool /* all_zeros */) override {
+    async_status write_slot(int64_t lsn, lba_t /* lba */, lba_count_t /* len */, homestore::multi_blk_id /* blkid */,
+                            bool /* all_zeros */) override {
         LOGW("HomeStoreCraftJournalBackend::write_slot lsn={} not yet implemented", lsn);
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
@@ -170,22 +170,34 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write rejected: slot is permanently empty dlsn={}", dlsn);
             co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
         }
-        // Cap the gap to prevent unbounded per-write allocation in missing_lsns_.
+        // Idempotent: slot already successfully written — return snapshot without a second write_slot call.
+        if (dlsn <= state_.last_append_lsn && !missing_lsns_.contains(dlsn)) {
+            LOGT("write idempotent: dlsn={} already written", dlsn);
+            co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
+        }
         static constexpr int64_t k_max_ooo_gap = 1'000'000;
+        // Guard 1: prevent signed overflow in the gap subtraction below (dlsn near INT64_MAX).
+        if (dlsn > INT64_MAX - k_max_ooo_gap) {
+            LOGW("write rejected: dlsn={} exceeds safe LSN range", dlsn);
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
+        // Guard 2: cap the gap to prevent unbounded per-write allocation in missing_lsns_.
         if (dlsn - state_.last_append_lsn > k_max_ooo_gap) {
             LOGW("write rejected: dlsn={} too far ahead of last_append_lsn={}", dlsn, state_.last_append_lsn);
             co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
-        for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap)
-            missing_lsns_.insert(gap);
+        // Empty-verdicted LSNs in the gap are already resolved — skip them to avoid re-stalling commit advancement.
+        for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap) {
+            if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
+        }
         if ((dlsn > state_.last_append_lsn) || missing_lsns_.contains(dlsn)) missing_lsns_.insert(dlsn);
         state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     }
 
     // HS_DATA_LINKED: for all_zeros=true skip data-service write; real block allocation wired in commit 2.
     homestore::multi_blk_id blkid{};
-    auto res = co_await journal_->write_slot(dlsn, static_cast< lba_t >(addr), static_cast< lba_count_t >(len),
-                                             blkid, all_zeros);
+    auto res = co_await journal_->write_slot(dlsn, static_cast< lba_t >(addr), static_cast< lba_count_t >(len), blkid,
+                                             all_zeros);
     if (!res) {
         LOGE("write_slot failed dlsn={} addr={} len={}: {}", dlsn, addr, len, res.error().message());
         co_return std::unexpected(res.error());
@@ -194,6 +206,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{missing_mu_};
+        // Re-validate term: a new login completing while write_slot was in flight may have run
+        // truncate(). Discarding this result prevents a ghost journal entry surviving past the truncation.
+        if (hdr.term != state_.term) {
+            LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         missing_lsns_.erase(dlsn);
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
