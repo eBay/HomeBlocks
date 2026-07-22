@@ -45,6 +45,11 @@ public:
     bool should_fail{false};
     int64_t truncated_to{INT64_MIN};
 
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
+                                                             lba_count_t /* len */) override {
+        co_return homestore::multi_blk_id{};
+    }
+
     async_status write_slot(int64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
@@ -58,6 +63,7 @@ public:
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return ok();
     }
+    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
 };
 
 // ── test fixture ─────────────────────────────────────────────────────────────

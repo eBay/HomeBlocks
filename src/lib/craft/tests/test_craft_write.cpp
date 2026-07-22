@@ -42,6 +42,13 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::set< int64_t > fail_lsns; // write_slot returns io_error for these lsns
+    int alloc_write_data_calls{0};
+
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
+                                                             lba_count_t /* len */) override {
+        ++alloc_write_data_calls;
+        co_return homestore::multi_blk_id{};
+    }
 
     async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
                             bool all_zeros) override {
@@ -58,6 +65,7 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
 
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
     size_t slot_count() const { return slots.size(); }
@@ -133,6 +141,7 @@ TEST_F(CraftWriteTest, AllZerosWrite) {
     EXPECT_EQ(dev_->missing_count(), 0u);
     ASSERT_TRUE(journal_->has_slot(0));
     EXPECT_TRUE(journal_->slots[0].all_zeros);
+    EXPECT_EQ(journal_->alloc_write_data_calls, 0); // no block allocation for all_zeros writes
 }
 
 // A failed write_slot must leave the lsn in missing_lsns_ (pre-insert invariant).

@@ -53,6 +53,11 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
 
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
+                                                             lba_count_t /* len */) override {
+        co_return homestore::multi_blk_id{};
+    }
+
     async_status write_slot(int64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
@@ -67,6 +72,7 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
 };
 
 // ── test fixture ─────────────────────────────────────────────────────────────

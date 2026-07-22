@@ -10,7 +10,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "6.0.4"
+    version = "6.0.5"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -48,7 +48,7 @@ class HomeBlocksConan(ConanFile):
 
     def build_requirements(self):
         self.test_requires("gtest/[^1.17]")
-        self.test_requires("ublkpp/[^0.35]@oss/main")
+        self.test_requires("ublkpp/[^0.36]@oss/main")
 
     def requirements(self):
         self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)

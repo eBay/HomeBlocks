@@ -15,24 +15,99 @@
 
 #include "craft_repl_dev.hpp"
 
-#include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t
+#include <coroutine>
+#include <cstring>
+
+#include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
+#include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
 
 namespace homeblocks {
 
-// ─── HomeStore journal backend ────────────────────────────────────────────────
+// ─── Journal entry on-disk format ─────────────────────────────────────────────
 //
-// Production backend: wraps a HomeStore home_log_store. write_slot / read_slot
-// are stubs implemented in S2 (PR #165). truncate_to() is implemented here (S4).
+// Each log slot is: [CraftJournalEntry header][serialized multi_blk_id bytes].
+// The payload (HS_DATA_LINKED) is written directly to the data service; only the
+// block reference is stored here.
+
+#pragma pack(1)
+struct CraftJournalEntry {
+    lba_t lba;
+    lba_count_t len;
+    uint8_t all_zeros;
+};
+#pragma pack()
+
+// ─── Callback-to-coroutine bridge ─────────────────────────────────────────────
+//
+// home_log_store::write_async is callback-based. This C++20 awaitable bridges it
+// to co_await: await_suspend calls write_async and captures the coroutine handle;
+// the callback resumes it when the write completes.
+//
+// blob_ lives in the coroutine frame for the full suspension, so write_async
+// always sees a valid buffer.
+//
+// KNOWN RISK (shutdown): write_async returns 0 without calling `cb` when is_stopping() is true
+// (HomeStore/src/lib/logstore/log_store.cpp:71). The coroutine is permanently suspended until the
+// process exits. Callers must drain all in-flight writes before initiating HomeStore shutdown.
+//
+// KNOWN GAP (I/O errors): write_async fires the same callback for both success and I/O failure
+// with no status argument. await_resume cannot surface the error, so write_slot always returns
+// ok() regardless of the underlying I/O result. A future fix requires a HomeStore API extension.
+
+struct LogstoreWriteAwaitable {
+    homestore::home_log_store* store_;
+    homestore::logstore_seq_num_t seq_;
+    sisl::io_blob_safe blob_;
+
+    bool await_ready() const noexcept { return false; }
+
+    template < typename H >
+    void await_suspend(H h) noexcept {
+        store_->write_async(
+            seq_, blob_, nullptr,
+            [h](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable { h.resume(); });
+    }
+
+    void await_resume() const noexcept {}
+};
+
+// ─── HomeStore journal backend ─────────────────────────────────────────────────
+//
+// Production backend: wraps a HomeStore home_log_store.
 
 class HomeStoreCraftJournalBackend : public CraftJournalBackend {
 public:
-    explicit HomeStoreCraftJournalBackend(shared< homestore::home_log_store > logstore) :
-            logstore_{std::move(logstore)} {}
+    explicit HomeStoreCraftJournalBackend(shared< homestore::home_log_store > logstore, uint64_t vol_ordinal) :
+            logstore_{std::move(logstore)}, vol_ordinal_{vol_ordinal} {}
 
-    async_status write_slot(int64_t lsn, lba_t /* lba */, lba_count_t /* len */, homestore::multi_blk_id /* blkid */,
-                            bool /* all_zeros */) override {
-        LOGW("HomeStoreCraftJournalBackend::write_slot lsn={} not yet implemented", lsn);
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // Allocate blocks via the HomeStore data service and write the payload (zero-copy).
+    // application_hint routes the allocation to this volume's chunk set via VolumeChunkSelector.
+    // Returns the allocated multi_blk_id on success.
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data,
+                                                             lba_count_t /* len */) override {
+        homestore::blk_alloc_hints hints;
+        hints.application_hint = vol_ordinal_;
+        homestore::multi_blk_id blkid{};
+        auto res = co_await homestore::data_service().async_alloc_write(data, hints, blkid);
+        if (!res) {
+            LOGE("async_alloc_write failed: {}", res.error().message());
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
+        co_return blkid;
+    }
+
+    // Serialize the journal entry (header + blkid) and write it to the log store.
+    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+                            bool all_zeros) override {
+        CraftJournalEntry hdr{lba, len, static_cast< uint8_t >(all_zeros)};
+        uint32_t blkid_sz = blkid.serialized_size();
+        sisl::io_blob_safe blob{static_cast< uint32_t >(sizeof(CraftJournalEntry)) + blkid_sz};
+        std::memcpy(blob.bytes(), &hdr, sizeof(CraftJournalEntry));
+        sisl::blob blkid_blob = blkid.serialize(); // non-owning view — copy before blkid goes out of scope
+        std::memcpy(blob.bytes() + sizeof(CraftJournalEntry), blkid_blob.cbytes(), blkid_sz);
+        co_await LogstoreWriteAwaitable{logstore_.get(), static_cast< homestore::logstore_seq_num_t >(lsn),
+                                        std::move(blob)};
+        co_return ok();
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
@@ -48,12 +123,23 @@ public:
         co_return ok();
     }
 
+    async_status free_data(homestore::multi_blk_id blkid) override {
+        auto res = co_await homestore::data_service().async_free_blk(blkid);
+        if (!res) {
+            LOGE("async_free_blk failed: {}", res.error().message());
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
+        co_return ok();
+    }
+
 private:
     shared< homestore::home_log_store > logstore_;
+    uint64_t vol_ordinal_;
 };
 
-unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore) {
-    return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore));
+unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
+                                                             uint64_t vol_ordinal) {
+    return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal);
 }
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -194,27 +280,60 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     }
 
-    // HS_DATA_LINKED: for all_zeros=true skip data-service write; real block allocation wired in commit 2.
+    // HS_DATA_LINKED: allocate blocks and write payload before journalling the block reference.
+    // all_zeros=true (WRITE_ZEROES/unmap) and empty data (test stubs) skip the data-service write.
+    //
+    // LATENT RISK: if the caller sends all_zeros=false with data.size==0 (e.g., a test stub with an
+    // empty sg_list but all_zeros not set), the journal entry records all_zeros=0 with a default-
+    // constructed blkid. On replay this produces a read against a zero blkid. The client wire rejects
+    // this, but internal and test paths must set all_zeros=true whenever no payload is provided.
     homestore::multi_blk_id blkid{};
+    bool blkid_allocated = false;
+    if (!all_zeros && data.size > 0) {
+        auto alloc_res = co_await journal_->alloc_write_data(data, static_cast< lba_count_t >(len));
+        if (!alloc_res) {
+            LOGE("alloc_write_data failed dlsn={}: {}", dlsn, alloc_res.error().message());
+            co_return std::unexpected(alloc_res.error());
+        }
+        blkid = *alloc_res;
+        blkid_allocated = true;
+    }
     auto res = co_await journal_->write_slot(dlsn, static_cast< lba_t >(addr), static_cast< lba_count_t >(len), blkid,
                                              all_zeros);
     if (!res) {
         LOGE("write_slot failed dlsn={} addr={} len={}: {}", dlsn, addr, len, res.error().message());
+        if (blkid_allocated) {
+            if (auto fr = co_await journal_->free_data(blkid); !fr)
+                LOGE("free_data failed after write_slot failure dlsn={}: {}", dlsn, fr.error().message());
+        }
         co_return std::unexpected(res.error());
     }
 
+    // Re-validate term: a new login completing while write_slot was in flight may have run
+    // truncate(). Discarding this result prevents a ghost journal entry surviving past the truncation.
+    // The lock is taken to snapshot the term and update state_, then released BEFORE free_data so we
+    // do not co_await while holding missing_mu_.
+    bool stale_post_flight = false;
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{missing_mu_};
-        // Re-validate term: a new login completing while write_slot was in flight may have run
-        // truncate(). Discarding this result prevents a ghost journal entry surviving past the truncation.
         if (hdr.term != state_.term) {
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            stale_post_flight = true;
+        } else {
+            missing_lsns_.erase(dlsn);
+            snapshot = {state_.commit_lsn, state_.last_append_lsn};
         }
-        missing_lsns_.erase(dlsn);
-        snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
+
+    if (stale_post_flight) {
+        if (blkid_allocated) {
+            if (auto fr = co_await journal_->free_data(blkid); !fr)
+                LOGE("free_data failed after post-flight stale-term discard dlsn={}: {}", dlsn, fr.error().message());
+        }
+        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+    }
+
     LOGT("write ok dlsn={} addr={} len={} all_zeros={}", dlsn, addr, len, all_zeros);
     co_return snapshot;
 }

@@ -70,17 +70,25 @@ struct JournalSlot {
 
 class CraftJournalBackend {
 public:
+    // Allocate blocks and write the data payload. Called BEFORE write_slot for non-zero writes.
+    // all_zeros=true and empty data bypass this; write_slot receives an empty multi_blk_id.
+    virtual async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data, lba_count_t len) = 0;
     virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                                     bool all_zeros) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
     // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
+    // Release blocks previously allocated by alloc_write_data. Called when write_slot fails or
+    // when the write is discarded post-flight (stale term). Free errors are logged but non-fatal.
+    virtual async_status free_data(homestore::multi_blk_id blkid) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
 // Factory that wraps a HomeStore log store. Used by volume.cpp when creating a CRAFT-mode volume.
+// vol_ordinal must match vol_info_->ordinal so async_alloc_write routes to this volume's chunks.
 // Tests inject MockCraftJournalBackend directly.
-unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore);
+unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
+                                                             uint64_t vol_ordinal);
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
