@@ -155,6 +155,64 @@ TEST_F(CraftWriteTest, EmptySlotRejectsWrite) {
     EXPECT_FALSE(dev_->is_missing(5));
 }
 
+// Empty verdict on a slot already in missing_lsns_ must remove it so the gap is resolved.
+// Without this, the slot stalls commit advancement permanently.
+TEST_F(CraftWriteTest, EmptyVerdictClearsMissingEntry) {
+    // Write lsn=10 with the journal injecting a failure → lsn 10 and gaps 0-9 all land in missing.
+    journal_->fail_lsns.insert(10);
+    auto r10 = do_write(0, 10);
+    ASSERT_FALSE(r10.has_value());
+    EXPECT_TRUE(dev_->is_missing(5));
+    EXPECT_TRUE(dev_->is_missing(10));
+
+    // S5 verdicts lsn=5 Empty: must be evicted from missing_lsns_.
+    dev_->seed_empty({5});
+    EXPECT_FALSE(dev_->is_missing(5));       // gap resolved
+    EXPECT_TRUE(dev_->is_empty_slot(5));     // permanently empty
+
+    // A late write to lsn=5 is still rejected with EMPTY_SLOT.
+    auto r5 = do_write(0, 5);
+    ASSERT_FALSE(r5.has_value());
+    EXPECT_EQ(r5.error(), make_error_condition(volume_error::EMPTY_SLOT));
+}
+
+// A negative dlsn is rejected before any state is touched.
+TEST_F(CraftWriteTest, NegativeDlsnRejected) {
+    auto r = do_write(0, -1);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(journal_->slot_count(), 0u);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), -1);
+}
+
+// A dlsn far ahead of last_append_lsn is rejected to prevent unbounded gap allocation.
+TEST_F(CraftWriteTest, ExcessiveGapRejected) {
+    auto r = do_write(0, 1'000'001);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(dev_->missing_count(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), -1);
+}
+
+// Gap of more than 1: writing lsn=4 after lsn=0 creates gaps {1,2,3} in missing_lsns_.
+TEST_F(CraftWriteTest, OutOfOrderWritesLargerGap) {
+    ASSERT_TRUE(do_write(0, 0).has_value());
+    auto r4 = do_write(0, 4);
+    ASSERT_TRUE(r4.has_value());
+    EXPECT_EQ(r4->last_append_lsn, 4);
+    EXPECT_EQ(dev_->missing_count(), 3u);
+    EXPECT_TRUE(dev_->is_missing(1));
+    EXPECT_TRUE(dev_->is_missing(2));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_FALSE(dev_->is_missing(4)); // 4 was successfully written
+
+    // Fill the gap one by one and verify the missing set drains.
+    ASSERT_TRUE(do_write(0, 2).has_value());
+    EXPECT_EQ(dev_->missing_count(), 2u);
+    ASSERT_TRUE(do_write(0, 1).has_value());
+    ASSERT_TRUE(do_write(0, 3).has_value());
+    EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
 } // namespace
 } // namespace homeblocks
 

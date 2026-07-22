@@ -133,6 +133,10 @@ void CraftReplDev::seed_empty(std::initializer_list< int64_t > empty) {
     std::lock_guard lk{missing_mu_};
     empty_lsns_.clear();
     empty_lsns_.insert(empty);
+    // Empty verdict resolves a gap: an LSN that was already in missing_lsns_ must be removed so
+    // it does not permanently stall commit advancement. apply_sync_rs_commit_lsn (S5) must do the same.
+    for (int64_t lsn : empty)
+        missing_lsns_.erase(lsn);
 }
 #endif
 
@@ -150,16 +154,27 @@ async_status CraftReplDev::logout(craft::client_hdr /* hdr */) {
 
 async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                                     sisl::sg_list data, bool all_zeros) {
-    if (hdr.term != state_.term) {
-        LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
-        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+    if (dlsn < 0) {
+        LOGW("write rejected: invalid dlsn={}", dlsn);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
 
     {
         std::lock_guard lock{missing_mu_};
+        // Term check is inside the lock: state_.term is mutated by apply_internal_login (S5) under the same mutex.
+        if (hdr.term != state_.term) {
+            LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         if (empty_lsns_.contains(dlsn)) {
             LOGW("write rejected: slot is permanently empty dlsn={}", dlsn);
             co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
+        }
+        // Cap the gap to prevent unbounded per-write allocation in missing_lsns_.
+        static constexpr int64_t k_max_ooo_gap = 1'000'000;
+        if (dlsn - state_.last_append_lsn > k_max_ooo_gap) {
+            LOGW("write rejected: dlsn={} too far ahead of last_append_lsn={}", dlsn, state_.last_append_lsn);
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
         for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap)
             missing_lsns_.insert(gap);
