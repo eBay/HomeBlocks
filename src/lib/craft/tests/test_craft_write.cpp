@@ -42,11 +42,14 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::set< int64_t > fail_lsns; // write_slot returns io_error for these lsns
+    bool fail_alloc{false};        // alloc_write_data returns io_error when set
     int alloc_write_data_calls{0};
+    int free_data_calls{0};
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
                                                              lba_count_t /* len */) override {
         ++alloc_write_data_calls;
+        if (fail_alloc) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return homestore::multi_blk_id{};
     }
 
@@ -65,7 +68,10 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
-    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id) override {
+        ++free_data_calls;
+        co_return ok();
+    }
 
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
     size_t slot_count() const { return slots.size(); }
@@ -84,6 +90,15 @@ protected:
     auto do_write(uint64_t term, int64_t lsn, bool all_zeros = false) {
         return homeblocks::detail::sync_get(
             dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}, all_zeros));
+    }
+
+    // Variant that marks data.size > 0 so the alloc_write_data branch is exercised.
+    // The mock ignores the actual iovecs; only data.size matters for the branch guard.
+    auto do_write_with_data(uint64_t term, int64_t lsn) {
+        sisl::sg_list data;
+        data.size = 4096;
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, std::move(data), false));
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -279,6 +294,39 @@ TEST_F(CraftWriteTest, GapCapFenceposts) {
     ASSERT_TRUE(do_write(0, 1'000'002).has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 1'000'002);
     EXPECT_EQ(dev_->missing_count(), 1u); // gap: 1,000,001
+}
+
+// A write with data.size > 0 (non-zero content) must call alloc_write_data exactly once.
+// This verifies the HS_DATA_LINKED branch is entered when the payload is non-empty.
+TEST_F(CraftWriteTest, NonZeroWriteCallsAllocWriteData) {
+    auto r = do_write_with_data(0, 0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1);
+    EXPECT_TRUE(journal_->has_slot(0));
+}
+
+// alloc_write_data failure propagates; write_slot must not be called and no block is freed
+// (there is nothing to free — allocation never succeeded).
+TEST_F(CraftWriteTest, AllocWriteDataFails_WriteRejected) {
+    journal_->fail_alloc = true;
+    auto r = do_write_with_data(0, 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1);
+    EXPECT_EQ(journal_->slot_count(), 0u);   // write_slot not called
+    EXPECT_EQ(journal_->free_data_calls, 0); // nothing to free
+    EXPECT_TRUE(dev_->is_missing(0));        // pre-insert invariant holds
+}
+
+// write_slot failure after a successful alloc_write_data must call free_data exactly once
+// (Finding 1 fix). This test exercises blkid_allocated=true path.
+TEST_F(CraftWriteTest, WriteSlotFailsWithData_BlocksFreed) {
+    journal_->fail_lsns.insert(0);
+    auto r = do_write_with_data(0, 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1); // alloc succeeded
+    EXPECT_EQ(journal_->slot_count(), 0u);          // write_slot returned error
+    EXPECT_EQ(journal_->free_data_calls, 1);        // blocks freed after write_slot failure
+    EXPECT_TRUE(dev_->is_missing(0));               // pre-insert invariant holds
 }
 
 } // namespace

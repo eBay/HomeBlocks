@@ -242,7 +242,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
                                                     sisl::sg_list data, bool all_zeros) {
     if (dlsn < 0) {
         LOGW("write rejected: invalid dlsn={}", dlsn);
-        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
 
     {
@@ -265,12 +265,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // Guard 1: prevent signed overflow in the gap subtraction below (dlsn near INT64_MAX).
         if (dlsn > INT64_MAX - k_max_ooo_gap) {
             LOGW("write rejected: dlsn={} exceeds safe LSN range", dlsn);
-            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+            co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
         }
         // Guard 2: cap the gap to prevent unbounded per-write allocation in missing_lsns_.
         if (dlsn - state_.last_append_lsn > k_max_ooo_gap) {
             LOGW("write rejected: dlsn={} too far ahead of last_append_lsn={}", dlsn, state_.last_append_lsn);
-            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+            co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
         // Empty-verdicted LSNs in the gap are already resolved — skip them to avoid re-stalling commit advancement.
         for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap) {
