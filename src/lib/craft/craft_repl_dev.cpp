@@ -244,6 +244,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         LOGW("write rejected: invalid dlsn={}", dlsn);
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
+    RELEASE_ASSERT(all_zeros || data.size > 0,
+                   "write: all_zeros=false requires non-empty data; set all_zeros=true for WRITE_ZEROES");
 
     {
         std::lock_guard lock{missing_mu_};

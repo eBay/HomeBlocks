@@ -121,8 +121,9 @@ public:
     async_status logout(craft::client_hdr hdr);
 
     // Append data at the client-assigned dLSN. Zero-copy; does NOT apply to the LBA index (hdr.commit_lsn drives
-    // that). An EMPTY `data` is a zero write (WRITE_ZEROES/unmap over [addr, addr+len)). The ack returns the
-    // achieved {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
+    // that). Set all_zeros=true for WRITE_ZEROES/unmap over [addr, addr+len); data must be empty in that case.
+    // Precondition: all_zeros=false requires non-empty data (data.size > 0). The ack returns the achieved
+    // {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
     // watermarks (the wire's write_rsp), so any round-trip refreshes the client's model of this member.
     async_result< craft::lsn_pair > write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                           sisl::sg_list data, bool all_zeros = false);

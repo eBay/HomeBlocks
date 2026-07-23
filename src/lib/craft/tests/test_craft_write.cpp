@@ -25,6 +25,7 @@
 
 #include <gtest/gtest.h>
 #include <map>
+#include <set>
 #include <sisl/logging/logging.h>
 
 #include "craft/craft_repl_dev.hpp"
@@ -87,7 +88,7 @@ protected:
         dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
     }
 
-    auto do_write(uint64_t term, int64_t lsn, bool all_zeros = false) {
+    auto do_write(uint64_t term, int64_t lsn, bool all_zeros = true) {
         return homeblocks::detail::sync_get(
             dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}, all_zeros));
     }
