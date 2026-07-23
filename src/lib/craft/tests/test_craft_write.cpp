@@ -241,16 +241,42 @@ TEST_F(CraftWriteTest, OutOfOrderWritesLargerGap) {
 // A retry of an already-written dlsn returns success idempotently without a second write_slot call.
 // Invariant: after a successful write, dlsn is absent from missing_lsns_; a second write with the
 // same dlsn must not violate the pre-insert invariant by calling write_slot without a prior insert.
+// Also covers cross-type retries: the original slot type (all_zeros vs data) is preserved; the
+// retry type is irrelevant — the slot is immutable once written.
 TEST_F(CraftWriteTest, DuplicateWriteIsIdempotent) {
+    // same-type: all_zeros then all_zeros at dLSN=0
     ASSERT_TRUE(do_write(0, 0).has_value());
     EXPECT_EQ(journal_->slot_count(), 1u);
     EXPECT_FALSE(dev_->is_missing(0));
 
-    // Retry same dlsn (ACK-loss scenario): must return success without dispatching a second write_slot.
     auto r2 = do_write(0, 0);
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(journal_->slot_count(), 1u); // write_slot not called again
     EXPECT_FALSE(dev_->is_missing(0));
+
+    // cross-type: data write first, then all_zeros retry at dLSN=1 — all_zeros is discarded
+    auto r_data = do_write_with_data(0, 1);
+    ASSERT_TRUE(r_data.has_value());
+    EXPECT_EQ(journal_->slot_count(), 2u);
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1);
+    EXPECT_FALSE(journal_->slots[1].all_zeros); // data slot preserved
+
+    auto r_zero = do_write(0, 1, /*all_zeros=*/true);
+    ASSERT_TRUE(r_zero.has_value());
+    EXPECT_EQ(journal_->slot_count(), 2u);          // write_slot not called again
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1); // no extra alloc for the all_zeros retry
+
+    // cross-type: all_zeros write first, then data retry at dLSN=2 — data is discarded
+    auto r_zero2 = do_write(0, 2, /*all_zeros=*/true);
+    ASSERT_TRUE(r_zero2.has_value());
+    EXPECT_EQ(journal_->slot_count(), 3u);
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1); // all_zeros never allocates
+    EXPECT_TRUE(journal_->slots[2].all_zeros);      // zero slot preserved
+
+    auto r_data2 = do_write_with_data(0, 2);
+    ASSERT_TRUE(r_data2.has_value());
+    EXPECT_EQ(journal_->slot_count(), 3u);          // write_slot not called again
+    EXPECT_EQ(journal_->alloc_write_data_calls, 1); // idempotent path skips alloc_write_data
 }
 
 // The gap loop must not re-introduce Empty-verdicted LSNs into missing_lsns_.
