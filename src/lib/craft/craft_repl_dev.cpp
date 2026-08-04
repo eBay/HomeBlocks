@@ -29,10 +29,22 @@ namespace homeblocks {
 // The payload (HS_DATA_LINKED) is written directly to the data service; only the
 // block reference is stored here.
 
+static constexpr uint32_t k_journal_magic = 0xC4AF5AFE; // "CRAFT SAFE" — corrupt or non-CRAFT slots fail this
+static constexpr uint8_t k_journal_version = 1;
+
+// On-disk format: magic first so recovery can rule out corruption or log slots not written by
+// this code before reading anything else. version follows so the rest of the layout can evolve
+// without breaking the magic check. lsn is stored redundantly for self-describing recovery and
+// cross-checking against the log-store sequence number. lba and len are BYTES (byte-addressed
+// API contract), not block units.
 #pragma pack(1)
 struct CraftJournalEntry {
-    lba_t lba;
-    lba_count_t len;
+    uint32_t magic;  // always k_journal_magic — first guard against corruption
+    uint8_t version; // always k_journal_version; bump when layout changes
+    uint64_t term;   // session term at write time — lets recovery skip stale-tail entries
+    int64_t lsn;     // dLSN — self-describing: cross-checks slot index on recovery
+    lba_t lba;       // BYTES (byte offset), not block index
+    lba_count_t len; // BYTES (byte count),  not block count
     uint8_t all_zeros;
 };
 #pragma pack()
@@ -45,6 +57,15 @@ struct CraftJournalEntry {
 //
 // blob_ lives in the coroutine frame for the full suspension, so write_async
 // always sees a valid buffer.
+//
+// KNOWN RISK (deadlock): the write_async callback fires synchronously inside LogDev's m_flush_mtx
+// (log_dev.cpp: flush_under_guard → flush → on_flush_completion → callback_lambda, with
+// has_repl_data_service()=true in HomeBlocks production). h.resume() therefore runs the coroutine
+// continuation while the non-recursive mutex is still held. In the current S2 code the continuation
+// only takes missing_mu_ (a different mutex) and calls data_service().async_free_blk(), so no
+// immediate deadlock. The risk becomes real when S3 adds advance_commit() which will read journal
+// slots (taking m_flush_mtx → self-deadlock). Fix before S3: dispatch h.resume() via
+// iomanager.run_on_main_fiber() instead of inline. See log_dev.cpp:468-609 and homeblks_impl.cpp:310.
 //
 // KNOWN RISK (shutdown): write_async returns 0 without calling `cb` when is_stopping() is true
 // (HomeStore/src/lib/logstore/log_store.cpp:71). The coroutine is permanently suspended until the
@@ -97,9 +118,10 @@ public:
     }
 
     // Serialize the journal entry (header + blkid) and write it to the log store.
-    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                             bool all_zeros) override {
-        CraftJournalEntry hdr{lba, len, static_cast< uint8_t >(all_zeros)};
+        CraftJournalEntry hdr{
+            k_journal_magic, k_journal_version, term, lsn, lba, len, static_cast< uint8_t >(all_zeros)};
         uint32_t blkid_sz = blkid.serialized_size();
         sisl::io_blob_safe blob{static_cast< uint32_t >(sizeof(CraftJournalEntry)) + blkid_sz};
         std::memcpy(blob.bytes(), &hdr, sizeof(CraftJournalEntry));
@@ -215,6 +237,11 @@ void CraftReplDev::seed_commit_lsn(int64_t commit) {
     state_.commit_lsn = commit;
 }
 
+void CraftReplDev::seed_term(uint64_t term) {
+    std::lock_guard lk{missing_mu_};
+    state_.term = term;
+}
+
 void CraftReplDev::seed_empty(std::initializer_list< int64_t > empty) {
     std::lock_guard lk{missing_mu_};
     empty_lsns_.clear();
@@ -226,7 +253,7 @@ void CraftReplDev::seed_empty(std::initializer_list< int64_t > empty) {
 }
 #endif
 
-// ─── stubs (S1/S2/S3/S5/S6/S7 implement these) ───────────────────────────────
+// ─── stubs (S1/S3/S5/S7 implement these) ─────────────────────────────────────
 
 async_result< craft::LoginResult > CraftReplDev::login(uint64_t /* client_token */) {
     LOGW("CraftReplDev::login not yet implemented");
@@ -244,8 +271,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         LOGW("write rejected: invalid dlsn={}", dlsn);
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
-    RELEASE_ASSERT(all_zeros || data.size > 0,
-                   "write: all_zeros=false requires non-empty data; set all_zeros=true for WRITE_ZEROES");
+    // Reject rather than abort: this condition is reachable from the client wire (S9 CraftConnector)
+    // so a RELEASE_ASSERT would let a malformed frame abort the entire replica process.
+    if (!all_zeros && data.size == 0) {
+        LOGW("write rejected: all_zeros=false requires non-empty data dlsn={} addr={} len={}", dlsn, addr, len);
+        co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
+    }
 
     {
         std::lock_guard lock{missing_mu_};
@@ -283,12 +314,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     }
 
     // HS_DATA_LINKED: allocate blocks and write payload before journalling the block reference.
-    // all_zeros=true (WRITE_ZEROES/unmap) and empty data (test stubs) skip the data-service write.
-    //
-    // LATENT RISK: if the caller sends all_zeros=false with data.size==0 (e.g., a test stub with an
-    // empty sg_list but all_zeros not set), the journal entry records all_zeros=0 with a default-
-    // constructed blkid. On replay this produces a read against a zero blkid. The client wire rejects
-    // this, but internal and test paths must set all_zeros=true whenever no payload is provided.
+    // all_zeros=true skips this; the early-return above guarantees !all_zeros implies data.size > 0.
     homestore::multi_blk_id blkid{};
     bool blkid_allocated = false;
     if (!all_zeros && data.size > 0) {
@@ -300,8 +326,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         blkid = *alloc_res;
         blkid_allocated = true;
     }
-    auto res = co_await journal_->write_slot(dlsn, static_cast< lba_t >(addr), static_cast< lba_count_t >(len), blkid,
-                                             all_zeros);
+    // addr and len are BYTES (byte-addressed API): CraftJournalEntry stores them verbatim as bytes.
+    // hdr.term is already verified against state_.term under missing_mu_ above; pass it so the
+    // on-disk entry carries the session term for stale-tail detection on recovery. dlsn is stored
+    // redundantly in CraftJournalEntry.lsn for self-describing recovery.
+    auto res = co_await journal_->write_slot(dlsn, hdr.term, static_cast< lba_t >(addr),
+                                             static_cast< lba_count_t >(len), blkid, all_zeros);
     if (!res) {
         LOGE("write_slot failed dlsn={} addr={} len={}: {}", dlsn, addr, len, res.error().message());
         if (blkid_allocated) {
@@ -315,6 +345,15 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // truncate(). Discarding this result prevents a ghost journal entry surviving past the truncation.
     // The lock is taken to snapshot the term and update state_, then released BEFORE free_data so we
     // do not co_await while holding missing_mu_.
+    //
+    // KNOWN RISK (stale-tail dangling blkid): write_slot already wrote a durable journal entry for
+    // this dlsn. If the term changed post-flight, free_data releases the blkid here, but the journal
+    // entry still references it. Two safety layers mitigate crash-between-free-and-truncate:
+    //   (a) The next login calls truncate(rs_commit_lsn) which drops everything above the resolution
+    //       frontier, removing the orphaned entry before any replay.
+    //   (b) CraftJournalEntry.term lets recovery identify and skip entries from a superseded session
+    //       even if the process crashes before truncate runs.
+    // A stronger fix (durable pending-free record) is deferred to S3 advance_commit work.
     bool stale_post_flight = false;
     craft::lsn_pair snapshot;
     {

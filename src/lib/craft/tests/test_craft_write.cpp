@@ -42,8 +42,9 @@ namespace {
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
-    std::set< int64_t > fail_lsns; // write_slot returns io_error for these lsns
-    bool fail_alloc{false};        // alloc_write_data returns io_error when set
+    std::map< int64_t, uint64_t > slot_terms; // term passed to write_slot, keyed by lsn
+    std::set< int64_t > fail_lsns;            // write_slot returns io_error for these lsns
+    bool fail_alloc{false};                   // alloc_write_data returns io_error when set
     int alloc_write_data_calls{0};
     int free_data_calls{0};
 
@@ -54,10 +55,11 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
+    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
                             bool all_zeros) override {
         if (fail_lsns.count(lsn)) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] = JournalSlot{lsn, false, all_zeros, lba, len, {}};
+        slot_terms[lsn] = term;
         co_return ok();
     }
 
@@ -354,6 +356,29 @@ TEST_F(CraftWriteTest, WriteSlotFailsWithData_BlocksFreed) {
     EXPECT_EQ(journal_->slot_count(), 0u);          // write_slot returned error
     EXPECT_EQ(journal_->free_data_calls, 1);        // blocks freed after write_slot failure
     EXPECT_TRUE(dev_->is_missing(0));               // pre-insert invariant holds
+}
+
+// all_zeros=false with an empty sg_list (data.size==0) was previously a RELEASE_ASSERT (process abort).
+// After the fix it returns invalid_argument so a malformed client frame cannot kill the replica.
+TEST_F(CraftWriteTest, AllZerosFalseWithEmptyDataRejected) {
+    sisl::sg_list empty_data{};
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, 4096, std::move(empty_data), /*all_zeros=*/false));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(journal_->slot_count(), 0u);  // write_slot not reached
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
+}
+
+// write_slot must receive the term from the client_hdr so CraftJournalEntry.term is populated correctly.
+// This is the on-disk term used to detect and skip stale-tail entries on recovery.
+TEST_F(CraftWriteTest, WriteSlotReceivesCorrectTerm) {
+    constexpr uint64_t k_term = 7;
+    dev_->seed_term(k_term);
+    auto r = do_write(k_term, 0);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(journal_->has_slot(0));
+    EXPECT_EQ(journal_->slot_terms[0], k_term);
 }
 
 } // namespace

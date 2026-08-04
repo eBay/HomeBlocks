@@ -57,8 +57,8 @@ struct JournalSlot {
     int64_t lsn{-1};
     bool is_empty{false};
     bool all_zeros{false};
-    lba_t lba{0};
-    lba_count_t len{0};
+    lba_t lba{0};       // BYTES, not block index — mirrors CraftJournalEntry.lba semantics
+    lba_count_t len{0}; // BYTES, not block count  — mirrors CraftJournalEntry.len semantics
     sisl::sg_list data{};
 };
 
@@ -73,8 +73,10 @@ public:
     // Allocate blocks and write the data payload. Called BEFORE write_slot for non-zero writes.
     // all_zeros=true and empty data bypass this; write_slot receives an empty multi_blk_id.
     virtual async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data, lba_count_t len) = 0;
-    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
-                                    bool all_zeros) = 0;
+    // term is the session term captured from state_.term at write() time — stored in
+    // CraftJournalEntry so recovery can skip stale-tail entries written under a deposed leader.
+    virtual async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len,
+                                    homestore::multi_blk_id blkid, bool all_zeros) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
     // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
@@ -207,6 +209,8 @@ public:
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
+    // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
+    void seed_term(uint64_t term);
 #endif
 
 private:

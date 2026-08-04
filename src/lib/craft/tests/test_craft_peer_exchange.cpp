@@ -58,7 +58,7 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
+    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
