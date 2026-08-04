@@ -57,7 +57,7 @@ public:
 
     async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
                             bool all_zeros) override {
-        if (fail_lsns.count(lsn)) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (fail_lsns.contains(lsn)) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] = JournalSlot{lsn, false, all_zeros, lba, len, {}};
         slot_terms[lsn] = term;
         co_return ok();
@@ -76,7 +76,7 @@ public:
         co_return ok();
     }
 
-    bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
+    bool has_slot(int64_t lsn) const { return slots.contains(lsn); }
     size_t slot_count() const { return slots.size(); }
 };
 
