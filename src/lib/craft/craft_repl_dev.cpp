@@ -20,6 +20,8 @@
 
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
+#include <iomgr/iomgr.hpp>                  // iomanager singleton, reactor_regex
+#include <sisl/async/value_awaitable.hpp>   // value_awaitable<T>: lock-free completion-before-suspend-safe bridge
 
 namespace homeblocks {
 
@@ -48,49 +50,6 @@ struct CraftJournalEntry {
     uint8_t all_zeros;
 };
 #pragma pack()
-
-// ─── Callback-to-coroutine bridge ─────────────────────────────────────────────
-//
-// home_log_store::write_async is callback-based. This C++20 awaitable bridges it
-// to co_await: await_suspend calls write_async and captures the coroutine handle;
-// the callback resumes it when the write completes.
-//
-// blob_ lives in the coroutine frame for the full suspension, so write_async
-// always sees a valid buffer.
-//
-// KNOWN RISK (deadlock): the write_async callback fires synchronously inside LogDev's m_flush_mtx
-// (log_dev.cpp: flush_under_guard → flush → on_flush_completion → callback_lambda, with
-// has_repl_data_service()=true in HomeBlocks production). h.resume() therefore runs the coroutine
-// continuation while the non-recursive mutex is still held. In the current S2 code the continuation
-// only takes missing_mu_ (a different mutex) and calls data_service().async_free_blk(), so no
-// immediate deadlock. The risk becomes real when S3 adds advance_commit() which will read journal
-// slots (taking m_flush_mtx → self-deadlock). Fix before S3: dispatch h.resume() via
-// iomanager.run_on_main_fiber() instead of inline. See log_dev.cpp:468-609 and homeblks_impl.cpp:310.
-//
-// KNOWN RISK (shutdown): write_async returns 0 without calling `cb` when is_stopping() is true
-// (HomeStore/src/lib/logstore/log_store.cpp:71). The coroutine is permanently suspended until the
-// process exits. Callers must drain all in-flight writes before initiating HomeStore shutdown.
-//
-// KNOWN GAP (I/O errors): write_async fires the same callback for both success and I/O failure
-// with no status argument. await_resume cannot surface the error, so write_slot always returns
-// ok() regardless of the underlying I/O result. A future fix requires a HomeStore API extension.
-
-struct LogstoreWriteAwaitable {
-    homestore::home_log_store* store_;
-    homestore::logstore_seq_num_t seq_;
-    sisl::io_blob_safe blob_;
-
-    bool await_ready() const noexcept { return false; }
-
-    template < typename H >
-    void await_suspend(H h) noexcept {
-        store_->write_async(
-            seq_, blob_, nullptr,
-            [h](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable { h.resume(); });
-    }
-
-    void await_resume() const noexcept {}
-};
 
 // ─── HomeStore journal backend ─────────────────────────────────────────────────
 //
@@ -127,8 +86,33 @@ public:
         std::memcpy(blob.bytes(), &hdr, sizeof(CraftJournalEntry));
         sisl::blob blkid_blob = blkid.serialize(); // non-owning view — copy before blkid goes out of scope
         std::memcpy(blob.bytes() + sizeof(CraftJournalEntry), blkid_blob.cbytes(), blkid_sz);
-        co_await LogstoreWriteAwaitable{logstore_.get(), static_cast< homestore::logstore_seq_num_t >(lsn),
-                                        std::move(blob)};
+        // Bridge write_async (callback) to co_await via value_awaitable<bool>.
+        //   • Deadlock-safe: the callback posts va->complete() to an iomgr reactor via run_on_forget,
+        //     decoupling coroutine resume from LogDev::m_flush_mtx (non-recursive mutex held during
+        //     the callback). Without this, S3's advance_commit() — which reads journal slots — would
+        //     re-enter m_flush_mtx and self-deadlock.
+        //   • INLINE-safe: if write_async fires the callback before await_suspend returns (INLINE
+        //     log-dev mode used by solo_repl_dev), value_awaitable::await_suspend atomically detects
+        //     k_done and returns false so the coroutine never suspends — no UB from frame destruction
+        //     inside the callback.
+        //   • blob lifetime: blob is a coroutine-frame local; the frame stays alive through co_await.
+        //     write_async holds only a reference, which remains valid for the full I/O duration.
+        //
+        // KNOWN RISK (shutdown): write_async skips the callback when is_stopping() is true
+        // (HomeStore/src/lib/logstore/log_store.cpp:71); complete() is never called and the coroutine
+        // stays suspended. Callers must drain in-flight writes before HomeStore shutdown.
+        //
+        // KNOWN GAP (I/O errors): write_async fires the same callback for success and failure with no
+        // status argument; write_slot always returns ok() regardless of the I/O result. A fix requires
+        // a HomeStore API extension.
+        auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
+        logstore_->write_async(
+            static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
+            [va](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
+                iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
+                                        [va = std::move(va)]() mutable { va->complete(true); });
+            });
+        co_await *va;
         co_return ok();
     }
 
