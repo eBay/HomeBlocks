@@ -41,12 +41,12 @@ static constexpr uint8_t k_journal_version = 1;
 // API contract), not block units.
 #pragma pack(1)
 struct CraftJournalEntry {
-    uint32_t magic;  // always k_journal_magic — first guard against corruption
-    uint8_t version; // always k_journal_version; bump when layout changes
-    uint64_t term;   // session term at write time — lets recovery skip stale-tail entries
-    int64_t lsn;     // dLSN — self-describing: cross-checks slot index on recovery
-    lba_t lba;       // BYTES (byte offset), not block index
-    lba_count_t len; // BYTES (byte count),  not block count
+    uint32_t magic;
+    uint8_t version;
+    uint64_t term;
+    int64_t lsn;
+    lba_t lba;
+    lba_count_t len;
     uint8_t all_zeros;
 };
 #pragma pack()
@@ -88,13 +88,16 @@ public:
         std::memcpy(blob.bytes() + sizeof(CraftJournalEntry), blkid_blob.cbytes(), blkid_sz);
         // Bridge write_async (callback) to co_await via value_awaitable<bool>.
         //   • Deadlock-safe: the callback posts va->complete() to an iomgr reactor via run_on_forget,
-        //     decoupling coroutine resume from LogDev::m_flush_mtx (non-recursive mutex held during
-        //     the callback). Without this, S3's advance_commit() — which reads journal slots — would
-        //     re-enter m_flush_mtx and self-deadlock.
+        //     decoupling coroutine resume from LogDev::m_flush_mtx. In production HomeBlocks always has
+        //     the repl data service (homeblks_impl.cpp:310,317), so the callback fires synchronously
+        //     inside flush() -> on_flush_completion(), which executes under flush_guard() (non-recursive
+        //     std::unique_lock on m_flush_mtx, log_dev.hpp:718). LogDev::read(), rollback(), and
+        //     truncate() all take flush_guard() unconditionally, so any journal op issued from the
+        //     continuation would self-deadlock without this dispatch.
         //   • INLINE-safe: if write_async fires the callback before await_suspend returns (INLINE
-        //     log-dev mode used by solo_repl_dev), value_awaitable::await_suspend atomically detects
-        //     k_done and returns false so the coroutine never suspends — no UB from frame destruction
-        //     inside the callback.
+        //     log-dev mode used by solo_repl_dev, append_async -> flush_if_necessary()), value_awaitable::
+        //     await_suspend atomically detects k_done and returns false so the coroutine never suspends —
+        //     no UB from frame destruction inside the callback.
         //   • blob lifetime: blob is a coroutine-frame local; the frame stays alive through co_await.
         //     write_async holds only a reference, which remains valid for the full I/O duration.
         //
@@ -325,19 +328,18 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(res.error());
     }
 
-    // Re-validate term: a new login completing while write_slot was in flight may have run
-    // truncate(). Discarding this result prevents a ghost journal entry surviving past the truncation.
-    // The lock is taken to snapshot the term and update state_, then released BEFORE free_data so we
-    // do not co_await while holding missing_mu_.
+    // Post-flight term recheck. Per CRAFT-Design, InternalLogin simultaneously bumps the term
+    // and truncates, with login quiescing all writes before truncating — so if that invariant holds,
+    // this branch is dead code (the term cannot change while write_slot is in flight).
     //
-    // KNOWN RISK (stale-tail dangling blkid): write_slot already wrote a durable journal entry for
-    // this dlsn. If the term changed post-flight, free_data releases the blkid here, but the journal
-    // entry still references it. Two safety layers mitigate crash-between-free-and-truncate:
-    //   (a) The next login calls truncate(rs_commit_lsn) which drops everything above the resolution
-    //       frontier, removing the orphaned entry before any replay.
-    //   (b) CraftJournalEntry.term lets recovery identify and skip entries from a superseded session
-    //       even if the process crashes before truncate runs.
-    // A stronger fix (durable pending-free record) is deferred to S3 advance_commit work.
+    // If the race occurs despite the quiescence guarantee, do NOT call free_data: write_slot already
+    // wrote a durable journal entry at dlsn that references blkid. There are only two orderings:
+    //   truncate ran after write_slot  — truncate drops the entry; no free needed.
+    //   truncate ran before write_slot — the entry survives above the new tail; freeing blkid here
+    //                                    leaves it dangling (re-allocatable blocks, journal still
+    //                                    references them). Actively harmful.
+    // In both orderings free_data is either unnecessary or wrong. blkid is intentionally not freed.
+    // CraftJournalEntry.term lets recovery skip the stale entry; the next login truncates it durably.
     bool stale_post_flight = false;
     craft::lsn_pair snapshot;
     {
@@ -351,13 +353,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
     }
 
-    if (stale_post_flight) {
-        if (blkid_allocated) {
-            if (auto fr = co_await journal_->free_data(blkid); !fr)
-                LOGE("free_data failed after post-flight stale-term discard dlsn={}: {}", dlsn, fr.error().message());
-        }
-        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
-    }
+    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
 
     LOGT("write ok dlsn={} addr={} len={} all_zeros={}", dlsn, addr, len, all_zeros);
     co_return snapshot;
