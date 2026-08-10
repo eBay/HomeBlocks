@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../hb_internal.hpp"
+#include "craft_raft_entries.hpp"
 #include <homestore/replication/repl_dev.hpp>
 
 #include <atomic>
@@ -80,6 +81,18 @@ public:
 // Factory that wraps a HomeStore log store. Used by volume.cpp when creating a CRAFT-mode volume.
 // Tests inject MockCraftJournalBackend directly.
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore);
+
+// ─── CraftPeerFetcher ─────────────────────────────────────────────────────────
+//
+// Abstraction over the server-to-server fetch_data() call. Injected into
+// CraftReplDev so unit tests can stub peer communication without a live network.
+// Production wires CraftConnector (S9). Default (null) leaves catch-up stubbed.
+
+class CraftPeerFetcher {
+public:
+    virtual async_result< std::vector< JournalSlot > > fetch_from_peer(std::vector< int64_t > lsns) = 0;
+    virtual ~CraftPeerFetcher() = default;
+};
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
@@ -188,6 +201,10 @@ public:
         return state_.commit_lsn;
     }
 
+    // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
+    // Called by CraftConnector (S9) after construction; tests inject a mock.
+    void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
+
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
@@ -256,7 +273,8 @@ private:
     };
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type.
-    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token);
+    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                  std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     volume_id_t vol_id_;
@@ -268,6 +286,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
+    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 
 } // namespace homeblocks

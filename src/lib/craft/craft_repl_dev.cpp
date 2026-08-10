@@ -265,7 +265,8 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& /
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
 
-void CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t /* client_token */) {
+void CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t /* client_token */,
+                                             std::vector< int64_t > /* empty_slots */) {
     LOGD("apply_sync_rs_commit_lsn rs_commit_lsn={} (not yet implemented)", rs_commit_lsn);
 }
 
