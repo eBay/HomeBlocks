@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include <sisl/fds/buffer.hpp>
@@ -84,17 +85,38 @@ inline size_t sync_rs_commit_lsn_key_size(size_t num_empty) {
 // sync_rs_commit_lsn_key_size(empty_slots.size()) first.
 inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, uint64_t client_token,
                                          const std::vector< int64_t >& empty_slots) {
+    // SyncRSCommitLSNPayload's 3 members total 20 bytes but sizeof rounds to 24 (8-byte alignment) --
+    // zero the whole fixed prefix first so that trailing padding, which rides along as part of the
+    // persisted/replicated entry, doesn't leak prior buffer contents or make equivalent entries
+    // byte-different.
+    std::memset(buf, 0, sizeof(SyncRSCommitLSNPayload));
+
     auto* p            = reinterpret_cast< SyncRSCommitLSNPayload* >(buf);
     p->rs_commit_lsn   = rs_commit_lsn;
     p->client_token    = client_token;
     p->num_empty_slots = static_cast< uint32_t >(empty_slots.size());
-    std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t));
+    // empty_slots.data() may be null when empty; memcpy(dest, nullptr, 0) is UB regardless of count.
+    if (!empty_slots.empty()) {
+        std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t));
+    }
 }
 
-// Reads the packed int64_t array immediately following *p (the trailing data serialize_sync_rs_commit_lsn wrote).
-inline std::vector< int64_t > parse_empty_slots(const SyncRSCommitLSNPayload* p) {
+// Reads the packed int64_t array immediately following the fixed prefix in `key` (the trailing data
+// serialize_sync_rs_commit_lsn wrote). `key` is persisted RAFT log data replayed on apply -- a truncated or
+// corrupt entry must not be trusted, so the fixed prefix and the declared num_empty_slots are validated
+// against key's actual size before the vector is ever constructed. Returns std::nullopt if the entry
+// doesn't parse.
+inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob const& key) {
+    if (key.size() < sizeof(SyncRSCommitLSNPayload)) { return std::nullopt; }
+
+    const auto* p = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
+
+    const size_t empty_count  = p->num_empty_slots;
+    const size_t expected_size = sizeof(SyncRSCommitLSNPayload) + empty_count * sizeof(int64_t);
+    if (key.size() != expected_size) { return std::nullopt; }
+
     const auto* src = reinterpret_cast< const int64_t* >(p + 1);
-    return std::vector< int64_t >(src, src + p->num_empty_slots);
+    return std::vector< int64_t >(src, src + empty_count);
 }
 
 } // namespace homeblocks
