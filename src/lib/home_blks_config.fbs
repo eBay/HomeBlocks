@@ -21,6 +21,9 @@ table HomeBlksSettings{
 
     // homestore dataservice chunk size;
     hs_data_chunk_size_mb: uint32 = 2048;
+
+    // how often (in appended LSNs) the leader auto-proposes a SyncRSCommitLSN entry;
+    sync_rs_commit_lsn_interval: uint32 = 128;
 }
 
 root_type HomeBlksSettings;
