@@ -101,9 +101,11 @@ public:
 // index. Non-CRAFT volumes are unaffected.
 
 class CraftReplDev {
+#ifdef _PRERELEASE
     // Lets test_craft_raft_entries.cpp call apply_sync_rs_commit_lsn (private) directly, so it can assert
     // on the exact result rather than only on-commit's discarded fire-and-forget outcome.
     friend class CraftRaftEntriesTest;
+#endif
 
 public:
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal);

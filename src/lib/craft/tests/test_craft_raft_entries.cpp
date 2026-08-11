@@ -162,6 +162,25 @@ TEST_F(CraftRaftEntriesTest, EmptySlotsReconciled) {
     EXPECT_EQ(dev_->commit_lsn(), 5);
 }
 
+// An empty_slots entry can also fall inside the range this same apply newly opens (rather than being
+// an already-missing LSN from before) -- it must end up ONLY in empty_lsns_, not re-added to
+// missing_lsns_ by the gap-marking step that runs right after reconciliation.
+TEST_F(CraftRaftEntriesTest, EmptySlotWithinNewGapRangeNotDoubleTracked) {
+    dev_->seed_lsns(0, {});
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
+    // The rest of the newly-opened gap range (1, 2, 4, 5) is still missing -- no peer_fetcher_ wired.
+    EXPECT_TRUE(dev_->is_missing(1));
+    EXPECT_TRUE(dev_->is_missing(2));
+    EXPECT_TRUE(dev_->is_missing(4));
+    EXPECT_TRUE(dev_->is_missing(5));
+    EXPECT_EQ(dev_->missing_count(), 4u);
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
 // ── watermark advance ──────────────────────────────────────────────────────────
 
 // last_append_lsn already covers rs_commit_lsn: nothing to fetch, commit_lsn advances directly.
@@ -289,7 +308,21 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMalformedSyncRSCommitLSNKey) {
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
 }
 
-TEST_F(CraftRaftEntriesTest, OnCommitLogsUnrecognizedEntryType) {
+// Distinct from the too-short case above: this key is large enough for the fixed prefix (and even
+// carries 2 real trailing slots), but lies about how many follow -- parse_empty_slots's exact-size
+// check (not on_commit's coarser size check) is what rejects it.
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsMismatchedEmptySlotsCount) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf     = make_sync_rs_commit_lsn_key(7, 0, {10, 20});
+    reinterpret_cast< SyncRSCommitLSNPayload* >(key_buf.data())->num_empty_slots = 5;
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
+}
+
+TEST_F(CraftRaftEntriesTest, OnCommitIgnoresUnrecognizedEntryType) {
     std::vector< uint8_t > header_buf(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header_buf.data())->type = static_cast< CraftEntryType >(99);
     std::vector< uint8_t > key_buf;
