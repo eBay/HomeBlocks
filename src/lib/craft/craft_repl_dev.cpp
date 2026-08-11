@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "craft_repl_dev.hpp"
+#include "../coro_helpers.hpp"
 
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t
 
@@ -254,20 +255,116 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
 
 // ─── RAFT listener ────────────────────────────────────────────────────────────
 
-void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& /* header */,
-                                                sisl::blob const& /* key */,
+void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                                                 std::vector< homestore::multi_blk_id > const& /* blkids */,
                                                 cintrusive< homestore::repl_req_ctx >& /* ctx */) {
-    // S5 will parse the entry type from `header` and dispatch to
-    // owner_->apply_sync_rs_commit_lsn() or owner_->apply_internal_login().
-    LOGD("CraftRaftListener::on_commit lsn={} (entry dispatch not yet implemented)", lsn);
+    if (header.size() < sizeof(CraftEntryHeader)) {
+        LOGE("on_commit lsn={} header too small ({} bytes)", lsn, header.size());
+        return;
+    }
+    const auto* entry_hdr = reinterpret_cast< const CraftEntryHeader* >(header.cbytes());
+
+    switch (entry_hdr->type) {
+    case CraftEntryType::SyncRSCommitLSN: {
+        if (key.size() < sizeof(SyncRSCommitLSNPayload)) {
+            LOGE("on_commit lsn={} SyncRSCommitLSN key too small ({} bytes)", lsn, key.size());
+            return;
+        }
+        const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
+        auto empty_slots    = parse_empty_slots(key);
+        if (!empty_slots) {
+            LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
+            return;
+        }
+        // apply_sync_rs_commit_lsn co_awaits peer fetch + journal writes; on_commit itself is a synchronous
+        // HomeStore callback, so fire-and-forget it.
+        detail::detach(owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token,
+                                                        std::move(*empty_slots)));
+        break;
+    }
+    case CraftEntryType::InternalLogin:
+        // Dispatch lands with 22887.
+        LOGD("on_commit lsn={} InternalLogin (dispatch not yet implemented)", lsn);
+        break;
+    default:
+        LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
+        break;
+    }
 }
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
+//
+// apply_sync_rs_commit_lsn (22886): client_token is verified against the current session first -- a mismatch
+// gates the ENTIRE apply (no reconciliation, no catch-up, no watermark advance), since a RAFT entry whose
+// token doesn't match the live session shouldn't be trusted to describe it. Once the token matches, every
+// other step is best-effort forward progress: empty_slots are reconciled and the newly-spanned range is
+// marked missing, catch-up attempts to fill in what it can from a peer, and commit_lsn/last_append_lsn
+// advance regardless of whether catch-up fully succeeded -- mirroring truncate()'s invariant that apply
+// never reverts the watermark, only advances it.
 
-void CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t /* client_token */,
-                                             std::vector< int64_t > /* empty_slots */) {
-    LOGD("apply_sync_rs_commit_lsn rs_commit_lsn={} (not yet implemented)", rs_commit_lsn);
+async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                                    std::vector< int64_t > empty_slots) {
+    std::vector< int64_t > to_fetch;
+    {
+        std::lock_guard lk{missing_mu_};
+        if (client_token != state_.client_token) {
+            LOGW("apply_sync_rs_commit_lsn: client_token mismatch want={} got={} rs_commit_lsn={} -- skipping apply",
+                state_.client_token, client_token, rs_commit_lsn);
+            co_return std::unexpected(make_error_condition(volume_error::WRONG_TOKEN));
+        }
+
+        for (int64_t lsn : empty_slots) {
+            empty_lsns_.insert(lsn);
+            missing_lsns_.erase(lsn);
+        }
+
+        // Everything newly spanned by this advance that isn't Empty-verdicted is a gap until catch-up
+        // (below) resolves it -- same idiom write() uses for gaps opened by an out-of-order dlsn.
+        for (int64_t lsn = state_.last_append_lsn + 1; lsn <= rs_commit_lsn; ++lsn) {
+            if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
+        }
+        state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
+
+        for (int64_t lsn : missing_lsns_) {
+            if (lsn <= rs_commit_lsn) to_fetch.push_back(lsn);
+        }
+    }
+
+    if (!to_fetch.empty()) {
+        if (peer_fetcher_ == nullptr) {
+            LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
+                to_fetch.size());
+        } else if (auto fetched = co_await peer_fetcher_->fetch_from_peer(to_fetch); !fetched) {
+            LOGE("apply_sync_rs_commit_lsn: fetch_from_peer failed: {} -- leaving {} lsn(s) as missing",
+                fetched.error().message(), to_fetch.size());
+        } else {
+            for (auto& slot : *fetched) {
+                if (slot.is_empty) {
+                    std::lock_guard lk{missing_mu_};
+                    empty_lsns_.insert(slot.lsn);
+                    missing_lsns_.erase(slot.lsn);
+                    continue;
+                }
+                auto res = co_await journal_->write_slot(slot.lsn, slot.lba, slot.len, std::move(slot.data));
+                if (!res) {
+                    LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
+                        res.error().message());
+                    continue;
+                }
+                std::lock_guard lk{missing_mu_};
+                missing_lsns_.erase(slot.lsn);
+            }
+        }
+    }
+
+    // Unconditional: commit_lsn is a replica-set-wide watermark RAFT already agreed on, independent of
+    // whether this replica's local catch-up succeeded.
+    {
+        std::lock_guard lk{missing_mu_};
+        state_.commit_lsn = std::max(state_.commit_lsn, rs_commit_lsn);
+    }
+    LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
+    co_return ok();
 }
 
 void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {

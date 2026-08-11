@@ -101,6 +101,10 @@ public:
 // index. Non-CRAFT volumes are unaffected.
 
 class CraftReplDev {
+    // Lets test_craft_raft_entries.cpp call apply_sync_rs_commit_lsn (private) directly, so it can assert
+    // on the exact result rather than only on-commit's discarded fire-and-forget outcome.
+    friend class CraftRaftEntriesTest;
+
 public:
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal);
     ~CraftReplDev() = default;
@@ -213,6 +217,9 @@ public:
     void seed_commit_lsn(int64_t commit);
     // Seeds the Empty-verdict set; does not affect missing_lsns_. Clears any prior seeded empties.
     void seed_empty(std::initializer_list< int64_t > empty);
+    // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
+    // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
+    homestore::repl_dev_listener& test_listener() { return raft_listener_; }
 #endif
 
 private:
@@ -272,9 +279,11 @@ private:
         CraftReplDev* owner_;
     };
 
-    // Called from CraftRaftListener::on_commit after deserialising the entry type.
-    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
-                                  std::vector< int64_t > empty_slots);
+    // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
+    // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
+    // fetch + journal writes.
+    async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                          std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     volume_id_t vol_id_;
