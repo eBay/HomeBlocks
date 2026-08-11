@@ -301,6 +301,8 @@ private:
         void on_config_rollback(int64_t) override {}
 
     private:
+        // KNOWN GAP: no lifetime guarantee across the detached apply_sync_rs_commit_lsn coroutine -- see
+        // the on_commit call site in craft_repl_dev.cpp for the full use-after-free writeup.
         CraftReplDev* owner_;
     };
 

@@ -69,7 +69,7 @@ using volume_handle = std::shared_ptr< volume >;
 // standard equivalent (invalid arg, no space, io error, unsupported op, ...) is returned as
 // std::make_error_condition(std::errc::*) directly rather than duplicated here.
 ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM,
-     EMPTY_SLOT, WRONG_TOKEN);
+     EMPTY_SLOT, WRONG_TOKEN, INVALID_ENTRY);
 
 ENUM(volume_state, uint32_t,
      INIT,       // created, not yet online

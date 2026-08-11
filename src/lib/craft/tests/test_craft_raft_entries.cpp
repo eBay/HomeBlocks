@@ -161,6 +161,35 @@ TEST_F(CraftRaftEntriesTest, TokenMismatchSkipsWholeApply) {
     EXPECT_EQ(dev_->missing_count(), 1u);
 }
 
+// ── empty_slots range validation ──────────────────────────────────────────────
+
+// A negative LSN in empty_slots is nonsensical for a SyncRSCommitLSN verdict -- reject the whole apply,
+// the same all-or-nothing gate as a token mismatch, before any state is touched.
+TEST_F(CraftRaftEntriesTest, RejectsEmptySlotWithNegativeLSN) {
+    dev_->seed_lsns(5, {3});
+    auto r = do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0, /*empty_slots=*/{-1});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INVALID_ENTRY));
+    EXPECT_EQ(dev_->commit_lsn(), -1);
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_EQ(dev_->missing_count(), 1u);
+}
+
+// An empty_slots entry above rs_commit_lsn names a slot the leader never pre-resolved (S5 only resolves
+// up to the LSN it proposes) -- reject the whole apply rather than let it poison empty_lsns_ for a slot
+// that hasn't even been reached yet.
+TEST_F(CraftRaftEntriesTest, RejectsEmptySlotAboveRSCommitLSN) {
+    dev_->seed_lsns(5, {3});
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{6});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INVALID_ENTRY));
+    EXPECT_EQ(dev_->commit_lsn(), -1);
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_EQ(dev_->missing_count(), 1u);
+}
+
 // ── empty_slots reconciliation ────────────────────────────────────────────────
 
 TEST_F(CraftRaftEntriesTest, EmptySlotsReconciled) {
@@ -239,6 +268,48 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
     EXPECT_FALSE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_EQ(dev_->last_append_lsn(), 2);
+}
+
+// fetch_data's contract is one entry per requested LSN. A response naming an LSN we never asked for (a
+// buggy/misbehaving peer) can't be partially trusted -- since gap-marking already advanced by this point
+// in the apply, this can't gate the whole apply the way the upfront empty_slots check does, but it CAN
+// still refuse the batch: none of the response is applied (same outcome as a fetch failure), even the
+// entries that individually look fine, and commit_lsn still advances (best-effort).
+TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(0, {});
+    fetcher_.response = {
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
+        JournalSlot{.lsn = 2, .is_empty = true},
+        JournalSlot{.lsn = 99, .is_empty = true}, // never requested -- only 1 and 2 were
+    };
+
+    auto r = do_apply(/*rs_commit_lsn=*/2, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(journal_->has_slot(1));
+    EXPECT_FALSE(dev_->is_empty_slot(2));
+    EXPECT_FALSE(dev_->is_empty_slot(99));
+    EXPECT_EQ(dev_->missing_count(), 2u); // 1 and 2 both remain missing
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+}
+
+// A duplicate entry for an actually-requested LSN is just as much a contract violation as an
+// unrequested one (validate_fetch_response catches both the same way) -- same whole-batch rejection.
+TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithDuplicateLSN) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(0, {});
+    fetcher_.response = {
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
+        JournalSlot{.lsn = 1, .lba_off_bytes = 20, .len_bytes = 4}, // duplicate
+    };
+
+    auto r = do_apply(/*rs_commit_lsn=*/1, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(journal_->has_slot(1));
+    EXPECT_EQ(dev_->missing_count(), 1u);
+    EXPECT_EQ(dev_->commit_lsn(), 1);
 }
 
 // fetch_data fails outright: commit_lsn still advances (best-effort); every spanned LSN remains missing.
