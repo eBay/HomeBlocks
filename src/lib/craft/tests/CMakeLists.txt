@@ -80,3 +80,18 @@ target_link_libraries(test_craft_journal_slot_wire
 )
 
 add_test(NAME CraftJournalSlotWireTest COMMAND test_craft_journal_slot_wire)
+
+# Unit tests for CraftReplDev::apply_sync_rs_commit_lsn and the on_commit SyncRSCommitLSN dispatch
+# (S5: SDSTOR-22886). Same pattern: compile craft_repl_dev.cpp directly.
+add_executable(test_craft_raft_entries)
+target_sources(test_craft_raft_entries PRIVATE
+    test_craft_raft_entries.cpp
+    ../craft_repl_dev.cpp
+)
+target_compile_definitions(test_craft_raft_entries PRIVATE _PRERELEASE)
+target_link_libraries(test_craft_raft_entries
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+
+add_test(NAME CraftRaftEntriesTest COMMAND test_craft_raft_entries)
