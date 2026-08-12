@@ -13,20 +13,27 @@
  *
  *********************************************************************************/
 
-// Unit tests for CraftReplDev::apply_sync_rs_commit_lsn and the on_commit SyncRSCommitLSN dispatch
-// (S5 / SDSTOR-22886). InternalLogin apply/dispatch is still a stub (lands with SDSTOR-22887) and is
-// not covered here.
+// Unit tests for CraftReplDev's two RAFT entry applies -- SyncRSCommitLSN (S5 / SDSTOR-22886) and
+// InternalLogin (S5 / SDSTOR-22887) -- and their on_commit dispatch.
 //
-// Tests verify:
+// SyncRSCommitLSN tests verify:
 //   - a client_token mismatch gates the ENTIRE apply: no reconciliation, no catch-up, no watermark advance
-//   - empty_slots are reconciled into empty_lsns_ and erased from missing_lsns_
+//   - empty_slots are range-validated against rs_commit_lsn and reconciled into empty_lsns_/missing_lsns_
 //   - commit_lsn/last_append_lsn advance directly when there's no gap to catch up on
 //   - fetch_data is invoked with exactly the missing LSNs when behind, and its response is persisted
+//   - a peer response naming an unrequested or duplicate LSN is rejected as a whole batch
 //   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_fetcher_ at all still lets
 //     commit_lsn advance, leaving unresolved LSNs in missing_lsns_
 //   - commit_lsn never decrements
 //   - on_commit parses a real serialized SyncRSCommitLSN entry and dispatches correctly (and rejects
 //     malformed header/key blobs without touching state)
+//
+// InternalLogin tests verify:
+//   - on_commit dispatches to apply_internal_login, which sets client_token/term
+//   - a wrong-size key (too short or too long) is rejected, state untouched
+//   - a second InternalLogin replaces client_token outright but never regresses term
+//   - once applied, write()'s term-fence check reflects the new term end-to-end
+//   - the client_token InternalLogin establishes is what apply_sync_rs_commit_lsn's token check uses
 //
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
@@ -116,6 +123,14 @@ std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64
                                                     const std::vector< int64_t >& empty_slots) {
     std::vector< uint8_t > buf(sync_rs_commit_lsn_key_size(empty_slots.size()));
     serialize_sync_rs_commit_lsn(buf.data(), rs_commit_lsn, client_token, empty_slots);
+    return buf;
+}
+
+std::vector< uint8_t > make_internal_login_key(uint64_t client_token, uint64_t term) {
+    std::vector< uint8_t > buf(sizeof(InternalLoginPayload));
+    auto* p         = reinterpret_cast< InternalLoginPayload* >(buf.data());
+    p->client_token = client_token;
+    p->term         = term;
     return buf;
 }
 
@@ -413,6 +428,140 @@ TEST_F(CraftRaftEntriesTest, OnCommitIgnoresUnrecognizedEntryType) {
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
+}
+
+// ── InternalLogin apply (SDSTOR-22887) ────────────────────────────────────────
+
+TEST_F(CraftRaftEntriesTest, OnCommitDispatchesInternalLogin) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf     = make_internal_login_key(/*client_token=*/42, /*term=*/5);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    EXPECT_EQ(dev_->client_token(), 42u);
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginWrongSize) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    std::vector< uint8_t > short_key(sizeof(InternalLoginPayload) - 1, 0);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
+
+    EXPECT_EQ(dev_->client_token(), 0u); // untouched
+    EXPECT_EQ(dev_->term(), 0u);         // untouched
+}
+
+// Unlike SyncRSCommitLSN's coarser "at least the fixed prefix" check (it has variable trailing data),
+// InternalLoginPayload never does -- on_commit's check is an exact-size `!=`, so a key that's too LARGE
+// must be rejected just as much as one that's too small.
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginKeyTooLarge) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    std::vector< uint8_t > long_key(sizeof(InternalLoginPayload) + 1, 0);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(long_key), {}, ctx);
+
+    EXPECT_EQ(dev_->client_token(), 0u); // untouched
+    EXPECT_EQ(dev_->term(), 0u);         // untouched
+}
+
+// "A second InternalLogin invalidates any existing session before establishing the new one" (ticket) --
+// the second apply's values must win outright, not merge with the first's. Driven through on_commit
+// (apply_internal_login itself is private, and TEST_F bodies live in a class derived from
+// CraftRaftEntriesTest -- friendship doesn't propagate to it, so the public dispatch path is used here).
+TEST_F(CraftRaftEntriesTest, SecondInternalLoginReplacesSession) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/1);
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/2);
+    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+
+    EXPECT_EQ(dev_->client_token(), 2u);
+    EXPECT_EQ(dev_->term(), 2u);
+}
+
+TEST_F(CraftRaftEntriesTest, InternalLoginTermNeverRegresses) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/3);
+    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// client_token has no ordering semantics (it's an opaque id, unlike term) -- it's a plain overwrite even
+// when the accompanying term regresses and is guarded. Pins down the intentional asymmetry between the
+// two fields so it doesn't read as an oversight to a future reader.
+TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegresses) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    auto key2 = make_internal_login_key(/*client_token=*/99, /*term=*/3); // lower term, different token
+    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+
+    EXPECT_EQ(dev_->term(), 5u);          // guarded against regression
+    EXPECT_EQ(dev_->client_token(), 99u); // overwritten regardless
+}
+
+// Happy-path regression check for the write()-term-check-under-lock reorg: a matching term still
+// succeeds normally (only the mismatch path changed).
+TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf     = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 5, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
+                    /*addr=*/0, /*len=*/0, {}, /*all_zeros=*/true));
+
+    ASSERT_TRUE(r.has_value());
+}
+
+// End-to-end: once InternalLogin moves state_.term forward, a write() still presenting the old term is
+// fenced out on its very next call -- the "invalidation" this ticket calls for, and the regression test
+// for write()'s term-check-under-lock fix.
+TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf     = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 4, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
+                    /*addr=*/0, /*len=*/0, {}, /*all_zeros=*/true));
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// Cross-entry-type integration: apply_sync_rs_commit_lsn's client_token check reads the SAME state_
+// InternalLogin writes. Untestable before this ticket (state_.client_token was permanently 0, matching
+// every SyncRSCommitLSN test's default). Once InternalLogin establishes a new token, do_apply must use
+// it -- the OLD default (0) is now itself a mismatch.
+TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNUsesTokenEstablishedByInternalLogin) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf     = make_internal_login_key(/*client_token=*/7, /*term=*/1);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto stale = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0); // the old default -- now stale
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), make_error_condition(volume_error::WRONG_TOKEN));
+
+    auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 5);
 }
 
 } // namespace

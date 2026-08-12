@@ -313,7 +313,9 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
 
     {
         std::lock_guard lock{missing_mu_};
-        // Term check is inside the lock: state_.term is mutated by apply_internal_login (S5) under the same mutex.
+        // state_.term is guarded by missing_mu_ like the rest of state_ -- read it under the same lock
+        // used for the gap-marking below rather than unlocked, now that apply_internal_login (22887)
+        // actually mutates it from the RAFT commit thread.
         if (hdr.term != state_.term) {
             LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
@@ -527,14 +529,33 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // coroutine is suspended inside fetch_from_peer()/write_slot(), it resumes into freed memory --
         // use-after-free. Two possible fixes:
         //   Check comments: https://github.com/sbinmalek/HomeBlocks/pull/2#discussion_r3761568811
+        //
+        // FIXME: KNOWN GAP (not yet fixed), distinct from the lifetime issue above: detaching here also
+        // breaks strict RAFT apply ordering. on_commit returns to HomeStore as soon as this coroutine hits
+        // its first co_await, so HomeStore can call on_commit for the NEXT committed entry -- a synchronous
+        // InternalLogin, or another detached SyncRSCommitLSN -- before this one's effects are fully applied.
+        // No individual field access races (missing_mu_ still guards every access), but replicas can end up
+        // applying entries in different effective orders depending on async completion timing, which
+        // violates the determinism RAFT relies on for replicas to converge. See the commit_lsn advance at
+        // the tail of apply_sync_rs_commit_lsn and the client_token overwrite in apply_internal_login for
+        // the two mutation points this exposes. Real fix: one per-device serialized apply queue that both
+        // entry types funnel through, processing one entry's full effect (including all its co_awaits)
+        // before starting the next -- not independent detached tasks.
         detail::detach(owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token,
                                                         std::move(*empty_slots)));
         break;
     }
-    case CraftEntryType::InternalLogin:
-        // Dispatch lands with 22887.
-        LOGD("on_commit lsn={} InternalLogin (dispatch not yet implemented)", lsn);
+    case CraftEntryType::InternalLogin: {
+        // Fixed-size payload, no variable trailing data (unlike SyncRSCommitLSN) -- exact-size check.
+        if (key.size() != sizeof(InternalLoginPayload)) {
+            LOGE("on_commit lsn={} InternalLogin key wrong size ({} bytes)", lsn, key.size());
+            return;
+        }
+        const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
+        // Pure in-memory state transition (no co_await) -- called directly, not detached.
+        owner_->apply_internal_login(login_payload->client_token, login_payload->term);
         break;
+    }
     default:
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
         break;
@@ -648,6 +669,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
     // Unconditional: commit_lsn is a replica-set-wide watermark RAFT already agreed on, independent of
     // whether this replica's local catch-up succeeded.
+    //
+    // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
+    // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
+    // the time this advance actually runs, breaking strict RAFT apply ordering.
     {
         std::lock_guard lk{missing_mu_};
         state_.commit_lsn = std::max(state_.commit_lsn, rs_commit_lsn);
@@ -656,8 +681,22 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     co_return ok();
 }
 
+// ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────
+//
+// Pure in-memory state transition -- no journal I/O, no peer fetch -- so this stays synchronous
+// (unlike apply_sync_rs_commit_lsn) and on_commit calls it directly rather than via detail::detach().
+// "Enforce single-writer exclusivity" needs no explicit rejection here: every other RPC's term-fence
+// check (STALE_TERM on mismatch) already does that. Overwriting state_.term is what invalidates any
+// existing session -- a caller still presenting the old term is fenced out on its very next call.
+
 void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
-    LOGD("apply_internal_login client_token={} term={} (not yet implemented)", client_token, term);
+    std::lock_guard lk{missing_mu_};
+    state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
+    // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
+    // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting
+    // log order blindly.
+    state_.term = std::max(state_.term, term);
+    LOGD("apply_internal_login client_token={} term={}", client_token, state_.term);
 }
 
 } // namespace homeblocks

@@ -226,6 +226,14 @@ public:
         std::lock_guard lk{missing_mu_};
         return state_.commit_lsn;
     }
+    uint64_t client_token() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.client_token;
+    }
+    uint64_t term() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.term;
+    }
 
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
