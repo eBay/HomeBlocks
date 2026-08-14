@@ -230,6 +230,10 @@ previously answered as one.
   it — `craft::wire::op` stops at 14 — so it is deferred at the *wire*, not merely at the transport. It need not
   ride the same channel as the client plane: these calls are node-to-node, and HomeBlocks may prefer its existing
   inter-node RPC. See `craft_client/docs/peer-plane.md` for the interface (`craft_peer`) and what remains.
+  Whatever it ends up being, it **must be timeout-bounded**: the catch-up call site
+  (`CraftPeerFetcher::fetch_from_peer`, used by `SyncRSCommitLSN` apply) already carries a `timeout_ms`
+  parameter (`peer_fetch_timeout_ms` in `home_blks_config.fbs`, default 5000ms) for the real transport to
+  enforce — a peer that misses it is treated as unreachable, same as any other hard failure.
 
 Note the asymmetry this creates, because it is easy to get backwards: HomeBlocks is **both ends** of the peer
 plane (it initiates on RAFT commit *and* serves peers) but **only the far end** of the client plane (it never
