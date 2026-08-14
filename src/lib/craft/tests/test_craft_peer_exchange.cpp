@@ -13,8 +13,7 @@
  *
  *********************************************************************************/
 
-// Unit tests for CraftReplDev::get_lsns(), get_rs_commit_lsn(), and fetch_data()
-// (S6: Peer Data Exchange APIs).
+// Unit tests for CraftReplDev::get_rs_commit_lsn() and fetch_data() (S6: Peer Data Exchange APIs).
 //
 // fetch_data() implements a four-way response per slot:
 //   present+data : slot in journal, all_zeros=false
@@ -85,7 +84,6 @@ protected:
         dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
     }
 
-    auto do_get_lsns() { return homeblocks::detail::sync_get(dev_->get_lsns(volume_id_t{})); }
     auto do_get_rs_commit_lsn() { return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(0, false)); }
     auto do_fetch_data(std::vector< int64_t > lsns) {
         return homeblocks::detail::sync_get(dev_->fetch_data(std::move(lsns)));
@@ -100,36 +98,24 @@ protected:
     std::unique_ptr< CraftReplDev > dev_;
 };
 
-// ── get_lsns / get_rs_commit_lsn ─────────────────────────────────────────────
+// ── get_rs_commit_lsn ────────────────────────────────────────────────────────
 
 // Fresh device: both watermarks default to -1 (uninitialized sentinel).
-TEST_F(CraftPeerExchangeTest, GetLsnsDefaultState) {
-    auto r = do_get_lsns();
+TEST_F(CraftPeerExchangeTest, GetRsCommitLsnDefaultState) {
+    auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->commit_lsn, -1);
     EXPECT_EQ(r->last_append_lsn, -1);
 }
 
-// After seeding, get_lsns reflects both watermarks correctly.
-TEST_F(CraftPeerExchangeTest, GetLsnsAfterSeed) {
+// After seeding, get_rs_commit_lsn reflects both watermarks correctly.
+TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
     dev_->seed_lsns(50, {30, 40});
     dev_->seed_commit_lsn(25);
-    auto r = do_get_lsns();
+    auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->commit_lsn, 25);
     EXPECT_EQ(r->last_append_lsn, 50);
-}
-
-// get_rs_commit_lsn is an alias of get_lsns; both must return the same snapshot.
-TEST_F(CraftPeerExchangeTest, GetRsCommitLsnMatchesGetLsns) {
-    dev_->seed_lsns(100, {});
-    dev_->seed_commit_lsn(80);
-    auto lsns_r = do_get_lsns();
-    auto rs_r = do_get_rs_commit_lsn();
-    ASSERT_TRUE(lsns_r.has_value());
-    ASSERT_TRUE(rs_r.has_value());
-    EXPECT_EQ(lsns_r->commit_lsn, rs_r->commit_lsn);
-    EXPECT_EQ(lsns_r->last_append_lsn, rs_r->last_append_lsn);
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────

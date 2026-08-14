@@ -15,7 +15,7 @@ target_link_libraries(test_craft_truncate
 
 add_test(NAME CraftTruncateTest COMMAND test_craft_truncate)
 
-# Unit tests for CraftReplDev::get_lsns(), get_rs_commit_lsn(), and fetch_data() (S6).
+# Unit tests for CraftReplDev::get_rs_commit_lsn() and fetch_data() (S6).
 # Same pattern as test_craft_truncate: compile craft_repl_dev.cpp directly.
 add_executable(test_craft_peer_exchange)
 target_sources(test_craft_peer_exchange PRIVATE

@@ -199,18 +199,9 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal) :
         vol_id_{vol_id}, journal_{std::move(journal)}, raft_listener_{this} {}
 
-// ─── get_lsns / get_rs_commit_lsn ────────────────────────────────────────────
+// ─── get_rs_commit_lsn ────────────────────────────────────────────
 // Snapshot the in-memory partition state under missing_mu_ for consistency with
 // write() which updates state_ under the same lock.
-
-async_result< craft::lsn_pair > CraftReplDev::get_lsns(volume_id_t /* vol_id */) {
-    craft::lsn_pair pair{};
-    {
-        std::lock_guard lk{missing_mu_};
-        pair = {state_.commit_lsn, state_.last_append_lsn};
-    }
-    co_return pair;
-}
 
 async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
     craft::lsn_pair pair{};
@@ -465,6 +456,11 @@ async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_toke
 // while fetch_data runs), so the snapshot taken under the lock is stable.
 //
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
+//
+// TODO: the loop below re-acquires missing_mu_ once per requested LSN. Since the snapshot is
+// already documented as stable for the whole batch (no concurrent writes during fetch_data),
+// classification for every LSN could be done under a single lock acquisition up front instead --
+// same result, fewer lock/unlock round trips for large batches.
 
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
     std::vector< JournalSlot > result;
