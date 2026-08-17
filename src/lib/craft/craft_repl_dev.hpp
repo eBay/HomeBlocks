@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_set>
@@ -105,6 +106,11 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 class CraftPeerFetcher {
 public:
     virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
+    // `timeout_ms` is the deadline this call must complete within (CraftReplDev passes
+    // peer_fetch_timeout_ms_, set from home_blks_config.fbs's peer_fetch_timeout_ms). A real transport
+    // (S9) must treat a missed deadline as a hard failure, same as an unreachable peer -- this interface
+    // only carries the contract; there's nothing to enforce yet since today's only implementations are
+    // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                    uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
@@ -116,15 +122,22 @@ public:
 // (write, read, login, truncate, ...) on top of a HomeStore log store and
 // index. Non-CRAFT volumes are unaffected.
 
-class CraftReplDev {
+class CraftReplDev : public std::enable_shared_from_this< CraftReplDev > {
 #ifdef _PRERELEASE
     // Lets test_craft_raft_entries.cpp call apply_sync_rs_commit_lsn (private) directly, so it can assert
     // on the exact result rather than only on-commit's discarded fire-and-forget outcome.
     friend class CraftRaftEntriesTest;
 #endif
 
-public:
+    // Private -- see create() below. shared_from_this() (used by apply_sync_rs_commit_lsn's detached
+    // coroutine) requires the object to already be owned by a shared_ptr, so construction is gated behind
+    // create() rather than exposed directly.
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal);
+
+public:
+    static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal) {
+        return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal)));
+    }
     ~CraftReplDev() = default;
 
     // ── client-facing ──────────────────────────────────────────────────────
@@ -312,8 +325,8 @@ private:
         void on_config_rollback(int64_t) override {}
 
     private:
-        // KNOWN GAP: no lifetime guarantee across the detached apply_sync_rs_commit_lsn coroutine -- see
-        // the on_commit call site in craft_repl_dev.cpp for the full use-after-free writeup.
+        // Back-pointer to the owning CraftReplDev -- raft_listener_ is a value member of CraftReplDev
+        // (see its declaration below), so this can never dangle
         CraftReplDev* owner_;
     };
 
@@ -337,7 +350,7 @@ private:
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
     CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};    // TODO: deadline for fetch_data; set from config at construction (S8/S9)
+    uint32_t peer_fetch_timeout_ms_{5000}; // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 

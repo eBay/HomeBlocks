@@ -81,7 +81,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
     }
 
     auto do_get_rs_commit_lsn() { return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(0, false)); }
@@ -95,7 +95,7 @@ protected:
     }
 
     MockCraftJournalBackend* journal_{nullptr};
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 // ── get_rs_commit_lsn ────────────────────────────────────────────────────────

@@ -520,16 +520,17 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // apply_sync_rs_commit_lsn co_awaits peer fetch + journal writes; on_commit itself is a synchronous
         // HomeStore callback, so fire-and-forget it.
         //
-        // FIXME: KNOWN GAP (not yet fixed): this coroutine captures only the raw `owner_` pointer, not anything
-        // that keeps CraftReplDev alive. If the object is destroyed (e.g. volume removal) while this
-        // coroutine is suspended inside fetch_from_peer()/write_slot(), it resumes into freed memory --
-        // use-after-free. Two possible fixes:
-        //   Check comments: https://github.com/sbinmalek/HomeBlocks/pull/2#discussion_r3761568811
+        // Lifetime: on_commit itself only touches the raw `owner_` pointer, which is safe since HomeStore
+        // never calls on_commit on a dead device. The DETACHED coroutine this dispatches into is a separate
+        // concern -- apply_sync_rs_commit_lsn opens with `auto self = shared_from_this()`, so the coroutine
+        // frame holds a strong reference across every co_await, keeping CraftReplDev alive even if every
+        // external owner (e.g. a volume-removal path) drops its shared_ptr mid-apply. Requires every
+        // CraftReplDev to be owned via shared_ptr
         //
-        // FIXME: KNOWN GAP (not yet fixed), distinct from the lifetime issue above: detaching here also
-        // breaks strict RAFT apply ordering. on_commit returns to HomeStore as soon as this coroutine hits
-        // its first co_await, so HomeStore can call on_commit for the NEXT committed entry -- a synchronous
-        // InternalLogin, or another detached SyncRSCommitLSN -- before this one's effects are fully applied.
+        // FIXME: KNOWN GAP (not yet fixed): detaching here also breaks strict RAFT apply ordering.
+        // on_commit returns to HomeStore as soon as this coroutine hits its first co_await, so
+        // HomeStore can call on_commit for the NEXT committed entry -- a synchronous InternalLogin, or
+        // another detached SyncRSCommitLSN -- before this one's effects are fully applied.
         // No individual field access races (missing_mu_ still guards every access), but replicas can end up
         // applying entries in different effective orders depending on async completion timing, which
         // violates the determinism RAFT relies on for replicas to converge. See the commit_lsn advance at
@@ -577,6 +578,10 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
+    // Lives in the coroutine frame across every co_await below -- see the lifetime comment at the
+    // on_commit call site (detail::detach) for why this is required.
+    auto self = shared_from_this();
+
     // Validated before any state is touched -- same all-or-nothing gate as the token check below, since an
     // out-of-range verdict means the entry itself cannot be trusted, not that this one slot should be skipped.
     for (int64_t lsn : empty_slots) {

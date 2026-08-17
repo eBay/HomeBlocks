@@ -90,7 +90,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
     }
 
     auto do_write(uint64_t term, int64_t lsn, bool all_zeros = true) {
@@ -108,7 +108,7 @@ protected:
     }
 
     MockCraftJournalBackend* journal_{nullptr};
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 // Each lsn arrives exactly one step ahead: no gap, no missing entries after each write.

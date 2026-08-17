@@ -150,7 +150,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
     }
 
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
@@ -160,7 +160,7 @@ protected:
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftPeerFetcher fetcher_;
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 namespace {
