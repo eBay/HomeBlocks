@@ -50,7 +50,7 @@ namespace homeblocks {
 
 enum class CraftEntryType : uint8_t {
     SyncRSCommitLSN = 1,
-    InternalLogin   = 2,
+    InternalLogin = 2,
 };
 
 // ─── header blob ─────────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ struct CraftEntryHeader {
 
 // Fixed prefix. Immediately followed by num_empty_slots × int64_t.
 struct SyncRSCommitLSNPayload {
-    int64_t  rs_commit_lsn;
+    int64_t rs_commit_lsn;
     uint64_t client_token;
     uint32_t num_empty_slots;
 };
@@ -91,14 +91,12 @@ inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, ui
     // byte-different.
     std::memset(buf, 0, sizeof(SyncRSCommitLSNPayload));
 
-    auto* p            = reinterpret_cast< SyncRSCommitLSNPayload* >(buf);
-    p->rs_commit_lsn   = rs_commit_lsn;
-    p->client_token    = client_token;
+    auto* p = reinterpret_cast< SyncRSCommitLSNPayload* >(buf);
+    p->rs_commit_lsn = rs_commit_lsn;
+    p->client_token = client_token;
     p->num_empty_slots = static_cast< uint32_t >(empty_slots.size());
     // empty_slots.data() may be null when empty; memcpy(dest, nullptr, 0) is UB regardless of count.
-    if (!empty_slots.empty()) {
-        std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t));
-    }
+    if (!empty_slots.empty()) { std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t)); }
 }
 
 // Reads the packed int64_t array immediately following the fixed prefix in `key` (the trailing data
@@ -111,7 +109,7 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 
     const auto* p = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
 
-    const size_t empty_count  = p->num_empty_slots;
+    const size_t empty_count = p->num_empty_slots;
     const size_t expected_size = sizeof(SyncRSCommitLSNPayload) + empty_count * sizeof(int64_t);
     if (key.size() != expected_size) { return std::nullopt; }
 

@@ -288,8 +288,7 @@ private:
     };
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type.
-    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
-                                  std::vector< int64_t > empty_slots);
+    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     volume_id_t vol_id_;
@@ -301,7 +300,7 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 
