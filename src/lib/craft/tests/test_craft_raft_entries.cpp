@@ -95,6 +95,7 @@ public:
 class MockCraftPeerFetcher : public CraftPeerFetcher {
 public:
     std::vector< int64_t > last_requested;
+    uint32_t last_timeout_ms{0};
     std::vector< JournalSlot > response;
     bool should_fail{false};
 
@@ -102,8 +103,10 @@ public:
         co_return craft::lsn_pair{};
     }
 
-    async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns) override {
+    async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
+                                                           uint32_t timeout_ms) override {
         last_requested = lsns;
+        last_timeout_ms = timeout_ms;
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
@@ -283,6 +286,19 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
     EXPECT_FALSE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_EQ(dev_->last_append_lsn(), 2);
+}
+
+// set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_data verbatim.
+TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_fetch_timeout_ms(1234);
+    dev_->seed_lsns(0, {});
+    fetcher_.response = {JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/1, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(fetcher_.last_timeout_ms, 1234u);
 }
 
 // fetch_data's contract is one entry per requested LSN. A response naming an LSN we never asked for (a

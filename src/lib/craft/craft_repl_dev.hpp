@@ -105,7 +105,8 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 class CraftPeerFetcher {
 public:
     virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
-    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns) = 0;
+    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
+                                                                   uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -237,6 +238,10 @@ public:
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
+    // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
+    // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
+    void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
+
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
@@ -331,7 +336,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
+    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};    // TODO: deadline for fetch_data; set from config at construction (S8/S9)
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 

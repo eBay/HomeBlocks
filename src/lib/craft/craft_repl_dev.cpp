@@ -619,7 +619,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         if (peer_fetcher_ == nullptr) {
             LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
                 to_fetch.size());
-        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch); !fetched) {
+        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_);
+                   !fetched) {
             LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
                 fetched.error().message(), to_fetch.size());
         } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
