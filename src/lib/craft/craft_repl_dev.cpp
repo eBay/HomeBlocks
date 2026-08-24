@@ -56,8 +56,9 @@ struct CraftJournalEntry {
     uint8_t all_zeros;
 };
 #pragma pack(pop)
-static_assert(sizeof(CraftJournalEntry) == 34, "CraftJournalEntry is a persisted on-disk format -- "
-                                               "a layout change here is a format migration, not a code change");
+static_assert(sizeof(CraftJournalEntry) == 34,
+              "CraftJournalEntry is a persisted on-disk format -- "
+              "a layout change here is a format migration, not a code change");
 
 // ─── HomeStore journal backend ─────────────────────────────────────────────────
 //
@@ -93,6 +94,9 @@ public:
         sisl::io_blob_safe blob{static_cast< uint32_t >(sizeof(CraftJournalEntry)) + blkid_sz};
         std::memcpy(blob.bytes(), &hdr, sizeof(CraftJournalEntry));
         sisl::blob blkid_blob = blkid.serialize(); // non-owning view — copy before blkid goes out of scope
+        // Internal HomeStore-API contract, not client-reachable: serialize() must return exactly
+        // serialized_size() bytes, or the memcpy below overreads blkid_blob's owned buffer.
+        DEBUG_ASSERT_EQ(blkid_blob.size(), blkid_sz, "multi_blk_id::serialize() size mismatch");
         std::memcpy(blob.bytes() + sizeof(CraftJournalEntry), blkid_blob.cbytes(), blkid_sz);
         // Bridge write_async (callback) to co_await via value_awaitable<bool>.
         //   • Deadlock-safe: the callback posts va->complete() to an iomgr reactor via run_on_forget,
@@ -129,8 +133,7 @@ public:
                                         [va = std::move(va)]() mutable { va->complete(true); });
             });
         if (write_ret < 0) {
-            LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire",
-                 lsn);
+            LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire", lsn);
             co_return std::unexpected(make_error_condition(std::errc::operation_not_supported));
         }
         co_await *va;

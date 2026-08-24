@@ -438,8 +438,8 @@ TEST_F(CraftWriteTest, NonZeroWriteIsZeroCopy) {
     data.size = buf.size();
     data.iovs.push_back(iovec{buf.data(), buf.size()});
 
-    auto r = homeblocks::detail::sync_get(
-        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, buf.size(), std::move(data), /* all_zeros = */ false));
+    auto r = homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, buf.size(),
+                                                      std::move(data), /* all_zeros = */ false));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(journal_->last_alloc_data_ptr, static_cast< void const* >(buf.data()));
 }

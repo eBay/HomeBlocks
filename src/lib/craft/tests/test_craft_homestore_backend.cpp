@@ -51,9 +51,9 @@ protected:
     // TIMER | INLINE matches solo_repl_dev's configuration: the mode where write_async's completion
     // can fire before await_suspend returns, the INLINE-safety hazard write_slot's comment documents.
     shared< homestore::home_log_store > make_logstore() {
-        auto flush_mode = static_cast< homestore::flush_mode_t >(
-            static_cast< uint32_t >(homestore::flush_mode_t::TIMER) |
-            static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
+        auto flush_mode =
+            static_cast< homestore::flush_mode_t >(static_cast< uint32_t >(homestore::flush_mode_t::TIMER) |
+                                                   static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
         auto logdev_id = homestore::logstore_service().create_new_logdev(flush_mode);
         return homestore::logstore_service().create_new_log_store(logdev_id, /* append_mode = */ false);
     }
@@ -65,9 +65,9 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
     ASSERT_TRUE(logstore != nullptr);
     auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
 
-    auto r = homeblocks::detail::sync_get(
-        backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
-                            homestore::multi_blk_id{}, /* all_zeros = */ true));
+    auto r =
+        homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                         homestore::multi_blk_id{}, /* all_zeros = */ true));
     ASSERT_TRUE(r.has_value());
 }
 
@@ -79,8 +79,8 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
 
     for (int64_t lsn = 0; lsn <= 4; ++lsn) {
-        auto r = homeblocks::detail::sync_get(backend->write_slot(
-            lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{}, /* all_zeros = */ true));
+        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true));
         ASSERT_TRUE(r.has_value());
     }
     ASSERT_EQ(logstore->tail_lsn(), 4);

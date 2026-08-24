@@ -93,8 +93,7 @@ protected:
 
     // Seed a data slot into the mock journal. lba and len default to small non-zero values.
     void add_slot(int64_t lsn, lba_t lba = 0, lba_count_t len = 4, bool all_zeros = false) {
-        journal_->slots[lsn] =
-            JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
+        journal_->slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
     }
 
     MockCraftJournalBackend* journal_{nullptr};
