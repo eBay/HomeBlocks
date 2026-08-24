@@ -101,22 +101,14 @@ public:
         //   • blob lifetime: blob is a coroutine-frame local; the frame stays alive through co_await.
         //     write_async holds only a reference, which remains valid for the full I/O duration.
         //
-        // KNOWN RISK (lost completion -> permanent suspension): write_async's callback is not
-        // guaranteed to fire. Two triggers collapse to the SAME failure mode, verified against
-        // homestore dev/v8.x:
-        //   - shutdown: write_async returns a non-positive seq_num without invoking the callback
-        //     when the log store is stopping (log_store.cpp:71); LogDev::append_async likewise
-        //     returns -1 when the logdev itself is stopping (log_dev.cpp:290). Guarded below: a
-        //     non-positive return means the callback will never fire, so this bails out with an
-        //     error instead of awaiting forever.
-        //   - journal I/O error: LogDev's flush path returns on a sync_pwritev failure BEFORE
-        //     calling on_flush_completion at all (log_dev.cpp:531-539) -- the callback is skipped
-        //     exactly like the shutdown case, not fired with a failure status. write_async has
-        //     already returned a positive seq_num by the time the flush runs, so this trigger has
-        //     no return-value signal and is NOT covered by the guard below. Tracked in
-        //     SDSTOR-24993 (HomeStore fix: propagate the error into the completion path itself,
-        //     not a status argument bolted onto a callback that won't fire; interim mitigation:
-        //     bound this co_await with a timeout).
+        // KNOWN RISK (lost completion -> permanent suspension): write_async's callback isn't
+        // guaranteed to fire, verified against homestore dev/v8.x. Two triggers, one failure mode:
+        //   - shutdown: write_async returns <= 0 without invoking the callback when the log store
+        //     or logdev is stopping (log_store.cpp:71, log_dev.cpp:290). Guarded below.
+        //   - journal I/O error: the flush path returns on a sync_pwritev failure BEFORE calling
+        //     on_flush_completion (log_dev.cpp:531-539) -- no return-value signal, NOT covered
+        //     below. Tracked in SDSTOR-24993 (fix: propagate the error into the completion path,
+        //     not a status arg on a callback that won't fire; interim: timeout the await).
         auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
         auto write_ret = logstore_->write_async(
             static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
@@ -306,15 +298,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write rejected: dlsn={} too far ahead of last_append_lsn={}", dlsn, state_.last_append_lsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
-        // Guard 3: cap cumulative missing_lsns_ growth, independent of any single write's gap distance.
-        // Guard 2 only bounds one write's contribution; a client walking the watermark forward in
-        // smaller-than-cap increments (e.g. +1,000,000 repeatedly) still grows missing_lsns_ without
-        // bound across many writes, each individually passing Guard 2. Scoped to writes that actually
-        // CREATE at least one new gap entry (dlsn > last_append_lsn + 1) -- NOT merely dlsn >
-        // last_append_lsn, which also matches a strictly in-order write (dlsn == last_append_lsn + 1)
-        // that adds nothing to the set. Two cases must stay exempt from this cap or the set could
-        // never drain back down once it reaches capacity: a write that FILLS an existing gap (dlsn <=
-        // last_append_lsn) shrinks the set, and a zero-gap in-order write leaves it unchanged.
+        // Guard 3: cap cumulative missing_lsns_ growth, independent of per-write distance -- Guard 2
+        // only bounds one write's contribution, so repeated smaller-than-cap jumps (e.g. +1,000,000
+        // each) still grow the set unboundedly. Scoped to dlsn > last_append_lsn + 1 (a real gap of
+        // >= 1 entry), not just dlsn > last_append_lsn: a gap-fill (dlsn <= last_append_lsn) or a
+        // zero-gap in-order write (dlsn == last_append_lsn + 1) must stay exempt, or the set could
+        // never drain once full.
         static constexpr size_t k_max_missing_lsns = 2'000'000;
         if (dlsn > state_.last_append_lsn + 1 && missing_lsns_.size() >= k_max_missing_lsns) {
             LOGW("write rejected: missing_lsns_ at capacity ({}) dlsn={}", missing_lsns_.size(), dlsn);
@@ -325,6 +314,13 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
         }
         if ((dlsn > state_.last_append_lsn) || missing_lsns_.contains(dlsn)) missing_lsns_.insert(dlsn);
+        // Advanced before write_slot runs, not rolled back on failure (see
+        // WriteSlotFails_LsnRemainsInMissing). Intentional (SDSTOR-22871) and safe per
+        // CRAFT-Design's recovery-watermark argument: login takes rs_commit_lsn =
+        // max(quorum.last_append_lsn) because false-include is benign, false-exclude is
+        // catastrophic. A failed local append is indistinguishable, to login, from a write
+        // that never reached quorum -- Phase 1b finds no real holder and marks it Empty.
+        // No data is lost; the only cost is an avoidable Empty verdict.
         state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     }
 
