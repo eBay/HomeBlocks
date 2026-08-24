@@ -39,7 +39,13 @@ static constexpr uint8_t k_journal_version = 1;
 // without breaking the magic check. lsn is stored redundantly for self-describing recovery and
 // cross-checking against the log-store sequence number. lba and len are BYTES (byte-addressed
 // API contract), not block units.
-#pragma pack(1)
+//
+// No CRC field: HomeStore's log_group_header already checksums the entire record body on every
+// append and verifies it on read/recovery replay (LogGroup::compute_crc, log_group.cpp; checked
+// in log_stream.cpp and log_dev.cpp, hard failure on mismatch) -- a CRAFT-level CRC would be
+// redundant. magic/version only rule out a garbage or non-CRAFT slot, not a bit flip; that's
+// covered one layer down instead of here.
+#pragma pack(push, 1)
 struct CraftJournalEntry {
     uint32_t magic;
     uint8_t version;
@@ -49,7 +55,9 @@ struct CraftJournalEntry {
     lba_count_t len;
     uint8_t all_zeros;
 };
-#pragma pack()
+#pragma pack(pop)
+static_assert(sizeof(CraftJournalEntry) == 34, "CraftJournalEntry is a persisted on-disk format -- "
+                                               "a layout change here is a format migration, not a code change");
 
 // ─── HomeStore journal backend ─────────────────────────────────────────────────
 //
