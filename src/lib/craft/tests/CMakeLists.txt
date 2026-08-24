@@ -44,3 +44,22 @@ target_link_libraries(test_craft_write
 )
 
 add_test(NAME CraftWriteTest COMMAND test_craft_write)
+
+# Exercises HomeStoreCraftJournalBackend::write_slot against a REAL HomeStore home_log_store
+# (PR #171 review 4900497567: the production backend was previously never executed by any test).
+# Links the full homeblocks library, unlike the tests above, because a real home_log_store
+# requires a running HomeStore instance -- this is the heaviest CRAFT test in the suite.
+add_executable(test_craft_homestore_backend)
+target_sources(test_craft_homestore_backend PRIVATE
+    test_craft_homestore_backend.cpp
+)
+target_include_directories(test_craft_homestore_backend PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../volume/tests
+)
+target_link_libraries(test_craft_homestore_backend
+    ${PROJECT_NAME}
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+
+add_test(NAME CraftHomeStoreBackendTest COMMAND test_craft_homestore_backend)
