@@ -352,6 +352,70 @@ TEST_F(CraftWriteTest, CumulativeMissingCapRejectsSustainedWalk) {
     EXPECT_EQ(dev_->missing_count(), 2'999'997u);  // unchanged
 }
 
+// Exact >= fencepost for Guard 3: walk missing_lsns_ up to precisely cap-1 (still accepted), then to
+// exactly cap (still accepted -- the write that REACHES the cap is not itself rejected, only the
+// next one that finds the cap already reached), then verify the following gap-creating write is
+// rejected. Mirrors GapCapFenceposts' precision for Guard 2.
+TEST_F(CraftWriteTest, CumulativeMissingCapFencepost) {
+    dev_->seed_lsns(0, {});
+    ASSERT_TRUE(do_write(0, 1'000'000).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'000).has_value());
+    EXPECT_EQ(dev_->missing_count(), 1'999'998u);
+
+    // Two +2 gap-creating writes walk the count up one entry at a time to the exact boundary.
+    ASSERT_TRUE(do_write(0, 2'000'002).has_value()); // pre-check size=1,999,998 (< cap) -> passes
+    EXPECT_EQ(dev_->missing_count(), 1'999'999u);    // cap - 1
+
+    ASSERT_TRUE(do_write(0, 2'000'004).has_value()); // pre-check size=1,999,999 (< cap) -> passes
+    EXPECT_EQ(dev_->missing_count(), 2'000'000u);    // == cap exactly
+
+    // The set is now exactly at cap; the next gap-creating write's pre-check sees size == cap.
+    auto r = do_write(0, 2'000'006);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::value_too_large));
+    EXPECT_EQ(dev_->last_append_lsn(), 2'000'004);
+    EXPECT_EQ(dev_->missing_count(), 2'000'000u);
+}
+
+// A write that FILLS an existing gap must succeed even when missing_lsns_ is already AT the cap --
+// otherwise the set could never drain back down once full, turning the mitigation into a permanent
+// replica lockup.
+TEST_F(CraftWriteTest, CumulativeMissingCapExemptsGapFill) {
+    dev_->seed_lsns(0, {});
+    ASSERT_TRUE(do_write(0, 1'000'000).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'000).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'002).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'004).has_value());
+    ASSERT_EQ(dev_->missing_count(), 2'000'000u); // exactly at cap
+
+    // lsn=1 has been in missing_lsns_ since the very first jump (gap 1..999,999).
+    ASSERT_TRUE(dev_->is_missing(1));
+    auto r = do_write(0, 1);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(dev_->is_missing(1));
+    EXPECT_EQ(dev_->missing_count(), 1'999'999u); // shrank by exactly one
+}
+
+// A strictly in-order write (dlsn == last_append_lsn + 1) creates no gap entry and must succeed even
+// when missing_lsns_ is already AT the cap. This is the corner case the dlsn > last_append_lsn + 1
+// condition (vs. the weaker dlsn > last_append_lsn) exists to protect: an in-order write is "ahead of
+// last_append_lsn" too, but adds nothing to the set, so it must not be blocked by unrelated OOO
+// activity that happened to fill the set elsewhere.
+TEST_F(CraftWriteTest, CumulativeMissingCapExemptsInOrderWrite) {
+    dev_->seed_lsns(0, {});
+    ASSERT_TRUE(do_write(0, 1'000'000).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'000).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'002).has_value());
+    ASSERT_TRUE(do_write(0, 2'000'004).has_value());
+    ASSERT_EQ(dev_->missing_count(), 2'000'000u); // exactly at cap
+    ASSERT_EQ(dev_->last_append_lsn(), 2'000'004);
+
+    auto r = do_write(0, 2'000'005);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 2'000'005);
+    EXPECT_EQ(dev_->missing_count(), 2'000'000u); // unchanged: no gap created
+}
+
 // A write with data.size > 0 (non-zero content) must call alloc_write_data exactly once.
 // This verifies the HS_DATA_LINKED branch is entered when the payload is non-empty.
 TEST_F(CraftWriteTest, NonZeroWriteCallsAllocWriteData) {

@@ -309,12 +309,14 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // Guard 3: cap cumulative missing_lsns_ growth, independent of any single write's gap distance.
         // Guard 2 only bounds one write's contribution; a client walking the watermark forward in
         // smaller-than-cap increments (e.g. +1,000,000 repeatedly) still grows missing_lsns_ without
-        // bound across many writes, each individually passing Guard 2. Scoped to gap-CREATING writes
-        // (dlsn > last_append_lsn) only: a write that FILLS an existing gap (dlsn <= last_append_lsn,
-        // already in missing_lsns_) shrinks the set and must not be blocked by this cap, or the set
-        // could never drain back down once it reaches capacity.
+        // bound across many writes, each individually passing Guard 2. Scoped to writes that actually
+        // CREATE at least one new gap entry (dlsn > last_append_lsn + 1) -- NOT merely dlsn >
+        // last_append_lsn, which also matches a strictly in-order write (dlsn == last_append_lsn + 1)
+        // that adds nothing to the set. Two cases must stay exempt from this cap or the set could
+        // never drain back down once it reaches capacity: a write that FILLS an existing gap (dlsn <=
+        // last_append_lsn) shrinks the set, and a zero-gap in-order write leaves it unchanged.
         static constexpr size_t k_max_missing_lsns = 2'000'000;
-        if (dlsn > state_.last_append_lsn && missing_lsns_.size() >= k_max_missing_lsns) {
+        if (dlsn > state_.last_append_lsn + 1 && missing_lsns_.size() >= k_max_missing_lsns) {
             LOGW("write rejected: missing_lsns_ at capacity ({}) dlsn={}", missing_lsns_.size(), dlsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
