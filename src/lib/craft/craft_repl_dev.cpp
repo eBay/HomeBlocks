@@ -277,9 +277,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
     // Reject rather than abort: this condition is reachable from the client wire (S9 CraftConnector)
-    // so a RELEASE_ASSERT would let a malformed frame abort the entire replica process.
-    if (!all_zeros && data.size == 0) {
-        LOGW("write rejected: all_zeros=false requires non-empty data dlsn={} addr={} len={}", dlsn, addr, len);
+    // so a RELEASE_ASSERT would let a malformed frame abort the entire replica process. all_zeros and
+    // data.size disagreeing either way is malformed: all_zeros=false requires a payload (the write());
+    // all_zeros=true requires none (WRITE_ZEROES/unmap names a range, it does not also carry data).
+    if (all_zeros == (data.size > 0)) {
+        LOGW("write rejected: all_zeros={} disagrees with data.size={} dlsn={} addr={} len={}", all_zeros, data.size,
+             dlsn, addr, len);
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
 

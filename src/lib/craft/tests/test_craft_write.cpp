@@ -480,6 +480,20 @@ TEST_F(CraftWriteTest, AllZerosFalseWithEmptyDataRejected) {
     EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
 }
 
+// The inverse bad combination: all_zeros=true with a non-empty sg_list. Previously silently
+// accepted and dropped the payload (the guard only covered !all_zeros && data.size == 0); now
+// rejected symmetrically, since WRITE_ZEROES/unmap names a range and must not also carry data.
+TEST_F(CraftWriteTest, AllZerosTrueWithNonEmptyDataRejected) {
+    sisl::sg_list data;
+    data.size = 4096;
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, 4096, std::move(data), /* all_zeros = */ true));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(journal_->slot_count(), 0u);  // write_slot not reached
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
+}
+
 // write_slot must receive the term from the client_hdr so CraftJournalEntry.term is populated correctly.
 // This is the on-disk term used to detect and skip stale-tail entries on recovery.
 TEST_F(CraftWriteTest, WriteSlotReceivesCorrectTerm) {
