@@ -57,8 +57,8 @@ struct JournalSlot {
     int64_t lsn{-1};
     bool is_empty{false};
     bool all_zeros{false};
-    lba_t lba{0};       // BYTES, not block index — mirrors CraftJournalEntry.lba semantics
-    lba_count_t len{0}; // BYTES, not block count  — mirrors CraftJournalEntry.len semantics
+    lba_t lba_off_bytes{0};
+    lba_count_t len_bytes{0};
     sisl::sg_list data{};
 };
 

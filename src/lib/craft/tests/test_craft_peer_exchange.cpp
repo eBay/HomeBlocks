@@ -93,7 +93,8 @@ protected:
 
     // Seed a data slot into the mock journal. lba and len default to small non-zero values.
     void add_slot(int64_t lsn, lba_t lba = 0, lba_count_t len = 4, bool all_zeros = false) {
-        journal_->slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba = lba, .len = len};
+        journal_->slots[lsn] =
+            JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -152,8 +153,8 @@ TEST_F(CraftPeerExchangeTest, FetchDataPresentData) {
     EXPECT_EQ((*r)[0].lsn, 5);
     EXPECT_FALSE((*r)[0].is_empty);
     EXPECT_FALSE((*r)[0].all_zeros);
-    EXPECT_EQ((*r)[0].lba, 10u);
-    EXPECT_EQ((*r)[0].len, 4u);
+    EXPECT_EQ((*r)[0].lba_off_bytes, 10u);
+    EXPECT_EQ((*r)[0].len_bytes, 4u);
 }
 
 // A zero-write slot (all_zeros=true) is returned with that flag set and no data payload.
