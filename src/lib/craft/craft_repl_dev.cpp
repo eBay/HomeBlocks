@@ -101,20 +101,34 @@ public:
         //   • blob lifetime: blob is a coroutine-frame local; the frame stays alive through co_await.
         //     write_async holds only a reference, which remains valid for the full I/O duration.
         //
-        // KNOWN RISK (shutdown): write_async skips the callback when is_stopping() is true
-        // (HomeStore/src/lib/logstore/log_store.cpp:71); complete() is never called and the coroutine
-        // stays suspended. Callers must drain in-flight writes before HomeStore shutdown.
-        //
-        // KNOWN GAP (I/O errors): write_async fires the same callback for success and failure with no
-        // status argument; write_slot always returns ok() regardless of the I/O result. A fix requires
-        // a HomeStore API extension.
+        // KNOWN RISK (lost completion -> permanent suspension): write_async's callback is not
+        // guaranteed to fire. Two triggers collapse to the SAME failure mode, verified against
+        // homestore dev/v8.x:
+        //   - shutdown: write_async returns a non-positive seq_num without invoking the callback
+        //     when the log store is stopping (log_store.cpp:71); LogDev::append_async likewise
+        //     returns -1 when the logdev itself is stopping (log_dev.cpp:290). Guarded below: a
+        //     non-positive return means the callback will never fire, so this bails out with an
+        //     error instead of awaiting forever.
+        //   - journal I/O error: LogDev's flush path returns on a sync_pwritev failure BEFORE
+        //     calling on_flush_completion at all (log_dev.cpp:531-539) -- the callback is skipped
+        //     exactly like the shutdown case, not fired with a failure status. write_async has
+        //     already returned a positive seq_num by the time the flush runs, so this trigger has
+        //     no return-value signal and is NOT covered by the guard below. Tracked in
+        //     SDSTOR-24993 (HomeStore fix: propagate the error into the completion path itself,
+        //     not a status argument bolted onto a callback that won't fire; interim mitigation:
+        //     bound this co_await with a timeout).
         auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
-        logstore_->write_async(
+        auto write_ret = logstore_->write_async(
             static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
             [va](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
                 iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
                                         [va = std::move(va)]() mutable { va->complete(true); });
             });
+        if (write_ret <= 0) {
+            LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire",
+                 lsn);
+            co_return std::unexpected(make_error_condition(std::errc::operation_not_supported));
+        }
         co_await *va;
         co_return ok();
     }
