@@ -102,9 +102,13 @@ public:
         //     write_async holds only a reference, which remains valid for the full I/O duration.
         //
         // KNOWN RISK (lost completion -> permanent suspension): write_async's callback isn't
-        // guaranteed to fire, verified against homestore dev/v8.x. Two triggers, one failure mode:
-        //   - shutdown: write_async returns <= 0 without invoking the callback when the log store
-        //     or logdev is stopping (log_store.cpp:71, log_dev.cpp:290). Guarded below.
+        // guaranteed to fire, verified against homestore source (log_dev.cpp, log_store.cpp). Two
+        // triggers, one failure mode:
+        //   - shutdown: write_async returns -1 without invoking the callback when the log store or
+        //     logdev is stopping (log_store.cpp:48,71; log_dev.cpp:293,301 -- append_async's own
+        //     is_stopping() check). On success it returns LogDev's internal m_log_idx, which starts
+        //     at 0 for a fresh logdev and is NOT the lsn/dLSN passed in -- only < 0 means stopping.
+        //     Guarded below.
         //   - journal I/O error: the flush path returns on a sync_pwritev failure BEFORE calling
         //     on_flush_completion (log_dev.cpp:531-539) -- no return-value signal, NOT covered
         //     below. Tracked in SDSTOR-24993 (fix: propagate the error into the completion path,
@@ -116,7 +120,7 @@ public:
                 iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
                                         [va = std::move(va)]() mutable { va->complete(true); });
             });
-        if (write_ret <= 0) {
+        if (write_ret < 0) {
             LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire",
                  lsn);
             co_return std::unexpected(make_error_condition(std::errc::operation_not_supported));
