@@ -15,12 +15,12 @@
 
 // Exercises HomeStoreCraftJournalBackend::write_slot against a REAL HomeStore home_log_store --
 // the only place in the CRAFT test suite that runs this code instead of MockCraftJournalBackend.
+// The value_awaitable/run_on_forget/INLINE-safety bridge in write_slot is the subtlest code in
+// this backend and was previously verified only by comments, never executed.
 //
-// szmyd (PR #171 review 4900497567): the value_awaitable/run_on_forget/INLINE-safety bridge in
-// write_slot is the subtlest code in the PR and was previously verified only by comments, never
-// executed. make_homestore_journal_backend has no production call site yet (S8/SDSTOR-22745 is
-// first), so this deliberately drives the backend directly rather than through CraftReplDev or a
-// volume -- narrowest test that still runs the real completion path.
+// make_homestore_journal_backend has no production call site yet, so this deliberately drives the
+// backend directly rather than through CraftReplDev or a volume -- the narrowest test that still
+// runs the real completion path.
 //
 // Links the full homeblocks library (unlike the other craft tests, which compile
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
@@ -93,9 +93,9 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
 // alloc_write_data's application_hint routes allocation through VolumeChunkSelector by vol_ordinal.
 // No volume was created in this test (make_homestore_journal_backend has no production call site
 // yet, so there is no real ordinal to allocate against), so this hits VolumeChunkSelector with an
-// unregistered ordinal -- and, before the fix in this same PR, that was a null-pointer dereference
-// (select_chunk indexed m_volume_chunks[ordinal] and dereferenced the null slot without checking).
-// This is now a regression test for that fix: alloc_write_data must fail cleanly, not crash.
+// unregistered ordinal -- previously a null-pointer dereference (select_chunk indexed
+// m_volume_chunks[ordinal] and dereferenced the null slot without checking), now fixed. This is a
+// regression test for that fix: alloc_write_data must fail cleanly, not crash.
 TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdinal) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);

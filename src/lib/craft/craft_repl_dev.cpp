@@ -123,8 +123,8 @@ public:
         //     Guarded below.
         //   - journal I/O error: the flush path returns on a sync_pwritev failure BEFORE calling
         //     on_flush_completion (log_dev.cpp:531-539) -- no return-value signal, NOT covered
-        //     below. Tracked in SDSTOR-24993 (fix: propagate the error into the completion path,
-        //     not a status arg on a callback that won't fire; interim: timeout the await).
+        //     below. Needs a HomeStore fix propagating the error into the completion path itself
+        //     (not a status arg on a callback that won't fire); interim: timeout the await.
         auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
         auto write_ret = logstore_->write_async(
             static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
@@ -333,7 +333,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
         if ((dlsn > state_.last_append_lsn) || missing_lsns_.contains(dlsn)) missing_lsns_.insert(dlsn);
         // Advanced before write_slot runs, not rolled back on failure (see
-        // WriteSlotFails_LsnRemainsInMissing). Intentional (SDSTOR-22871) and safe per
+        // WriteSlotFails_LsnRemainsInMissing). Intentional, and safe per
         // CRAFT-Design's recovery-watermark argument: login takes rs_commit_lsn =
         // max(quorum.last_append_lsn) because false-include is benign, false-exclude is
         // catastrophic. A failed local append is indistinguishable, to login, from a write

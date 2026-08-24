@@ -428,10 +428,10 @@ TEST_F(CraftWriteTest, NonZeroWriteCallsAllocWriteData) {
     EXPECT_TRUE(journal_->has_slot(0));
 }
 
-// Zero-copy (SDSTOR-22873): the sg_list's iovec must reach alloc_write_data unchanged -- same
-// buffer pointer, not a copy. do_write_with_data (used above) sets data.size without real iovs, so
-// it cannot exercise this; this test builds a real buffer and checks pointer identity survives the
-// full path (write() -> alloc_write_data), which is the only way a copy would be detectable.
+// Zero-copy: the sg_list's iovec must reach alloc_write_data unchanged -- same buffer pointer,
+// not a copy. do_write_with_data (used above) sets data.size without real iovs, so it cannot
+// exercise this; this test builds a real buffer and checks pointer identity survives the full
+// path (write() -> alloc_write_data), which is the only way a copy would be detectable.
 TEST_F(CraftWriteTest, NonZeroWriteIsZeroCopy) {
     std::array< uint8_t, 4096 > buf{};
     sisl::sg_list data;
