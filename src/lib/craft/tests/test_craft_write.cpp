@@ -23,6 +23,7 @@
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles
 // craft_repl_dev.cpp directly (same pattern as test_craft_truncate.cpp).
 
+#include <array>
 #include <gtest/gtest.h>
 #include <map>
 #include <set>
@@ -47,10 +48,12 @@ public:
     bool fail_alloc{false};                   // alloc_write_data returns io_error when set
     int alloc_write_data_calls{0};
     int free_data_calls{0};
+    void const* last_alloc_data_ptr{nullptr}; // iov_base seen by the most recent alloc_write_data call
 
-    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data,
                                                              lba_count_t /* len */) override {
         ++alloc_write_data_calls;
+        last_alloc_data_ptr = data.iovs.empty() ? nullptr : data.iovs[0].iov_base;
         if (fail_alloc) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return homestore::multi_blk_id{};
     }
@@ -423,6 +426,22 @@ TEST_F(CraftWriteTest, NonZeroWriteCallsAllocWriteData) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(journal_->alloc_write_data_calls, 1);
     EXPECT_TRUE(journal_->has_slot(0));
+}
+
+// Zero-copy (SDSTOR-22873): the sg_list's iovec must reach alloc_write_data unchanged -- same
+// buffer pointer, not a copy. do_write_with_data (used above) sets data.size without real iovs, so
+// it cannot exercise this; this test builds a real buffer and checks pointer identity survives the
+// full path (write() -> alloc_write_data), which is the only way a copy would be detectable.
+TEST_F(CraftWriteTest, NonZeroWriteIsZeroCopy) {
+    std::array< uint8_t, 4096 > buf{};
+    sisl::sg_list data;
+    data.size = buf.size();
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, buf.size(), std::move(data), /* all_zeros = */ false));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(journal_->last_alloc_data_ptr, static_cast< void const* >(buf.data()));
 }
 
 // alloc_write_data failure propagates; write_slot must not be called and no block is freed
