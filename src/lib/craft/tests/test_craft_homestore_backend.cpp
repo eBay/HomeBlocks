@@ -26,6 +26,8 @@
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
 // a running HomeStore instance.
 
+#include <cstring>
+
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 #include <homestore/logstore_service.hpp>
@@ -43,24 +45,69 @@ std::unique_ptr< test_common::HBTestHelper > g_helper;
 
 using namespace homeblocks;
 
-class CraftHomeStoreBackendTest : public ::testing::Test {};
+class CraftHomeStoreBackendTest : public ::testing::Test {
+protected:
+    // Each test gets its own logdev/log_store so writes/rollbacks in one test cannot affect another.
+    // TIMER | INLINE matches solo_repl_dev's configuration: the mode where write_async's completion
+    // can fire before await_suspend returns, the INLINE-safety hazard write_slot's comment documents.
+    shared< homestore::home_log_store > make_logstore() {
+        auto flush_mode = static_cast< homestore::flush_mode_t >(
+            static_cast< uint32_t >(homestore::flush_mode_t::TIMER) |
+            static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
+        auto logdev_id = homestore::logstore_service().create_new_logdev(flush_mode);
+        return homestore::logstore_service().create_new_log_store(logdev_id, /* append_mode = */ false);
+    }
+};
 
-// TIMER | INLINE matches solo_repl_dev's configuration: the mode where write_async's completion
-// can fire before await_suspend returns, the INLINE-safety hazard write_slot's comment documents.
 // A hang here (rather than a pass) is exactly the deadlock/UB this test exists to catch.
 TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
-    auto flush_mode = static_cast< homestore::flush_mode_t >(
-        static_cast< uint32_t >(homestore::flush_mode_t::TIMER) | static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
-    auto logdev_id = homestore::logstore_service().create_new_logdev(flush_mode);
-    auto logstore = homestore::logstore_service().create_new_log_store(logdev_id, /* append_mode = */ false);
+    auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-
     auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
 
     auto r = homeblocks::detail::sync_get(
         backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
                             homestore::multi_blk_id{}, /* all_zeros = */ true));
     ASSERT_TRUE(r.has_value());
+}
+
+// truncate_to(lsn) must drop journal entries above lsn from the real logdev's tail -- verified via
+// the log_store's own tail_lsn() rather than read_slot (not yet implemented; returns not_supported).
+TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+
+    for (int64_t lsn = 0; lsn <= 4; ++lsn) {
+        auto r = homeblocks::detail::sync_get(backend->write_slot(
+            lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{}, /* all_zeros = */ true));
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(logstore->tail_lsn(), 4);
+
+    auto r = homeblocks::detail::sync_get(backend->truncate_to(2));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(logstore->tail_lsn(), 2);
+}
+
+// alloc_write_data's application_hint routes allocation through VolumeChunkSelector by vol_ordinal.
+// No volume was created in this test (make_homestore_journal_backend has no production call site
+// yet, so there is no real ordinal to allocate against), so this hits VolumeChunkSelector with an
+// unregistered ordinal -- and, before the fix in this same PR, that was a null-pointer dereference
+// (select_chunk indexed m_volume_chunks[ordinal] and dereferenced the null slot without checking).
+// This is now a regression test for that fix: alloc_write_data must fail cleanly, not crash.
+TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdinal) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+
+    constexpr uint32_t k_len = 4096;
+    sisl::io_blob_safe buf{k_len, 512};
+    std::memset(buf.bytes(), 0xab, k_len);
+    sisl::sg_list data{.size = k_len, .iovs = {iovec{buf.bytes(), k_len}}};
+
+    auto alloc_r = homeblocks::detail::sync_get(backend->alloc_write_data(data, static_cast< lba_count_t >(k_len)));
+    ASSERT_FALSE(alloc_r.has_value());
 }
 
 int main(int argc, char* argv[]) {
