@@ -325,6 +325,33 @@ TEST_F(CraftWriteTest, GapCapFenceposts) {
     EXPECT_EQ(dev_->missing_count(), 1u); // gap: 1,000,001
 }
 
+// Guard 2 (per-write gap cap) only bounds a single write's contribution to missing_lsns_. A client
+// that walks the watermark forward in cap-sized increments (+1,000,000 repeatedly) never trips Guard
+// 2, yet missing_lsns_ grows without bound across writes. Guard 3 closes this: it rejects a
+// gap-creating write once the CUMULATIVE set size already reached its cap, independent of this
+// write's own gap distance. Three walks of exactly k_max_ooo_gap each succeed (Guard 3's check uses
+// the size BEFORE this write, which only crosses the cap after the third); the fourth is rejected.
+TEST_F(CraftWriteTest, CumulativeMissingCapRejectsSustainedWalk) {
+    dev_->seed_lsns(0, {});
+
+    ASSERT_TRUE(do_write(0, 1'000'000).has_value());
+    EXPECT_EQ(dev_->missing_count(), 999'999u);
+
+    ASSERT_TRUE(do_write(0, 2'000'000).has_value());
+    EXPECT_EQ(dev_->missing_count(), 1'999'998u);
+
+    ASSERT_TRUE(do_write(0, 3'000'000).has_value());
+    EXPECT_EQ(dev_->missing_count(), 2'999'997u); // now over the 2,000,000 cap
+
+    // A further gap-creating jump is rejected even though its own gap distance (1,000,000) is well
+    // within the per-write Guard 2 cap — Guard 3 is what stops the sustained walk.
+    auto r = do_write(0, 4'000'000);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::value_too_large));
+    EXPECT_EQ(dev_->last_append_lsn(), 3'000'000); // rejected write must not advance state
+    EXPECT_EQ(dev_->missing_count(), 2'999'997u);  // unchanged
+}
+
 // A write with data.size > 0 (non-zero content) must call alloc_write_data exactly once.
 // This verifies the HS_DATA_LINKED branch is entered when the payload is non-empty.
 TEST_F(CraftWriteTest, NonZeroWriteCallsAllocWriteData) {

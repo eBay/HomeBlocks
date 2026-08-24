@@ -306,6 +306,18 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write rejected: dlsn={} too far ahead of last_append_lsn={}", dlsn, state_.last_append_lsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
+        // Guard 3: cap cumulative missing_lsns_ growth, independent of any single write's gap distance.
+        // Guard 2 only bounds one write's contribution; a client walking the watermark forward in
+        // smaller-than-cap increments (e.g. +1,000,000 repeatedly) still grows missing_lsns_ without
+        // bound across many writes, each individually passing Guard 2. Scoped to gap-CREATING writes
+        // (dlsn > last_append_lsn) only: a write that FILLS an existing gap (dlsn <= last_append_lsn,
+        // already in missing_lsns_) shrinks the set and must not be blocked by this cap, or the set
+        // could never drain back down once it reaches capacity.
+        static constexpr size_t k_max_missing_lsns = 2'000'000;
+        if (dlsn > state_.last_append_lsn && missing_lsns_.size() >= k_max_missing_lsns) {
+            LOGW("write rejected: missing_lsns_ at capacity ({}) dlsn={}", missing_lsns_.size(), dlsn);
+            co_return std::unexpected(make_error_condition(std::errc::value_too_large));
+        }
         // Empty-verdicted LSNs in the gap are already resolved — skip them to avoid re-stalling commit advancement.
         for (int64_t gap = state_.last_append_lsn + 1; gap < dlsn; ++gap) {
             if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
