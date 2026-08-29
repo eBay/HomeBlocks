@@ -346,7 +346,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // all_zeros=true skips this; the early-return above guarantees !all_zeros implies data.size > 0.
     homestore::multi_blk_id blkid{};
     bool blkid_allocated = false;
-    if (!all_zeros && data.size > 0) {
+    if (!all_zeros) {
         auto alloc_res = co_await journal_->alloc_write_data(data, static_cast< lba_count_t >(len));
         if (!alloc_res) {
             LOGE("alloc_write_data failed dlsn={}: {}", dlsn, alloc_res.error().message());
