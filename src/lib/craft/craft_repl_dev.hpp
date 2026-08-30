@@ -57,8 +57,8 @@ struct JournalSlot {
     int64_t lsn{-1};
     bool is_empty{false};
     bool all_zeros{false};
-    lba_t lba{0};
-    lba_count_t len{0};
+    lba_t lba_off_bytes{0};
+    lba_count_t len_bytes{0};
     sisl::sg_list data{};
 };
 
@@ -70,16 +70,27 @@ struct JournalSlot {
 
 class CraftJournalBackend {
 public:
-    virtual async_status write_slot(int64_t lsn, lba_t lba, lba_count_t len, sisl::sg_list data) = 0;
+    // Allocate blocks and write the data payload. Called BEFORE write_slot for non-zero writes.
+    // all_zeros=true and empty data bypass this; write_slot receives an empty multi_blk_id.
+    virtual async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data, lba_count_t len) = 0;
+    // term is the session term captured from state_.term at write() time — stored in
+    // CraftJournalEntry so recovery can skip stale-tail entries written under a deposed leader.
+    virtual async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len,
+                                    homestore::multi_blk_id blkid, bool all_zeros) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
     // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
     virtual async_status truncate_to(int64_t lsn) = 0;
+    // Release blocks previously allocated by alloc_write_data. Called when write_slot fails or
+    // when the write is discarded post-flight (stale term). Free errors are logged but non-fatal.
+    virtual async_status free_data(homestore::multi_blk_id blkid) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
 // Factory that wraps a HomeStore log store. Used by volume.cpp when creating a CRAFT-mode volume.
+// vol_ordinal must match vol_info_->ordinal so async_alloc_write routes to this volume's chunks.
 // Tests inject MockCraftJournalBackend directly.
-unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore);
+unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
+                                                             uint64_t vol_ordinal);
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
@@ -112,11 +123,12 @@ public:
     async_status logout(craft::client_hdr hdr);
 
     // Append data at the client-assigned dLSN. Zero-copy; does NOT apply to the LBA index (hdr.commit_lsn drives
-    // that). An EMPTY `data` is a zero write (WRITE_ZEROES/unmap over [addr, addr+len)). The ack returns the
-    // achieved {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
+    // that). Set all_zeros=true for WRITE_ZEROES/unmap over [addr, addr+len); data must be empty in that case.
+    // Precondition: all_zeros=false requires non-empty data (data.size > 0). The ack returns the achieved
+    // {commit_lsn, last_append_lsn} snapshotted with the append -- every CRAFT IO response piggybacks the
     // watermarks (the wire's write_rsp), so any round-trip refreshes the client's model of this member.
     async_result< craft::lsn_pair > write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
-                                          sisl::sg_list data);
+                                          sisl::sg_list data, bool all_zeros = false);
 
     // read_lsn is the horizon H: serve the latest version <= H for [addr, addr+len), from the LBA index if applied
     // or from the journal-tail overlay if only Appended (no index write on the read path). Never fetches from a
@@ -194,8 +206,11 @@ public:
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
     // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
     void seed_commit_lsn(int64_t commit);
-    // Seeds the Empty-verdict set; does not affect missing_lsns_. Clears any prior seeded empties.
+    // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
+    // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
+    // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
+    void seed_term(uint64_t term);
 #endif
 
 private:

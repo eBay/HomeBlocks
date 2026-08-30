@@ -107,6 +107,7 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
 
     // We dont take lock on volumes vector and volume chunks vector
     // as they precreated and never changed
+    if (volume_ordinal >= m_volume_chunks.size() || !m_volume_chunks[volume_ordinal]) { return nullptr; }
     auto volc = m_volume_chunks[volume_ordinal];
 
     // TODO to remove , keep trak of number of freed and alloc blks.

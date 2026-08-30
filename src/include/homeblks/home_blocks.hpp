@@ -68,7 +68,8 @@ using volume_handle = std::shared_ptr< volume >;
 // ride result<T> while staying branchable: if (r.error() == volume_error::CRC_MISMATCH) { ... }. Anything with a
 // standard equivalent (invalid arg, no space, io error, unsupported op, ...) is returned as
 // std::make_error_condition(std::errc::*) directly rather than duplicated here.
-ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM);
+ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM,
+     EMPTY_SLOT);
 
 ENUM(volume_state, uint32_t,
      INIT,       // created, not yet online
@@ -173,14 +174,17 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 
 // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length and must be
 // aligned to the volume's lba_size (from craft::LoginResult), else std::errc::invalid_argument. `data` is a
-// caller-owned (iomgr) buffer: EMPTY data (size 0) is a zero write (WRITE_ZEROES / unmap; reads back as
-// a hole); non-empty data is a data write of exactly `len` bytes -- so the empty buffer, not a flag,
-// signals a zero write. Not applied to the index directly; `hdr.commit_lsn` rides along and advances the
+// caller-owned (iomgr) buffer: set `all_zeros=true` for a WRITE_ZEROES/unmap over [addr, addr+len) --
+// `data` must be empty in that case; otherwise this is a data write of exactly `len` bytes and `data`
+// must be non-empty. The flag, not data emptiness, is what selects the write kind -- an empty buffer
+// with all_zeros=false (or vice versa) is rejected as std::errc::invalid_argument, not silently
+// reinterpreted. Not applied to the index directly; `hdr.commit_lsn` rides along and advances the
 // frontier best-effort in dLSN order (CRAFT's piggybacked commit). STALE_TERM if hdr.term != session term.
 // The ack returns the replica's achieved {commit_lsn, last_append_lsn}: every CRAFT IO response piggybacks
 // the watermarks, so any round-trip refreshes the client's per-member model without a keep_alive.
 [[nodiscard]] async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn,
-                                                          uint64_t addr, uint64_t len, sisl::sg_list data);
+                                                          uint64_t addr, uint64_t len, sisl::sg_list data,
+                                                          bool all_zeros = false);
 
 // Read the latest version <= `read_lsn` (horizon H) for [addr, addr+len) (BYTE offset/length, aligned to
 // lba_size). Fills the caller-owned `dest` buffer in place -- data sub-ranges get their bytes, holes get

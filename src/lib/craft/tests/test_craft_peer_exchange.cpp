@@ -53,7 +53,12 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
 
-    async_status write_slot(int64_t, lba_t, lba_count_t, sisl::sg_list) override {
+    async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
+                                                             lba_count_t /* len */) override {
+        co_return homestore::multi_blk_id{};
+    }
+
+    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
@@ -67,6 +72,7 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
 };
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -87,7 +93,7 @@ protected:
 
     // Seed a data slot into the mock journal. lba and len default to small non-zero values.
     void add_slot(int64_t lsn, lba_t lba = 0, lba_count_t len = 4, bool all_zeros = false) {
-        journal_->slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba = lba, .len = len};
+        journal_->slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -146,8 +152,8 @@ TEST_F(CraftPeerExchangeTest, FetchDataPresentData) {
     EXPECT_EQ((*r)[0].lsn, 5);
     EXPECT_FALSE((*r)[0].is_empty);
     EXPECT_FALSE((*r)[0].all_zeros);
-    EXPECT_EQ((*r)[0].lba, 10u);
-    EXPECT_EQ((*r)[0].len, 4u);
+    EXPECT_EQ((*r)[0].lba_off_bytes, 10u);
+    EXPECT_EQ((*r)[0].len_bytes, 4u);
 }
 
 // A zero-write slot (all_zeros=true) is returned with that flag set and no data payload.
