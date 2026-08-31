@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../hb_internal.hpp"
+#include "craft_raft_entries.hpp"
 #include <homestore/replication/repl_dev.hpp>
 
 #include <atomic>
@@ -92,6 +93,21 @@ public:
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
                                                              uint64_t vol_ordinal);
 
+// ─── CraftPeerFetcher ─────────────────────────────────────────────────────────
+//
+// Abstraction over the server-to-server peer plane (mirrors craft::peer::craft_peer in
+// craft_client 1:1, so a wire-backed implementation can forward each call straight into
+// craft_client's peer codec (peer_codec.cpp) with no translation). Injected into CraftReplDev
+// so unit tests can stub peer communication without a live network. Production wires
+// CraftConnector (S9). Default (null) leaves catch-up/resolution stubbed.
+
+class CraftPeerFetcher {
+public:
+    virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
+    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns) = 0;
+    virtual ~CraftPeerFetcher() = default;
+};
+
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
 // One instance per CRAFT-mode volume. Implements the full CRAFT data plane
@@ -160,8 +176,13 @@ public:
     // Return {commit_lsn, last_append_lsn} for the local partition.
     async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);
 
-    // Alias of get_lsns exposed to peer servers during GetRSCommitLSN broadcast.
-    async_result< craft::lsn_pair > get_rs_commit_lsn();
+    // Callee side of the GetRSCommitLSN broadcast -- matches craft::craft_peer::get_rs_commit_lsn's
+    // shape (craft_client's include/craft/peer.hpp) so a future wire-decoded request has somewhere
+    // to pass {term, is_login}. is_login=true is meant to quiesce prior-session writes before
+    // reporting last_append (the fencing barrier); watchdog/periodic polls pass is_login=false.
+    // Neither term-fencing nor quiesce is implemented yet -- both parameters are accepted but
+    // unused until S9 needs them (matches craft_client's own reference implementation today).
+    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn.
     // Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
@@ -199,6 +220,10 @@ public:
         std::lock_guard lk{missing_mu_};
         return state_.commit_lsn;
     }
+
+    // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
+    // Called by CraftConnector (S9) after construction; tests inject a mock.
+    void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
@@ -271,7 +296,7 @@ private:
     };
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type.
-    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token);
+    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     volume_id_t vol_id_;
@@ -283,6 +308,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
+    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
+    std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 
 } // namespace homeblocks

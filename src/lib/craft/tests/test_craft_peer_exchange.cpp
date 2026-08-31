@@ -86,7 +86,7 @@ protected:
     }
 
     auto do_get_lsns() { return homeblocks::detail::sync_get(dev_->get_lsns(volume_id_t{})); }
-    auto do_get_rs_commit_lsn() { return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn()); }
+    auto do_get_rs_commit_lsn() { return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(0, false)); }
     auto do_fetch_data(std::vector< int64_t > lsns) {
         return homeblocks::detail::sync_get(dev_->fetch_data(std::move(lsns)));
     }
