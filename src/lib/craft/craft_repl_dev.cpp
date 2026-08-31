@@ -190,7 +190,7 @@ async_result< craft::lsn_pair > CraftReplDev::get_lsns(volume_id_t /* vol_id */)
     co_return pair;
 }
 
-async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn() {
+async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
     craft::lsn_pair pair{};
     {
         std::lock_guard lk{missing_mu_};

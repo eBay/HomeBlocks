@@ -95,13 +95,16 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 
 // ─── CraftPeerFetcher ─────────────────────────────────────────────────────────
 //
-// Abstraction over the server-to-server fetch_data() call. Injected into
-// CraftReplDev so unit tests can stub peer communication without a live network.
-// Production wires CraftConnector (S9). Default (null) leaves catch-up stubbed.
+// Abstraction over the server-to-server peer plane (mirrors craft::peer::craft_peer in
+// craft_client 1:1, so a wire-backed implementation can forward each call straight into
+// craft_client's peer codec (peer_codec.cpp) with no translation). Injected into CraftReplDev
+// so unit tests can stub peer communication without a live network. Production wires
+// CraftConnector (S9). Default (null) leaves catch-up/resolution stubbed.
 
 class CraftPeerFetcher {
 public:
-    virtual async_result< std::vector< JournalSlot > > fetch_from_peer(std::vector< int64_t > lsns) = 0;
+    virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
+    virtual async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -173,8 +176,13 @@ public:
     // Return {commit_lsn, last_append_lsn} for the local partition.
     async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);
 
-    // Alias of get_lsns exposed to peer servers during GetRSCommitLSN broadcast.
-    async_result< craft::lsn_pair > get_rs_commit_lsn();
+    // Callee side of the GetRSCommitLSN broadcast -- matches craft::craft_peer::get_rs_commit_lsn's
+    // shape (craft_client's include/craft/peer.hpp) so a future wire-decoded request has somewhere
+    // to pass {term, is_login}. is_login=true is meant to quiesce prior-session writes before
+    // reporting last_append (the fencing barrier); watchdog/periodic polls pass is_login=false.
+    // Neither term-fencing nor quiesce is implemented yet -- both parameters are accepted but
+    // unused until S9 needs them (matches craft_client's own reference implementation today).
+    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn.
     // Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.

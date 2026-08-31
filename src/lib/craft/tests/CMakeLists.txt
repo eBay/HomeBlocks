@@ -63,3 +63,20 @@ target_link_libraries(test_craft_homestore_backend
 )
 
 add_test(NAME CraftHomeStoreBackendTest COMMAND test_craft_homestore_backend)
+
+# Verifies homeblocks::JournalSlot stays wire-compatible with craft_client's craft::JournalSlot:
+# per-field compile-time layout checks, plus round-trips through the REAL peer-plane codec
+# (craft::peer::encode_fetch_data_rsp / decode_fetch_data_rsp in peer_codec.cpp). This is the only
+# craft test binary that needs craft_client::craft_client (the component peer_codec.cpp is built
+# into) in addition to craft_client::craft_types.
+add_executable(test_craft_journal_slot_wire)
+target_sources(test_craft_journal_slot_wire PRIVATE
+    test_craft_journal_slot_wire.cpp
+)
+target_link_libraries(test_craft_journal_slot_wire
+    ${COMMON_TEST_DEPS}
+    craft_client::craft_client
+    -rdynamic
+)
+
+add_test(NAME CraftJournalSlotWireTest COMMAND test_craft_journal_slot_wire)
