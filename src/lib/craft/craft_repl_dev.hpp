@@ -104,7 +104,7 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 class CraftPeerFetcher {
 public:
     virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
-    virtual async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) = 0;
+    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 

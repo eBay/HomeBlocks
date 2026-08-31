@@ -48,10 +48,7 @@
 
 namespace homeblocks {
 
-enum class CraftEntryType : uint8_t {
-    SyncRSCommitLSN = 1,
-    InternalLogin = 2,
-};
+ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin);
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
@@ -62,6 +59,7 @@ struct CraftEntryHeader {
 // ─── key blob: SyncRSCommitLSN ───────────────────────────────────────────────
 
 // Fixed prefix. Immediately followed by num_empty_slots × int64_t.
+#pragma pack(push, 1)
 struct SyncRSCommitLSNPayload {
     int64_t rs_commit_lsn;
     uint64_t client_token;
@@ -74,6 +72,7 @@ struct InternalLoginPayload {
     uint64_t client_token;
     uint64_t term;
 };
+#pragma pack(pop)
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -111,6 +110,7 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 
     const size_t empty_count = p->num_empty_slots;
     const size_t expected_size = sizeof(SyncRSCommitLSNPayload) + empty_count * sizeof(int64_t);
+    // The size needs to match exactly. This restriction can be lifted later
     if (key.size() != expected_size) { return std::nullopt; }
 
     const auto* src = reinterpret_cast< const int64_t* >(p + 1);
