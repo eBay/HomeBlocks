@@ -55,8 +55,8 @@ namespace {
 static_assert(std::is_same_v< decltype(JournalSlot::lsn), decltype(craft::JournalSlot::lsn) >);
 static_assert(std::is_same_v< decltype(JournalSlot::is_empty), decltype(craft::JournalSlot::is_empty) >);
 static_assert(std::is_same_v< decltype(JournalSlot::all_zeros), decltype(craft::JournalSlot::all_zeros) >);
-static_assert(std::is_same_v< decltype(JournalSlot::lba), decltype(craft::JournalSlot::lba) >);
-static_assert(std::is_same_v< decltype(JournalSlot::len), decltype(craft::JournalSlot::len) >);
+static_assert(std::is_same_v< decltype(JournalSlot::lba_off_bytes), decltype(craft::JournalSlot::lba) >);
+static_assert(std::is_same_v< decltype(JournalSlot::len_bytes), decltype(craft::JournalSlot::len) >);
 static_assert(sizeof(JournalSlot) == sizeof(craft::JournalSlot),
               "homeblocks::JournalSlot must stay layout-compatible with craft::JournalSlot "
               "(craft_client's include/craft/peer.hpp)");
@@ -68,8 +68,8 @@ craft::JournalSlot to_craft_slot(JournalSlot const& s) {
     out.lsn = s.lsn;
     out.is_empty = s.is_empty;
     out.all_zeros = s.all_zeros;
-    out.lba = s.lba;
-    out.len = s.len;
+    out.lba = s.lba_off_bytes;
+    out.len = s.len_bytes;
     out.data = s.data;
     return out;
 }
@@ -118,8 +118,8 @@ TEST(JournalSlotWireCompliance, RoundTripsDataSlot) {
 
     JournalSlot slot;
     slot.lsn = 42;
-    slot.lba = 100;
-    slot.len = 4;
+    slot.lba_off_bytes = 100;
+    slot.len_bytes = 4;
     slot.data.iovs.push_back(iovec{payload, sizeof(payload)});
     slot.data.size = sizeof(payload);
 
@@ -128,8 +128,8 @@ TEST(JournalSlotWireCompliance, RoundTripsDataSlot) {
     ASSERT_EQ(result.size(), 1u);
     auto const& d = result[0];
     EXPECT_EQ(d.lsn, slot.lsn);
-    EXPECT_EQ(d.lba, slot.lba);
-    EXPECT_EQ(d.len, slot.len);
+    EXPECT_EQ(d.lba, slot.lba_off_bytes);
+    EXPECT_EQ(d.len, slot.len_bytes);
     EXPECT_FALSE(d.is_empty);
     EXPECT_FALSE(d.all_zeros);
     ASSERT_EQ(d.data.size, sizeof(payload));
@@ -153,8 +153,8 @@ TEST(JournalSlotWireCompliance, RoundTripsEmptySlot) {
 TEST(JournalSlotWireCompliance, RoundTripsZeroWriteSlot) {
     JournalSlot slot;
     slot.lsn = 9;
-    slot.lba = 5;
-    slot.len = 8;
+    slot.lba_off_bytes = 5;
+    slot.len_bytes = 8;
     slot.all_zeros = true;
 
     auto rt = round_trip({slot});
@@ -173,15 +173,15 @@ TEST(JournalSlotWireCompliance, RoundTripsMixedBatch) {
 
     JournalSlot data_slot;
     data_slot.lsn = 1;
-    data_slot.lba = 2;
-    data_slot.len = 2;
+    data_slot.lba_off_bytes = 2;
+    data_slot.len_bytes = 2;
     data_slot.data.iovs.push_back(iovec{payload, sizeof(payload)});
     data_slot.data.size = sizeof(payload);
 
     JournalSlot zero_slot;
     zero_slot.lsn = 2;
-    zero_slot.lba = 4;
-    zero_slot.len = 2;
+    zero_slot.lba_off_bytes = 4;
+    zero_slot.len_bytes = 2;
     zero_slot.all_zeros = true;
 
     JournalSlot empty_slot;
