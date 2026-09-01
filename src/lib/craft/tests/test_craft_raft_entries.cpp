@@ -104,7 +104,7 @@ public:
     }
 
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
-                                                           uint32_t timeout_ms) override {
+                                                          uint32_t timeout_ms) override {
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -123,7 +123,7 @@ std::vector< uint8_t > make_header(CraftEntryType type) {
 }
 
 std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64_t client_token,
-                                                    const std::vector< int64_t >& empty_slots) {
+                                                   const std::vector< int64_t >& empty_slots) {
     std::vector< uint8_t > buf(sync_rs_commit_lsn_key_size(empty_slots.size()));
     serialize_sync_rs_commit_lsn(buf.data(), rs_commit_lsn, client_token, empty_slots);
     return buf;
@@ -131,9 +131,9 @@ std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64
 
 std::vector< uint8_t > make_internal_login_key(uint64_t client_token, uint64_t term) {
     std::vector< uint8_t > buf(sizeof(InternalLoginPayload));
-    auto* p         = reinterpret_cast< InternalLoginPayload* >(buf.data());
+    auto* p = reinterpret_cast< InternalLoginPayload* >(buf.data());
     p->client_token = client_token;
-    p->term         = term;
+    p->term = term;
     return buf;
 }
 
@@ -310,8 +310,7 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
-        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
-        JournalSlot{.lsn = 2, .is_empty = true},
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4}, JournalSlot{.lsn = 2, .is_empty = true},
         JournalSlot{.lsn = 99, .is_empty = true}, // never requested -- only 1 and 2 were
     };
 
@@ -393,7 +392,7 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
 
 TEST_F(CraftRaftEntriesTest, OnCommitDispatchesSyncRSCommitLSN) {
     auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
-    auto key_buf     = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, /*empty_slots=*/{});
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, /*empty_slots=*/{});
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
@@ -426,7 +425,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMalformedSyncRSCommitLSNKey) {
 // check (not on_commit's coarser size check) is what rejects it.
 TEST_F(CraftRaftEntriesTest, OnCommitRejectsMismatchedEmptySlotsCount) {
     auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
-    auto key_buf     = make_sync_rs_commit_lsn_key(7, 0, {10, 20});
+    auto key_buf = make_sync_rs_commit_lsn_key(7, 0, {10, 20});
     reinterpret_cast< SyncRSCommitLSNPayload* >(key_buf.data())->num_empty_slots = 5;
     cintrusive< homestore::repl_req_ctx > ctx{};
 
@@ -450,7 +449,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitIgnoresUnrecognizedEntryType) {
 
 TEST_F(CraftRaftEntriesTest, OnCommitDispatchesInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    auto key_buf     = make_internal_login_key(/*client_token=*/42, /*term=*/5);
+    auto key_buf = make_internal_login_key(/*client_token=*/42, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
@@ -533,7 +532,7 @@ TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegr
 // succeeds normally (only the mismatch path changed).
 TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    auto key_buf     = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
@@ -549,7 +548,7 @@ TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
 // for write()'s term-check-under-lock fix.
 TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    auto key_buf     = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
@@ -567,7 +566,7 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
 // it -- the OLD default (0) is now itself a mismatch.
 TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNUsesTokenEstablishedByInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    auto key_buf     = make_internal_login_key(/*client_token=*/7, /*term=*/1);
+    auto key_buf = make_internal_login_key(/*client_token=*/7, /*term=*/1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 

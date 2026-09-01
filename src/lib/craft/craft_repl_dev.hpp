@@ -112,7 +112,7 @@ public:
     // only carries the contract; there's nothing to enforce yet since today's only implementations are
     // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
-                                                                   uint32_t timeout_ms) = 0;
+                                                                  uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -343,14 +343,14 @@ private:
     // TODO: Can this be replaced with boost::icl::interval_set? Particularly helpful when a write
     // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
     // insert one LSN at a time under missing_mu_, which is O(gap width) instead of O(log ranges).
-    std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    std::unordered_set< int64_t > empty_lsns_;   // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
-    mutable std::mutex missing_mu_;    // guards state_, missing_lsns_, and empty_lsns_
+    std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
+    std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
+    mutable std::mutex missing_mu_;            // guards state_, missing_lsns_, and empty_lsns_
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000}; // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 

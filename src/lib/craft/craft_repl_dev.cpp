@@ -38,7 +38,7 @@ namespace {
 // every entry matches exactly one requested LSN. Erasing from `pending` as we go catches duplicates for
 // free: a repeated lsn finds nothing left to erase the second time.
 std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& requested,
-                                                  std::vector< JournalSlot > const& response) {
+                                                 std::vector< JournalSlot > const& response) {
     std::unordered_set< int64_t > pending{requested.begin(), requested.end()};
     for (auto const& slot : response) {
         if (pending.erase(slot.lsn) == 0) return slot.lsn;
@@ -512,7 +512,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
             return;
         }
         const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
-        auto empty_slots    = parse_empty_slots(key);
+        auto empty_slots = parse_empty_slots(key);
         if (!empty_slots) {
             LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
             return;
@@ -538,8 +538,8 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // the two mutation points this exposes. Real fix: one per-device serialized apply queue that both
         // entry types funnel through, processing one entry's full effect (including all its co_awaits)
         // before starting the next -- not independent detached tasks.
-        detail::detach(owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token,
-                                                        std::move(*empty_slots)));
+        detail::detach(
+            owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token, std::move(*empty_slots)));
         break;
     }
     case CraftEntryType::InternalLogin: {
@@ -586,8 +586,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // out-of-range verdict means the entry itself cannot be trusted, not that this one slot should be skipped.
     for (int64_t lsn : empty_slots) {
         if (lsn < 0 || lsn > rs_commit_lsn) {
-            LOGE("apply_sync_rs_commit_lsn: empty_slots lsn={} out of range [0, {}] -- rejecting entire apply",
-                lsn, rs_commit_lsn);
+            LOGE("apply_sync_rs_commit_lsn: empty_slots lsn={} out of range [0, {}] -- rejecting entire apply", lsn,
+                 rs_commit_lsn);
             co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
         }
     }
@@ -598,7 +598,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         std::lock_guard lk{missing_mu_};
         if (client_token != state_.client_token) {
             LOGW("apply_sync_rs_commit_lsn: client_token mismatch want={} got={} rs_commit_lsn={} -- skipping apply",
-                state_.client_token, client_token, rs_commit_lsn);
+                 state_.client_token, client_token, rs_commit_lsn);
             co_return std::unexpected(make_error_condition(volume_error::WRONG_TOKEN));
         }
         term = state_.term;
@@ -623,11 +623,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     if (!to_fetch.empty()) {
         if (peer_fetcher_ == nullptr) {
             LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
-                to_fetch.size());
-        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_);
-                   !fetched) {
+                 to_fetch.size());
+        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_); !fetched) {
             LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
-                fetched.error().message(), to_fetch.size());
+                 fetched.error().message(), to_fetch.size());
         } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
             // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
             // repeated) -- any deviation means the response itself can't be trusted, so none of it is
@@ -635,7 +634,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
             // fine from a peer that has already proven unreliable.
             LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
                  "entire batch, leaving {} lsn(s) as missing",
-                *bad_lsn, to_fetch.size());
+                 *bad_lsn, to_fetch.size());
         } else {
             for (auto& slot : *fetched) {
                 if (slot.is_empty) {
@@ -651,7 +650,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
                     if (!alloc_res) {
                         LOGE("apply_sync_rs_commit_lsn: alloc_write_data failed lsn={}: {} -- leaving as missing",
-                            slot.lsn, alloc_res.error().message());
+                             slot.lsn, alloc_res.error().message());
                         continue;
                     }
                     blkid = *alloc_res;
@@ -660,7 +659,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                                                          slot.all_zeros);
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
-                        res.error().message());
+                         res.error().message());
                     continue;
                 }
                 std::lock_guard lk{missing_mu_};
