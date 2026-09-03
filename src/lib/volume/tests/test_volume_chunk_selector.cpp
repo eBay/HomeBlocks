@@ -77,8 +77,12 @@ uint16_t VChunk::get_chunk_id() const { return m_internal_chunk->get_chunk_id();
 
 blk_num_t VChunk::get_total_blks() const { return m_internal_chunk->get_total_blks(); }
 
-uint64_t VChunk::size() const { return m_internal_chunk->size(); }
 void VChunk::reset() {}
+
+uint64_t VChunk::size() const { return m_internal_chunk->size(); }
+
+// void VChunk::reset_block_allocator() {}
+
 cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk; }
 
 } // namespace homestore
@@ -146,6 +150,11 @@ TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
     // Release all chunks to simulate volume destroy.
     for (uint32_t i = 0; i < 5; i++) {
         chunk_sel->release_chunks(i /* ordinal */);
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (chunk_sel->num_free_chunks() != init_num_free_chunks && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     // All the chunks will be free.

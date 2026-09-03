@@ -15,6 +15,7 @@
 #include "volume_chunk_selector.hpp"
 #include "hb_internal.hpp"
 #include <iomgr/iomgr_flip.hpp>
+#include <homestore/index_service.hpp>
 
 namespace homeblocks {
 
@@ -29,9 +30,11 @@ void VolumeChunkSelector::add_chunk(homestore::cshared< Chunk >& chunk) {
     auto vol_chunk = std::make_shared< HBChunk >(chunk);
     auto chunk_id = homestore::VChunk(chunk).get_chunk_id();
     auto pdev_id = homestore::VChunk(chunk).get_pdev_id();
+
+    LOGDEBUG("Adding chunk id {} to selector {}", chunk_id, m_module_name);
+    std::lock_guard lock(m_chunk_sel_mutex);
     m_all_chunks.emplace(chunk_id, vol_chunk);
     m_per_dev_chunks[pdev_id].emplace(chunk_id, vol_chunk);
-    LOGDEBUG("Adding chunk id {} to selector {}", chunk_id, m_module_name);
 }
 
 std::vector< chunk_num_t > VolumeChunkSelector::allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size,
@@ -306,26 +309,55 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     return true;
 }
 
+// Release the active chunks back to the per device chunk pool
 void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
-    // Release the active chunks back to the per device chunk pool.
-    std::lock_guard lock(m_chunk_sel_mutex);
-    std::string str;
-    uint64_t count = 0;
-    auto volc = m_volume_chunks[volume_ordinal];
-    RELEASE_ASSERT(volc, "volume doesnt exists");
+    std::vector< shared< HBChunk > > chunks;
+    {
+        std::lock_guard lock(m_chunk_sel_mutex);
+        auto volc = std::exchange(m_volume_chunks[volume_ordinal], nullptr);
+        RELEASE_ASSERT(volc, "volume doesnt exists");
 
-    for (auto chunk : volc->m_chunks) {
-        if (chunk) {
-            chunk->m_vol_ordinal = INVALID_VOL_ORDINAL;
-            m_per_dev_chunks[chunk->get_pdev_id()].emplace(chunk->get_chunk_id(), chunk);
-            fmt::format_to(std::back_inserter(str), "{} ", chunk->get_chunk_id());
-            count++;
+        chunks.reserve(volc->m_chunks.size());
+        for (auto& chunk : volc->m_chunks) {
+            if (chunk) { chunks.emplace_back(std::move(chunk)); }
         }
+        volc->m_chunks.clear();
     }
 
-    m_volume_chunks[volume_ordinal] = nullptr;
-    LOGI("Released chunks for volume={} num_chunks={}", volume_ordinal, count);
-    LOGDEBUG("Released chunks={}", str);
+    if (chunks.empty()) {
+        LOGI("Released chunks for volume={} num_chunks={}", volume_ordinal, 0);
+        LOGDEBUG("No chunks released");
+        return;
+    }
+
+    auto release_fn = [this, volume_ordinal](std::vector< shared< HBChunk > > chunks) {
+        std::string str;
+
+        for (auto& chunk : chunks) {
+            fmt::format_to(std::back_inserter(str), "{} ", chunk->get_chunk_id());
+
+            if (homestore::hs() && homestore::hs()->has_index_service()) {
+                homestore::hs()->index_service().wb_cache().evict_chunk_blkids(*chunk->get_internal_chunk());
+            }
+
+            {
+                std::lock_guard lock{m_chunk_sel_mutex};
+                chunk->m_vol_ordinal = INVALID_VOL_ORDINAL;
+                m_per_dev_chunks[chunk->get_pdev_id()].emplace(chunk->get_chunk_id(), chunk);
+            }
+        }
+
+        LOGI("Released chunks for volume={} num_chunks={}", volume_ordinal, chunks.size());
+        LOGDEBUG("Released chunks={}", str);
+    };
+
+    if (homestore::hs() && homestore::hs()->has_index_service()) {
+        // Clear wbc entries in a separate thread
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker,
+                                [release_fn, chunks = std::move(chunks)]() mutable { release_fn(std::move(chunks)); });
+    } else {
+        release_fn(std::move(chunks));
+    }
 }
 
 void VolumeChunkSelector::foreach_chunks(std::function< void(homestore::cshared< Chunk >&) >&& cb) {

@@ -9,7 +9,7 @@ class TestFailedError(Exception):
 
 
 def run_test(options):
-    cmd_opts = f"--gtest_filter=VolumeIOTest.LongRunningRandomIO --gtest_break_on_failure {options['log_mods']} --run_time={options['run_time']} --vol_size_gb={options['vol_size_gb']} --num_vols={options['num_vols']} --device_list {options['device_list']} --hs_chunk_size_mb={options['hs_chunk_size_mb']}"
+    cmd_opts = f"--gtest_filter=VolumeIOTest.LongRunningRandomIO --gtest_break_on_failure {options['log_mods']} --run_time={options['run_time']} --vol_size_gb={options['vol_size_gb']} --num_vols={options['num_vols']} --device_list {options['device_list']}" #--hs_chunk_size_mb={options['hs_chunk_size_mb']}"
     test_cmd = f"{options['dirpath']}/test_volume_io {cmd_opts}"
     print(f"Running command: {test_cmd}")
     try:
@@ -34,7 +34,7 @@ def parse_arguments():
     parser.add_argument('--device_list', help='Device list', default='')
     parser.add_argument('--init_device', help='Initialize device', type=bool, default=True)
     parser.add_argument('--use_file', help='Initialize device', action="store_true")
-    parser.add_argument('--hs_chunk_size_mb', help='hs_chunk_size', type=int, default=2048)
+    #parser.add_argument('--hs_chunk_size_mb', help='hs_chunk_size', type=int, default=2048)
 
     # Parse the known arguments and ignore any unknown arguments
     args, unknown = parser.parse_known_args()
@@ -67,3 +67,6 @@ def long_runnig_io(options):
 def long_running(*args):
     options = parse_arguments()
     long_runnig_io(options)
+
+if __name__ == "__main__":
+    long_running()
