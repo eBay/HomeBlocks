@@ -184,6 +184,33 @@ public:
         co_return ok();
     }
 
+    // Reads the raw local entry back off the log store -- the exact bytes write_slot wrote,
+    // header + serialized blkid -- and hands the blkid to free_data. Never goes through
+    // read_slot/JournalSlot: that type is wire-shared with craft::JournalSlot for peer fetch_data
+    // responses and deliberately carries no blkid (meaningless to a remote peer).
+    async_status free_slot(int64_t lsn) override {
+        homestore::log_buffer buf;
+        try {
+            buf = logstore_->read_sync(static_cast< homestore::logstore_seq_num_t >(lsn));
+        } catch (std::exception const& e) {
+            LOGE("free_slot: read_sync failed lsn={}: {}", lsn, e.what());
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (buf.size() < sizeof(CraftJournalEntry)) {
+            LOGE("free_slot: entry truncated lsn={} size={}", lsn, buf.size());
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        CraftJournalEntry hdr{};
+        std::memcpy(&hdr, buf.bytes(), sizeof(CraftJournalEntry));
+        if (hdr.all_zeros) co_return ok();
+
+        homestore::multi_blk_id blkid{};
+        blkid.deserialize(sisl::blob{buf.bytes() + sizeof(CraftJournalEntry),
+                                     buf.size() - static_cast< uint32_t >(sizeof(CraftJournalEntry))},
+                          true /* copy */);
+        co_return co_await free_data(blkid);
+    }
+
 private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
@@ -598,6 +625,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
+    std::vector< int64_t > to_free;
     std::vector< int64_t > to_fetch;
     uint64_t term;
     {
@@ -610,7 +638,9 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            missing_lsns_.erase(lsn);
+            if (missing_lsns_.erase(lsn)) {
+                to_free.push_back(lsn);
+            }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
@@ -623,6 +653,15 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
         for (int64_t lsn : missing_lsns_) {
             if (lsn <= rs_commit_lsn) to_fetch.push_back(lsn);
+        }
+    }
+
+    if (!to_free.empty()) {
+        for (int64_t lsn : to_free) {
+            if (auto fr = co_await journal_->free_slot(lsn); !fr) {
+                LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn,
+                     fr.error().message());
+            }
         }
     }
 
@@ -652,6 +691,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                 // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
                 // journalling the block reference. all_zeros slots carry no data and skip alloc.
                 homestore::multi_blk_id blkid{};
+                bool blkid_allocated = false;
                 if (!slot.all_zeros) {
                     auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
                     if (!alloc_res) {
@@ -660,12 +700,24 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                         continue;
                     }
                     blkid = *alloc_res;
+                    blkid_allocated = true;
+
                 }
+
+                //FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros);
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
                          res.error().message());
+                    if (blkid_allocated) {
+                        detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+                            if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                                LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
+                                     lsn, fr.error().message());
+                            co_return ok();
+                        }());
+                    }
                     continue;
                 }
                 std::lock_guard lk{missing_mu_};

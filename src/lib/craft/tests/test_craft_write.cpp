@@ -31,6 +31,7 @@
 
 #include "craft/craft_repl_dev.hpp"
 #include "coro_helpers.hpp"
+#include "mock_journal_backend.hpp"
 
 SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
@@ -66,18 +67,15 @@ public:
         co_return ok();
     }
 
-    async_result< JournalSlot > read_slot(int64_t lsn) override {
-        auto it = slots.find(lsn);
-        if (it == slots.end())
-            co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
-        co_return it->second;
-    }
+    async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();
     }
+
+    async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
 
     bool has_slot(int64_t lsn) const { return slots.contains(lsn); }
     size_t slot_count() const { return slots.size(); }

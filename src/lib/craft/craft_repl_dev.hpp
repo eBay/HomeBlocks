@@ -86,6 +86,13 @@ public:
     // Release blocks previously allocated by alloc_write_data. Called when write_slot fails or
     // when the write is discarded post-flight (stale term). Free errors are logged but non-fatal.
     virtual async_status free_data(homestore::multi_blk_id blkid) = 0;
+    // TODO: Need to revisit this if this func can be avoided
+    // Reads the already-committed local entry at lsn and, if it isn't all_zeros, frees the blkid
+    // it references via free_data. Local-only by design: unlike read_slot/JournalSlot (the
+    // wire-shared type used to answer a peer's fetch_data), a blkid has no meaning off this
+    // replica, so this never needs to leave the local backend. Used by apply_sync_rs_commit_lsn's
+    // to_free path to reclaim blocks under an entry a later SyncRSCommitLSN verdicts Empty.
+    virtual async_status free_slot(int64_t lsn) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
