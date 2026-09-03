@@ -451,44 +451,50 @@ async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_toke
 // empty_lsns_ is checked first: a slot in both empty_lsns_ and the journal returns is_empty=true
 // (Empty beats data, the reconciliation invariant from S5).
 //
-// The missing_mu_ lock is dropped before each co_await read_slot() call to avoid holding a mutex
-// across a suspension point. Callers are serialised by the login sequence (no concurrent writes
-// while fetch_data runs), so the snapshot taken under the lock is stable.
+// The missing_mu_ lock is held only for the up-front classification pass below, dropped before any
+// co_await read_slot() call to avoid holding a mutex across a suspension point. Callers are
+// serialised by the login sequence (no concurrent writes while fetch_data runs), so the snapshot
+// taken under the lock is stable for the whole batch.
 //
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
-//
-// TODO: the loop below re-acquires missing_mu_ once per requested LSN. Since the snapshot is
-// already documented as stable for the whole batch (no concurrent writes during fetch_data),
-// classification for every LSN could be done under a single lock acquisition up front instead --
-// same result, fewer lock/unlock round trips for large batches.
 
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
+    enum class SlotKind { Empty, Present, Absent };
+
+    std::vector< SlotKind > kinds;
+    kinds.reserve(lsns.size());
+    {
+        std::lock_guard lk{missing_mu_};
+        for (int64_t lsn : lsns) {
+            if (empty_lsns_.contains(lsn)) {
+                kinds.push_back(SlotKind::Empty);
+            } else if (lsn >= 0 && lsn <= state_.last_append_lsn && !missing_lsns_.contains(lsn)) {
+                kinds.push_back(SlotKind::Present);
+            } else {
+                kinds.push_back(SlotKind::Absent);
+            }
+        }
+    }
+
     std::vector< JournalSlot > result;
     result.reserve(lsns.size());
 
-    for (int64_t lsn : lsns) {
-        enum class SlotKind { Empty, Present, Absent };
-        SlotKind kind;
-        {
-            std::lock_guard lk{missing_mu_};
-            if (empty_lsns_.contains(lsn)) {
-                kind = SlotKind::Empty;
-            } else if (lsn >= 0 && lsn <= state_.last_append_lsn && !missing_lsns_.contains(lsn)) {
-                kind = SlotKind::Present;
-            } else {
-                kind = SlotKind::Absent;
-            }
-        }
-
-        if (kind == SlotKind::Empty) {
+    for (size_t i = 0; i < lsns.size(); ++i) {
+        const int64_t lsn = lsns[i];
+        switch (kinds[i]) {
+        case SlotKind::Empty:
             result.push_back(JournalSlot{.lsn = lsn, .is_empty = true});
-        } else if (kind == SlotKind::Present) {
+            break;
+        case SlotKind::Present: {
             auto slot_r = co_await journal_->read_slot(lsn);
             if (!slot_r) co_return std::unexpected(slot_r.error());
             slot_r->lsn = lsn;
             result.push_back(std::move(*slot_r));
+            break;
         }
-        // Absent: omit from result (not-present-here)
+        case SlotKind::Absent:
+            break; // omit from result (not-present-here)
+        }
     }
 
     co_return result;
@@ -604,9 +610,9 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            empty_lsns_.insert(lsn);
             missing_lsns_.erase(lsn);
         }
+        empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
         // Everything newly spanned by this advance that isn't Empty-verdicted is a gap until catch-up
         // (below) resolves it -- same idiom write() uses for gaps opened by an out-of-order dlsn.
