@@ -594,20 +594,19 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
 //
-// apply_sync_rs_commit_lsn (22886): client_token is verified against the current session first -- a mismatch
-// gates the ENTIRE apply (no reconciliation, no catch-up, no watermark advance), since a RAFT entry whose
-// token doesn't match the live session shouldn't be trusted to describe it. empty_slots is range-checked
-// against rs_commit_lsn next, for the same reason and with the same all-or-nothing gate: SyncRSCommitLSN
-// verdicts are only ever defined for slots the leader pre-resolved up to rs_commit_lsn (S5), so a negative
-// or out-of-range entry is a malformed/corrupt RAFT entry, not a legitimate verdict -- trusting it would
-// permanently poison empty_lsns_ for a slot that hasn't even been reached yet. Once both checks pass, every
-// other step is best-effort forward progress: empty_slots are reconciled and the newly-spanned range is
-// marked missing, catch-up attempts to fill in what it can from a peer, and commit_lsn/last_append_lsn
-// advance regardless of whether catch-up fully succeeded -- mirroring truncate()'s invariant that apply
-// never reverts the watermark, only advances it. A peer's fetch_data response gets its own all-or-nothing
-// check (validate_fetch_response): unlike the two checks above, this one can't gate the whole apply (gap
-// marking and last_append_lsn already advanced by the time the response arrives), so a malformed response
-// is instead treated exactly like a failed fetch -- none of it applied, everything requested stays missing.
+// apply_sync_rs_commit_lsn (22886): empty_slots is range-checked against rs_commit_lsn first -- the only
+// all-or-nothing gate on this apply. SyncRSCommitLSN verdicts are only ever defined for slots the leader
+// pre-resolved up to rs_commit_lsn (S5). client_token is NOT checked against the current session. Past the
+// range check, every step is best-effort
+// forward progress: empty_slots are reconciled and the newly-spanned range is marked missing, catch-up
+// attempts to fill in what it can from a peer, and last_append_lsn advances regardless of whether catch-up
+// fully succeeded -- mirroring truncate()'s invariant that apply never reverts the watermark, only advances
+// it. commit_lsn is different: it's the local contiguous prefix (CRAFT-Design), so it only advances up to
+// the first still-unresolved Missing slot, skipping over Empty ones, even though rs_commit_lsn itself is a
+// watermark the whole replica set already agreed on. A peer's fetch_data response gets its own
+// all-or-nothing check (validate_fetch_response): unlike the range check above, this one can't gate the
+// whole apply (gap marking and last_append_lsn already advanced by the time the response arrives), so a
+// malformed response is instead treated exactly like a failed fetch
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
@@ -615,8 +614,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // on_commit call site (detail::detach) for why this is required.
     auto self = shared_from_this();
 
-    // Validated before any state is touched -- same all-or-nothing gate as the token check below, since an
-    // out-of-range verdict means the entry itself cannot be trusted, not that this one slot should be skipped.
+    // Validated before any state is touched -- an out-of-range verdict means the entry itself cannot be
+    // trusted, not that this one slot should be skipped, so it gates the entire apply.
     for (int64_t lsn : empty_slots) {
         if (lsn < 0 || lsn > rs_commit_lsn) {
             LOGE("apply_sync_rs_commit_lsn: empty_slots lsn={} out of range [0, {}] -- rejecting entire apply", lsn,
@@ -630,17 +629,18 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     uint64_t term;
     {
         std::lock_guard lk{missing_mu_};
-        if (client_token != state_.client_token) {
-            LOGW("apply_sync_rs_commit_lsn: client_token mismatch want={} got={} rs_commit_lsn={} -- skipping apply",
-                 state_.client_token, client_token, rs_commit_lsn);
-            co_return std::unexpected(make_error_condition(volume_error::WRONG_TOKEN));
-        }
+        // client_token is NOT gated against state_.client_token here. Per the login sequence (CRAFT-Design),
+        // SyncRSCommitLSN applies BEFORE InternalLogin (which sets state_.client_token), so an equality-fence
+        // here would veto the very entry that carries login's own Empty verdicts,
+        // and would also veto every post-restart watchdog SyncRSCommitLSN, since state_ is
+        // in-memory-only and client_token resets to 0 across a restart. craft_client's reference
+        // (MemCraftReplica::cold_apply_sync) discards the parameter outright for the same reason.
+        // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
+        // checks (see apply_internal_login's header comment), not from an equality check here.
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            if (missing_lsns_.erase(lsn)) {
-                to_free.push_back(lsn);
-            }
+            if (missing_lsns_.erase(lsn)) { to_free.push_back(lsn); }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
@@ -701,10 +701,9 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     }
                     blkid = *alloc_res;
                     blkid_allocated = true;
-
                 }
 
-                //FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
+                // FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros);
                 if (!res) {
@@ -726,15 +725,21 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    // Unconditional: commit_lsn is a replica-set-wide watermark RAFT already agreed on, independent of
-    // whether this replica's local catch-up succeeded.
+    // commit_lsn (CRAFT-Design) is the LOCAL CONTIGUOUS prefix, distinct from rs_commit_lsn (the
+    // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
+    // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
+    // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
     //
     // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
     // the time this advance actually runs, breaking strict RAFT apply ordering.
     {
         std::lock_guard lk{missing_mu_};
-        state_.commit_lsn = std::max(state_.commit_lsn, rs_commit_lsn);
+        int64_t next = state_.commit_lsn + 1;
+        while (next <= rs_commit_lsn && !missing_lsns_.contains(next)) {
+            state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
+            ++next;
+        }
     }
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();

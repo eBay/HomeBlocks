@@ -17,13 +17,16 @@
 // InternalLogin (S5 / SDSTOR-22887) -- and their on_commit dispatch.
 //
 // SyncRSCommitLSN tests verify:
-//   - a client_token mismatch gates the ENTIRE apply: no reconciliation, no catch-up, no watermark advance
+//   - client_token is carried on the entry for observability only -- it is NOT gated against local state,
+//     regardless of what InternalLogin has (or hasn't) established, since SyncRSCommitLSN applies before
+//     the InternalLogin that would set it (see the inline comment at the call site for why)
 //   - empty_slots are range-validated against rs_commit_lsn and reconciled into empty_lsns_/missing_lsns_
 //   - commit_lsn/last_append_lsn advance directly when there's no gap to catch up on
 //   - fetch_data is invoked with exactly the missing LSNs when behind, and its response is persisted
 //   - a peer response naming an unrequested or duplicate LSN is rejected as a whole batch
-//   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_fetcher_ at all still lets
-//     commit_lsn advance, leaving unresolved LSNs in missing_lsns_
+//   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_fetcher_ at all leaves the
+//     affected LSN(s) missing; commit_lsn stalls just below the first unresolved Missing slot (Empty
+//     slots are skipped over), never advancing past it regardless of rs_commit_lsn
 //   - commit_lsn never decrements
 //   - on_commit parses a real serialized SyncRSCommitLSN entry and dispatches correctly (and rejects
 //     malformed header/key blobs without touching state)
@@ -33,7 +36,8 @@
 //   - a wrong-size key (too short or too long) is rejected, state untouched
 //   - a second InternalLogin replaces client_token outright but never regresses term
 //   - once applied, write()'s term-fence check reflects the new term end-to-end
-//   - the client_token InternalLogin establishes is what apply_sync_rs_commit_lsn's token check uses
+//   - InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- old or
+//     new token, the apply proceeds the same either way
 //
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
@@ -163,18 +167,19 @@ protected:
 
 namespace {
 
-// ── client_token gate ─────────────────────────────────────────────────────────
+// ── client_token is not gated ─────────────────────────────────────────────────
 
-// state_.client_token defaults to 0; a non-matching token must veto the whole apply.
-TEST_F(CraftRaftEntriesTest, TokenMismatchSkipsWholeApply) {
+// client_token is carried for observability only -- a mismatch must NOT block the apply. See the inline
+// comment in apply_sync_rs_commit_lsn (under missing_mu_) for why: SyncRSCommitLSN applies before the
+// InternalLogin that would establish state_.client_token, so an equality-fence here would make login
+// itself unreachable.
+TEST_F(CraftRaftEntriesTest, ClientTokenMismatchDoesNotBlockApply) {
     dev_->seed_lsns(5, {3});
     auto r = do_apply(/*rs_commit_lsn=*/100, /*client_token=*/999);
 
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::WRONG_TOKEN));
-    EXPECT_EQ(dev_->commit_lsn(), -1);
-    EXPECT_EQ(dev_->last_append_lsn(), 5);
-    EXPECT_EQ(dev_->missing_count(), 1u);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 100);
+    EXPECT_EQ(dev_->commit_lsn(), 2); // stalls at lsn=3, still missing -- no peer_fetcher_ wired
 }
 
 // ── empty_slots range validation ──────────────────────────────────────────────
@@ -234,7 +239,7 @@ TEST_F(CraftRaftEntriesTest, EmptySlotWithinNewGapRangeNotDoubleTracked) {
     EXPECT_TRUE(dev_->is_missing(4));
     EXPECT_TRUE(dev_->is_missing(5));
     EXPECT_EQ(dev_->missing_count(), 4u);
-    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_EQ(dev_->commit_lsn(), 0); // stalls at lsn=1, still missing -- no peer_fetcher_ wired
 }
 
 // ── watermark advance ──────────────────────────────────────────────────────────
@@ -302,8 +307,8 @@ TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
 // fetch_data's contract is one entry per requested LSN. A response naming an LSN we never asked for (a
 // buggy/misbehaving peer) can't be partially trusted -- since gap-marking already advanced by this point
 // in the apply, this can't gate the whole apply the way the upfront empty_slots check does, but it CAN
-// still refuse the batch: none of the response is applied (same outcome as a fetch failure), even the
-// entries that individually look fine, and commit_lsn still advances (best-effort).
+// still refuse the batch: none of the response is applied (same outcome as a fetch failure), and commit_lsn
+// stalls at the first still-missing lsn (best-effort forward progress, not a jump to rs_commit_lsn).
 TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
@@ -319,7 +324,7 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     EXPECT_FALSE(dev_->is_empty_slot(2));
     EXPECT_FALSE(dev_->is_empty_slot(99));
     EXPECT_EQ(dev_->missing_count(), 2u); // 1 and 2 both remain missing
-    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(dev_->commit_lsn(), 0);     // stalls at lsn=1, still missing
 }
 
 // A duplicate entry for an actually-requested LSN is just as much a contract violation as an
@@ -337,11 +342,12 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithDuplicateLSN) {
     ASSERT_TRUE(r.has_value());
     EXPECT_FALSE(journal_->has_slot(1));
     EXPECT_EQ(dev_->missing_count(), 1u);
-    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_EQ(dev_->commit_lsn(), 0); // stalls at lsn=1, still missing
 }
 
-// fetch_data fails outright: commit_lsn still advances (best-effort); every spanned LSN remains missing.
-TEST_F(CraftRaftEntriesTest, BehindFetchFailsStillAdvancesCommitLsn) {
+// fetch_data fails outright: commit_lsn stalls at the first missing lsn (best-effort, not a jump to
+// rs_commit_lsn); every spanned LSN remains missing.
+TEST_F(CraftRaftEntriesTest, BehindFetchFailsCommitLsnStallsAtFirstMissing) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.should_fail = true;
@@ -349,24 +355,24 @@ TEST_F(CraftRaftEntriesTest, BehindFetchFailsStillAdvancesCommitLsn) {
     auto r = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(dev_->commit_lsn(), 3);
+    EXPECT_EQ(dev_->commit_lsn(), 0); // stalls at lsn=1, still missing
     EXPECT_EQ(dev_->last_append_lsn(), 3);
     EXPECT_EQ(dev_->missing_count(), 3u);
 }
 
 // No peer_fetcher_ wired at all (S9 not wired yet): same best-effort outcome as a fetch failure.
-TEST_F(CraftRaftEntriesTest, BehindNoPeerFetcherStillAdvancesCommitLsn) {
+TEST_F(CraftRaftEntriesTest, BehindNoPeerFetcherCommitLsnStallsAtFirstMissing) {
     dev_->seed_lsns(0, {});
 
     auto r = do_apply(/*rs_commit_lsn=*/2, /*client_token=*/0);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(dev_->commit_lsn(), 0); // stalls at lsn=1, still missing
     EXPECT_EQ(dev_->missing_count(), 2u);
 }
 
 // A fetched slot's write_slot fails: that LSN alone stays missing; the rest of catch-up still applies,
-// and commit_lsn still advances.
+// and commit_lsn advances up to (but not past) it.
 TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
@@ -383,7 +389,7 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
     EXPECT_FALSE(journal_->has_slot(2));
     EXPECT_FALSE(dev_->is_missing(1));
     EXPECT_TRUE(dev_->is_missing(2));
-    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(dev_->commit_lsn(), 1); // lsn=1 resolved; stalls at lsn=2, still missing
 }
 
 // ── on_commit dispatch ─────────────────────────────────────────────────────────
@@ -395,7 +401,8 @@ TEST_F(CraftRaftEntriesTest, OnCommitDispatchesSyncRSCommitLSN) {
 
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
-    EXPECT_EQ(dev_->commit_lsn(), 7);
+    // last_append_lsn advances unconditionally
+    EXPECT_EQ(dev_->last_append_lsn(), 7);
 }
 
 TEST_F(CraftRaftEntriesTest, OnCommitRejectsHeaderTooSmall) {
@@ -558,23 +565,21 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
 }
 
-// Cross-entry-type integration: apply_sync_rs_commit_lsn's client_token check reads the SAME state_
-// InternalLogin writes. Untestable before this ticket (state_.client_token was permanently 0, matching
-// every SyncRSCommitLSN test's default). Once InternalLogin establishes a new token, do_apply must use
-// it -- the OLD default (0) is now itself a mismatch.
-TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNUsesTokenEstablishedByInternalLogin) {
+// InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- neither the
+// stale/old token nor the newly-established one gates the apply; both succeed identically. Guards against
+// reintroducing an equality-fence keyed off InternalLogin's client_token.
+TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToken) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     auto key_buf = make_internal_login_key(/*client_token=*/7, /*term=*/1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
-    auto stale = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0); // the old default -- now stale
-    ASSERT_FALSE(stale.has_value());
-    EXPECT_EQ(stale.error(), make_error_condition(volume_error::WRONG_TOKEN));
+    auto stale = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0); // the old default -- would have been a mismatch
+    ASSERT_TRUE(stale.has_value());
 
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
-    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
 }
 
 } // namespace
