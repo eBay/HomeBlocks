@@ -23,6 +23,7 @@
 
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/crc.hpp>                // crc16_t10dif -- same routine and seed volume.cpp uses
+#include <homestore/checkpoint/cp_mgr.hpp>  // cp_mgr(), CPManager::trigger_cp_flush()
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
 #include <iomgr/iomgr.hpp>                  // iomanager singleton, reactor_regex
 #include <iomgr/timer.hpp>                  // iomgr::schedule_recurring -- the watchdog's RAII timer
@@ -353,6 +354,23 @@ private:
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
                                                              uint64_t vol_ordinal, uint32_t lba_size) {
     return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal, lba_size);
+}
+
+// ─── HomeStoreCraftCheckpointTrigger (SDSTOR-22888) ──────────────────────────
+//
+// Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
+
+class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
+public:
+    async_status trigger_cp_flush(bool force) override {
+        if (!co_await homestore::cp_mgr().trigger_cp_flush(force))
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        co_return ok();
+    }
+};
+
+unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger() {
+    return std::make_unique< HomeStoreCraftCheckpointTrigger >();
 }
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -1192,6 +1210,9 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     co_return craft::read_result{std::move(extents), snapshot};
 }
 
+// TODO(SDSTOR-22733): once implemented, this is the other commit_lsn-advance path SDSTOR-22888's
+// checkpoint trigger needs to cover (see apply_sync_rs_commit_lsn's own hook) -- same
+// checkpoint_lsn_interval_/last_checkpoint_lsn_ bookkeeping under missing_mu_, same force=false.
 async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) {
     // Checked ahead of recovering_: a faulted restart recovery is permanent, not a "still starting up,
     // try again shortly" condition -- see recovery_faulted_'s doc comment.
@@ -1710,12 +1731,45 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
     // the time this advance actually runs, breaking strict RAFT apply ordering.
+    int64_t commit_lsn_snapshot;
+    bool should_checkpoint = false;
     {
         std::lock_guard lk{missing_mu_};
         int64_t next = state_.commit_lsn + 1;
         while (next <= rs_commit_lsn && !missing_lsns_.contains(next)) {
             state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
             ++next;
+        }
+        commit_lsn_snapshot = state_.commit_lsn;
+        // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
+        // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
+        // doesn't lag arbitrarily far behind commit_lsn. Interval reuses sync_rs_commit_lsn_interval
+        // (via checkpoint_lsn_interval_) rather than its own knob -- ties checkpoint cadence to the
+        // periodic SyncRSCommitLSN cadence. last_checkpoint_lsn_ is updated right here, before the
+        // lock is released  so that two overlapping apply_sync_rs_commit_lsn calls can't both read
+        // the same stale last_checkpoint_lsn_ and both decide to fire.
+        if (commit_lsn_snapshot - last_checkpoint_lsn_ >= checkpoint_lsn_interval_) {
+            last_checkpoint_lsn_ = commit_lsn_snapshot;
+            should_checkpoint = true;
+        }
+    }
+    if (should_checkpoint) {
+        // force=false: let this coalesce with any checkpoint already in flight rather than forcing
+        // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc
+        // comment). Detached (fire-and-forget) -- same pattern as the free_data cleanup above:
+        // nothing here depends on the flush completing. A failure is logged, not propagated,
+        // same posture as catch-up/fetch failures elsewhere in this function.
+        if (checkpoint_trigger_ == nullptr) {
+            LOGW("apply_sync_rs_commit_lsn: commit_lsn={} crossed checkpoint interval but no "
+                 "checkpoint_trigger_ wired -- skipping",
+                 commit_lsn_snapshot);
+        } else {
+            detail::detach([self, commit_lsn_snapshot]() -> async_status {
+                if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+                    LOGE("apply_sync_rs_commit_lsn: checkpoint trigger failed at commit_lsn={}: {}",
+                         commit_lsn_snapshot, cp.error().message());
+                co_return ok();
+            }());
         }
     }
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);

@@ -30,6 +30,9 @@
 //   - commit_lsn never decrements
 //   - on_commit parses a real serialized SyncRSCommitLSN entry and dispatches correctly (and rejects
 //     malformed header/key blobs without touching state)
+//   - a checkpoint trigger (SDSTOR-22888) fires once commit_lsn has advanced by at least
+//     checkpoint_lsn_interval_ since the last trigger (accumulating across calls, not just within
+//     one), is a no-op when unwired, and a trigger failure is logged but never fails the apply
 //
 // InternalLogin tests verify:
 //   - on_commit dispatches to apply_internal_login, which sets client_token/term
@@ -125,6 +128,27 @@ public:
     }
 };
 
+// ── checkpoint trigger mock ───────────────────────────────────────────────────
+//
+// Records call count / last `force` value; fail_next injects a one-shot error.
+
+class MockCraftCheckpointTrigger : public CraftCheckpointTrigger {
+public:
+    int call_count{0};
+    bool last_force{false};
+    bool fail_next{false};
+
+    async_status trigger_cp_flush(bool force) override {
+        ++call_count;
+        last_force = force;
+        if (fail_next) {
+            fail_next = false;
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        co_return ok();
+    }
+};
+
 // ── wire-format helpers for the on_commit dispatch tests ─────────────────────
 
 sisl::blob as_blob(std::vector< uint8_t >& buf) { return sisl::blob{buf.data(), static_cast< uint32_t >(buf.size())}; }
@@ -173,6 +197,7 @@ protected:
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftPeerFetcher fetcher_;
+    MockCraftCheckpointTrigger trigger_;
     std::shared_ptr< CraftReplDev > dev_;
 };
 
@@ -401,6 +426,115 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
     EXPECT_FALSE(dev_->is_missing(1));
     EXPECT_TRUE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 1); // lsn=1 resolved; stalls at lsn=2, still missing
+}
+
+// ── checkpoint trigger (SDSTOR-22888) ─────────────────────────────────────────
+
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresOnceIntervalCrossed) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(10, {});
+
+    auto r = do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 10);
+    EXPECT_EQ(trigger_.call_count, 1);
+    EXPECT_FALSE(trigger_.last_force);
+}
+
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerDoesNotFireBelowInterval) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(3, {});
+
+    auto r = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+    EXPECT_EQ(trigger_.call_count, 0);
+}
+
+// Two applies whose individual advances each stay below the interval on their own, but whose
+// combined progress since the last trigger crosses it on the second call -- the interval tracks
+// cumulative distance from last_checkpoint_lsn_, not distance moved within a single apply.
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerAccumulatesAcrossCalls) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(10, {});
+
+    auto r1 = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+    EXPECT_EQ(trigger_.call_count, 0);
+
+    auto r2 = do_apply(/*rs_commit_lsn=*/4, /*client_token=*/0);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 4);
+    EXPECT_EQ(trigger_.call_count, 1);
+}
+
+// Pins down the exact boundary (>=, not >): delta from last_checkpoint_lsn_ (-1) to commit_lsn (4)
+// is exactly 5, equal to the interval, not one past it.
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresExactlyAtIntervalBoundary) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(4, {});
+
+    auto r = do_apply(/*rs_commit_lsn=*/4, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 4);
+    EXPECT_EQ(trigger_.call_count, 1);
+}
+
+// A single call can advance commit_lsn by far more than one interval's width (e.g. a large
+// catch-up). The claim must reset last_checkpoint_lsn_ to the ACTUAL commit_lsn reached (50), not
+// to last_checkpoint_lsn_ + interval (-1 + 5 = 4) -- the two are indistinguishable in
+// CheckpointTriggerAccumulatesAcrossCalls above (both land on 4 there), so this pins it down with a
+// jump big enough to tell them apart: a second, small follow-up advance must NOT refire, which it
+// would if the baseline had been left at 4 instead of 50.
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerBaselineTracksActualReachedValue) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(60, {});
+
+    auto r1 = do_apply(/*rs_commit_lsn=*/50, /*client_token=*/0);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 50);
+    EXPECT_EQ(trigger_.call_count, 1);
+
+    auto r2 = do_apply(/*rs_commit_lsn=*/51, /*client_token=*/0);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 51);
+    EXPECT_EQ(trigger_.call_count, 1); // delta since the real baseline (50) is only 1 -- must not refire
+}
+
+// No checkpoint_trigger_ wired (production not yet wired, same posture as peer_fetcher_): crossing
+// the interval must not crash or fail the apply, just skip the trigger.
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerNoOpsWhenUnwired) {
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(10, {});
+
+    auto r = do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 10);
+}
+
+// A checkpoint trigger failure is logged, not propagated -- best-effort, same posture as this
+// function's catch-up/fetch failure handling.
+TEST_F(CraftRaftEntriesTest, CheckpointTriggerFailureDoesNotFailApply) {
+    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_lsn_interval(5);
+    trigger_.fail_next = true;
+    dev_->seed_lsns(10, {});
+
+    auto r = do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 10);
+    EXPECT_EQ(trigger_.call_count, 1);
 }
 
 // ── on_commit dispatch ─────────────────────────────────────────────────────────
