@@ -22,6 +22,11 @@
 // backend directly rather than through CraftReplDev or a volume -- the narrowest test that still
 // runs the real completion path.
 //
+// Also exercises HomeStoreCraftCheckpointTrigger::trigger_cp_flush (SDSTOR-22888) against the REAL
+// homestore::cp_mgr() -- same rationale: MockCraftCheckpointTrigger (test_craft_raft_entries.cpp)
+// covers CraftReplDev's own gating logic, but the wrapper's factory -> cp_mgr().trigger_cp_flush()
+// -> async_status conversion chain had never been compiled and run against a live CPManager.
+//
 // Links the full homeblocks library (unlike the other craft tests, which compile
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
 // a running HomeStore instance.
@@ -108,6 +113,26 @@ TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdin
 
     auto alloc_r = homeblocks::detail::sync_get(backend->alloc_write_data(data, static_cast< lba_count_t >(k_len)));
     ASSERT_FALSE(alloc_r.has_value());
+}
+
+// force=false: the value apply_sync_rs_commit_lsn's periodic trigger actually passes today.
+TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerFlushesRealCPManager) {
+    auto trigger = make_homestore_checkpoint_trigger();
+    ASSERT_TRUE(trigger != nullptr);
+
+    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ false));
+    ASSERT_TRUE(r.has_value());
+}
+
+// force=true: untested until now -- this is the value truncate()'s FIXME (craft_repl_dev.hpp) says
+// a future correctness-critical call site will need, but the passthrough itself had never been
+// exercised against the real cp_mgr() for either value.
+TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
+    auto trigger = make_homestore_checkpoint_trigger();
+    ASSERT_TRUE(trigger != nullptr);
+
+    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ true));
+    ASSERT_TRUE(r.has_value());
 }
 
 int main(int argc, char* argv[]) {
