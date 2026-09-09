@@ -24,6 +24,10 @@ table HomeBlksSettings{
 
     // how often (in appended LSNs) the leader auto-proposes a SyncRSCommitLSN entry;
     sync_rs_commit_lsn_interval: uint32 = 128;
+
+    // deadline (in milliseconds) for a server-to-server peer fetch_data() call;
+    // a peer that misses it is treated as unreachable, same as a hard failure.
+    peer_fetch_timeout_ms: uint32 = 5000;
 }
 
 root_type HomeBlksSettings;

@@ -10,7 +10,7 @@ required_conan_version = ">=1.60.0"
 
 class HomeBlocksConan(ConanFile):
     name = "homeblocks"
-    version = "6.0.6"
+    version = "6.0.7"
 
     homepage = "https://github.com/eBay/HomeBlocks"
     description = "Block Store built on HomeStore"
@@ -108,7 +108,7 @@ class HomeBlocksConan(ConanFile):
         cmake.configure()
         cmake.build()
         if not self.conf.get("tools.build:skip_test", default=False):
-            jobs = self.conf.get("tools.build:jobs", default=3)
+            jobs = self.conf.get("tools.build:jobs", default=4)
             env = Environment()
             env.define("CTEST_PARALLEL_LEVEL", str(jobs))
             if self.options.get_safe("sanitize") == "thread":

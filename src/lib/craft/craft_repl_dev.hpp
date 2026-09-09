@@ -20,8 +20,10 @@
 
 #include <atomic>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace homestore {
@@ -84,6 +86,13 @@ public:
     // Release blocks previously allocated by alloc_write_data. Called when write_slot fails or
     // when the write is discarded post-flight (stale term). Free errors are logged but non-fatal.
     virtual async_status free_data(homestore::multi_blk_id blkid) = 0;
+    // TODO: Need to revisit this if this func can be avoided
+    // Reads the already-committed local entry at lsn and, if it isn't all_zeros, frees the blkid
+    // it references via free_data. Local-only by design: unlike read_slot/JournalSlot (the
+    // wire-shared type used to answer a peer's fetch_data), a blkid has no meaning off this
+    // replica, so this never needs to leave the local backend. Used by apply_sync_rs_commit_lsn's
+    // to_free path to reclaim blocks under an entry a later SyncRSCommitLSN verdicts Empty.
+    virtual async_status free_slot(int64_t lsn) = 0;
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -104,7 +113,13 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 class CraftPeerFetcher {
 public:
     virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
-    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns) = 0;
+    // `timeout_ms` is the deadline this call must complete within (CraftReplDev passes
+    // peer_fetch_timeout_ms_, set from home_blks_config.fbs's peer_fetch_timeout_ms). A real transport
+    // (S9) must treat a missed deadline as a hard failure, same as an unreachable peer -- this interface
+    // only carries the contract; there's nothing to enforce yet since today's only implementations are
+    // direct function calls (production is unwired, tests call synchronously).
+    virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
+                                                                  uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -114,9 +129,22 @@ public:
 // (write, read, login, truncate, ...) on top of a HomeStore log store and
 // index. Non-CRAFT volumes are unaffected.
 
-class CraftReplDev {
-public:
+class CraftReplDev : public std::enable_shared_from_this< CraftReplDev > {
+#ifdef _PRERELEASE
+    // Lets test_craft_raft_entries.cpp call apply_sync_rs_commit_lsn (private) directly, so it can assert
+    // on the exact result rather than only on-commit's discarded fire-and-forget outcome.
+    friend class CraftRaftEntriesTest;
+#endif
+
+    // Private -- see create() below. shared_from_this() (used by apply_sync_rs_commit_lsn's detached
+    // coroutine) requires the object to already be owned by a shared_ptr, so construction is gated behind
+    // create() rather than exposed directly.
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal);
+
+public:
+    static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal) {
+        return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal)));
+    }
     ~CraftReplDev() = default;
 
     // ── client-facing ──────────────────────────────────────────────────────
@@ -173,9 +201,6 @@ public:
 
     // ── internal / peer API (server-to-server; NEVER reachable over the client wire) ──
 
-    // Return {commit_lsn, last_append_lsn} for the local partition.
-    async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);
-
     // Callee side of the GetRSCommitLSN broadcast -- matches craft::craft_peer::get_rs_commit_lsn's
     // shape (craft_client's include/craft/peer.hpp) so a future wire-decoded request has somewhere
     // to pass {term, is_login}. is_login=true is meant to quiesce prior-session writes before
@@ -220,10 +245,22 @@ public:
         std::lock_guard lk{missing_mu_};
         return state_.commit_lsn;
     }
+    uint64_t client_token() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.client_token;
+    }
+    uint64_t term() const {
+        std::lock_guard lk{missing_mu_};
+        return state_.term;
+    }
 
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
+
+    // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
+    // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
+    void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
@@ -236,6 +273,9 @@ public:
     void seed_empty(std::initializer_list< int64_t > empty);
     // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
     void seed_term(uint64_t term);
+    // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
+    // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
+    homestore::repl_dev_listener& test_listener() { return raft_listener_; }
 #endif
 
 private:
@@ -292,23 +332,32 @@ private:
         void on_config_rollback(int64_t) override {}
 
     private:
+        // Back-pointer to the owning CraftReplDev -- raft_listener_ is a value member of CraftReplDev
+        // (see its declaration below), so this can never dangle
         CraftReplDev* owner_;
     };
 
-    // Called from CraftRaftListener::on_commit after deserialising the entry type.
-    void apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots);
+    // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
+    // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
+    // fetch + journal writes.
+    async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                          std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     volume_id_t vol_id_;
     unique< CraftJournalBackend > journal_;
     CraftPartitionState state_;
-    std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    std::set< int64_t > empty_lsns_;   // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
-    mutable std::mutex missing_mu_;    // guards state_, missing_lsns_, and empty_lsns_
+    // TODO: Can this be replaced with boost::icl::interval_set? Particularly helpful when a write
+    // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
+    // insert one LSN at a time under missing_mu_, which is O(gap width) instead of O(log ranges).
+    std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
+    std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
+    mutable std::mutex missing_mu_;            // guards state_, missing_lsns_, and empty_lsns_
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
     CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 
