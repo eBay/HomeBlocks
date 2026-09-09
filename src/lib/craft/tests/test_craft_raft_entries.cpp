@@ -281,6 +281,18 @@ TEST_F(CraftRaftEntriesTest, EmptySlotAlreadyVerdictedNotFreedAgain) {
     EXPECT_EQ(journal_->free_data_calls, 1); // unchanged -- not freed a second time
 }
 
+// Same double-free guard, but for a duplicate *within* one empty_slots list rather than across two
+// calls
+TEST_F(CraftRaftEntriesTest, EmptySlotDuplicatedWithinSameBatchFreedOnce) {
+    dev_->seed_lsns(5, {});
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3, 3});
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
 // An empty_slots entry can also fall inside the range this same apply newly opens (rather than being
 // an already-missing LSN from before) -- it must end up ONLY in empty_lsns_, not re-added to
 // missing_lsns_ by the gap-marking step that runs right after reconciliation.
