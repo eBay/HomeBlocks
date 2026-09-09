@@ -203,6 +203,15 @@ public:
         }
         CraftJournalEntry hdr{};
         std::memcpy(&hdr, buf.bytes(), sizeof(CraftJournalEntry));
+        if (hdr.magic != k_journal_magic || hdr.version != k_journal_version) {
+            LOGE("free_slot: corrupt or foreign entry lsn={} magic={:#x} version={} -- refusing to free", lsn,
+                 hdr.magic, hdr.version);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (hdr.lsn != lsn) {
+            LOGE("free_slot: lsn mismatch requested={} stored={} -- refusing to free", lsn, hdr.lsn);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
         if (hdr.all_zeros) co_return ok();
 
         homestore::multi_blk_id blkid{};

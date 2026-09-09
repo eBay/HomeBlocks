@@ -31,7 +31,10 @@
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
 // a running HomeStore instance.
 
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
@@ -113,6 +116,49 @@ TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdin
 
     auto alloc_r = homeblocks::detail::sync_get(backend->alloc_write_data(data, static_cast< lba_count_t >(k_len)));
     ASSERT_FALSE(alloc_r.has_value());
+}
+
+// free_slot reads the raw entry back off the log store and validates magic/version/lsn before trusting it.
+TEST_F(CraftHomeStoreBackendTest, FreeSlotSucceedsForRealEntry) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+
+    auto w = homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0,
+                                                              /* len = */ 4096, homestore::multi_blk_id{},
+                                                              /* all_zeros = */ true));
+    ASSERT_TRUE(w.has_value());
+
+    auto r = homeblocks::detail::sync_get(backend->free_slot(0));
+    ASSERT_TRUE(r.has_value());
+}
+
+// Writes a raw blob directly to the log store (bypassing write_slot's serialization entirely) that
+// doesn't conform to CraftJournalEntry's magic/version -- simulates a corrupt or foreign record.
+// free_slot must reject it rather than misreading garbage bytes as a valid blkid.
+TEST_F(CraftHomeStoreBackendTest, FreeSlotRejectsCorruptEntry) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+
+    std::vector< uint8_t > garbage(64, 0xEE); // larger than sizeof(CraftJournalEntry); not its magic/version
+    sisl::io_blob raw_blob{garbage.data(), static_cast< uint32_t >(garbage.size()), /* is_aligned = */ false};
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    logstore->write_async(/* seq_num = */ 0, raw_blob, nullptr,
+                          [&](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) {
+                              std::lock_guard< std::mutex > lk{mu};
+                              done = true;
+                              cv.notify_one();
+                          });
+    std::unique_lock< std::mutex > lk{mu};
+    cv.wait(lk, [&] { return done; });
+    lk.unlock();
+
+    auto r = homeblocks::detail::sync_get(backend->free_slot(0));
+    ASSERT_FALSE(r.has_value());
 }
 
 // force=false: the value apply_sync_rs_commit_lsn's periodic trigger actually passes today.
