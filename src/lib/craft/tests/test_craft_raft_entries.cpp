@@ -69,6 +69,7 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
+    int free_data_calls{0};
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -86,7 +87,10 @@ public:
 
     async_status truncate_to(int64_t) override { co_return ok(); }
 
-    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id) override {
+        ++free_data_calls;
+        co_return ok();
+    }
 
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
 
@@ -246,6 +250,35 @@ TEST_F(CraftRaftEntriesTest, EmptySlotsReconciled) {
     EXPECT_TRUE(dev_->is_empty_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
     EXPECT_EQ(dev_->commit_lsn(), 5);
+    // lsn=3 was missing -- never had local data, so verdicting it Empty must not free anything.
+    EXPECT_EQ(journal_->free_data_calls, 0);
+}
+
+TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataFreesBlock) {
+    dev_->seed_lsns(5, {});
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
+// Double-free guard: an lsn already verdicted Empty by a prior apply must not be re-freed if it
+// appears again in a later (redundant/overlapping) SyncRSCommitLSN's empty_slots -- nothing in the
+// protocol strictly forbids this, and re-adding it here would double-free the same blkid.
+TEST_F(CraftRaftEntriesTest, EmptySlotAlreadyVerdictedNotFreedAgain) {
+    dev_->seed_lsns(5, {});
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+
+    auto first = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(journal_->free_data_calls, 1);
+
+    auto second = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(journal_->free_data_calls, 1); // unchanged -- not freed a second time
 }
 
 // An empty_slots entry can also fall inside the range this same apply newly opens (rather than being
@@ -265,6 +298,8 @@ TEST_F(CraftRaftEntriesTest, EmptySlotWithinNewGapRangeNotDoubleTracked) {
     EXPECT_TRUE(dev_->is_missing(5));
     EXPECT_EQ(dev_->missing_count(), 4u);
     EXPECT_EQ(dev_->commit_lsn(), 0); // stalls at lsn=1, still missing -- no peer_fetcher_ wired
+    // lsn=3 was beyond last_append_lsn (0) at apply time -- never locally appended, so nothing to free.
+    EXPECT_EQ(journal_->free_data_calls, 0);
 }
 
 // ── watermark advance ──────────────────────────────────────────────────────────

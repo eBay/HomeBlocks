@@ -661,7 +661,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            if (missing_lsns_.erase(lsn)) { to_free.push_back(lsn); }
+            bool const was_missing = missing_lsns_.erase(lsn) > 0;
+            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) {
+                to_free.push_back(lsn);
+            }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
