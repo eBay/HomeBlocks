@@ -1631,7 +1631,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    std::vector< int64_t > to_free;
+    std::unordered_set< int64_t > to_free;
     std::vector< int64_t > to_fetch;
     uint64_t term;
     {
@@ -1648,9 +1648,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
-            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) {
-                to_free.push_back(lsn);
-            }
+            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
@@ -1713,7 +1711,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     blkid_allocated = true;
                 }
 
-                // FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
+                // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+                // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+                // default instance. That's an implicit, undocumented dependency on HomeStore's current
+                // behavior -- see SDSTOR-25613.
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros, slot.csums);
                 if (!res) {
