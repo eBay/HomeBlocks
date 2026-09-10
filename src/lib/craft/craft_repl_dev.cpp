@@ -317,7 +317,24 @@ public:
         }
         CraftJournalEntry hdr{};
         std::memcpy(&hdr, buf.bytes(), sizeof(CraftJournalEntry));
+        // Same validate-before-trust guards as read_slot(): a corrupt/misplaced/malformed record must
+        // fail cleanly here too, not just when read via read_slot(). Trusting hdr.len (and deriving
+        // nlbas/blkid_off from it) or hdr.all_zeros from an unvalidated header risks deserializing a
+        // garbage blkid and freeing whatever blocks that garbage happens to decode to.
+        if (hdr.magic != k_journal_magic || hdr.version != k_journal_version) {
+            LOGE("free_slot lsn={} bad magic/version: magic={:#x} version={}", lsn, hdr.magic, hdr.version);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (hdr.lsn != lsn) {
+            LOGE("free_slot lsn={} hdr.lsn={} mismatch -- corrupt or misplaced record", lsn, hdr.lsn);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
         if (hdr.all_zeros) co_return ok();
+        if (hdr.len == 0 || hdr.len % lba_size_ != 0) {
+            LOGE("free_slot lsn={} hdr.len={} not a positive multiple of lba_size={} -- malformed record", lsn,
+                 hdr.len, lba_size_);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
 
         // hdr.len bytes of real data means a non-empty csum array precedes the blkid in this
         // slot's blob -- [header][csums][blkid], not [header][blkid] -- so the blkid offset must
@@ -706,17 +723,24 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
         } else {
+            // Populate the journal-tail overlay (makes this entry locally readable ahead of commit()
+            // applying it) BEFORE erasing dlsn from missing_lsns_, and both under the same missing_mu_
+            // critical section commit_impl's is_missing check also takes: otherwise a concurrent
+            // commit_impl run (another write()'s or keep_alive()'s piggyback) could see dlsn already
+            // erased, read/apply/retire it, and advance commit_lsn past it -- all before this call gets
+            // around to inserting the overlay entry. That would leave a permanently-orphaned overlay
+            // entry below commit_lsn: harmless (clamped out at read time) but never retired until the
+            // same LBA happens to be overwritten by a later write. Doing both under one lock closes the
+            // window entirely -- commit_impl either still sees dlsn as missing (stalls) or sees it
+            // resolved with the overlay already populated, never the state in between.
+            populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_),
+                             all_zeros, blkid, csums);
             missing_lsns_.erase(dlsn);
             snapshot = {state_.commit_lsn, state_.last_append_lsn};
         }
     }
 
     if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
-
-    // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
-    // it to the index.
-    populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_), all_zeros,
-                     blkid, csums);
 
     // Best-effort piggyback: advance commit_lsn toward the client's own view of it. Every outcome --
     // a stall at a gap, or even a genuine commit() fault -- is ignored here; the write itself already
