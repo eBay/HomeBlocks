@@ -30,12 +30,18 @@ using Chunk = homestore::Chunk;
 class VolumeChunkSelector : public homestore::ChunkSelector {
     static constexpr homestore::chunk_num_t num_chunks_per_vol_init = 1;
     static constexpr homestore::chunk_num_t num_chunks_per_resize = 3;
-    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX;
+    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX; // not owned by any volume
 
     struct HBChunk : public homestore::VChunk {
         HBChunk(homestore::cshared< Chunk >& chunk) : homestore::VChunk(chunk) {}
         ~HBChunk() = default;
         uint64_t m_vol_ordinal{INVALID_VOL_ORDINAL};
+
+        /*void reset() {
+            LOGERROR("1. Resetting chunk bitmap");
+            m_vol_ordinal = INVALID_VOL_ORDINAL;
+            this->reset_block_allocator();
+        }*/
     };
 
     struct VolumeChunksInfo {
