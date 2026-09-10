@@ -140,6 +140,19 @@ TEST_F(CraftCommitHsTest, WriteCommitReadRoundTrip) {
     EXPECT_EQ(std::memcmp(dest.cbytes(), content.cbytes(), content.size()), 0);
 }
 
+// The ack must reflect the piggyback commit's OWN progress, not a snapshot taken before it ran.
+// The first write into a fresh partition piggybacks commit_lsn=0 (nothing to stall on, applies
+// immediately) -- a pre-commit snapshot would incorrectly report the partition's initial state
+// (commit_lsn=-1) rather than the commit_lsn=0 this very call just achieved.
+TEST_F(CraftCommitHsTest, WriteAckReflectsPostCommitSnapshot) {
+    constexpr lba_t k_lba = 20;
+    sisl::io_blob_safe content{k_page_size, 512};
+    std::memset(content.bytes(), 0xEF, content.size());
+    auto r = do_write(/* dlsn = */ 0, k_lba, /* nlbas = */ 1, content, /* commit_lsn = */ 0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->commit_lsn, 0); // post-commit value, not the pre-commit -1
+}
+
 // A write with NO commit piggyback (commit_lsn=-1) never reaches the real index -- the data is
 // still locally readable via the journal-tail overlay alone.
 TEST_F(CraftCommitHsTest, OverlayReadableBeforeCommit) {

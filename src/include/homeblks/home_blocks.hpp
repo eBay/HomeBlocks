@@ -69,7 +69,7 @@ using volume_handle = std::shared_ptr< volume >;
 // standard equivalent (invalid arg, no space, io error, unsupported op, ...) is returned as
 // std::make_error_condition(std::errc::*) directly rather than duplicated here.
 ENUM(volume_error, uint16_t, UNKNOWN_VOLUME = 1, CRC_MISMATCH, INDEX_ERROR, INTERNAL_ERROR, OFFLINE, STALE_TERM,
-     EMPTY_SLOT, WRONG_TOKEN, INVALID_ENTRY);
+     EMPTY_SLOT, WRONG_TOKEN, INVALID_ENTRY, HORIZON_STALE);
 
 ENUM(volume_state, uint32_t,
      INIT,       // created, not yet online
@@ -189,7 +189,12 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // zeros -- and returns craft::read_result: the sparse layout (which byte sub-ranges were data vs holes; the
 // thin/hole info) PLUS the replica's piggybacked {commit_lsn, last_append_lsn}, snapshotted atomically with
 // the read. Served from the index or the journal-tail overlay; never fetches from a peer. Advances the
-// frontier to hdr.commit_lsn (piggybacked commit). std::errc::invalid_argument if addr/len are misaligned.
+// frontier to hdr.commit_lsn (piggybacked commit) BEFORE resolving read_lsn, so a request whose own
+// piggyback (or a concurrent write/keep_alive) pushes commit_lsn past read_lsn is unanswerable -- the
+// pre-read_lsn version is gone from the index by construction (apply is a blind overwrite past
+// commit_lsn) and is not reconstructible from anything this replica still holds. Returns
+// volume_error::HORIZON_STALE in that case rather than silently serving a too-new version.
+// std::errc::invalid_argument if addr/len are misaligned.
 [[nodiscard]] async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr,
                                                             int64_t read_lsn, uint64_t addr, uint64_t len,
                                                             sisl::sg_list dest);

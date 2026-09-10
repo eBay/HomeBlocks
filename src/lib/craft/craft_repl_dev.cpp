@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <coroutine>
 #include <cstring>
+#include <limits>
 
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/crc.hpp>                // crc16_t10dif -- same routine and seed volume.cpp uses
@@ -236,10 +237,28 @@ public:
 
         JournalSlot slot;
         slot.lsn = hdr.lsn;
+        // Corruption / misplaced-record guard: hdr.lsn is a redundant copy of the seq_num this record
+        // was written under. A mismatch means a corrupt on-disk blob (or, in principle, a misrouted
+        // log-store sequence number) -- either way, trusting the record's other fields (lba/len/blkid)
+        // from here on would be unsafe.
+        if (hdr.lsn != lsn) {
+            LOGE("read_slot lsn={} hdr.lsn={} mismatch -- corrupt or misplaced record", lsn, hdr.lsn);
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
         slot.all_zeros = hdr.all_zeros != 0;
         slot.lba_off_bytes = hdr.lba;
         slot.len_bytes = hdr.len;
 
+        // A non-all_zeros slot's len must be a positive multiple of lba_size -- write() enforces this
+        // at the client boundary, but a stale/legacy or corrupted on-disk record could still violate
+        // it. Must be checked before nlbas is used to derive the csum-array and blkid offsets below:
+        // an unvalidated len (e.g. 0, or not lba-aligned) would silently misalign both, deserializing
+        // garbage rather than failing cleanly.
+        if (!slot.all_zeros && (hdr.len == 0 || hdr.len % lba_size_ != 0)) {
+            LOGE("read_slot lsn={} hdr.len={} not a positive multiple of lba_size={} -- malformed record",
+                 lsn, hdr.len, lba_size_);
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
         uint32_t nlbas = slot.all_zeros ? 0 : (hdr.len / lba_size_);
         uint32_t csum_bytes = nlbas * static_cast< uint32_t >(sizeof(homestore::csum_t));
         if (buf.size() < k_csum_array_offset + csum_bytes) {
@@ -396,13 +415,38 @@ async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term
 async_status CraftReplDev::truncate(int64_t lsn) {
     // Guard before touching the journal: truncating below commit_lsn would drop
     // committed entries and break the commit_lsn <= last_append_lsn invariant.
+    int64_t last_append_snapshot;
     {
         std::lock_guard lk{missing_mu_};
         DEBUG_ASSERT_GE(lsn, state_.commit_lsn, "truncate below committed prefix");
+        last_append_snapshot = state_.last_append_lsn;
+    }
+
+    // Step 0 (before rollback): every entry above lsn that's about to be dropped may reference a
+    // real data block -- home_log_store::rollback (behind truncate_to below) only removes the
+    // journal RECORDS; block lifecycle (HS_DATA_LINKED) is this class's job, not HomeStore's. Each
+    // entry's blkid must be read BEFORE truncate_to() destroys the record -- there is no way to
+    // recover it afterward. A read_slot() failure here just means this specific lsn was never
+    // journaled locally (a genuine gap): nothing to free, not an error, and must never abort the
+    // truncate itself over a slot that was already absent.
+    std::vector< homestore::multi_blk_id > freed_blkids;
+    for (int64_t l = lsn + 1; l <= last_append_snapshot; ++l) {
+        auto slot_r = co_await journal_->read_slot(l);
+        if (slot_r && !slot_r->all_zeros && slot_r->blkid.is_valid()) freed_blkids.push_back(slot_r->blkid);
     }
 
     // Step 1: journal rollback — synchronous; fails fast on I/O error.
     if (auto r = co_await journal_->truncate_to(lsn); !r) co_return r;
+
+    // Step 1.5: free every block collected above, now that the rollback has succeeded. Non-fatal on
+    // individual failure -- same as every other reclaim call site in this class -- since the journal
+    // record is already gone from the log either way; a failed free merely leaks that one block
+    // rather than aborting an otherwise-successful truncate.
+    for (auto const& blkid : freed_blkids) {
+        if (auto fr = co_await journal_->free_data(blkid); !fr)
+            LOGE("truncate: free_data failed reclaiming blk={} (dropped above lsn={}): {}", blkid.to_string(), lsn,
+                 fr.error().message());
+    }
 
     // Steps 2 + 3 under the same mutex write() uses.
     {
@@ -501,9 +545,18 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     }
     // data.size must match len exactly: the CRC loop below reads nlbas*lba_size_ == len bytes from
     // data.iovs[0]'s buffer, and a data.size that merely claims to match len without the backing
-    // iovec actually being that large would over-read past the caller's buffer.
-    if (!all_zeros && (data.iovs.empty() || data.size != len || data.iovs[0].iov_len < len)) {
-        LOGW("write rejected: data.size={} does not match len={} dlsn={}", data.size, len, dlsn);
+    // iovec actually being that large would over-read past the caller's buffer. Exactly one iovec is
+    // required: the CRC loop and alloc_write_data both only ever look at iovs[0], so a second (or
+    // later) iovec is always dead/unused today -- but a caller-supplied sg_list claiming exactly
+    // `len` total bytes while carrying extra trailing iovecs is self-inconsistent input, and trusting
+    // iovs.size()==1 here means the CRC/copy logic never needs to change if that assumption is ever
+    // revisited. Rejecting it now is cheap, forward-looking hygiene, not a response to an exploitable
+    // gap -- data.iovs[0].iov_len < len above already fully closes the "CRC only covers iovs[0]"
+    // corruption scenario on its own (a multi-iovec write can only reach this point if iovs[0] alone
+    // already covers the whole range).
+    if (!all_zeros && (data.iovs.size() != 1 || data.size != len || data.iovs[0].iov_len < len)) {
+        LOGW("write rejected: data.size={} does not match len={} or iovs.size()={} != 1 dlsn={}", data.size, len,
+             data.iovs.size(), dlsn);
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
 
@@ -519,7 +572,11 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
         // Without this, all_committed_lsn only moves via keep_alive() messages, so quiet partitions
         // (write-only, no explicit keep_alive) never advance the reclaim floor at all.
-        state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // hdr.all_committed_lsn is client-controlled wire input: -1 is the "unset" sentinel (skip),
+        // any other negative value is malformed (ignore rather than corrupt this long-lived floor).
+        // There is no other per-call bound to validate against here -- see keep_alive()'s doc comment.
+        if (hdr.all_committed_lsn >= -1)
+            state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
         if (empty_lsns_.contains(dlsn)) {
             LOGW("write rejected: slot is permanently empty dlsn={}", dlsn);
             co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
@@ -669,6 +726,14 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
 
     touch_watchdog();
 
+    // Re-snapshot after the piggyback commit() above: the pre-commit snapshot captured earlier
+    // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
+    // reflect whatever progress commit() just made, not a view from before this call's own piggyback ran.
+    {
+        std::lock_guard lock{missing_mu_};
+        snapshot = {state_.commit_lsn, state_.last_append_lsn};
+    }
+
     LOGT("write ok dlsn={} addr={} len={} all_zeros={}", dlsn, addr, len, all_zeros);
     co_return snapshot;
 }
@@ -710,6 +775,18 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             is_empty = empty_lsns_.contains(lsn);
         }
         if (is_missing) break; // stall at the first hole -- not an error
+
+        // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals
+        // retiring_lsn -- shared by the data-apply path below and the is_empty path further down (a
+        // higher-dLSN overlay entry for the same LBA, from a later append not yet committed, must
+        // survive either way -- see the original comment this was factored out of).
+        auto retire_overlay_range = [this](lba_t start_lba, lba_t end_lba, int64_t retiring_lsn) {
+            std::lock_guard lk{overlay_mu_};
+            for (lba_t l = start_lba; l <= end_lba; ++l) {
+                auto it = overlay_.find(l);
+                if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
+            }
+        };
 
         if (!is_empty) {
             auto slot_r = co_await journal_->read_slot(lsn);
@@ -765,21 +842,37 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                 }
                 if (auto r = write_fn(start_lba, end_lba, blocks_info); !r) co_return std::unexpected(r.error());
                 // Reclaim any superseded old blkid inline, same as write()'s own free_data call sites.
+                // old_blkid == new_blkid means this slot was already applied (crash-replay of an
+                // idempotent commit before commit_lsn was durably persisted): the index already holds
+                // this exact blkid, so freeing it here would free a block the index still references.
                 for (auto const& [_, info] : blocks_info) {
-                    if (!info.old_blkid.is_valid()) continue;
+                    if (!info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
                     if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{info.old_blkid}); !fr)
                         LOGE("free_data failed reclaiming blk={} lsn={}: {}", info.old_blkid.to_string(), lsn,
                              fr.error().message());
                 }
             }
 
-            // Retire the overlay entry for each applied LBA, but ONLY if its recorded lsn equals the
-            // lsn just applied -- a higher-dLSN overlay entry for the same LBA (a later write already
-            // appended but not yet committed) must survive.
-            std::lock_guard lk{overlay_mu_};
-            for (lba_t l = start_lba; l <= end_lba; ++l) {
-                auto it = overlay_.find(l);
-                if (it != overlay_.end() && it->second.lsn == lsn) overlay_.erase(it);
+            retire_overlay_range(start_lba, end_lba, lsn);
+        } else {
+            // Empty-verdicted (S5 SyncRSCommitLSN): the index deliberately never applies this lsn.
+            // But "Empty beats data" reconciliation (see request_resolution's doc comment in
+            // home_blocks.hpp) means the verdict holds even if THIS replica itself already journaled
+            // real data for it -- e.g. the leader's resolution round verdicted Empty without
+            // successfully using this replica as a holder. If that happened, write()'s post-flight
+            // already created a real overlay entry for it that would otherwise never get retired
+            // (permanently stale, and -- worse -- still SERVED on reads, since the overlay wins over
+            // the index within the horizon, directly contradicting the Empty verdict). read_slot()
+            // here is purely to discover the LBA range to retire, not to apply anything to the index.
+            // A read_slot() failure just means this replica never had this lsn locally either (the
+            // ordinary case: this lsn was this replica's OWN gap, resolved as empty because no
+            // replica anywhere held it) -- nothing to retire, not an error.
+            if (auto slot_r = co_await journal_->read_slot(lsn); slot_r) {
+                auto& slot = *slot_r;
+                if (uint32_t const nlbas = static_cast< uint32_t >(slot.len_bytes / lba_size_); nlbas > 0) {
+                    lba_t const start_lba = static_cast< lba_t >(slot.lba_off_bytes) / lba_size_;
+                    retire_overlay_range(start_lba, start_lba + nlbas - 1, lsn);
+                }
             }
         }
 
@@ -884,7 +977,9 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
-        state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // Reject malformed negative values -- see write()'s doc comment.
+        if (hdr.all_committed_lsn >= -1)
+            state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
     }
     // Best-effort piggyback, same reasoning as write()'s: read()'s own success does not depend on
     // whether commit() advances further, so a genuine commit() fault here is swallowed rather than
@@ -950,6 +1045,18 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
         std::lock_guard lk{missing_mu_};
         commit_lsn_snapshot = state_.commit_lsn;
     }
+    // read_lsn and hdr.commit_lsn arrive in the same frame with nothing coupling them: read()'s own
+    // piggyback commit (or a concurrent write()/keep_alive()'s) can advance commit_lsn_snapshot past
+    // read_lsn before this snapshot is even taken. Once that happens the pre-read_lsn version is gone
+    // from the index -- apply is a blind overwrite past commit_lsn by design (see commit()'s doc
+    // comment) -- so there is nothing left on this replica to serve read_lsn correctly. Reject rather
+    // than silently returning the too-new index value (CRAFT-Design: "writes above H are ignored even
+    // if the replica holds them").
+    if (read_lsn < commit_lsn_snapshot) {
+        LOGW("read rejected: read_lsn={} is below commit_lsn={} -- horizon already advanced, unanswerable",
+             read_lsn, commit_lsn_snapshot);
+        co_return std::unexpected(make_error_condition(volume_error::HORIZON_STALE));
+    }
 
     // Committed state from the index.
     index_kv_list_t index_kvs;
@@ -958,6 +1065,25 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     index_map.reserve(index_kvs.size());
     for (auto const& [key, value] : index_kvs)
         index_map.emplace(key.lba(), value);
+
+    // read_fn above takes no lock of its own (an index query, not a read of missing_mu_-guarded
+    // state) -- a concurrent commit_impl run can apply new LSNs to the index for an LBA in
+    // [start_lba, end_lba] while read_fn is executing, even though the pre-check above passed
+    // against the OLD snapshot. Re-snapshot commit_lsn now and re-check against read_lsn: if it
+    // moved past read_lsn during the query, index_kvs just fetched may already reflect state above
+    // the client's horizon for some LBA in range -- reject rather than silently serve a stale-snapshot
+    // read as if it were still valid. This also narrows commit_lsn_snapshot to the freshest known-safe
+    // value for the overlay clamp just below (a strictly tighter, still-correct bound).
+    {
+        std::lock_guard lk{missing_mu_};
+        commit_lsn_snapshot = state_.commit_lsn;
+    }
+    if (read_lsn < commit_lsn_snapshot) {
+        LOGW("read rejected: commit_lsn advanced to {} past read_lsn={} while the index was being "
+             "queried -- horizon already advanced, unanswerable",
+             commit_lsn_snapshot, read_lsn);
+        co_return std::unexpected(make_error_condition(volume_error::HORIZON_STALE));
+    }
 
     // Per-LBA source: hole (default), or a single-block data reference (blkid + csum) from whichever
     // of overlay/index wins. Overlay wins over the index for the same LBA (it is strictly newer), but
@@ -990,8 +1116,16 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
         LOGW("read rejected: dest sg_list has no iovecs (size={})", dest.size);
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
+    // dest.iovs[0].iov_len must be able to hold the full requested range -- an undersized buffer
+    // would otherwise have the memset/read_data calls below write past its end.
+    uint64_t const dest_capacity = static_cast< uint64_t >(nlbas) * lba_size_;
+    if (dest.iovs[0].iov_len < dest_capacity) {
+        LOGW("read rejected: dest iov_len={} smaller than required={} (nlbas={} lba_size={})", dest.iovs[0].iov_len,
+             dest_capacity, nlbas, lba_size_);
+        co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
+    }
     auto* dest_buf = static_cast< uint8_t* >(dest.iovs[0].iov_base);
-    std::vector< bool > is_hole(nlbas);
+    std::vector< bool > is_hole(nlbas, false); // value-initialized to false regardless; explicit for clarity
 
     for (uint32_t i = 0; i < nlbas;) {
         if (sources[i].hole) {
@@ -1002,10 +1136,15 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
         }
         // Extend the contiguous run: same blk_num/chunk-progression merge volume.cpp's non-CRAFT
         // read path uses (generate_blkids_to_read) -- batches one async_read per contiguous run
-        // instead of one per LBA.
+        // instead of one per LBA. Capped at blk_count_t's max (65535): craft_max_io_len_mb (up to
+        // 128 MiB by default) / a small lba_size_ can produce a single contiguous run far larger
+        // than blk_count_t (uint16_t) can hold, which would otherwise silently truncate in the
+        // static_cast below. Splitting into an extra run here just costs one more read_data batch
+        // in that rare case -- correctness is unaffected, nothing is lost or misread.
         uint32_t j = i + 1;
         while (j < nlbas && !sources[j].hole && sources[j].blkid.blk_num() == sources[j - 1].blkid.blk_num() + 1 &&
-               sources[j].blkid.chunk_num() == sources[j - 1].blkid.chunk_num()) {
+               sources[j].blkid.chunk_num() == sources[j - 1].blkid.chunk_num() &&
+               (j - i) < std::numeric_limits< homestore::blk_count_t >::max()) {
             ++j;
         }
         uint32_t const run_nlbas = j - i;
@@ -1018,19 +1157,18 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
 
         for (uint32_t k = i; k < j; ++k) {
             uint8_t const* lba_buf = dest_buf + k * lba_size_;
-            bool const all_zero = std::all_of(lba_buf, lba_buf + lba_size_, [](uint8_t b) { return b == 0; });
-            if (all_zero) {
-                // Read-time-only collapse: a data write whose payload happened to be all-zero bytes
-                // reads back as a hole. This scan must never run on the write path.
-                is_hole[k] = true;
-                continue;
-            }
+            // CRC is checked FIRST, unconditionally -- a bit-flip that happens to zero out real
+            // (non-zero-checksummed) data must surface as CRC_MISMATCH, not silently collapse to an
+            // indistinguishable hole. Only once the content is verified intact does the all-zero
+            // collapse below decide hole-vs-data.
             auto const computed = crc16_t10dif(k_craft_crc16_seed, lba_buf, lba_size_);
             if (computed != sources[k].csum) {
                 LOGE("read: crc mismatch lba={} expected={} actual={}", start_lba + k, sources[k].csum, computed);
                 co_return std::unexpected(make_error_condition(volume_error::CRC_MISMATCH));
             }
-            is_hole[k] = false;
+            // Read-time-only collapse: a data write whose payload happened to be all-zero bytes
+            // reads back as a hole. This scan must never run on the write path.
+            is_hole[k] = std::all_of(lba_buf, lba_buf + lba_size_, [](uint8_t b) { return b == 0; });
         }
         i = j;
     }
@@ -1073,7 +1211,15 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
         }
         // Max-monotonic: never let a stale/reordered message regress the floor S8's eventual journal
         // reclaim reads. The reclaim action itself is not implemented here -- see the doc comment.
-        state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // hdr.all_committed_lsn is client-controlled wire input with no per-call bound to validate
+        // against (it legitimately advances independently of this call's own commit_lsn/
+        // last_append_lsn -- confirmed by existing tests). -1 is the "unset" sentinel (skip); any
+        // OTHER negative value is unambiguously malformed and is ignored rather than corrupting this
+        // long-lived floor. Does not catch an absurdly-large-but-positive value (no bound exists for
+        // that here) -- S8's eventual reclaim implementation must validate against real journal state
+        // before consuming this floor, not this layer.
+        if (hdr.all_committed_lsn >= -1)
+            state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
     }
 
     touch_watchdog();
@@ -1093,13 +1239,9 @@ void CraftReplDev::touch_watchdog() {
     if (watchdog_timeout_ns_ == 0) return;
     {
         std::lock_guard lk{missing_mu_};
-        // Not yet logged in -- no session to watch. NOTE this only prevents ARMING before the first
-        // login; it does not DISARM an already-armed timer once a session ends. logout() is still a
-        // stub today (see the "stubs" section) and never actually resets state_.term back to 0, so this
-        // is currently unreachable in practice -- but whoever implements real logout() should also stop
-        // the watchdog there (watchdog_token_.cancel() is cheap and idempotent), or every tick after a
-        // real logout will keep calling append() with a stale client_token until the object itself is
-        // destroyed (append() is still a stub too, so today this is inert, not harmful).
+        // Not yet logged in -- no session to watch.
+        // TODO: this only prevents ARMING before first login, doesn't DISARM on logout -- real
+        // logout() must also call watchdog_token_.cancel() once it's implemented (currently a stub).
         if (state_.term == 0) return;
     }
     // Record activity unconditionally (cheap atomic store) before the arm-once check below, so even

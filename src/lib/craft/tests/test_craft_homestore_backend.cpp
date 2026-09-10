@@ -211,6 +211,80 @@ TEST_F(CraftHomeStoreBackendTest, ReadSlotBadMagicFails) {
     ASSERT_FALSE(r.has_value());
 }
 
+// A record with a correct magic but a stomped version byte must be rejected -- this is the version
+// field's entire purpose: a layout change (e.g. the checksum-array region added between the header
+// and the blkid) bumps k_journal_version so a record from a different layout fails this check
+// instead of being misparsed. version (uint8_t) sits at offset 4, right after the 4-byte magic.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotBadVersionFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto w =
+        homeblocks::detail::sync_get(backend->write_slot(0, 1, 0, k_page_size, homestore::multi_blk_id{},
+                                                         /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
+    ASSERT_TRUE(w.has_value());
+
+    auto raw = logstore->read_sync(0);
+    sisl::io_blob_safe corrupted{raw.size()};
+    std::memcpy(corrupted.bytes(), raw.bytes(), raw.size());
+    corrupted.bytes()[4] = 99; // stomp version, leave magic (bytes 0-3) intact
+    write_raw_blob(logstore, 1, corrupted);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(1));
+    ASSERT_FALSE(r.has_value());
+}
+
+// A record whose embedded hdr.lsn does not match the seq_num it was read back at must be rejected
+// rather than silently trusted -- simulated here by writing a valid slot at lsn=0, then re-writing
+// that SAME (otherwise perfectly valid) blob verbatim at lsn=1: the blob's own hdr.lsn field still
+// says 0, so read_slot(1) must fail the cross-check rather than return a slot claiming to be lsn=1.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotLsnMismatchFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto w =
+        homeblocks::detail::sync_get(backend->write_slot(0, 1, 0, k_page_size, homestore::multi_blk_id{},
+                                                         /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
+    ASSERT_TRUE(w.has_value());
+
+    auto raw = logstore->read_sync(0);
+    sisl::io_blob_safe replayed{raw.size()};
+    std::memcpy(replayed.bytes(), raw.bytes(), raw.size());
+    write_raw_blob(logstore, 1, replayed);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(1));
+    ASSERT_FALSE(r.has_value());
+}
+
+// A non-all_zeros record whose hdr.len is not a positive multiple of lba_size (corrupted/malformed)
+// must be rejected before it's used to derive nlbas -- otherwise an unaligned len silently
+// misaligns the csum-array and blkid offsets that follow, deserializing garbage rather than
+// failing cleanly. hdr.len is a lba_count_t (uint32_t) sitting at a fixed offset (29 bytes) within
+// CraftJournalEntry's packed 34-byte layout: magic(4)+version(1)+term(8)+lsn(8)+lba(8)+len(4)+all_zeros(1).
+TEST_F(CraftHomeStoreBackendTest, ReadSlotMisalignedLenFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    homestore::multi_blk_id blkid{42, 1, 7};
+    std::vector< homestore::csum_t > csums{111};
+    auto w = homeblocks::detail::sync_get(
+        backend->write_slot(0, 1, 0, k_page_size, blkid, /* all_zeros = */ false, csums));
+    ASSERT_TRUE(w.has_value());
+
+    auto raw = logstore->read_sync(0);
+    sisl::io_blob_safe corrupted{raw.size()};
+    std::memcpy(corrupted.bytes(), raw.bytes(), raw.size());
+    uint32_t const bad_len = 1; // nonzero, but not a multiple of k_page_size
+    std::memcpy(corrupted.bytes() + 29, &bad_len, sizeof(bad_len));
+    write_raw_blob(logstore, 1, corrupted);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(1));
+    ASSERT_FALSE(r.has_value());
+}
+
 // A truncated blob (real header/magic, but cut short of even the fixed header size) must be
 // rejected rather than read past the end of the buffer.
 TEST_F(CraftHomeStoreBackendTest, ReadSlotTruncatedBlobFails) {

@@ -321,6 +321,27 @@ TEST_F(CraftCommitTest, EmptySlotSkip) {
     EXPECT_TRUE(index_.entries.count(2));
 }
 
+// szmyd (PR #175 review, on the record but not filed inline): commit_impl's is_empty branch skips
+// overlay retirement alongside the apply. Reachable via "Empty beats data" reconciliation
+// (request_resolution's doc comment in home_blocks.hpp): a replica can have already journaled real
+// data (and thus a real overlay entry) for an lsn that the CLUSTER-WIDE resolution round still
+// verdicts Empty (e.g. the leader's round didn't successfully use this replica as a holder). The
+// index correctly never applies it, but without retiring the overlay, this replica would keep
+// SERVING that data on reads -- directly contradicting the Empty verdict, not just leaving harmless
+// stale bookkeeping.
+TEST_F(CraftCommitTest, EmptyVerdictRetiresOverlayEvenWhenThisReplicaHadTheData) {
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 0, /* lba = */ 5, /* nlbas = */ 1).has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(5), 0); // write() created a real overlay entry
+
+    dev_->seed_empty({0}); // cluster-wide Empty verdict despite this replica having the data
+
+    auto r = do_commit(0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    EXPECT_FALSE(index_.entries.count(5)); // never applied -- Empty beats data
+    EXPECT_EQ(dev_->overlay_lsn_for(5), -1); // retired -- must not still be served on reads
+}
+
 // all_zeros apply removes the index entry and reclaims its block.
 TEST_F(CraftCommitTest, AllZerosApplyRemovesEntryAndFreesBlock) {
     index_.entries[0] = BlockInfo{homestore::blk_id{500, 1, 1}, homestore::blk_id{}, 99};
@@ -346,6 +367,31 @@ TEST_F(CraftCommitTest, DataApplyWritesEntryAndFreesSupersededBlock) {
     ASSERT_TRUE(index_.entries.count(0));
     EXPECT_EQ(index_.entries[0].new_checksum, 222);
     EXPECT_EQ(journal_->free_data_calls, 1); // old blk_id{500,1,1} reclaimed
+}
+
+// Crash-replay of an already-applied slot before commit_lsn was durably persisted past it: the
+// index already holds this exact blkid from the first apply (a separate, already-flushed
+// checkpoint), so re-applying the same slot must NOT free it -- old_blkid == new_blkid means
+// "already applied" (a no-op replay), not "superseded by a newer write".
+TEST_F(CraftCommitTest, CrashReplayOfAppliedSlotDoesNotFreeLiveBlock) {
+    dev_->seed_lsns(0, {});
+    journal_->add_data_slot(0, /* lba = */ 0, /* nlbas = */ 1, /* blk_num = */ 999, {222});
+
+    auto r1 = do_commit(0);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    ASSERT_TRUE(index_.entries.count(0));
+    EXPECT_EQ(journal_->free_data_calls, 0); // no prior entry to supersede on the first apply
+
+    // Simulate a crash before commit_lsn was durably persisted past this slot: commit_lsn regresses
+    // to before lsn=0 (as if superblock recovery restored an older value), while the index (already
+    // flushed at its own checkpoint) still has lsn=0's write applied.
+    dev_->seed_commit_lsn(-1);
+
+    auto r2 = do_commit(0);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    EXPECT_EQ(journal_->free_data_calls, 0); // must NOT free blk_num=999 -- index still references it
 }
 
 // LBA written at dLSN 3 and 5 (5 superseding 3 in the overlay, highest-dLSN-wins); committing
@@ -585,6 +631,19 @@ TEST_F(CraftCommitTest, CrcMismatchFails) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::CRC_MISMATCH));
 }
 
+// A bit-flip that happens to zero out an LBA whose checksum was computed over real (non-zero)
+// content must be reported as CRC_MISMATCH, not silently collapsed to an indistinguishable hole --
+// the all-zero read-time collapse must never bypass the CRC check.
+TEST_F(CraftCommitTest, AllZeroCorruptionFailsCrcInsteadOfCollapsing) {
+    std::vector< uint8_t > content(k_page_size, 0xCD); // checksum computed over non-zero content
+    seed_index_entry(/* lba = */ 0, /* blk_num = */ 500, content);
+    journal_->seed_block(500, std::vector< uint8_t >(k_page_size, 0x00)); // corrupted to all-zero
+
+    auto r = do_read(/* read_lsn = */ 10, /* lba = */ 0, /* nlbas = */ 1);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::CRC_MISMATCH));
+}
+
 // A multi-LBA read spanning a contiguous data run followed by a hole must merge the run into one
 // extent (one batched read, not one per LBA) and report the hole as a separate, correctly-offset
 // extent.
@@ -609,6 +668,49 @@ TEST_F(CraftCommitTest, MultiLbaReadMergesAdjacentExtents) {
     expected.insert(expected.end(), content1.begin(), content1.end());
     expected.insert(expected.end(), k_page_size, 0);
     EXPECT_EQ(dest_buf_, expected);
+}
+
+// A single contiguous data run larger than blk_count_t's max (65535 -- uint16_t) must be split
+// across multiple read_data batches rather than let the run_nlbas -> blk_count_t static_cast
+// silently truncate (65536 wraps to 0, anything larger wraps to some smaller-than-intended count) --
+// either would misread real data. Uses a tiny 8-byte lba_size (rather than k_page_size) so a run
+// this large still fits under this test binary's craft_max_io_len_mb=1 MiB cap; constructs its own
+// dev_/journal_/index_ locally since CraftCommitTest's own fixture is fixed at k_page_size.
+TEST_F(CraftCommitTest, LargeContiguousRunSplitsAcrossBlkCountTLimit) {
+    constexpr uint32_t k_tiny_lba_size = 8;
+    constexpr uint32_t k_nlbas = 65536; // one more than blk_count_t's max (65535)
+
+    auto mock = std::make_unique< MockCraftJournalBackend >();
+    auto* journal = mock.get();
+    FakeIndex index;
+    auto dev = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock), k_tiny_lba_size, nullptr);
+
+    std::vector< uint8_t > content(k_tiny_lba_size, 0xAB);
+    auto const csum = crc16_t10dif(k_test_crc16_seed, content.data(), content.size());
+    for (uint32_t lba = 0; lba < k_nlbas; ++lba) {
+        homestore::blk_num_t const blk_num = 1000 + lba; // one contiguous run across all k_nlbas LBAs
+        index.entries[lba] = BlockInfo{homestore::blk_id{blk_num, 1, /* chunk = */ 1}, homestore::blk_id{}, csum};
+        journal->seed_block(blk_num, content);
+    }
+
+    std::vector< uint8_t > dest_buf(static_cast< size_t >(k_nlbas) * k_tiny_lba_size, 0xFF);
+    sisl::sg_list dest;
+    dest.size = dest_buf.size();
+    dest.iovs.push_back(iovec{dest_buf.data(), dest_buf.size()});
+    auto r = homeblocks::detail::sync_get(dev->read_with(
+        /* read_lsn = */ 10, /* addr = */ 0, dest.size, std::move(dest),
+        [&index](lba_t s, lba_t e, std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out) {
+            return index.read_from_index(s, e, out);
+        }));
+    ASSERT_TRUE(r.has_value());
+    // The split is invisible to the caller: both batches return the same content, so the final
+    // adjacent-extent merge collapses them back into a single extent.
+    ASSERT_EQ(r->extents.size(), 1u);
+    EXPECT_FALSE(r->extents[0].hole);
+    for (uint32_t lba = 0; lba < k_nlbas; ++lba)
+        EXPECT_EQ(
+            std::memcmp(dest_buf.data() + static_cast< size_t >(lba) * k_tiny_lba_size, content.data(), k_tiny_lba_size),
+            0);
 }
 
 // An in-horizon overlay entry must win over an EXISTING committed index entry for the same LBA
@@ -640,6 +742,17 @@ TEST_F(CraftCommitTest, HorizonBoundaryEqualLsnServed) {
     ASSERT_EQ(r->extents.size(), 1u);
     EXPECT_FALSE(r->extents[0].hole);
     EXPECT_EQ(dest_buf_, std::vector< uint8_t >(k_page_size, 0xAB)); // served, not clamped away
+}
+
+// read_lsn below commit_lsn is unanswerable: the index has already blind-overwritten past commit_lsn
+// (apply is destructive by design), so a caller asking for a horizon strictly below the frontier must
+// be rejected rather than silently served the too-new committed value.
+TEST_F(CraftCommitTest, ReadRejectsStaleHorizon) {
+    dev_->seed_commit_lsn(10);
+
+    auto r = do_read(/* read_lsn = */ 5, /* lba = */ 0, /* nlbas = */ 1); // 5 < commit_lsn=10
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::HORIZON_STALE));
 }
 
 // A single read spanning three distinct sources in one call: committed index data, an absent hole,
@@ -1044,6 +1157,19 @@ TEST_F(CraftCommitTest, KeepAliveCapturesAllCommittedLsnMonotonically) {
     EXPECT_EQ(dev_->all_committed_lsn(), 9);
 }
 
+// A malformed all_committed_lsn (negative, but not the -1 "unset" sentinel) must be ignored rather
+// than corrupting the floor -- the call itself still succeeds (this is best-effort floor metadata,
+// not core I/O semantics that should fail the whole call).
+TEST_F(CraftCommitTest, KeepAliveIgnoresMalformedNegativeAllCommittedLsn) {
+    auto r1 = homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{0, -1, /* all_committed_lsn = */ 5}));
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(dev_->all_committed_lsn(), 5);
+
+    auto r2 = homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{0, -1, /* all_committed_lsn = */ -7}));
+    ASSERT_TRUE(r2.has_value()); // the call itself still succeeds
+    EXPECT_EQ(dev_->all_committed_lsn(), 5); // floor unchanged -- malformed value ignored, not applied
+}
+
 // ── delete_fn error path ──────────────────────────────────────────────────────
 
 // A delete_fn failure during an all_zeros apply must propagate the error and leave commit_lsn
@@ -1078,6 +1204,29 @@ TEST_F(CraftCommitTest, ReadFnErrorPropagates) {
             return std::unexpected(volume_error::INDEX_ERROR);
         }));
     ASSERT_FALSE(r.has_value());
+}
+
+// The pre-index-read horizon check only catches a commit_lsn that advanced BEFORE the snapshot was
+// taken. read_fn itself takes no lock, so a concurrent commit_impl can still advance commit_lsn past
+// read_lsn WHILE read_fn is executing -- simulated here by having read_fn itself perform the advance,
+// standing in for a commit_impl run on another thread interleaving with this query. The post-read_fn
+// re-check must catch this and reject, not just the pre-check.
+TEST_F(CraftCommitTest, ReadRejectsHorizonAdvancedDuringIndexQuery) {
+    dest_buf_.assign(k_page_size, 0xFF);
+    sisl::sg_list dest;
+    dest.size = dest_buf_.size();
+    dest.iovs.push_back(iovec{dest_buf_.data(), dest_buf_.size()});
+
+    auto r = homeblocks::detail::sync_get(dev_->read_with(
+        /* read_lsn = */ 5, 0, k_page_size, std::move(dest),
+        [this](lba_t s, lba_t e, std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out) {
+            // Stands in for a concurrent commit_impl run advancing the frontier past read_lsn while
+            // this index query is in flight.
+            dev_->seed_commit_lsn(10);
+            return index_.read_from_index(s, e, out);
+        }));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::HORIZON_STALE));
 }
 
 // ── read() negative read_lsn ──────────────────────────────────────────────────
@@ -1140,6 +1289,23 @@ TEST_F(CraftCommitTest, RebuildOverlaySkipsNlbasZeroSlot) {
 TEST_F(CraftCommitTest, ReadDestEmptyIovsRejected) {
     sisl::sg_list dest;
     dest.size = k_page_size; // non-zero size claimed but no backing iovec
+
+    auto r = homeblocks::detail::sync_get(dev_->read_with(
+        /* read_lsn = */ 0, 0, k_page_size, std::move(dest),
+        [this](lba_t s, lba_t e, std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out) {
+            return index_.read_from_index(s, e, out);
+        }));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+}
+
+// A dest iovec that's non-empty but too small for the requested range must be rejected -- an
+// undersized iov_len would otherwise have the memset/read_data calls write past the buffer's end.
+TEST_F(CraftCommitTest, ReadDestUndersizedIovLenRejected) {
+    std::vector< uint8_t > small_buf(k_page_size / 2); // half the size a 1-page read needs
+    sisl::sg_list dest;
+    dest.size = k_page_size; // claims a full page, but the backing iovec is only half that
+    dest.iovs.push_back(iovec{small_buf.data(), small_buf.size()});
 
     auto r = homeblocks::detail::sync_get(dev_->read_with(
         /* read_lsn = */ 0, 0, k_page_size, std::move(dest),

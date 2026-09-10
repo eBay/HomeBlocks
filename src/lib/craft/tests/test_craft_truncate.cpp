@@ -23,6 +23,9 @@
 // craft_repl_dev.cpp directly (not via the ${PROJECT_NAME}_craft OBJECT lib which is linked
 // into the main library together with homeblks_impl.cpp that owns the definition normally).
 
+#include <map>
+#include <vector>
+
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -49,6 +52,8 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     bool should_fail{false};
     int64_t truncated_to{INT64_MIN};
+    std::map< int64_t, JournalSlot > slots; // seeded directly by tests -- see add_data_slot/add_all_zeros_slot
+    std::vector< homestore::multi_blk_id > freed_blkids; // every free_data() call, in order
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
                                                              lba_count_t /* len */) override {
@@ -60,8 +65,12 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
-    async_result< JournalSlot > read_slot(int64_t) override {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // Looks up a seeded slot; a never-seeded lsn returns not_supported -- matches the ordinary case
+    // of a gap (an lsn this replica never journaled) and lets truncate()'s pre-free scan skip it.
+    async_result< JournalSlot > read_slot(int64_t lsn) override {
+        auto it = slots.find(lsn);
+        if (it == slots.end()) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+        co_return it->second;
     }
 
     async_status truncate_to(int64_t lsn) override {
@@ -69,7 +78,10 @@ public:
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return ok();
     }
-    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    async_status free_data(homestore::multi_blk_id blkid) override {
+        freed_blkids.push_back(blkid);
+        co_return ok();
+    }
 
     async_status free_slot(int64_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
@@ -77,6 +89,15 @@ public:
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
+
+    // Seed a data (non-all_zeros) slot referencing a single-block blkid -- for truncate()'s
+    // pre-rollback free scan tests.
+    void add_data_slot(int64_t lsn, homestore::blk_num_t blk_num) {
+        slots[lsn] = JournalSlot{.lsn = lsn, .blkid = homestore::multi_blk_id{blk_num, 1, /* chunk = */ 1}};
+    }
+
+    // Seed an all_zeros slot -- no blkid, nothing for the pre-free scan to free.
+    void add_all_zeros_slot(int64_t lsn) { slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = true}; }
 };
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -155,6 +176,60 @@ TEST_F(CraftTruncateTest, MissingEntryAtTruncationPointKept) {
     EXPECT_EQ(dev_->missing_count(), 2u); // 80 and 90 survive; 95 erased
     EXPECT_TRUE(dev_->is_missing(90));
     EXPECT_FALSE(dev_->is_missing(95));
+}
+
+// ── S4 block leak: truncate() must free blocks referenced by dropped entries ─────────────────
+//
+// home_log_store::rollback (behind truncate_to) only removes journal RECORDS -- it has no idea
+// about the data-service blocks those records reference (HS_DATA_LINKED: block lifecycle is this
+// class's job). Every entry above lsn that truncate() drops must have its block freed BEFORE the
+// record is gone, or it leaks permanently from the block allocator.
+
+// Two dropped data entries above lsn: both blocks must be freed.
+TEST_F(CraftTruncateTest, TruncateFreesBlocksForDroppedDataEntries) {
+    dev_->seed_lsns(100, {});
+    journal_->add_data_slot(91, /* blk_num = */ 500);
+    journal_->add_data_slot(95, /* blk_num = */ 501);
+
+    auto r = do_truncate(90);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(journal_->freed_blkids.size(), 2u);
+    EXPECT_EQ(journal_->freed_blkids[0].blk_num(), 500u);
+    EXPECT_EQ(journal_->freed_blkids[1].blk_num(), 501u);
+}
+
+// A dropped entry AT OR BELOW lsn (still committed, not being dropped) must not be freed.
+TEST_F(CraftTruncateTest, TruncateDoesNotFreeEntriesAtOrBelowLsn) {
+    dev_->seed_lsns(100, {});
+    journal_->add_data_slot(90, /* blk_num = */ 400); // at lsn -- survives, must not be freed
+    journal_->add_data_slot(91, /* blk_num = */ 500); // above lsn -- dropped, must be freed
+
+    auto r = do_truncate(90);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(journal_->freed_blkids.size(), 1u);
+    EXPECT_EQ(journal_->freed_blkids[0].blk_num(), 500u);
+}
+
+// An all_zeros entry above lsn has no block to free -- the scan must not call free_data for it.
+TEST_F(CraftTruncateTest, TruncateSkipsFreeForAllZerosEntries) {
+    dev_->seed_lsns(100, {});
+    journal_->add_all_zeros_slot(91);
+
+    auto r = do_truncate(90);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(journal_->freed_blkids.empty());
+}
+
+// A gap above lsn (never journaled locally, no slot seeded) must be skipped silently -- read_slot's
+// failure is the ordinary case here, not an error, and must not abort the truncate.
+TEST_F(CraftTruncateTest, TruncateSkipsFreeForGapsAboveLsn) {
+    dev_->seed_lsns(100, {92}); // 92 is a real gap -- no slot seeded for it
+    journal_->add_data_slot(91, /* blk_num = */ 500);
+
+    auto r = do_truncate(90);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(journal_->freed_blkids.size(), 1u); // only 91's real block, nothing for the gap at 92
+    EXPECT_EQ(journal_->freed_blkids[0].blk_num(), 500u);
 }
 
 // commit_lsn is invariant: truncate() must not alter it.

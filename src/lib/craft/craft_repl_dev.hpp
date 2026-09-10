@@ -61,6 +61,16 @@ struct CraftPartitionState {
     int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
                                    // floors journal reclaim (S8: truncate below min(this, checkpointed apply
                                    // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
+                                   // TODO(S8): this is client-controlled wire input with only a narrow
+                                   // malformed-negative check applied where it's captured (write()/read()/
+                                   // keep_alive()) -- there is NO per-call bound possible there: a lagging
+                                   // replica legitimately sees this arrive ahead of its own last_append_lsn/
+                                   // commit_lsn (that gap is the signal it needs to catch up via S6 peer
+                                   // exchange), so clamping against local state would break that. Before using
+                                   // this as a reclaim floor, S8 must validate it against real journal/
+                                   // checkpoint state (e.g. never reclaim past what's actually durable/
+                                   // replicated here), since a buggy/malicious client could otherwise poison
+                                   // it with an absurdly large value with no local signal to catch it.
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:

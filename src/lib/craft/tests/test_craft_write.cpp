@@ -496,6 +496,25 @@ TEST_F(CraftWriteTest, MalformedSgListRejected) {
     EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
 }
 
+// Exactly one iovec is required, even when iovs[0] ALONE already fully covers len (isolating this
+// from the iov_len<len check above, which would otherwise also fire): a second, unused trailing
+// iovec makes the sg_list self-inconsistent (claims exactly `len` total bytes yet carries dead
+// extra capacity) and must be rejected rather than silently ignored.
+TEST_F(CraftWriteTest, MultiIovecRejectedEvenWhenFirstIovAloneSuffices) {
+    static std::vector< uint8_t > buf(k_page_size, 0xAB);
+    sisl::sg_list data;
+    data.size = k_page_size;
+    data.iovs.push_back(iovec{buf.data(), k_page_size}); // alone already satisfies the other checks
+    data.iovs.push_back(iovec{buf.data(), k_page_size}); // extra, unused -- only this makes it fail
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, k_page_size, std::move(data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(journal_->slot_count(), 0u);  // write_slot not reached
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
+}
+
 // write_slot must receive the term from the client_hdr so CraftJournalEntry.term is populated correctly.
 // This is the on-disk term used to detect and skip stale-tail entries on recovery.
 TEST_F(CraftWriteTest, WriteSlotReceivesCorrectTerm) {
