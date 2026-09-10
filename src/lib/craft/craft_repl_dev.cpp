@@ -255,8 +255,8 @@ public:
         // an unvalidated len (e.g. 0, or not lba-aligned) would silently misalign both, deserializing
         // garbage rather than failing cleanly.
         if (!slot.all_zeros && (hdr.len == 0 || hdr.len % lba_size_ != 0)) {
-            LOGE("read_slot lsn={} hdr.len={} not a positive multiple of lba_size={} -- malformed record",
-                 lsn, hdr.len, lba_size_);
+            LOGE("read_slot lsn={} hdr.len={} not a positive multiple of lba_size={} -- malformed record", lsn, hdr.len,
+                 lba_size_);
             co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
         uint32_t nlbas = slot.all_zeros ? 0 : (hdr.len / lba_size_);
@@ -1053,8 +1053,8 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     // than silently returning the too-new index value (CRAFT-Design: "writes above H are ignored even
     // if the replica holds them").
     if (read_lsn < commit_lsn_snapshot) {
-        LOGW("read rejected: read_lsn={} is below commit_lsn={} -- horizon already advanced, unanswerable",
-             read_lsn, commit_lsn_snapshot);
+        LOGW("read rejected: read_lsn={} is below commit_lsn={} -- horizon already advanced, unanswerable", read_lsn,
+             commit_lsn_snapshot);
         co_return std::unexpected(make_error_condition(volume_error::HORIZON_STALE));
     }
 
@@ -1682,7 +1682,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
                 // FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
-                                                         slot.all_zeros);
+                                                         slot.all_zeros, slot.csums);
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
                          res.error().message());

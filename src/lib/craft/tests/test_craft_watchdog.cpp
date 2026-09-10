@@ -71,6 +71,9 @@ public:
     }
     async_status truncate_to(int64_t) override { co_return ok(); }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    async_status free_slot(int64_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
@@ -84,8 +87,8 @@ protected:
         orig_timeout_ms_ = HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms);
         HB_SETTINGS_FACTORY().modifiable_settings(
             [](auto& s) { s.craft_watchdog_timeout_ms = k_test_watchdog_timeout_ms; });
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::make_unique< MockCraftJournalBackend >(),
-                                                k_page_size, /* indx_tbl = */ nullptr);
+        dev_ = CraftReplDev::create(volume_id_t{}, std::make_unique< MockCraftJournalBackend >(), k_page_size,
+                                    /* indx_tbl = */ nullptr);
     }
 
     void TearDown() override {
@@ -101,7 +104,7 @@ protected:
     }
 
     uint64_t orig_timeout_ms_{0};
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -168,8 +171,8 @@ TEST_F(CraftWatchdogTest, DestructorRacesFiringManyIterations) {
     static constexpr int kIterations = 200;
 
     for (int i = 0; i < kIterations; ++i) {
-        auto dev = std::make_unique< CraftReplDev >(volume_id_t{}, std::make_unique< MockCraftJournalBackend >(),
-                                                    k_page_size, /* indx_tbl = */ nullptr);
+        auto dev = CraftReplDev::create(volume_id_t{}, std::make_unique< MockCraftJournalBackend >(), k_page_size,
+                                        /* indx_tbl = */ nullptr);
         dev->seed_term(7);
         ASSERT_TRUE(homeblocks::detail::sync_get(dev->keep_alive(craft::client_hdr{7, -1, -1})).has_value())
             << "iteration " << i;

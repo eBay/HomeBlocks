@@ -86,7 +86,7 @@ protected:
         ASSERT_TRUE(logstore != nullptr);
 
         auto backend = make_homestore_journal_backend(logstore, s_vol->ordinal(), k_page_size);
-        dev_ = std::make_unique< CraftReplDev >(s_vol->id(), std::move(backend), k_page_size, s_vol->indx_table());
+        dev_ = CraftReplDev::create(s_vol->id(), std::move(backend), k_page_size, s_vol->indx_table());
     }
 
     // term=0 matches CraftPartitionState's default -- login() is still a stub, so there is no other
@@ -121,7 +121,7 @@ protected:
     }
 
     static volume_handle s_vol;
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 volume_handle CraftCommitHsTest::s_vol;
 

@@ -159,10 +159,12 @@ target_sources(test_craft_raft_entries PRIVATE
     ../craft_repl_dev.cpp
 )
 target_compile_definitions(test_craft_raft_entries PRIVATE _PRERELEASE)
+target_sources(test_craft_raft_entries PRIVATE ${HB_CONFIG_BINDUMP})
 target_link_libraries(test_craft_raft_entries
     ${COMMON_TEST_DEPS}
     -rdynamic
 )
+add_dependencies(test_craft_raft_entries ${PROJECT_NAME}_core)
 
 add_test(NAME CraftRaftEntriesTest COMMAND test_craft_raft_entries)
 

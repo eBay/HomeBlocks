@@ -190,8 +190,8 @@ private:
                           shared< VolumeIndexTable > indx_tbl);
 
 public:
-    static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal,
-                                         uint32_t lba_size, shared< VolumeIndexTable > indx_tbl) {
+    static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
+                                         shared< VolumeIndexTable > indx_tbl) {
         return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal), lba_size, std::move(indx_tbl)));
     }
     // Cancels the watchdog's recurring timer (iomgr::timer_token::cancel(wait=true)), blocking until
@@ -527,7 +527,7 @@ private:
     // insert one LSN at a time under missing_mu_, which is O(gap width) instead of O(log ranges).
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
-    bool commit_running_{false};       // at most one commit_impl() run active at a time -- see commit()'s doc comment
+    bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
     // dlsns currently between "claimed as non-idempotent" and "write_slot has completed" in write() --
     // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;

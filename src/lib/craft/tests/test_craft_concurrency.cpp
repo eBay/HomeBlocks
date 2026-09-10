@@ -98,6 +98,9 @@ public:
 
     async_status truncate_to(int64_t) override { co_return ok(); }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    async_status free_slot(int64_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 
     async_status read_data(homestore::multi_blk_id blkid, sisl::sg_list& dest) override {
         auto* buf = static_cast< uint8_t* >(dest.iovs[0].iov_base);
@@ -175,7 +178,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
 
     auto do_write_data(int64_t dlsn, lba_t lba, uint8_t fill) {
@@ -210,7 +213,7 @@ protected:
 
     MockCraftJournalBackend* journal_{nullptr};
     FakeIndex index_;
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 // N real threads each write a disjoint subset of a shared dLSN/LBA space concurrently (thread t

@@ -122,6 +122,9 @@ public:
         ++free_data_calls;
         co_return ok();
     }
+    async_status free_slot(int64_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
     // Same error category HomeStoreCraftJournalBackend::read_data returns for a real async_read
     // failure -- a missing block_data entry here means the test forgot to seed it, not a
     // filesystem-shaped condition, so this mirrors production's actual error vocabulary rather than
@@ -209,7 +212,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
 
     auto do_commit(int64_t upto_lsn) {
@@ -265,7 +268,7 @@ protected:
     std::vector< uint8_t > dest_buf_;
     MockCraftJournalBackend* journal_{nullptr};
     FakeIndex index_;
-    std::unique_ptr< CraftReplDev > dev_;
+    std::shared_ptr< CraftReplDev > dev_;
 };
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -338,7 +341,7 @@ TEST_F(CraftCommitTest, EmptyVerdictRetiresOverlayEvenWhenThisReplicaHadTheData)
     auto r = do_commit(0);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(dev_->commit_lsn(), 0);
-    EXPECT_FALSE(index_.entries.count(5)); // never applied -- Empty beats data
+    EXPECT_FALSE(index_.entries.count(5));   // never applied -- Empty beats data
     EXPECT_EQ(dev_->overlay_lsn_for(5), -1); // retired -- must not still be served on reads
 }
 
@@ -683,7 +686,7 @@ TEST_F(CraftCommitTest, LargeContiguousRunSplitsAcrossBlkCountTLimit) {
     auto mock = std::make_unique< MockCraftJournalBackend >();
     auto* journal = mock.get();
     FakeIndex index;
-    auto dev = std::make_unique< CraftReplDev >(volume_id_t{}, std::move(mock), k_tiny_lba_size, nullptr);
+    auto dev = CraftReplDev::create(volume_id_t{}, std::move(mock), k_tiny_lba_size, nullptr);
 
     std::vector< uint8_t > content(k_tiny_lba_size, 0xAB);
     auto const csum = crc16_t10dif(k_test_crc16_seed, content.data(), content.size());
@@ -708,9 +711,9 @@ TEST_F(CraftCommitTest, LargeContiguousRunSplitsAcrossBlkCountTLimit) {
     ASSERT_EQ(r->extents.size(), 1u);
     EXPECT_FALSE(r->extents[0].hole);
     for (uint32_t lba = 0; lba < k_nlbas; ++lba)
-        EXPECT_EQ(
-            std::memcmp(dest_buf.data() + static_cast< size_t >(lba) * k_tiny_lba_size, content.data(), k_tiny_lba_size),
-            0);
+        EXPECT_EQ(std::memcmp(dest_buf.data() + static_cast< size_t >(lba) * k_tiny_lba_size, content.data(),
+                              k_tiny_lba_size),
+                  0);
 }
 
 // An in-horizon overlay entry must win over an EXISTING committed index entry for the same LBA
@@ -1166,7 +1169,7 @@ TEST_F(CraftCommitTest, KeepAliveIgnoresMalformedNegativeAllCommittedLsn) {
     EXPECT_EQ(dev_->all_committed_lsn(), 5);
 
     auto r2 = homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{0, -1, /* all_committed_lsn = */ -7}));
-    ASSERT_TRUE(r2.has_value()); // the call itself still succeeds
+    ASSERT_TRUE(r2.has_value());             // the call itself still succeeds
     EXPECT_EQ(dev_->all_committed_lsn(), 5); // floor unchanged -- malformed value ignored, not applied
 }
 

@@ -270,8 +270,8 @@ TEST_F(CraftHomeStoreBackendTest, ReadSlotMisalignedLenFails) {
 
     homestore::multi_blk_id blkid{42, 1, 7};
     std::vector< homestore::csum_t > csums{111};
-    auto w = homeblocks::detail::sync_get(
-        backend->write_slot(0, 1, 0, k_page_size, blkid, /* all_zeros = */ false, csums));
+    auto w =
+        homeblocks::detail::sync_get(backend->write_slot(0, 1, 0, k_page_size, blkid, /* all_zeros = */ false, csums));
     ASSERT_TRUE(w.has_value());
 
     auto raw = logstore->read_sync(0);

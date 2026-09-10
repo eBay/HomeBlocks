@@ -46,16 +46,21 @@
 #include <map>
 #include <optional>
 #include <sisl/logging/logging.h>
+#include <sisl/options/options.h>
 
 #include "craft/craft_repl_dev.hpp"
 #include "coro_helpers.hpp"
+#include "home_blks_config.hpp"
 #include "mock_journal_backend.hpp"
 
 SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
+SISL_OPTIONS_ENABLE(logging)
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 namespace {
+
+static constexpr uint32_t k_page_size = 4096;
 
 // ── journal mock ──────────────────────────────────────────────────────────────
 //
@@ -72,10 +77,12 @@ public:
     }
 
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
-                            homestore::multi_blk_id /* blkid */, bool all_zeros) override {
+                            homestore::multi_blk_id /* blkid */, bool all_zeros,
+                            std::vector< homestore::csum_t > const& csums) override {
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
+        slots[lsn] =
+            JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .csums = csums};
         co_return ok();
     }
 
@@ -86,6 +93,10 @@ public:
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
 
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
+
+    async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
 };
@@ -152,7 +163,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
 
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
@@ -313,7 +324,8 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
-        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4}, JournalSlot{.lsn = 2, .is_empty = true},
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
+        JournalSlot{.lsn = 2, .is_empty = true},
         JournalSlot{.lsn = 99, .is_empty = true}, // never requested -- only 1 and 2 were
     };
 
@@ -543,7 +555,7 @@ TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
 
     auto r = homeblocks::detail::sync_get(
         dev_->write(craft::client_hdr{.term = 5, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
-                    /*addr=*/0, /*len=*/0, {}, /*all_zeros=*/true));
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
 
     ASSERT_TRUE(r.has_value());
 }
@@ -559,7 +571,7 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
 
     auto r = homeblocks::detail::sync_get(
         dev_->write(craft::client_hdr{.term = 4, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
-                    /*addr=*/0, /*len=*/0, {}, /*all_zeros=*/true));
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
@@ -587,5 +599,9 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    SISL_OPTIONS_LOAD(argc, argv, logging);
+    // This light suite never starts iomgr, so the watchdog's real recurring timer must stay
+    // disabled -- same reasoning as every other light CRAFT test binary.
+    HB_SETTINGS_FACTORY().load_json("{\"craft_watchdog_timeout_ms\": 0}");
     return RUN_ALL_TESTS();
 }
