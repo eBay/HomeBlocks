@@ -59,6 +59,8 @@ SISL_OPTION_GROUP(
      "number"),
     (index_chunk_size_mb, "", "index_chunk_size_mb", "index_chunk_size_mb",
      ::cxxopts::value< uint32_t >()->default_value("128"), "number"),
+    (dynamic_chunk_allocation, "", "dynamic_chunk_allocation", "lazy chunk allocation on/off",
+     ::cxxopts::value< bool >()->default_value("true"), "true or false"),
     (data_chunk_size_mb, "", "data_chunk_size_mb", "data_chunk_size_mb",
      ::cxxopts::value< uint32_t >()->default_value("128"), "number"));
 

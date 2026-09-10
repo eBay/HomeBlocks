@@ -78,9 +78,10 @@ bool volume::init(bool is_recovery) {
         // first time creation of the volume, let's write the superblock;
 
         // Allocate initial set of chunks for the volume with thin provisioning.
+        shared< HomeBlocksImpl > hb = HomeBlocksImpl::instance();
         uint32_t pdev_id;
-        auto chunk_ids =
-            volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes, pdev_id);
+        auto chunk_ids = volume_chunk_selector_->allocate_init_chunks(vol_info_->ordinal, vol_info_->size_bytes,
+                                                                      pdev_id, hb->dynamic_chunk_allocation());
         if (chunk_ids.empty()) {
             LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name,
                  boost::uuids::to_string(vol_info_->id));

@@ -320,6 +320,7 @@ sudo build/Debug/src/test/legacy_ublk/homeblk_ublk \
 | `--vol_size_mb` / `--page_size` | Volume size and logical block size (default 4096) when creating. |
 | `--num_threads` | HomeBlocks iomgr reactor count. |
 | `--data_chunk_size_mb` / `--index_chunk_size_mb` | HomeStore chunk sizing (see the note below). |
+| `--dynamic_chunk_allocation=<true\|false>` | Lazy (thin) data chunk allocation for new volumes: `true` starts a volume with a few chunks and grows on demand, `false` pre-allocates all of its chunks at create. Overrides the `dynamic_chunk_allocation` dynamic config (default `true`). |
 | `--device_id <n>` | ublk device id: `-1` to assign one, `>=0` to recover a kernel-preserved device. |
 
 In another terminal, drive I/O at the printed device. All raw I/O is `O_DIRECT` with the volume's page size as

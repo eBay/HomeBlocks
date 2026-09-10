@@ -275,6 +275,16 @@ hs_chunk_size_cfg_t HomeBlocksImpl::get_chunk_size() const {
     return hs_chunk_sz;
 }
 
+bool HomeBlocksImpl::dynamic_chunk_allocation() const {
+    if (SISL_OPTIONS.count("dynamic_chunk_allocation")) {
+        auto const on = SISL_OPTIONS["dynamic_chunk_allocation"].as< bool >();
+        LOGI("Using dynamic_chunk_allocation option value: {}", on);
+        return on;
+    }
+
+    return HB_DYNAMIC_CONFIG(dynamic_chunk_allocation);
+}
+
 void HomeBlocksImpl::init_homestore() {
     LOGI("Starting iomgr with {} threads", config_.threads);
     ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = config_.threads}).with_http_server();

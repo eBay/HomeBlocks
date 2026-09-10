@@ -9,6 +9,12 @@
 #include <volume/volume_chunk_selector.hpp>
 #include "test_common.hpp"
 
+#include <future>
+#include <thread>
+#include <atomic>
+#include <algorithm>
+#include <unordered_set>
+
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_volume_chunk_selector,
                   (num_vols, "", "num_vols", "number of volumes", ::cxxopts::value< uint32_t >()->default_value("2"),
@@ -78,10 +84,24 @@ uint16_t VChunk::get_chunk_id() const { return m_internal_chunk->get_chunk_id();
 blk_num_t VChunk::get_total_blks() const { return m_internal_chunk->get_total_blks(); }
 
 uint64_t VChunk::size() const { return m_internal_chunk->size(); }
+
 void VChunk::reset() {}
+
 cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk; }
 
+// void VChunk::reset_block_allocator() {}
+
 } // namespace homestore
+
+template < typename Pred >
+void wait_until(Pred&& pred, std::chrono::milliseconds timeout = std::chrono::milliseconds{5000},
+                std::chrono::milliseconds poll = std::chrono::milliseconds{50}) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!pred() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(poll);
+    }
+    ASSERT_TRUE(pred());
+}
 
 class ChunkSelectorTest : public ::testing::Test {
 public:
@@ -147,6 +167,9 @@ TEST_F(ChunkSelectorTest, AllocateReleaseChunksTest) {
     for (uint32_t i = 0; i < 5; i++) {
         chunk_sel->release_chunks(i /* ordinal */);
     }
+
+    wait_until([&] { return chunk_sel->num_free_chunks() == init_num_free_chunks; }, std::chrono::seconds{10},
+               std::chrono::milliseconds{100});
 
     // All the chunks will be free.
     RELEASE_ASSERT_EQ(init_num_free_chunks, chunk_sel->num_free_chunks(), "num free chunks mismatch");
@@ -230,6 +253,190 @@ TEST_F(ChunkSelectorTest, RecoverChunksTest) {
     hints.application_hint = 0;
     auto chunk = chunk_sel->select_chunk(1 /* nblks */, hints);
     RELEASE_ASSERT(chunk, "Chunk not available");
+}
+
+TEST_F(ChunkSelectorTest, ConcurrentAllocateSameVolumeTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    add_chunks_per_pdev(chunk_sel, 2 /*pdevs*/, 10 /*chunks per pdev*/);
+
+    std::vector< chunk_num_t > r1, r2;
+    uint32_t pdev1{UINT32_MAX}, pdev2{UINT32_MAX};
+    std::atomic< bool > go{false};
+
+    auto worker = [&](std::vector< chunk_num_t >& out, uint32_t& pdev) {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        out = chunk_sel->allocate_init_chunks(0 /* same volume */, 64 * Ki, pdev);
+    };
+
+    std::thread t1(worker, std::ref(r1), std::ref(pdev1));
+    std::thread t2(worker, std::ref(r2), std::ref(pdev2));
+
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    ASSERT_FALSE(r1.empty());
+    ASSERT_FALSE(r2.empty());
+
+    std::sort(r1.begin(), r1.end());
+    std::sort(r2.begin(), r2.end());
+
+    EXPECT_EQ(r1, r2);
+    EXPECT_EQ(pdev1, pdev2);
+
+    auto chunks = chunk_sel->get_chunks(0);
+    ASSERT_EQ(chunks.size(), r1.size());
+
+    std::unordered_set< chunk_num_t > uniq{r1.begin(), r1.end()};
+    EXPECT_EQ(uniq.size(), r1.size());
+}
+
+TEST_F(ChunkSelectorTest, SelectChunkReturnsNullWhenOutOfSpaceTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    // Single chunk volume, but no space in the chunk
+    auto chunk = std::make_shared< homestore::Chunk >(0 /*pdev*/, 0 /*chunk_id*/);
+    chunk->set_available_blks(0);
+    chunk_sel->add_chunk(chunk);
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto ids = chunk_sel->allocate_init_chunks(0 /* ordinal */, 8 * Ki /* <= one chunk */, pdev_id, false);
+    ASSERT_FALSE(ids.empty());
+
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = 0;
+
+    auto start = std::chrono::steady_clock::now();
+    auto out = chunk_sel->select_chunk(1 /* nblks */, hints);
+    auto dur = std::chrono::steady_clock::now() - start;
+
+    EXPECT_EQ(out, nullptr);
+    EXPECT_LT(dur, std::chrono::seconds(2));
+}
+
+TEST_F(ChunkSelectorTest, ConcurrentSelectAndReleaseTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    add_chunks_per_pdev(chunk_sel, 2 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free_before_alloc = chunk_sel->num_free_chunks();
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto ids = chunk_sel->allocate_init_chunks(0 /* ordinal */, 64 * Ki, pdev_id);
+    ASSERT_FALSE(ids.empty());
+
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = 0;
+
+    std::atomic< bool > done{false};
+    std::atomic< uint32_t > select_success{0};
+    std::atomic< uint32_t > select_null{0};
+
+    std::thread selector([&] {
+        while (!done.load(std::memory_order_acquire)) {
+            auto chunk = chunk_sel->select_chunk(1 /* nblks */, hints);
+            if (chunk) {
+                ++select_success;
+            } else {
+                ++select_null;
+                break;
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::thread releaser([&] {
+        chunk_sel->release_chunks(0 /* ordinal */);
+        done.store(true, std::memory_order_release);
+    });
+
+    releaser.join();
+    selector.join();
+
+    wait_until([&] { return chunk_sel->num_free_chunks() == total_free_before_alloc; },
+               std::chrono::milliseconds{10000});
+
+    EXPECT_EQ(chunk_sel->num_free_chunks(), total_free_before_alloc);
+    EXPECT_TRUE(chunk_sel->get_chunks(0).empty());
+    EXPECT_GT(select_success.load() + select_null.load(), 0u);
+}
+
+TEST_F(ChunkSelectorTest, ResizeCallbackBlockedThenReleaseTest) {
+    std::promise< void > cb_entered_promise;
+    auto cb_entered = cb_entered_promise.get_future();
+
+    std::promise< void > allow_cb_exit_promise;
+    auto allow_cb_exit = allow_cb_exit_promise.get_future();
+
+    auto chunk_sel = std::make_shared< VolumeChunkSelector >(
+        "test", [&, this](uint64_t, const std::vector< chunk_num_t >& chunk_ids) {
+            EXPECT_FALSE(chunk_ids.empty());
+            cb_entered_promise.set_value();
+            allow_cb_exit.wait();
+        });
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free_before_alloc = chunk_sel->num_free_chunks();
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto ids = chunk_sel->allocate_init_chunks(0 /* ordinal */, 64 * Ki /* max_num_chunks > 1 */, pdev_id, true);
+    ASSERT_FALSE(ids.empty());
+
+    // Exhaust currently active chunks so select_chunk() must try resize
+    auto active_chunks = chunk_sel->get_chunks(0);
+    ASSERT_FALSE(active_chunks.empty());
+    for (auto& c : active_chunks) {
+        c->get_internal_chunk()->set_available_blks(0);
+    }
+
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = 0;
+
+    std::thread selector([&] { (void)chunk_sel->select_chunk(1 /* nblks */, hints); });
+
+    ASSERT_EQ(cb_entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+    std::thread releaser([&] { chunk_sel->release_chunks(0 /* ordinal */); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    allow_cb_exit_promise.set_value();
+
+    selector.join();
+    releaser.join();
+
+    wait_until([&] { return chunk_sel->num_free_chunks() == total_free_before_alloc; },
+               std::chrono::milliseconds{10000});
+
+    EXPECT_EQ(chunk_sel->num_free_chunks(), total_free_before_alloc);
+    EXPECT_TRUE(chunk_sel->get_chunks(0).empty());
+}
+
+TEST_F(ChunkSelectorTest, RecoverReleaseReallocateTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free = chunk_sel->num_free_chunks();
+
+    std::vector< homestore::chunk_num_t > recovered_ids{0, 1, 2};
+    ASSERT_TRUE(chunk_sel->recover_chunks(0 /* ordinal */, 0 /* pdev */, 48 * Ki, recovered_ids));
+
+    auto recovered_chunks = chunk_sel->get_chunks(0);
+    ASSERT_EQ(recovered_chunks.size(), recovered_ids.size());
+
+    chunk_sel->release_chunks(0 /* ordinal */);
+
+    wait_until([&] { return chunk_sel->num_free_chunks() == total_free; }, std::chrono::milliseconds{10000});
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto new_ids = chunk_sel->allocate_init_chunks(1 /* new ordinal */, 48 * Ki, pdev_id, true);
+    ASSERT_FALSE(new_ids.empty());
+    EXPECT_EQ(pdev_id, 0u);
 }
 
 int main(int argc, char* argv[]) {

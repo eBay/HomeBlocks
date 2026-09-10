@@ -153,6 +153,7 @@ public:
     bool is_restricted() const { return is_restricted_.load(); }
     bool is_shutting_down() const { return shutdown_started_.test(); }
     hs_chunk_size_cfg_t get_chunk_size() const;
+    bool dynamic_chunk_allocation() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
 
 public:
