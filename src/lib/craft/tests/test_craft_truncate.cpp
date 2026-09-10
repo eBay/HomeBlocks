@@ -25,15 +25,20 @@
 
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
+#include <sisl/options/options.h>
 
 #include "craft/craft_repl_dev.hpp"
+#include "home_blks_config.hpp"
 #include "coro_helpers.hpp"
 
 SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
+SISL_OPTIONS_ENABLE(logging)
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 namespace {
+
+static constexpr uint32_t k_page_size = 4096;
 
 // ── minimal journal mock ──────────────────────────────────────────────────────
 //
@@ -50,7 +55,8 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool) override {
+    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool,
+                            std::vector< homestore::csum_t > const&) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
@@ -68,6 +74,9 @@ public:
     async_status free_slot(int64_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
+    async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -77,7 +86,7 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
 
     auto do_truncate(int64_t lsn) { return homeblocks::detail::sync_get(dev_->truncate(lsn)); }
@@ -171,5 +180,7 @@ TEST_F(CraftTruncateTest, JournalErrorShieldsState) {
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    SISL_OPTIONS_LOAD(argc, argv, logging);
+    HB_SETTINGS_FACTORY().load_json("{\"craft_watchdog_timeout_ms\": 0}");
     return RUN_ALL_TESTS();
 }

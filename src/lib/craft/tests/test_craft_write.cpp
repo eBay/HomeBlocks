@@ -25,19 +25,28 @@
 
 #include <array>
 #include <gtest/gtest.h>
+#include <homestore/crc.hpp>
 #include <map>
 #include <set>
 #include <sisl/logging/logging.h>
+#include <sisl/options/options.h>
 
 #include "craft/craft_repl_dev.hpp"
+#include "home_blks_config.hpp"
 #include "coro_helpers.hpp"
 #include "mock_journal_backend.hpp"
 
+// Must match k_craft_crc16_seed in craft_repl_dev.cpp -- same seed volume.cpp's non-CRAFT path uses.
+static constexpr homestore::csum_t k_test_crc16_seed = 0x8005;
+
 SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
+SISL_OPTIONS_ENABLE(logging)
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 
 namespace homeblocks {
 namespace {
+
+static constexpr uint32_t k_page_size = 4096;
 
 // ── journal mock ──────────────────────────────────────────────────────────────
 
@@ -59,10 +68,11 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
-                            bool all_zeros) override {
+    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+                            bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
         if (fail_lsns.contains(lsn)) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        slots[lsn] = JournalSlot{lsn, false, all_zeros, lba, len, {}};
+        slots[lsn] = JournalSlot{
+            .lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .blkid = blkid, .csums = csums};
         slot_terms[lsn] = term;
         co_return ok();
     }
@@ -73,6 +83,9 @@ public:
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();
+    }
+    async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
@@ -88,21 +101,24 @@ protected:
     void SetUp() override {
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
-        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock));
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
 
-    auto do_write(uint64_t term, int64_t lsn, bool all_zeros = true) {
+    auto do_write(uint64_t term, int64_t lsn) {
         return homeblocks::detail::sync_get(
-            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}, all_zeros));
+            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, sisl::sg_list{}));
     }
 
-    // Variant that marks data.size > 0 so the alloc_write_data branch is exercised.
-    // The mock ignores the actual iovecs; only data.size matters for the branch guard.
+    // Variant that marks data.size > 0 so the alloc_write_data branch (and the checksum loop, which
+    // reads real bytes from the first iovec) is exercised. Backed by a real buffer since write()
+    // computes a per-LBA CRC over it.
     auto do_write_with_data(uint64_t term, int64_t lsn) {
+        static std::array< uint8_t, k_page_size > buf{};
         sisl::sg_list data;
-        data.size = 4096;
+        data.size = k_page_size;
+        data.iovs.push_back(iovec{buf.data(), buf.size()});
         return homeblocks::detail::sync_get(
-            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, 4096, std::move(data), false));
+            dev_->write(craft::client_hdr{term, -1, -1}, lsn, 0, k_page_size, std::move(data)));
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -152,9 +168,9 @@ TEST_F(CraftWriteTest, TermRejection) {
     EXPECT_EQ(dev_->missing_count(), 0u);
 }
 
-// all_zeros=true skips data allocation; journal slot is marked all_zeros.
+// Empty data skips data allocation; journal slot is marked all_zeros.
 TEST_F(CraftWriteTest, AllZerosWrite) {
-    auto r = do_write(0, 0, /*all_zeros=*/true);
+    auto r = do_write(0, 0);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->last_append_lsn, 0);
     EXPECT_EQ(dev_->missing_count(), 0u);
@@ -264,13 +280,13 @@ TEST_F(CraftWriteTest, DuplicateWriteIsIdempotent) {
     EXPECT_EQ(journal_->alloc_write_data_calls, 1);
     EXPECT_FALSE(journal_->slots[1].all_zeros); // data slot preserved
 
-    auto r_zero = do_write(0, 1, /*all_zeros=*/true);
+    auto r_zero = do_write(0, 1);
     ASSERT_TRUE(r_zero.has_value());
     EXPECT_EQ(journal_->slot_count(), 2u);          // write_slot not called again
     EXPECT_EQ(journal_->alloc_write_data_calls, 1); // no extra alloc for the all_zeros retry
 
-    // cross-type: all_zeros write first, then data retry at dLSN=2 — data is discarded
-    auto r_zero2 = do_write(0, 2, /*all_zeros=*/true);
+    // cross-type: zero write first, then data retry at dLSN=2 — data is discarded
+    auto r_zero2 = do_write(0, 2);
     ASSERT_TRUE(r_zero2.has_value());
     EXPECT_EQ(journal_->slot_count(), 3u);
     EXPECT_EQ(journal_->alloc_write_data_calls, 1); // all_zeros never allocates
@@ -436,8 +452,8 @@ TEST_F(CraftWriteTest, NonZeroWriteIsZeroCopy) {
     data.size = buf.size();
     data.iovs.push_back(iovec{buf.data(), buf.size()});
 
-    auto r = homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, buf.size(),
-                                                      std::move(data), /* all_zeros = */ false));
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, buf.size(), std::move(data)));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(journal_->last_alloc_data_ptr, static_cast< void const* >(buf.data()));
 }
@@ -466,26 +482,14 @@ TEST_F(CraftWriteTest, WriteSlotFailsWithData_BlocksFreed) {
     EXPECT_TRUE(dev_->is_missing(0));               // pre-insert invariant holds
 }
 
-// all_zeros=false with an empty sg_list (data.size==0) was previously a RELEASE_ASSERT (process abort).
-// After the fix it returns invalid_argument so a malformed client frame cannot kill the replica.
-TEST_F(CraftWriteTest, AllZerosFalseWithEmptyDataRejected) {
-    sisl::sg_list empty_data{};
-    auto r = homeblocks::detail::sync_get(
-        dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, 4096, std::move(empty_data), /*all_zeros=*/false));
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
-    EXPECT_EQ(journal_->slot_count(), 0u);  // write_slot not reached
-    EXPECT_EQ(dev_->last_append_lsn(), -1); // no state mutation
-}
-
-// The inverse bad combination: all_zeros=true with a non-empty sg_list. Previously silently
-// accepted and dropped the payload (the guard only covered !all_zeros && data.size == 0); now
-// rejected symmetrically, since WRITE_ZEROES/unmap names a range and must not also carry data.
-TEST_F(CraftWriteTest, AllZerosTrueWithNonEmptyDataRejected) {
+// A malformed sg_list (data.size > 0 but iovs is empty) is rejected -- the CRAFT connector builds
+// sg_lists from real payloads, so this should be unreachable, but protects against a connector
+// bug that sets size without populating the iovec.
+TEST_F(CraftWriteTest, MalformedSgListRejected) {
     sisl::sg_list data;
-    data.size = 4096;
+    data.size = 4096; // size set but no iovs -- malformed
     auto r = homeblocks::detail::sync_get(
-        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, 4096, std::move(data), /* all_zeros = */ true));
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, 4096, std::move(data)));
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
     EXPECT_EQ(journal_->slot_count(), 0u);  // write_slot not reached
@@ -503,10 +507,108 @@ TEST_F(CraftWriteTest, WriteSlotReceivesCorrectTerm) {
     EXPECT_EQ(journal_->slot_terms[0], k_term);
 }
 
+// len must be a positive multiple of lba_size_ -- len=0 would let nlbas=0 reach commit()'s
+// end_lba = start_lba + nlbas - 1 computation later, underflowing lba_t (unsigned) into a
+// near-UINT64_MAX range applied to the real index.
+TEST_F(CraftWriteTest, ZeroLenRejected) {
+    sisl::sg_list empty_data{};
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, /* len = */ 0, std::move(empty_data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(journal_->slot_count(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), -1);
+}
+
+// A len that doesn't evenly divide lba_size_ is rejected -- it would otherwise silently round
+// nlbas down (e.g. len < lba_size_ rounds to nlbas=0, the same underflow risk as ZeroLenRejected).
+TEST_F(CraftWriteTest, UnalignedLenRejected) {
+    sisl::sg_list empty_data{};
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, /* len = */ k_page_size / 2, std::move(empty_data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+}
+
+// addr must also be block-aligned (the BYTE-addressed API's own documented contract) -- an
+// unaligned addr would silently floor-divide to the wrong starting LBA everywhere it's used.
+TEST_F(CraftWriteTest, UnalignedAddrRejected) {
+    sisl::sg_list empty_data{};
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, 0, /* addr = */ 1, k_page_size, std::move(empty_data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+}
+
+// write() computes a real per-LBA CRC16 (crc16_t10dif) over the payload while it's still in
+// memory -- verify the computed value matches an independently-computed one, not just that
+// something of the right array length reached write_slot.
+TEST_F(CraftWriteTest, ComputesCorrectChecksum) {
+    std::array< uint8_t, k_page_size > buf{};
+    buf.fill(0xCD);
+    sisl::sg_list data;
+    data.size = k_page_size;
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{0, -1, -1}, /* dlsn = */ 0, 0, k_page_size, std::move(data)));
+    ASSERT_TRUE(r.has_value());
+
+    auto expected = crc16_t10dif(k_test_crc16_seed, buf.data(), buf.size());
+    ASSERT_EQ(journal_->slots[0].csums.size(), 1u);
+    EXPECT_EQ(journal_->slots[0].csums[0], expected);
+}
+
+// A write spanning multiple LBAs computes one checksum per LBA, each over its own page -- not a
+// single checksum for the whole buffer, and not the same value repeated for every page.
+TEST_F(CraftWriteTest, MultiLbaWriteComputesPerLbaChecksums) {
+    constexpr uint32_t k_nlbas = 3;
+    std::array< uint8_t, k_nlbas * k_page_size > buf{};
+    // Distinct content per page so identical checksums would indicate a bug (e.g. always hashing
+    // just the first page for every LBA).
+    for (uint32_t i = 0; i < k_nlbas; ++i)
+        std::fill_n(buf.data() + i * k_page_size, k_page_size, uint8_t(i + 1));
+    sisl::sg_list data;
+    data.size = buf.size();
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+
+    auto r = homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, buf.size(), std::move(data)));
+    ASSERT_TRUE(r.has_value());
+
+    ASSERT_EQ(journal_->slots[0].csums.size(), k_nlbas);
+    for (uint32_t i = 0; i < k_nlbas; ++i) {
+        auto expected = crc16_t10dif(k_test_crc16_seed, buf.data() + i * k_page_size, k_page_size);
+        EXPECT_EQ(journal_->slots[0].csums[i], expected);
+    }
+    EXPECT_NE(journal_->slots[0].csums[0], journal_->slots[0].csums[1]);
+    EXPECT_NE(journal_->slots[0].csums[1], journal_->slots[0].csums[2]);
+}
+
+// ── craft_max_io_len_mb enforcement in write() ───────────────────────────────
+
+// craft_max_io_len_mb is set to 1 MiB in main() -- a write of 1 MiB + one page (page-aligned,
+// non-zero) must be rejected before any block allocation. Guards against a malformed wire frame
+// driving an unbounded index range operation or a multi-GiB allocation.
+TEST_F(CraftWriteTest, MaxIoLenEnforced) {
+    // 1 MiB + one page: aligned, non-zero, but above the 1 MiB cap.
+    constexpr uint64_t k_over_limit = 1024 * 1024 + k_page_size;
+    sisl::sg_list data;
+    data.size = k_over_limit; // the len > max_io_len check fires before any sg_list access
+    auto r =
+        homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, 0, 0, k_over_limit, std::move(data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(journal_->slots.size(), 0u); // no slot written
+}
+
 } // namespace
 } // namespace homeblocks
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    SISL_OPTIONS_LOAD(argc, argv, logging);
+    // craft_watchdog_timeout_ms=0: watchdog disabled (no iomgr needed).
+    // craft_max_io_len_mb=1: small cap for MaxIoLenEnforced test; all other tests use <= 12 KiB.
+    HB_SETTINGS_FACTORY().load_json("{\"craft_watchdog_timeout_ms\": 0, \"craft_max_io_len_mb\": 1}");
     return RUN_ALL_TESTS();
 }

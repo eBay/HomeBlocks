@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "index_fixed_kv.hpp"
 
 namespace homeblocks {
@@ -81,6 +83,27 @@ public:
             return std::unexpected(volume_error::INDEX_ERROR);
         }
         return {};
+    }
+
+    // Unmap [start_lba, end_lba]: removes every index entry in range in a single range-remove call,
+    // capturing each removed entry's blkid via the filter callback (which is invoked once per entry
+    // and unconditionally votes to remove it) so the caller can reclaim those blocks.
+    status delete_lba_range(lba_t start_lba, lba_t end_lba, std::vector< homestore::blk_id >& out_freed_blkids) {
+        homestore::remove_filter_cb_t filter_cb = [&out_freed_blkids](homestore::BtreeKey const&,
+                                                                      homestore::BtreeValue const& value) -> bool {
+            out_freed_blkids.push_back(static_cast< VolumeIndexValue const& >(value).blkid());
+            return true; // unconditionally remove every entry in range
+        };
+        auto rreq = homestore::BtreeRangeRemoveRequest< VolumeIndexKey >{
+            homestore::BtreeKeyRange< VolumeIndexKey >{VolumeIndexKey{start_lba}, VolumeIndexKey{end_lba}}, nullptr,
+            std::numeric_limits< uint32_t >::max(), filter_cb};
+        // not_found: nothing was mapped in this range -- unmap of nothing is a no-op, not a failure.
+        if (auto result = hs_index_table_->remove(rreq);
+            result != homestore::btree_status_t::success && result != homestore::btree_status_t::not_found) {
+            LOGERROR("Failed to remove lba range [{}, {}] from index, error={}", start_lba, end_lba, result);
+            return std::unexpected(volume_error::INDEX_ERROR);
+        }
+        return ok();
     }
 
     void rollback_write(lba_t start_lba, lba_t end_lba, std::unordered_map< lba_t, BlockInfo >& blocks_info) {

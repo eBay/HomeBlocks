@@ -29,8 +29,10 @@
 #include <cstring>
 
 #include <gtest/gtest.h>
+#include <sisl/async/value_awaitable.hpp>
 #include <sisl/options/options.h>
 #include <homestore/logstore_service.hpp>
+#include <iomgr/iomgr.hpp>
 
 #include "hb_internal.hpp"
 #include "craft/craft_repl_dev.hpp"
@@ -44,6 +46,30 @@ SISL_LOGGING_DECL(test_craft_homestore_backend)
 std::unique_ptr< test_common::HBTestHelper > g_helper;
 
 using namespace homeblocks;
+
+static constexpr uint32_t k_page_size = 4096;
+
+// Writes a raw blob directly to the log store, bypassing HomeStoreCraftJournalBackend::write_slot's
+// own encoding -- used to simulate a corrupted/malformed on-disk record for read_slot's validate-
+// before-trust tests. Mirrors write_slot's OWN write_async/value_awaitable completion bridge rather
+// than using home_log_store::write_and_flush(): write_and_flush leaves the logdev's completion
+// bookkeeping inconsistent with what a graceful homestore shutdown expects, hanging teardown
+// indefinitely (confirmed by bisection -- every test using it hangs in isolation; every test using
+// this bridge, or write_slot itself, does not).
+void write_raw_blob(shared< homestore::home_log_store > const& logstore, int64_t lsn, sisl::io_blob_safe const& blob) {
+    auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
+    auto write_ret = logstore->write_async(
+        static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
+        [va](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
+            iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
+                                    [va = std::move(va)]() mutable { va->complete(true); });
+        });
+    ASSERT_GE(write_ret, 0);
+    homeblocks::detail::sync_get([va]() -> homestore::async_status {
+        co_await *va;
+        co_return homestore::ok();
+    }());
+}
 
 class CraftHomeStoreBackendTest : public ::testing::Test {
 protected:
@@ -63,11 +89,11 @@ protected:
 TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
 
-    auto r =
-        homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
-                                                         homestore::multi_blk_id{}, /* all_zeros = */ true));
+    auto r = homeblocks::detail::sync_get(
+        backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{},
+                            /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
     ASSERT_TRUE(r.has_value());
 }
 
@@ -76,11 +102,12 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
 TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
 
     for (int64_t lsn = 0; lsn <= 4; ++lsn) {
         auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
-                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true));
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
+                                                                  std::vector< homestore::csum_t >{}));
         ASSERT_TRUE(r.has_value());
     }
     ASSERT_EQ(logstore->tail_lsn(), 4);
@@ -88,6 +115,123 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     auto r = homeblocks::detail::sync_get(backend->truncate_to(2));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(logstore->tail_lsn(), 2);
+}
+
+// read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    homestore::multi_blk_id blkid{/* blk_num = */ 42, /* nblks = */ 2, /* chunk_num = */ 7};
+    std::vector< homestore::csum_t > csums{111, 222};
+
+    auto w = homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 3, /* term = */ 5, /* lba = */ 100,
+                                                              /* len = */ 2 * k_page_size, blkid,
+                                                              /* all_zeros = */ false, csums));
+    ASSERT_TRUE(w.has_value());
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(3));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->lsn, 3);
+    EXPECT_FALSE(r->all_zeros);
+    EXPECT_EQ(r->lba_off_bytes, 100u);
+    EXPECT_EQ(r->len_bytes, 2 * k_page_size);
+    EXPECT_EQ(r->csums, csums);
+    EXPECT_TRUE(r->blkid == blkid);
+}
+
+// A never-appended lsn must fail cleanly (the log store throws std::out_of_range internally).
+TEST_F(CraftHomeStoreBackendTest, ReadSlotUnknownLsnFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(99));
+    ASSERT_FALSE(r.has_value());
+}
+
+// read_slot must round-trip an all_zeros slot correctly: nlbas=0 (empty csum array), and the
+// still-present (empty) serialized multi_blk_id region.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotRoundTripsAllZerosSlot) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto w =
+        homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 200,
+                                                         /* len = */ 2 * k_page_size, homestore::multi_blk_id{},
+                                                         /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
+    ASSERT_TRUE(w.has_value());
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(0));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->all_zeros);
+    EXPECT_EQ(r->lba_off_bytes, 200u);
+    EXPECT_EQ(r->len_bytes, 2 * k_page_size);
+    EXPECT_TRUE(r->csums.empty());
+}
+
+// A blob too small for even the fixed 34-byte header must fail cleanly, not crash or misread
+// garbage as a header.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotTooSmallForHeaderFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    sisl::io_blob_safe tiny{4};
+    std::memset(tiny.bytes(), 0, tiny.size());
+    write_raw_blob(logstore, 0, tiny);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(0));
+    ASSERT_FALSE(r.has_value());
+}
+
+// A record with a correctly-sized blob but a stomped magic must be rejected rather than trusted.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotBadMagicFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    // Write a real all_zeros slot to get a correctly-sized, otherwise-valid blob.
+    auto w =
+        homeblocks::detail::sync_get(backend->write_slot(0, 1, 0, k_page_size, homestore::multi_blk_id{},
+                                                         /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
+    ASSERT_TRUE(w.has_value());
+
+    // Corrupt the leading bytes (the on-disk magic field starts at offset 0) and rewrite at a
+    // fresh lsn -- read_slot must reject it rather than trust a garbage header.
+    auto raw = logstore->read_sync(0);
+    sisl::io_blob_safe corrupted{raw.size()};
+    std::memcpy(corrupted.bytes(), raw.bytes(), raw.size());
+    std::memset(corrupted.bytes(), 0xFF, 4);
+    write_raw_blob(logstore, 1, corrupted);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(1));
+    ASSERT_FALSE(r.has_value());
+}
+
+// A truncated blob (real header/magic, but cut short of even the fixed header size) must be
+// rejected rather than read past the end of the buffer.
+TEST_F(CraftHomeStoreBackendTest, ReadSlotTruncatedBlobFails) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    homestore::multi_blk_id blkid{42, 2, 7};
+    std::vector< homestore::csum_t > csums{111, 222};
+    auto w = homeblocks::detail::sync_get(
+        backend->write_slot(0, 1, 0, 2 * k_page_size, blkid, /* all_zeros = */ false, csums));
+    ASSERT_TRUE(w.has_value());
+
+    auto raw = logstore->read_sync(0);
+    ASSERT_GT(raw.size(), 10u);
+    sisl::io_blob_safe truncated{10}; // smaller than even the fixed 34-byte header
+    std::memcpy(truncated.bytes(), raw.bytes(), 10);
+    write_raw_blob(logstore, 1, truncated);
+
+    auto r = homeblocks::detail::sync_get(backend->read_slot(1));
+    ASSERT_FALSE(r.has_value());
 }
 
 // alloc_write_data's application_hint routes allocation through VolumeChunkSelector by vol_ordinal.
@@ -99,7 +243,7 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
 TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdinal) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
 
     constexpr uint32_t k_len = 4096;
     sisl::io_blob_safe buf{k_len, 512};

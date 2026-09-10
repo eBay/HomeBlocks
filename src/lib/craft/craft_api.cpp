@@ -51,10 +51,10 @@ async_status logout(volume_handle const& vol, craft::client_hdr hdr) {
 }
 
 async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn,
-                                            uint64_t addr, uint64_t len, sisl::sg_list data, bool all_zeros) {
+                                            uint64_t addr, uint64_t len, sisl::sg_list data) {
     auto* d = craft_dev_of(vol);
     if (!d) co_return no_craft_backend();
-    co_return co_await d->write(hdr, dlsn, addr, len, std::move(data), all_zeros);
+    co_return co_await d->write(hdr, dlsn, addr, len, std::move(data));
 }
 
 async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr, int64_t read_lsn,

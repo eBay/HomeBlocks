@@ -57,9 +57,10 @@ static_assert(std::is_same_v< decltype(JournalSlot::is_empty), decltype(craft::J
 static_assert(std::is_same_v< decltype(JournalSlot::all_zeros), decltype(craft::JournalSlot::all_zeros) >);
 static_assert(std::is_same_v< decltype(JournalSlot::lba_off_bytes), decltype(craft::JournalSlot::lba) >);
 static_assert(std::is_same_v< decltype(JournalSlot::len_bytes), decltype(craft::JournalSlot::len) >);
-static_assert(sizeof(JournalSlot) == sizeof(craft::JournalSlot),
-              "homeblocks::JournalSlot must stay layout-compatible with craft::JournalSlot "
-              "(craft_client's include/craft/peer.hpp)");
+// homeblocks::JournalSlot is intentionally a superset of craft::JournalSlot: it carries two
+// additional HomeBlocks-internal fields (blkid, csums) that are parsed from the on-disk blob but
+// are never part of the wire format. sizeof equality no longer holds; the per-field is_same_v
+// checks above are the effective wire-compat pin for the shared fields.
 
 // ── round-trip helpers ────────────────────────────────────────────────────────
 

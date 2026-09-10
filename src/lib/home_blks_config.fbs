@@ -28,6 +28,18 @@ table HomeBlksSettings{
     // deadline (in milliseconds) for a server-to-server peer fetch_data() call;
     // a peer that misses it is treated as unreachable, same as a hard failure.
     peer_fetch_timeout_ms: uint32 = 5000;
+
+    // CRAFT client-liveness watchdog timeout in milliseconds -- reset on every successful write()/
+    // keep_alive(); on expiry (no activity from the current session) proposes a SyncRSCommitLSN
+    // entry via append() so the replica set can make progress without the client.
+    // 0 = watchdog disabled.
+    craft_watchdog_timeout_ms: uint64 = 30000;
+
+    // Maximum byte length (in MiB) accepted for a single CRAFT write() or read() call. Requests
+    // larger than this are rejected with invalid_argument -- both paths are reachable from the
+    // client wire, so an unbounded len would allow a malformed frame to drive an unbounded index
+    // range operation or a multi-GiB allocation.
+    craft_max_io_len_mb: uint64 = 128;
 }
 
 root_type HomeBlksSettings;
