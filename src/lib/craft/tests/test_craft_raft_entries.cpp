@@ -324,8 +324,7 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
-        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
-        JournalSlot{.lsn = 2, .is_empty = true},
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4}, JournalSlot{.lsn = 2, .is_empty = true},
         JournalSlot{.lsn = 99, .is_empty = true}, // never requested -- only 1 and 2 were
     };
 
