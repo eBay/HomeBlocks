@@ -31,6 +31,7 @@
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
 // a running HomeStore instance.
 
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -365,14 +366,18 @@ TEST_F(CraftHomeStoreBackendTest, FreeSlotRejectsCorruptEntry) {
     std::mutex mu;
     std::condition_variable cv;
     bool done = false;
-    logstore->write_async(/* seq_num = */ 0, raw_blob, nullptr,
-                          [&](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) {
-                              std::lock_guard< std::mutex > lk{mu};
-                              done = true;
-                              cv.notify_one();
-                          });
+    auto write_ret = logstore->write_async(
+        /* seq_num = */ 0, raw_blob, nullptr,
+        [&](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) {
+            std::lock_guard< std::mutex > lk{mu};
+            done = true;
+            cv.notify_one();
+        });
+    ASSERT_GE(write_ret, 0) << "write_async rejected -- log store or logdev is stopping, callback will not fire";
+
     std::unique_lock< std::mutex > lk{mu};
-    cv.wait(lk, [&] { return done; });
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5), [&] { return done; }))
+        << "write_async callback never fired -- lost completion (see craft_repl_dev.cpp:139-150)";
     lk.unlock();
 
     auto r = homeblocks::detail::sync_get(backend->free_slot(0));
