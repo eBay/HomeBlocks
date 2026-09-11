@@ -341,11 +341,11 @@ TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdin
 TEST_F(CraftHomeStoreBackendTest, FreeSlotSucceedsForRealEntry) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
 
-    auto w = homeblocks::detail::sync_get(backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0,
-                                                              /* len = */ 4096, homestore::multi_blk_id{},
-                                                              /* all_zeros = */ true));
+    auto w = homeblocks::detail::sync_get(
+        backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{},
+                            /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
     ASSERT_TRUE(w.has_value());
 
     auto r = homeblocks::detail::sync_get(backend->free_slot(0));
@@ -358,7 +358,7 @@ TEST_F(CraftHomeStoreBackendTest, FreeSlotSucceedsForRealEntry) {
 TEST_F(CraftHomeStoreBackendTest, FreeSlotRejectsCorruptEntry) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
 
     std::vector< uint8_t > garbage(64, 0xEE); // larger than sizeof(CraftJournalEntry); not its magic/version
     sisl::io_blob raw_blob{garbage.data(), static_cast< uint32_t >(garbage.size()), /* is_aligned = */ false};
