@@ -512,6 +512,20 @@ private:
     async_result< int64_t > commit_impl(int64_t upto_lsn, write_index_fn_t const& write_fn,
                                         delete_index_fn_t const& delete_fn);
 
+    // Must be called with missing_mu_ held. Returns true if commit_lsn_snapshot has crossed
+    // checkpoint_lsn_interval_ since last_checkpoint_lsn_ -- and if so, updates last_checkpoint_lsn_ to
+    // commit_lsn_snapshot before returning, so an overlapping caller under the same lock observes the
+    // new value rather than racing on a stale one. Split from fire_checkpoint_trigger() because that
+    // awaits (via detail::detach) and must not run with the lock held.
+    bool checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot);
+
+    // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
+    // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
+    // same commit_lsn_snapshot. Safe without missing_mu_ held. Shared by every commit_lsn-advance path:
+    // commit_impl() (covers write()'s piggyback and keep_alive()) and apply_sync_rs_commit_lsn()'s own
+    // walk-forward loop.
+    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
+
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
     // declared at the top of this class) so tests can exercise it against a fake index instead of a
     // real VolumeIndexTable. read() binds this to indx_tbl_'s real read_from_index; read_with()

@@ -765,6 +765,41 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_return snapshot;
 }
 
+// ─── proactive checkpoint trigger (SDSTOR-22888) ─────────────────────────────
+//
+// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback and
+// keep_alive() -- and apply_sync_rs_commit_lsn()'s own walk-forward loop) so a checkpoint fires
+// regardless of which path is driving commit_lsn forward. Split into a locked check and an unlocked
+// fire because the fire awaits (via detail::detach) and must not run with missing_mu_ held.
+
+bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot) {
+    // Interval reuses sync_rs_commit_lsn_interval (via checkpoint_lsn_interval_) rather than its own
+    // knob -- ties checkpoint cadence to the periodic SyncRSCommitLSN cadence. last_checkpoint_lsn_ is
+    // updated here, before the caller releases missing_mu_, so two overlapping callers can't both read
+    // the same stale last_checkpoint_lsn_ and both decide to fire.
+    if (commit_lsn_snapshot - last_checkpoint_lsn_ < checkpoint_lsn_interval_) return false;
+    last_checkpoint_lsn_ = commit_lsn_snapshot;
+    return true;
+}
+
+void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
+    if (checkpoint_trigger_ == nullptr) {
+        LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
+             commit_lsn_snapshot);
+        return;
+    }
+    // force=false: let this coalesce with any checkpoint already in flight rather than forcing
+    // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc comment).
+    // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
+    // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
+    auto self = shared_from_this();
+    detail::detach([self, commit_lsn_snapshot]() -> async_status {
+        if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+            LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
+        co_return ok();
+    }());
+}
+
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
 //
 // Advances commit_lsn toward upto_lsn by applying each committable slot to the index. At most one
@@ -907,8 +942,15 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         state_.commit_lsn = lsn;
     }
 
-    std::lock_guard lk{missing_mu_};
-    co_return state_.commit_lsn;
+    int64_t final_commit_lsn;
+    bool should_checkpoint;
+    {
+        std::lock_guard lk{missing_mu_};
+        final_commit_lsn = state_.commit_lsn;
+        should_checkpoint = checkpoint_interval_crossed_locked(final_commit_lsn);
+    }
+    if (should_checkpoint) fire_checkpoint_trigger(final_commit_lsn);
+    co_return final_commit_lsn;
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
@@ -1219,9 +1261,6 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     co_return craft::read_result{std::move(extents), snapshot};
 }
 
-// TODO(SDSTOR-22733): once implemented, this is the other commit_lsn-advance path SDSTOR-22888's
-// checkpoint trigger needs to cover (see apply_sync_rs_commit_lsn's own hook) -- same
-// checkpoint_lsn_interval_/last_checkpoint_lsn_ bookkeeping under missing_mu_, same force=false.
 async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) {
     // Checked ahead of recovering_: a faulted restart recovery is permanent, not a "still starting up,
     // try again shortly" condition -- see recovery_faulted_'s doc comment.
@@ -1745,7 +1784,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
     // the time this advance actually runs, breaking strict RAFT apply ordering.
     int64_t commit_lsn_snapshot;
-    bool should_checkpoint = false;
+    bool should_checkpoint;
     {
         std::lock_guard lk{missing_mu_};
         int64_t next = state_.commit_lsn + 1;
@@ -1756,35 +1795,12 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         commit_lsn_snapshot = state_.commit_lsn;
         // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
         // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
-        // doesn't lag arbitrarily far behind commit_lsn. Interval reuses sync_rs_commit_lsn_interval
-        // (via checkpoint_lsn_interval_) rather than its own knob -- ties checkpoint cadence to the
-        // periodic SyncRSCommitLSN cadence. last_checkpoint_lsn_ is updated right here, before the
-        // lock is released  so that two overlapping apply_sync_rs_commit_lsn calls can't both read
-        // the same stale last_checkpoint_lsn_ and both decide to fire.
-        if (commit_lsn_snapshot - last_checkpoint_lsn_ >= checkpoint_lsn_interval_) {
-            last_checkpoint_lsn_ = commit_lsn_snapshot;
-            should_checkpoint = true;
-        }
+        // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
+        // write()'s piggyback and keep_alive() (which don't go through this function) advance the
+        // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
+        should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
-    if (should_checkpoint) {
-        // force=false: let this coalesce with any checkpoint already in flight rather than forcing
-        // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc
-        // comment). Detached (fire-and-forget) -- same pattern as the free_data cleanup above:
-        // nothing here depends on the flush completing. A failure is logged, not propagated,
-        // same posture as catch-up/fetch failures elsewhere in this function.
-        if (checkpoint_trigger_ == nullptr) {
-            LOGW("apply_sync_rs_commit_lsn: commit_lsn={} crossed checkpoint interval but no "
-                 "checkpoint_trigger_ wired -- skipping",
-                 commit_lsn_snapshot);
-        } else {
-            detail::detach([self, commit_lsn_snapshot]() -> async_status {
-                if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
-                    LOGE("apply_sync_rs_commit_lsn: checkpoint trigger failed at commit_lsn={}: {}",
-                         commit_lsn_snapshot, cp.error().message());
-                co_return ok();
-            }());
-        }
-    }
+    if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
 }
