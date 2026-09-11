@@ -30,12 +30,24 @@ using Chunk = homestore::Chunk;
 class VolumeChunkSelector : public homestore::ChunkSelector {
     static constexpr homestore::chunk_num_t num_chunks_per_vol_init = 1;
     static constexpr homestore::chunk_num_t num_chunks_per_resize = 3;
-    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX;
+    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX; // not owned by any volume
 
     struct HBChunk : public homestore::VChunk {
         HBChunk(homestore::cshared< Chunk >& chunk) : homestore::VChunk(chunk) {}
         ~HBChunk() = default;
         uint64_t m_vol_ordinal{INVALID_VOL_ORDINAL};
+
+        /*void reset() {
+            LOGERROR("1. Resetting chunk bitmap");
+            m_vol_ordinal = INVALID_VOL_ORDINAL;
+            this->reset_block_allocator();
+        }*/
+    };
+
+private:
+    enum class ResizeOp {
+        Idle,
+        InProgress,
     };
 
     struct VolumeChunksInfo {
@@ -54,6 +66,10 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
         std::atomic< uint32_t > m_next_chunk_index{0};
         uint64_t ordinal;
         uint32_t pdev;
+
+        std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
+        std::atomic< uint32_t > inflight_selects{};
+        std::atomic< bool > releasing{false};
     };
 
 public:
@@ -93,11 +109,6 @@ private:
     std::string dump_chunks() const;
 
 private:
-    enum class ResizeOp {
-        Idle,
-        InProgress,
-    };
-
     // Store volume chunks details with index as volume ordinal.
     std::vector< shared< VolumeChunksInfo > > m_volume_chunks;
 
@@ -111,9 +122,8 @@ private:
     // for allocation. This pool is used for allocation of chunks to volume.
     // Chunks once allocated to volume are removed from this pool.
     std::unordered_map< uint64_t, ChunkMap > m_per_dev_chunks;
-    mutable std::mutex m_chunk_sel_mutex;
+    mutable std::shared_mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
-    std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
     std::string m_module_name;
 };
 
