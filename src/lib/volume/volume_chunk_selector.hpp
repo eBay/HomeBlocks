@@ -44,6 +44,12 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
         }*/
     };
 
+private:
+    enum class ResizeOp {
+        Idle,
+        InProgress,
+    };
+
     struct VolumeChunksInfo {
         // List of active chunks allocated for the volume.
         // Each volume is assigned and physical device and
@@ -60,6 +66,10 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
         std::atomic< uint32_t > m_next_chunk_index{0};
         uint64_t ordinal;
         uint32_t pdev;
+
+        std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
+        std::atomic< uint32_t > inflight_selects{};
+        std::atomic< bool > releasing{false};
     };
 
 public:
@@ -99,11 +109,6 @@ private:
     std::string dump_chunks() const;
 
 private:
-    enum class ResizeOp {
-        Idle,
-        InProgress,
-    };
-
     // Store volume chunks details with index as volume ordinal.
     std::vector< shared< VolumeChunksInfo > > m_volume_chunks;
 
@@ -117,9 +122,8 @@ private:
     // for allocation. This pool is used for allocation of chunks to volume.
     // Chunks once allocated to volume are removed from this pool.
     std::unordered_map< uint64_t, ChunkMap > m_per_dev_chunks;
-    mutable std::mutex m_chunk_sel_mutex;
+    mutable std::shared_mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
-    std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
     std::string m_module_name;
 };
 
