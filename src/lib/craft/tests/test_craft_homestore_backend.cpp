@@ -22,11 +22,20 @@
 // backend directly rather than through CraftReplDev or a volume -- the narrowest test that still
 // runs the real completion path.
 //
+// Also exercises HomeStoreCraftCheckpointTrigger::trigger_cp_flush (SDSTOR-22888) against the REAL
+// homestore::cp_mgr() -- same rationale: MockCraftCheckpointTrigger (test_craft_raft_entries.cpp)
+// covers CraftReplDev's own gating logic, but the wrapper's factory -> cp_mgr().trigger_cp_flush()
+// -> async_status conversion chain had never been compiled and run against a live CPManager.
+//
 // Links the full homeblocks library (unlike the other craft tests, which compile
 // craft_repl_dev.cpp directly to avoid HomeStore bring-up) because a real home_log_store requires
 // a running HomeStore instance.
 
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <sisl/async/value_awaitable.hpp>
@@ -326,6 +335,73 @@ TEST_F(CraftHomeStoreBackendTest, AllocWriteDataFailsCleanlyForUnregisteredOrdin
 
     auto alloc_r = homeblocks::detail::sync_get(backend->alloc_write_data(data, static_cast< lba_count_t >(k_len)));
     ASSERT_FALSE(alloc_r.has_value());
+}
+
+// free_slot reads the raw entry back off the log store and validates magic/version/lsn before trusting it.
+TEST_F(CraftHomeStoreBackendTest, FreeSlotSucceedsForRealEntry) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto w = homeblocks::detail::sync_get(
+        backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{},
+                            /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
+    ASSERT_TRUE(w.has_value());
+
+    auto r = homeblocks::detail::sync_get(backend->free_slot(0));
+    ASSERT_TRUE(r.has_value());
+}
+
+// Writes a raw blob directly to the log store (bypassing write_slot's serialization entirely) that
+// doesn't conform to CraftJournalEntry's magic/version -- simulates a corrupt or foreign record.
+// free_slot must reject it rather than misreading garbage bytes as a valid blkid.
+TEST_F(CraftHomeStoreBackendTest, FreeSlotRejectsCorruptEntry) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    std::vector< uint8_t > garbage(64, 0xEE); // larger than sizeof(CraftJournalEntry); not its magic/version
+    sisl::io_blob raw_blob{garbage.data(), static_cast< uint32_t >(garbage.size()), /* is_aligned = */ false};
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    auto write_ret = logstore->write_async(
+        /* seq_num = */ 0, raw_blob, nullptr,
+        [&](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) {
+            std::lock_guard< std::mutex > lk{mu};
+            done = true;
+            cv.notify_one();
+        });
+    ASSERT_GE(write_ret, 0) << "write_async rejected -- log store or logdev is stopping, callback will not fire";
+
+    std::unique_lock< std::mutex > lk{mu};
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5), [&] { return done; }))
+        << "write_async callback never fired -- lost completion (see craft_repl_dev.cpp:139-150)";
+    lk.unlock();
+
+    auto r = homeblocks::detail::sync_get(backend->free_slot(0));
+    ASSERT_FALSE(r.has_value());
+}
+
+// force=false: the value apply_sync_rs_commit_lsn's periodic trigger actually passes today.
+TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerFlushesRealCPManager) {
+    auto trigger = make_homestore_checkpoint_trigger();
+    ASSERT_TRUE(trigger != nullptr);
+
+    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ false));
+    ASSERT_TRUE(r.has_value());
+}
+
+// force=true: untested until now -- this is the value truncate()'s FIXME (craft_repl_dev.hpp) says
+// a future correctness-critical call site will need, but the passthrough itself had never been
+// exercised against the real cp_mgr() for either value.
+TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
+    auto trigger = make_homestore_checkpoint_trigger();
+    ASSERT_TRUE(trigger != nullptr);
+
+    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ true));
+    ASSERT_TRUE(r.has_value());
 }
 
 int main(int argc, char* argv[]) {

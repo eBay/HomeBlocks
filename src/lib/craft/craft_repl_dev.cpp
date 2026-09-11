@@ -23,6 +23,7 @@
 
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/crc.hpp>                // crc16_t10dif -- same routine and seed volume.cpp uses
+#include <homestore/checkpoint/cp_mgr.hpp>  // cp_mgr(), CPManager::trigger_cp_flush()
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
 #include <iomgr/iomgr.hpp>                  // iomanager singleton, reactor_regex
 #include <iomgr/timer.hpp>                  // iomgr::schedule_recurring -- the watchdog's RAII timer
@@ -317,6 +318,15 @@ public:
         }
         CraftJournalEntry hdr{};
         std::memcpy(&hdr, buf.bytes(), sizeof(CraftJournalEntry));
+        if (hdr.magic != k_journal_magic || hdr.version != k_journal_version) {
+            LOGE("free_slot: corrupt or foreign entry lsn={} magic={:#x} version={} -- refusing to free", lsn,
+                 hdr.magic, hdr.version);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (hdr.lsn != lsn) {
+            LOGE("free_slot: lsn mismatch requested={} stored={} -- refusing to free", lsn, hdr.lsn);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
         if (hdr.all_zeros) co_return ok();
 
         // hdr.len bytes of real data means a non-empty csum array precedes the blkid in this
@@ -353,6 +363,23 @@ private:
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
                                                              uint64_t vol_ordinal, uint32_t lba_size) {
     return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal, lba_size);
+}
+
+// ─── HomeStoreCraftCheckpointTrigger (SDSTOR-22888) ──────────────────────────
+//
+// Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
+
+class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
+public:
+    async_status trigger_cp_flush(bool force) override {
+        if (!co_await homestore::cp_mgr().trigger_cp_flush(force))
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        co_return ok();
+    }
+};
+
+unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger() {
+    return std::make_unique< HomeStoreCraftCheckpointTrigger >();
 }
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -738,6 +765,41 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_return snapshot;
 }
 
+// ─── proactive checkpoint trigger (SDSTOR-22888) ─────────────────────────────
+//
+// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback and
+// keep_alive() -- and apply_sync_rs_commit_lsn()'s own walk-forward loop) so a checkpoint fires
+// regardless of which path is driving commit_lsn forward. Split into a locked check and an unlocked
+// fire because the fire awaits (via detail::detach) and must not run with missing_mu_ held.
+
+bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot) {
+    // Interval reuses sync_rs_commit_lsn_interval (via checkpoint_lsn_interval_) rather than its own
+    // knob -- ties checkpoint cadence to the periodic SyncRSCommitLSN cadence. last_checkpoint_lsn_ is
+    // updated here, before the caller releases missing_mu_, so two overlapping callers can't both read
+    // the same stale last_checkpoint_lsn_ and both decide to fire.
+    if (commit_lsn_snapshot - last_checkpoint_lsn_ < checkpoint_lsn_interval_) return false;
+    last_checkpoint_lsn_ = commit_lsn_snapshot;
+    return true;
+}
+
+void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
+    if (checkpoint_trigger_ == nullptr) {
+        LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
+             commit_lsn_snapshot);
+        return;
+    }
+    // force=false: let this coalesce with any checkpoint already in flight rather than forcing
+    // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc comment).
+    // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
+    // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
+    auto self = shared_from_this();
+    detail::detach([self, commit_lsn_snapshot]() -> async_status {
+        if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+            LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
+        co_return ok();
+    }());
+}
+
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
 //
 // Advances commit_lsn toward upto_lsn by applying each committable slot to the index. At most one
@@ -880,8 +942,15 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         state_.commit_lsn = lsn;
     }
 
-    std::lock_guard lk{missing_mu_};
-    co_return state_.commit_lsn;
+    int64_t final_commit_lsn;
+    bool should_checkpoint;
+    {
+        std::lock_guard lk{missing_mu_};
+        final_commit_lsn = state_.commit_lsn;
+        should_checkpoint = checkpoint_interval_crossed_locked(final_commit_lsn);
+    }
+    if (should_checkpoint) fire_checkpoint_trigger(final_commit_lsn);
+    co_return final_commit_lsn;
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
@@ -1601,7 +1670,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    std::vector< int64_t > to_free;
+    std::unordered_set< int64_t > to_free;
     std::vector< int64_t > to_fetch;
     uint64_t term;
     {
@@ -1617,7 +1686,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            if (missing_lsns_.erase(lsn)) { to_free.push_back(lsn); }
+            bool const was_missing = missing_lsns_.erase(lsn) > 0;
+            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
@@ -1680,7 +1750,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     blkid_allocated = true;
                 }
 
-                // FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
+                // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+                // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+                // default instance. That's an implicit, undocumented dependency on HomeStore's current
+                // behavior -- see SDSTOR-25613.
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros, slot.csums);
                 if (!res) {
@@ -1710,6 +1783,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
     // the time this advance actually runs, breaking strict RAFT apply ordering.
+    int64_t commit_lsn_snapshot;
+    bool should_checkpoint;
     {
         std::lock_guard lk{missing_mu_};
         int64_t next = state_.commit_lsn + 1;
@@ -1717,7 +1792,15 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
             state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
             ++next;
         }
+        commit_lsn_snapshot = state_.commit_lsn;
+        // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
+        // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
+        // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
+        // write()'s piggyback and keep_alive() (which don't go through this function) advance the
+        // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
+        should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
+    if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
 }
