@@ -13,7 +13,7 @@
  *
  *********************************************************************************/
 
-// Real multi-threaded tests for CraftReplDev's own internal locking (missing_mu_, overlay_mu_,
+// Real multi-threaded tests for CraftReplDev's own internal locking (state_mu_, overlay_mu_,
 // commit_running_) -- every other CRAFT test drives calls from a single thread via sync_get(), so
 // none of them ever exercise genuine concurrent contention on these locks.
 //
@@ -344,7 +344,7 @@ TEST_F(CraftConcurrencyTest, ConcurrentWriteAndReadNoTornReads) {
 }
 
 // N real threads all call commit_with() targeting the same upto_lsn concurrently against a shared,
-// pre-seeded journal -- commit_running_ (guarded by missing_mu_) must ensure the apply loop's
+// pre-seeded journal -- commit_running_ (guarded by state_mu_) must ensure the apply loop's
 // write_fn runs for each LBA EXACTLY ONCE across all callers combined, never zero (stall) and never
 // twice (double-apply), regardless of which thread actually "wins" the race. write_fn sleeps briefly
 // to widen the window so concurrent callers genuinely overlap with the winner's in-flight run rather
@@ -395,7 +395,7 @@ TEST_F(CraftConcurrencyTest, ConcurrentCommitWithSerializesNoDoubleApply) {
 // production (write, commit/keep_alive-equivalent, read -- NOT truncate(), which is documented as
 // login-only/quiesced and would violate its own precondition if raced against concurrent writes) --
 // all firing simultaneously from many real threads for a sustained run, against a single shared
-// instance. Every one of missing_mu_, overlay_mu_, and commit_running_ is under real contention at
+// instance. Every one of state_mu_, overlay_mu_, and commit_running_ is under real contention at
 // once, not in isolation the way the more focused tests above exercise them one at a time.
 //
 // Correctness is checked two ways: (1) no operation anywhere in the run returns an unexpected error

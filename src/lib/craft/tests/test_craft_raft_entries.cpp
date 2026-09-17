@@ -210,7 +210,7 @@ namespace {
 // ── client_token is not gated ─────────────────────────────────────────────────
 
 // client_token is carried for observability only -- a mismatch must NOT block the apply. See the inline
-// comment in apply_sync_rs_commit_lsn (under missing_mu_) for why: SyncRSCommitLSN applies before the
+// comment in apply_sync_rs_commit_lsn (under state_mu_) for why: SyncRSCommitLSN applies before the
 // InternalLogin that would establish state_.client_token, so an equality-fence here would make login
 // itself unreachable.
 TEST_F(CraftRaftEntriesTest, ClientTokenMismatchDoesNotBlockApply) {

@@ -25,7 +25,7 @@ add_dependencies(test_craft_truncate ${PROJECT_NAME}_core)
 
 add_test(NAME CraftTruncateTest COMMAND test_craft_truncate)
 
-# Real multi-threaded tests for CraftReplDev's own internal locking (missing_mu_, overlay_mu_,
+# Real multi-threaded tests for CraftReplDev's own internal locking (state_mu_, overlay_mu_,
 # commit_running_). Same pattern as test_craft_truncate (compile craft_repl_dev.cpp directly, no
 # HomeStore/iomgr) -- MockCraftJournalBackend's coroutine bodies never suspend across a real async
 # boundary, so real std::thread callers drive genuinely concurrent CraftReplDev execution with no
