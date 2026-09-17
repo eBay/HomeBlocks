@@ -583,7 +583,7 @@ private:
     // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
-                                    // in_flight_write_dlsns_, and last_checkpoint_lsn_
+                                  // in_flight_write_dlsns_, and last_checkpoint_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.

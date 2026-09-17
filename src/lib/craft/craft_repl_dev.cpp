@@ -372,9 +372,13 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
 public:
     async_status trigger_cp_flush(bool force) override {
-        if (!co_await homestore::cp_mgr().trigger_cp_flush(force))
-            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-        co_return ok();
+        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
+        // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
+        // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
+        // (this trigger's only current caller, fire_checkpoint_trigger, coalesces with any in-flight
+        // flush on purpose). Only a force=true false return is a real failure worth surfacing.
+        if (!force) co_return ok();
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
 };
 

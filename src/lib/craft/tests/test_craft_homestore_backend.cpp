@@ -39,6 +39,7 @@
 
 #include <gtest/gtest.h>
 #include <sisl/async/value_awaitable.hpp>
+#include <sisl/async/when_all.hpp>
 #include <sisl/options/options.h>
 #include <homestore/logstore_service.hpp>
 #include <iomgr/iomgr.hpp>
@@ -402,6 +403,28 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
 
     auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ true));
     ASSERT_TRUE(r.has_value());
+}
+
+// cp_mgr()'s in-flight-flush gate (m_in_flush_phase) is a synchronous check-and-set at entry: the
+// first of several concurrent trigger_cp_flush(false) calls holds it for the duration of the real
+// flush, so every other concurrent call observes it already set and gets HomeStore's synchronous
+// false back -- not a failure. HomeStoreCraftCheckpointTrigger must map that to ok() when
+// force=false; every one of these concurrent calls must succeed, not just the one that actually flushed.
+TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFails) {
+    auto trigger = make_homestore_checkpoint_trigger();
+    ASSERT_TRUE(trigger != nullptr);
+
+    constexpr int k_concurrent = 20;
+    std::vector< homestore::async_status > futs; // async_status is itself a sisl::async::task<result<...>>
+    futs.reserve(k_concurrent);
+    for (int i = 0; i < k_concurrent; ++i) {
+        futs.push_back(trigger->trigger_cp_flush(/* force = */ false));
+    }
+
+    auto const results = homeblocks::detail::sync_get(sisl::async::when_all(std::move(futs)));
+    for (auto const& r : results) {
+        EXPECT_TRUE(r.has_value());
+    }
 }
 
 int main(int argc, char* argv[]) {
