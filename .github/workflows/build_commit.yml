@@ -40,7 +40,7 @@ jobs:
   CraftClientDeps:
     needs: SislDeps
     if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') && github.event_name != 'pull_request' }}
-    uses: szmyd/craft_client/.github/workflows/build_dependencies.yml@dev/v0.x
+    uses: eBay/craft_client/.github/workflows/build_dependencies.yml@dev/v0.x
     with:
       branch: dev/v0.x
       platform: ${{ inputs.platform }}

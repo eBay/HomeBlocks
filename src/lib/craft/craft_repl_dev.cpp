@@ -23,6 +23,7 @@
 
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/crc.hpp>                // crc16_t10dif -- same routine and seed volume.cpp uses
+#include <homestore/checkpoint/cp_mgr.hpp>  // cp_mgr(), CPManager::trigger_cp_flush()
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
 #include <iomgr/iomgr.hpp>                  // iomanager singleton, reactor_regex
 #include <iomgr/timer.hpp>                  // iomgr::schedule_recurring -- the watchdog's RAII timer
@@ -317,6 +318,15 @@ public:
         }
         CraftJournalEntry hdr{};
         std::memcpy(&hdr, buf.bytes(), sizeof(CraftJournalEntry));
+        if (hdr.magic != k_journal_magic || hdr.version != k_journal_version) {
+            LOGE("free_slot: corrupt or foreign entry lsn={} magic={:#x} version={} -- refusing to free", lsn,
+                 hdr.magic, hdr.version);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (hdr.lsn != lsn) {
+            LOGE("free_slot: lsn mismatch requested={} stored={} -- refusing to free", lsn, hdr.lsn);
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
         if (hdr.all_zeros) co_return ok();
 
         // hdr.len bytes of real data means a non-empty csum array precedes the blkid in this
@@ -355,6 +365,27 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
     return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal, lba_size);
 }
 
+// ─── HomeStoreCraftCheckpointTrigger (SDSTOR-22888) ──────────────────────────
+//
+// Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
+
+class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
+public:
+    async_status trigger_cp_flush(bool force) override {
+        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
+        // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
+        // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
+        // (this trigger's only current caller, fire_checkpoint_trigger, coalesces with any in-flight
+        // flush on purpose). Only a force=true false return is a real failure worth surfacing.
+        if (!force) co_return ok();
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+};
+
+unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger() {
+    return std::make_unique< HomeStoreCraftCheckpointTrigger >();
+}
+
 // ─── constructor ──────────────────────────────────────────────────────────────
 
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
@@ -384,13 +415,13 @@ CraftReplDev::~CraftReplDev() {
 }
 
 // ─── get_rs_commit_lsn ────────────────────────────────────────────
-// Snapshot the in-memory partition state under missing_mu_ for consistency with
+// Snapshot the in-memory partition state under state_mu_ for consistency with
 // write() which updates state_ under the same lock.
 
 async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
     craft::lsn_pair pair{};
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         pair = {state_.commit_lsn, state_.last_append_lsn};
     }
     co_return pair;
@@ -417,7 +448,7 @@ async_status CraftReplDev::truncate(int64_t lsn) {
     // committed entries and break the commit_lsn <= last_append_lsn invariant.
     int64_t last_append_snapshot;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         DEBUG_ASSERT_GE(lsn, state_.commit_lsn, "truncate below committed prefix");
         last_append_snapshot = state_.last_append_lsn;
     }
@@ -450,7 +481,7 @@ async_status CraftReplDev::truncate(int64_t lsn) {
 
     // Steps 2 + 3 under the same mutex write() uses.
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         if (state_.last_append_lsn > lsn) state_.last_append_lsn = lsn;
         missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
     }
@@ -474,24 +505,24 @@ async_status CraftReplDev::truncate(int64_t lsn) {
 
 #ifdef _PRERELEASE
 void CraftReplDev::seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing) {
-    std::lock_guard lk{missing_mu_};
+    std::lock_guard lk{state_mu_};
     state_.last_append_lsn = last_append;
     missing_lsns_.clear();
     missing_lsns_.insert(missing);
 }
 
 void CraftReplDev::seed_commit_lsn(int64_t commit) {
-    std::lock_guard lk{missing_mu_};
+    std::lock_guard lk{state_mu_};
     state_.commit_lsn = commit;
 }
 
 void CraftReplDev::seed_term(uint64_t term) {
-    std::lock_guard lk{missing_mu_};
+    std::lock_guard lk{state_mu_};
     state_.term = term;
 }
 
 void CraftReplDev::seed_empty(std::initializer_list< int64_t > empty) {
-    std::lock_guard lk{missing_mu_};
+    std::lock_guard lk{state_mu_};
     empty_lsns_.clear();
     empty_lsns_.insert(empty);
     // Empty verdict resolves a gap: an LSN that was already in missing_lsns_ must be removed so
@@ -561,8 +592,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     }
 
     {
-        std::lock_guard lock{missing_mu_};
-        // state_.term is guarded by missing_mu_ like the rest of state_ -- read it under the same lock
+        std::lock_guard lock{state_mu_};
+        // state_.term is guarded by state_mu_ like the rest of state_ -- read it under the same lock
         // used for the gap-marking below rather than unlocked, now that apply_internal_login (22887)
         // actually mutates it from the RAFT commit thread.
         if (hdr.term != state_.term) {
@@ -641,7 +672,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         CraftReplDev* self;
         int64_t dlsn;
         ~InFlightDlsnGuard() {
-            std::lock_guard lk{self->missing_mu_};
+            std::lock_guard lk{self->state_mu_};
             self->in_flight_write_dlsns_.erase(dlsn);
         }
     } in_flight_guard{this, dlsn};
@@ -672,7 +703,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
     }
     // addr and len are BYTES (byte-addressed API): CraftJournalEntry stores them verbatim as bytes.
-    // hdr.term is already verified against state_.term under missing_mu_ above; pass it so the
+    // hdr.term is already verified against state_.term under state_mu_ above; pass it so the
     // on-disk entry carries the session term for stale-tail detection on recovery. dlsn is stored
     // redundantly in CraftJournalEntry.lsn for self-describing recovery.
     auto res = co_await journal_->write_slot(dlsn, hdr.term, static_cast< lba_t >(addr),
@@ -701,7 +732,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     bool stale_post_flight = false;
     craft::lsn_pair snapshot;
     {
-        std::lock_guard lock{missing_mu_};
+        std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
@@ -730,7 +761,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
     // reflect whatever progress commit() just made, not a view from before this call's own piggyback ran.
     {
-        std::lock_guard lock{missing_mu_};
+        std::lock_guard lock{state_mu_};
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
 
@@ -738,10 +769,45 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_return snapshot;
 }
 
+// ─── proactive checkpoint trigger (SDSTOR-22888) ─────────────────────────────
+//
+// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback and
+// keep_alive() -- and apply_sync_rs_commit_lsn()'s own walk-forward loop) so a checkpoint fires
+// regardless of which path is driving commit_lsn forward. Split into a locked check and an unlocked
+// fire because the fire awaits (via detail::detach) and must not run with state_mu_ held.
+
+bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot) {
+    // Interval reuses sync_rs_commit_lsn_interval (via checkpoint_lsn_interval_) rather than its own
+    // knob -- ties checkpoint cadence to the periodic SyncRSCommitLSN cadence. last_checkpoint_lsn_ is
+    // updated here, before the caller releases state_mu_, so two overlapping callers can't both read
+    // the same stale last_checkpoint_lsn_ and both decide to fire.
+    if (commit_lsn_snapshot - last_checkpoint_lsn_ < checkpoint_lsn_interval_) return false;
+    last_checkpoint_lsn_ = commit_lsn_snapshot;
+    return true;
+}
+
+void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
+    if (checkpoint_trigger_ == nullptr) {
+        LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
+             commit_lsn_snapshot);
+        return;
+    }
+    // force=false: let this coalesce with any checkpoint already in flight rather than forcing
+    // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc comment).
+    // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
+    // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
+    auto self = shared_from_this();
+    detail::detach([self, commit_lsn_snapshot]() -> async_status {
+        if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+            LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
+        co_return ok();
+    }());
+}
+
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
 //
 // Advances commit_lsn toward upto_lsn by applying each committable slot to the index. At most one
-// run is ever active at a time (commit_running_, guarded by missing_mu_ and reset via RAII on every
+// run is ever active at a time (commit_running_, guarded by state_mu_ and reset via RAII on every
 // exit path); a concurrent caller is a safe no-op -- the in-flight run covers the same ground, and
 // every subsequent write()/keep_alive() retries the advance. Never holds a lock across the co_await
 // read_slot() suspension point below (same rule fetch_data's doc comment already establishes).
@@ -750,7 +816,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                                                   delete_index_fn_t const& delete_fn) {
     int64_t commit_lsn, last_append_lsn;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         if (commit_running_) co_return state_.commit_lsn; // another run is already advancing
         commit_running_ = true;
         commit_lsn = state_.commit_lsn;
@@ -761,7 +827,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
     struct RunningGuard {
         CraftReplDev* self;
         ~RunningGuard() {
-            std::lock_guard lk{self->missing_mu_};
+            std::lock_guard lk{self->state_mu_};
             self->commit_running_ = false;
         }
     } guard{this};
@@ -770,7 +836,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
     for (int64_t lsn = commit_lsn + 1; lsn <= target; ++lsn) {
         bool is_missing, is_empty;
         {
-            std::lock_guard lk{missing_mu_};
+            std::lock_guard lk{state_mu_};
             is_missing = missing_lsns_.contains(lsn);
             is_empty = empty_lsns_.contains(lsn);
         }
@@ -876,18 +942,25 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             }
         }
 
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         state_.commit_lsn = lsn;
     }
 
-    std::lock_guard lk{missing_mu_};
-    co_return state_.commit_lsn;
+    int64_t final_commit_lsn;
+    bool should_checkpoint;
+    {
+        std::lock_guard lk{state_mu_};
+        final_commit_lsn = state_.commit_lsn;
+        should_checkpoint = checkpoint_interval_crossed_locked(final_commit_lsn);
+    }
+    if (should_checkpoint) fire_checkpoint_trigger(final_commit_lsn);
+    co_return final_commit_lsn;
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
     if (!indx_tbl_) {
         // No index configured (write-path-only tests): nothing to apply, no-op safely.
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         co_return state_.commit_lsn;
     }
     write_index_fn_t write_fn = [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
@@ -971,7 +1044,7 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     }
     {
-        std::lock_guard lock{missing_mu_};
+        std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("read rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
@@ -1042,7 +1115,7 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
 
     int64_t commit_lsn_snapshot;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         commit_lsn_snapshot = state_.commit_lsn;
     }
     // read_lsn and hdr.commit_lsn arrive in the same frame with nothing coupling them: read()'s own
@@ -1066,7 +1139,7 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     for (auto const& [key, value] : index_kvs)
         index_map.emplace(key.lba(), value);
 
-    // read_fn above takes no lock of its own (an index query, not a read of missing_mu_-guarded
+    // read_fn above takes no lock of its own (an index query, not a read of state_mu_-guarded
     // state) -- a concurrent commit_impl run can apply new LSNs to the index for an LBA in
     // [start_lba, end_lba] while read_fn is executing, even though the pre-check above passed
     // against the OLD snapshot. Re-snapshot commit_lsn now and re-check against read_lsn: if it
@@ -1075,7 +1148,7 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     // read as if it were still valid. This also narrows commit_lsn_snapshot to the freshest known-safe
     // value for the overlay clamp just below (a strictly tighter, still-correct bound).
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         commit_lsn_snapshot = state_.commit_lsn;
     }
     if (read_lsn < commit_lsn_snapshot) {
@@ -1186,7 +1259,7 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
 
     craft::lsn_pair snapshot;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
     co_return craft::read_result{std::move(extents), snapshot};
@@ -1204,7 +1277,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
         co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     }
     {
-        std::lock_guard lock{missing_mu_};
+        std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("keep_alive rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
@@ -1229,7 +1302,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
     // silently swallowed.
     if (auto r = co_await commit(hdr.commit_lsn); !r) co_return std::unexpected(r.error());
 
-    std::lock_guard lock{missing_mu_};
+    std::lock_guard lock{state_mu_};
     co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
 
@@ -1238,7 +1311,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
 void CraftReplDev::touch_watchdog() {
     if (watchdog_timeout_ns_ == 0) return;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         // Not yet logged in -- no session to watch.
         // TODO: this only prevents ARMING before first login, doesn't DISARM on logout -- real
         // logout() must also call watchdog_token_.cancel() once it's implemented (currently a stub).
@@ -1329,7 +1402,7 @@ void CraftReplDev::on_watchdog_tick() {
     int64_t last_append_lsn;
     uint64_t client_token;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         last_append_lsn = state_.last_append_lsn;
         client_token = state_.client_token;
     }
@@ -1359,7 +1432,7 @@ async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_toke
 // empty_lsns_ is checked first: a slot in both empty_lsns_ and the journal returns is_empty=true
 // (Empty beats data, the reconciliation invariant from S5).
 //
-// The missing_mu_ lock is held only for the up-front classification pass below, dropped before any
+// The state_mu_ lock is held only for the up-front classification pass below, dropped before any
 // co_await read_slot() call to avoid holding a mutex across a suspension point. Callers are
 // serialised by the login sequence (no concurrent writes while fetch_data runs), so the snapshot
 // taken under the lock is stable for the whole batch.
@@ -1372,7 +1445,7 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
     std::vector< SlotKind > kinds;
     kinds.reserve(lsns.size());
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         for (int64_t lsn : lsns) {
             if (empty_lsns_.contains(lsn)) {
                 kinds.push_back(SlotKind::Empty);
@@ -1422,7 +1495,7 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
 async_status CraftReplDev::rebuild_overlay() {
     int64_t commit_lsn, last_append_lsn;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
     }
@@ -1430,7 +1503,7 @@ async_status CraftReplDev::rebuild_overlay() {
     for (int64_t lsn = commit_lsn + 1; lsn <= last_append_lsn; ++lsn) {
         bool is_missing, is_empty;
         {
-            std::lock_guard lk{missing_mu_};
+            std::lock_guard lk{state_mu_};
             is_missing = missing_lsns_.contains(lsn);
             is_empty = empty_lsns_.contains(lsn);
         }
@@ -1493,7 +1566,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // on_commit returns to HomeStore as soon as this coroutine hits its first co_await, so
         // HomeStore can call on_commit for the NEXT committed entry -- a synchronous InternalLogin, or
         // another detached SyncRSCommitLSN -- before this one's effects are fully applied.
-        // No individual field access races (missing_mu_ still guards every access), but replicas can end up
+        // No individual field access races (state_mu_ still guards every access), but replicas can end up
         // applying entries in different effective orders depending on async completion timing, which
         // violates the determinism RAFT relies on for replicas to converge. See the commit_lsn advance at
         // the tail of apply_sync_rs_commit_lsn and the client_token overwrite in apply_internal_login for
@@ -1601,11 +1674,11 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    std::vector< int64_t > to_free;
+    std::unordered_set< int64_t > to_free;
     std::vector< int64_t > to_fetch;
     uint64_t term;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         // client_token is NOT gated against state_.client_token here. Per the login sequence (CRAFT-Design),
         // SyncRSCommitLSN applies BEFORE InternalLogin (which sets state_.client_token), so an equality-fence
         // here would veto the very entry that carries login's own Empty verdicts,
@@ -1617,7 +1690,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         term = state_.term;
 
         for (int64_t lsn : empty_slots) {
-            if (missing_lsns_.erase(lsn)) { to_free.push_back(lsn); }
+            bool const was_missing = missing_lsns_.erase(lsn) > 0;
+            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
         }
         empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
 
@@ -1660,7 +1734,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         } else {
             for (auto& slot : *fetched) {
                 if (slot.is_empty) {
-                    std::lock_guard lk{missing_mu_};
+                    std::lock_guard lk{state_mu_};
                     empty_lsns_.insert(slot.lsn);
                     missing_lsns_.erase(slot.lsn);
                     continue;
@@ -1680,7 +1754,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     blkid_allocated = true;
                 }
 
-                // FIXME: We need to address the case when blkid is not set. How would write_slot handle that?
+                // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+                // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+                // default instance. That's an implicit, undocumented dependency on HomeStore's current
+                // behavior -- see SDSTOR-25613.
                 auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros, slot.csums);
                 if (!res) {
@@ -1696,7 +1773,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     }
                     continue;
                 }
-                std::lock_guard lk{missing_mu_};
+                std::lock_guard lk{state_mu_};
                 missing_lsns_.erase(slot.lsn);
             }
         }
@@ -1710,14 +1787,24 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
     // the time this advance actually runs, breaking strict RAFT apply ordering.
+    int64_t commit_lsn_snapshot;
+    bool should_checkpoint;
     {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         int64_t next = state_.commit_lsn + 1;
         while (next <= rs_commit_lsn && !missing_lsns_.contains(next)) {
             state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
             ++next;
         }
+        commit_lsn_snapshot = state_.commit_lsn;
+        // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
+        // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
+        // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
+        // write()'s piggyback and keep_alive() (which don't go through this function) advance the
+        // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
+        should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
+    if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
 }
@@ -1731,7 +1818,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 // existing session -- a caller still presenting the old term is fenced out on its very next call.
 
 void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
-    std::lock_guard lk{missing_mu_};
+    std::lock_guard lk{state_mu_};
     state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
     // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
     // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting

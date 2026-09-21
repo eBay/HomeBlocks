@@ -1354,7 +1354,7 @@ TEST_F(CraftCommitTest, WriteCapturesAllCommittedLsn) {
 // read() must capture hdr.all_committed_lsn (the R1-1 fix applies to read() too). The real
 // entry point is used (not read_with()) because only read() accepts a client_hdr. Even though
 // read() returns not_supported (no index configured in this fixture), the capture happens in the
-// missing_mu_ block ahead of the !indx_tbl_ check, so the floor is advanced before the error.
+// state_mu_ block ahead of the !indx_tbl_ check, so the floor is advanced before the error.
 TEST_F(CraftCommitTest, ReadCapturesAllCommittedLsn) {
     ASSERT_EQ(dev_->all_committed_lsn(), -1);
 

@@ -153,6 +153,27 @@ public:
     virtual ~CraftPeerFetcher() = default;
 };
 
+// ─── CraftCheckpointTrigger ───────────────────────────────────────────────────
+//
+// Abstraction over HomeStore's checkpoint manager (homestore::cp_mgr().trigger_cp_flush()).
+// Injected into CraftReplDev so unit tests (which compile craft_repl_dev.cpp directly against a
+// mock journal backend, with no running HomeStore instance -- see test_craft_raft_entries.cpp) can
+// exercise the trigger without touching HomeStore. Production code passes
+// HomeStoreCraftCheckpointTrigger (defined in craft_repl_dev.cpp). Default (null) leaves the
+// trigger stubbed -- same posture as CraftPeerFetcher.
+
+class CraftCheckpointTrigger {
+public:
+    virtual async_status trigger_cp_flush(bool force) = 0;
+    virtual ~CraftCheckpointTrigger() = default;
+};
+
+// Factory that wraps homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev
+// (there is exactly one CPManager per HomeStore instance), unlike make_homestore_journal_backend
+// which is per-volume -- so CraftReplDev takes this via a non-owning pointer (set_checkpoint_trigger),
+// not ownership at construction. Tests inject MockCraftCheckpointTrigger directly.
+unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger();
+
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
 // One instance per CRAFT-mode volume. Implements the full CRAFT data plane
@@ -267,6 +288,11 @@ public:
     // prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back write -- leaving it
     // would let a later read serve stale data from a write that no longer exists in the journal). Called
     // only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
+    // FIXME(S4/S7): before dropping entries here, force a completed checkpoint --
+    // co_await checkpoint_trigger_->trigger_cp_flush(true). Once entries above/below lsn are gone, the journal is
+    // no longer a durable record of them; if HomeStore's checkpoint has only been requested and not yet
+    // completed, a crash in between loses that data. HomeStore's own IndexTable::destroy() hits the
+    // identical problem and force-flushes before removing its superblock for exactly this reason.
     async_status truncate(int64_t lsn);
 
     // Propose a SyncRSCommitLSN RAFT entry (called by watchdog or leader during login).
@@ -289,41 +315,41 @@ public:
     // ── observability ─────────────────────────────────────────────────────
 
     size_t missing_count() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return missing_lsns_.size();
     }
 
     bool is_missing(int64_t lsn) const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return missing_lsns_.contains(lsn);
     }
 
     bool is_empty_slot(int64_t lsn) const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return empty_lsns_.contains(lsn);
     }
 
     int64_t last_append_lsn() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return state_.last_append_lsn;
     }
     int64_t commit_lsn() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return state_.commit_lsn;
     }
     uint64_t client_token() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return state_.client_token;
     }
     uint64_t term() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return state_.term;
     }
     // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim
     // (S8's job, not read anywhere yet in this class); exposed so S8's eventual reclaim logic has
     // something to read.
     int64_t all_committed_lsn() const {
-        std::lock_guard lk{missing_mu_};
+        std::lock_guard lk{state_mu_};
         return state_.all_committed_lsn;
     }
 
@@ -334,6 +360,17 @@ public:
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
     void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
+
+    // Wires the HomeStore checkpoint trigger used by apply_sync_rs_commit_lsn's periodic checkpoint
+    // (SDSTOR-22888). One CraftCheckpointTrigger instance is shared by every volume's CraftReplDev;
+    // tests inject a mock.
+    void set_checkpoint_trigger(CraftCheckpointTrigger* t) { checkpoint_trigger_ = t; }
+
+    // Overrides the commit_lsn delta between checkpoint triggers (default matches
+    // sync_rs_commit_lsn_interval's own default of 128, tying checkpoint cadence to the periodic
+    // SyncRSCommitLSN cadence). Production sets this from HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval)
+    // after construction, same pattern as set_peer_fetch_timeout_ms.
+    void set_checkpoint_lsn_interval(int64_t n) { checkpoint_lsn_interval_ = n; }
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
@@ -475,6 +512,20 @@ private:
     async_result< int64_t > commit_impl(int64_t upto_lsn, write_index_fn_t const& write_fn,
                                         delete_index_fn_t const& delete_fn);
 
+    // Must be called with state_mu_ held. Returns true if commit_lsn_snapshot has crossed
+    // checkpoint_lsn_interval_ since last_checkpoint_lsn_ -- and if so, updates last_checkpoint_lsn_ to
+    // commit_lsn_snapshot before returning, so an overlapping caller under the same lock observes the
+    // new value rather than racing on a stale one. Split from fire_checkpoint_trigger() because that
+    // awaits (via detail::detach) and must not run with the lock held.
+    bool checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot);
+
+    // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
+    // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
+    // same commit_lsn_snapshot. Safe without state_mu_ held. Shared by every commit_lsn-advance path:
+    // commit_impl() (covers write()'s piggyback and keep_alive()) and apply_sync_rs_commit_lsn()'s own
+    // walk-forward loop.
+    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
+
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
     // declared at the top of this class) so tests can exercise it against a fake index instead of a
     // real VolumeIndexTable. read() binds this to indx_tbl_'s real read_from_index; read_with()
@@ -524,15 +575,15 @@ private:
     CraftPartitionState state_;
     // TODO: Can this be replaced with boost::icl::interval_set? Particularly helpful when a write
     // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
-    // insert one LSN at a time under missing_mu_, which is O(gap width) instead of O(log ranges).
+    // insert one LSN at a time under state_mu_, which is O(gap width) instead of O(log ranges).
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
     // dlsns currently between "claimed as non-idempotent" and "write_slot has completed" in write() --
     // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
-    mutable std::mutex
-        missing_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_, in_flight_write_dlsns_
+    mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
+                                  // in_flight_write_dlsns_, and last_checkpoint_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
@@ -553,7 +604,7 @@ private:
         bool all_zeros{false};
     };
     std::unordered_map< lba_t, OverlayEntry > overlay_;
-    mutable std::mutex overlay_mu_; // lock order: missing_mu_ before overlay_mu_
+    mutable std::mutex overlay_mu_; // lock order: state_mu_ before overlay_mu_
 
     bool login_in_progress_{false};
     std::mutex login_mu_;
@@ -615,6 +666,15 @@ private:
 #ifdef _PRERELEASE
     std::atomic< int > watchdog_fire_count_{0}; // test-only; never present in production binaries
 #endif
+    CraftCheckpointTrigger* checkpoint_trigger_{nullptr}; // null until production wiring; unit tests inject a mock
+    int64_t checkpoint_lsn_interval_{128};                // commit_lsn delta between checkpoint triggers; see
+                                                          // set_checkpoint_lsn_interval()
+    int64_t last_checkpoint_lsn_{-1}; // commit_lsn as of the last triggered checkpoint (guarded by state_mu_)
+                                      // FIXME(S8/SDSTOR-22745): defaults to -1 in lockstep with state_.commit_lsn
+                                      // When S8 wires recovering commit_lsn from the journal/superblock on restart,
+                                      // seed this to the recovered commit_lsn too (not -1), or the first post-
+                                      // restart apply_sync_rs_commit_lsn will unconditionally fire a checkpoint
+                                      // regardless of how recently one actually happened before the crash.
 };
 
 } // namespace homeblocks

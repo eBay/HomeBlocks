@@ -206,7 +206,7 @@ jobs:
     - name: Retrieve CraftClient
       uses: actions/checkout@v4
       with:
-        repository: szmyd/craft_client
+        repository: eBay/craft_client
         path: import/craft_client
         ref: dev/v0.x
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
