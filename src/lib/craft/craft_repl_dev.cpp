@@ -815,12 +815,23 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         last_append_lsn = state_.last_append_lsn;
     }
     // Guaranteed reset on every exit path (stall, success, or error): a local RAII object's destructor
-    // runs when the coroutine frame unwinds, exactly like a plain function's locals on return.
+    // runs when the coroutine frame unwinds, exactly like a plain function's locals on return. Also
+    // runs the checkpoint-interval check here rather than only on the happy-path tail: folding it into
+    // this same critical section means every exit -- including an early error return mid-loop -- still
+    // gets a chance to fire the checkpoint (a slot that keeps failing on retry no longer permanently
+    // starves it), and merges what would otherwise be two separate state_mu_ acquisitions into one.
     struct RunningGuard {
         CraftReplDev* self;
         ~RunningGuard() {
-            std::lock_guard lk{self->state_mu_};
-            self->commit_running_ = false;
+            int64_t final_commit_lsn;
+            bool should_checkpoint;
+            {
+                std::lock_guard lk{self->state_mu_};
+                self->commit_running_ = false;
+                final_commit_lsn = self->state_.commit_lsn;
+                should_checkpoint = self->checkpoint_interval_crossed_locked(final_commit_lsn);
+            }
+            if (should_checkpoint) self->fire_checkpoint_trigger(final_commit_lsn);
         }
     } guard{this};
 
@@ -938,15 +949,8 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         state_.commit_lsn = lsn;
     }
 
-    int64_t final_commit_lsn;
-    bool should_checkpoint;
-    {
-        std::lock_guard lk{state_mu_};
-        final_commit_lsn = state_.commit_lsn;
-        should_checkpoint = checkpoint_interval_crossed_locked(final_commit_lsn);
-    }
-    if (should_checkpoint) fire_checkpoint_trigger(final_commit_lsn);
-    co_return final_commit_lsn;
+    std::lock_guard lk{state_mu_};
+    co_return state_.commit_lsn;
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
