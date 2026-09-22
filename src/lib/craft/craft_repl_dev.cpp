@@ -804,8 +804,8 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 // every subsequent write()/keep_alive() retries the advance. Never holds a lock across the co_await
 // read_slot() suspension point below (same rule fetch_data's doc comment already establishes).
 
-async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t const& write_fn,
-                                                  delete_index_fn_t const& delete_fn) {
+async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t write_fn,
+                                                  delete_index_fn_t delete_fn) {
     int64_t commit_lsn, last_append_lsn;
     {
         std::lock_guard lk{state_mu_};
@@ -965,14 +965,14 @@ async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
     delete_index_fn_t delete_fn = [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
         return indx_tbl_->delete_lba_range(s, e, freed);
     };
-    auto r = co_await commit_impl(upto_lsn, write_fn, delete_fn);
+    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
     co_return r;
 }
 
 #ifdef _PRERELEASE
 async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_fn_t write_fn,
                                                   delete_index_fn_t delete_fn) {
-    auto r = co_await commit_impl(upto_lsn, write_fn, delete_fn);
+    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
     co_return r;
 }
 #endif

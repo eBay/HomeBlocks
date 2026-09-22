@@ -502,8 +502,7 @@ private:
     // operations (write_index_fn_t / delete_index_fn_t, declared at the top of this class) so tests
     // can exercise it against a fake index instead of a real VolumeIndexTable. commit() binds these
     // to indx_tbl_'s real methods; commit_with() (test-only) binds test doubles.
-    async_result< int64_t > commit_impl(int64_t upto_lsn, write_index_fn_t const& write_fn,
-                                        delete_index_fn_t const& delete_fn);
+    async_result< int64_t > commit_impl(int64_t upto_lsn, write_index_fn_t write_fn, delete_index_fn_t delete_fn);
 
     // Must be called with state_mu_ held. Returns true if commit_lsn_snapshot has crossed
     // checkpoint_lsn_interval_ since last_checkpoint_lsn_ -- and if so, updates last_checkpoint_lsn_ to
