@@ -161,10 +161,10 @@ public:
 // Default (empty) leaves the trigger stubbed -- same posture as CraftPeerFetcher.
 using checkpoint_trigger_fn_t = std::function< async_status(bool force) >;
 
-// Factory that wraps homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev
-// (there is exactly one CPManager per HomeStore instance), unlike make_homestore_journal_backend
-// which is per-volume -- so CraftReplDev takes this via a non-owning fn (set_checkpoint_trigger),
-// not ownership at construction. Tests inject a plain callable directly.
+// Factory that wraps homestore::cp_mgr() (there is exactly one CPManager per HomeStore instance,
+// unlike make_homestore_journal_backend which is per-volume). Each CraftReplDev stores its own copy
+// of the returned callable by value (set_checkpoint_trigger) -- callers don't need to keep the
+// factory's result alive themselves. Tests inject a plain callable directly.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn();
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
