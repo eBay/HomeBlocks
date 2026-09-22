@@ -814,6 +814,12 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
     }
+    // Tracks the highest lsn successfully applied so far, updated per-iteration below WITHOUT
+    // state_mu_. Written to the shared state_.commit_lsn exactly once, in
+    // RunningGuard's destructor, instead of per-iteration -- see the destructor's own comment for why
+    // this trades a per-iteration lock for a real (accepted) staleness window on the read path.
+    int64_t final_commit_lsn = commit_lsn;
+
     // Guaranteed reset on every exit path (stall, success, or error): a local RAII object's destructor
     // runs when the coroutine frame unwinds, exactly like a plain function's locals on return. Also
     // runs the checkpoint-interval check here rather than only on the happy-path tail: folding it into
@@ -822,18 +828,18 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
     // starves it), and merges what would otherwise be two separate state_mu_ acquisitions into one.
     struct RunningGuard {
         CraftReplDev* self;
+        int64_t* final_commit_lsn_ptr;
         ~RunningGuard() {
-            int64_t final_commit_lsn;
             bool should_checkpoint;
             {
                 std::lock_guard lk{self->state_mu_};
+                self->state_.commit_lsn = *final_commit_lsn_ptr;
                 self->commit_running_ = false;
-                final_commit_lsn = self->state_.commit_lsn;
-                should_checkpoint = self->checkpoint_interval_crossed_locked(final_commit_lsn);
+                should_checkpoint = self->checkpoint_interval_crossed_locked(*final_commit_lsn_ptr);
             }
-            if (should_checkpoint) self->fire_checkpoint_trigger(final_commit_lsn);
+            if (should_checkpoint) self->fire_checkpoint_trigger(*final_commit_lsn_ptr);
         }
-    } guard{this};
+    } guard{this, &final_commit_lsn};
 
     int64_t const target = std::min(upto_lsn, last_append_lsn);
     for (int64_t lsn = commit_lsn + 1; lsn <= target; ++lsn) {
@@ -945,12 +951,10 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             }
         }
 
-        std::lock_guard lk{state_mu_};
-        state_.commit_lsn = lsn;
+        final_commit_lsn = lsn; // no lock -- see final_commit_lsn's own doc comment above
     }
 
-    std::lock_guard lk{state_mu_};
-    co_return state_.commit_lsn;
+    co_return final_commit_lsn;
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
