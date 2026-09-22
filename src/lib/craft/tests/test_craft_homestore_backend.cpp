@@ -22,7 +22,7 @@
 // backend directly rather than through CraftReplDev or a volume -- the narrowest test that still
 // runs the real completion path.
 //
-// Also exercises HomeStoreCraftCheckpointTrigger::trigger_cp_flush (SDSTOR-22888) against the REAL
+// Also exercises make_homestore_checkpoint_trigger_fn's result (SDSTOR-22888) against the REAL
 // homestore::cp_mgr() -- same rationale: MockCraftCheckpointTrigger (test_craft_raft_entries.cpp)
 // covers CraftReplDev's own gating logic, but the wrapper's factory -> cp_mgr().trigger_cp_flush()
 // -> async_status conversion chain had never been compiled and run against a live CPManager.
@@ -387,10 +387,9 @@ TEST_F(CraftHomeStoreBackendTest, FreeSlotRejectsCorruptEntry) {
 
 // force=false: the value apply_sync_rs_commit_lsn's periodic trigger actually passes today.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerFlushesRealCPManager) {
-    auto trigger = make_homestore_checkpoint_trigger();
-    ASSERT_TRUE(trigger != nullptr);
+    auto trigger = make_homestore_checkpoint_trigger_fn();
 
-    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ false));
+    auto r = homeblocks::detail::sync_get(trigger(/* force = */ false));
     ASSERT_TRUE(r.has_value());
 }
 
@@ -398,27 +397,26 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerFlushesRealCPManager) {
 // a future correctness-critical call site will need, but the passthrough itself had never been
 // exercised against the real cp_mgr() for either value.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
-    auto trigger = make_homestore_checkpoint_trigger();
-    ASSERT_TRUE(trigger != nullptr);
+    auto trigger = make_homestore_checkpoint_trigger_fn();
 
-    auto r = homeblocks::detail::sync_get(trigger->trigger_cp_flush(/* force = */ true));
+    auto r = homeblocks::detail::sync_get(trigger(/* force = */ true));
     ASSERT_TRUE(r.has_value());
 }
 
 // cp_mgr()'s in-flight-flush gate (m_in_flush_phase) is a synchronous check-and-set at entry: the
 // first of several concurrent trigger_cp_flush(false) calls holds it for the duration of the real
 // flush, so every other concurrent call observes it already set and gets HomeStore's synchronous
-// false back -- not a failure. HomeStoreCraftCheckpointTrigger must map that to ok() when
-// force=false; every one of these concurrent calls must succeed, not just the one that actually flushed.
+// false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to ok()
+// when force=false; every one of these concurrent calls must succeed, not just the one that
+// actually flushed.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFails) {
-    auto trigger = make_homestore_checkpoint_trigger();
-    ASSERT_TRUE(trigger != nullptr);
+    auto trigger = make_homestore_checkpoint_trigger_fn();
 
     constexpr int k_concurrent = 20;
     std::vector< homestore::async_status > futs; // async_status is itself a sisl::async::task<result<...>>
     futs.reserve(k_concurrent);
     for (int i = 0; i < k_concurrent; ++i) {
-        futs.push_back(trigger->trigger_cp_flush(/* force = */ false));
+        futs.push_back(trigger(/* force = */ false));
     }
 
     auto const results = homeblocks::detail::sync_get(sisl::async::when_all(std::move(futs)));

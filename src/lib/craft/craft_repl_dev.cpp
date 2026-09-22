@@ -365,13 +365,9 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
     return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal, lba_size);
 }
 
-// ─── HomeStoreCraftCheckpointTrigger (SDSTOR-22888) ──────────────────────────
-//
 // Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
-
-class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
-public:
-    async_status trigger_cp_flush(bool force) override {
+checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
+    return [](bool force) -> async_status {
         if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
         // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
@@ -379,11 +375,7 @@ public:
         // flush on purpose). Only a force=true false return is a real failure worth surfacing.
         if (!force) co_return ok();
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-    }
-};
-
-unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger() {
-    return std::make_unique< HomeStoreCraftCheckpointTrigger >();
+    };
 }
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -787,18 +779,18 @@ bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapsho
 }
 
 void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
-    if (checkpoint_trigger_ == nullptr) {
+    if (!checkpoint_trigger_) {
         LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
              commit_lsn_snapshot);
         return;
     }
     // force=false: let this coalesce with any checkpoint already in flight rather than forcing
-    // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc comment).
+    // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
     // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
     auto self = shared_from_this();
     detail::detach([self, commit_lsn_snapshot]() -> async_status {
-        if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+        if (auto cp = co_await self->checkpoint_trigger_(false); !cp)
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
         co_return ok();
     }());
