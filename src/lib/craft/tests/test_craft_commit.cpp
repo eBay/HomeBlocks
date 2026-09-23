@@ -496,6 +496,46 @@ TEST_F(CraftCommitTest, WriteFnErrorAbortsCommit) {
     EXPECT_EQ(dev_->commit_lsn(), -1); // nothing applied
 }
 
+// ── checkpoint trigger on error exit (PR #182 review) ─────────────────────────
+
+struct MockCraftCheckpointTrigger {
+    int call_count{0};
+    async_status operator()(bool) {
+        ++call_count;
+        co_return ok();
+    }
+};
+
+// The checkpoint-interval check now runs from RunningGuard's destructor, so it must fire even when
+// a later slot in the same commit_impl run fails -- not just on the happy-path tail. Slots 0-2
+// succeed (crossing a checkpoint_lsn_interval_ of 2), then slot 3's write_fn fails; the checkpoint
+// trigger must still fire once, at the partially-advanced commit_lsn (2).
+TEST_F(CraftCommitTest, CheckpointTriggerFiresOnErrorExit) {
+    dev_->seed_lsns(3, {});
+    journal_->add_data_slot(0, 0, 1, 100, {11});
+    journal_->add_data_slot(1, 1, 1, 101, {12});
+    journal_->add_data_slot(2, 2, 1, 102, {13});
+    journal_->add_data_slot(3, 3, 1, 103, {14});
+
+    MockCraftCheckpointTrigger trigger;
+    dev_->set_checkpoint_trigger(std::ref(trigger));
+    dev_->set_checkpoint_lsn_interval(2);
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        3,
+        [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
+            if (s == 3) return std::unexpected(volume_error::INDEX_ERROR); // fail on the 4th slot
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 2); // lsns 0-2 applied; lsn 3 aborted the run
+    EXPECT_EQ(trigger.call_count, 1); // checkpoint still fired despite the error exit
+}
+
 // commit() clamps to last_append_lsn even if asked to commit further than what has actually been
 // appended locally (e.g. the client's own view of commit_lsn is ahead of this replica).
 TEST_F(CraftCommitTest, ClampsToLastAppendLsn) {

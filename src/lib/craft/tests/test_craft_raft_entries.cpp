@@ -136,13 +136,12 @@ public:
 //
 // Records call count / last `force` value; fail_next injects a one-shot error.
 
-class MockCraftCheckpointTrigger : public CraftCheckpointTrigger {
-public:
+struct MockCraftCheckpointTrigger {
     int call_count{0};
     bool last_force{false};
     bool fail_next{false};
 
-    async_status trigger_cp_flush(bool force) override {
+    async_status operator()(bool force) {
         ++call_count;
         last_force = force;
         if (fail_next) {
@@ -478,7 +477,7 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
 // ── checkpoint trigger (SDSTOR-22888) ─────────────────────────────────────────
 
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresOnceIntervalCrossed) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     dev_->seed_lsns(10, {});
 
@@ -491,7 +490,7 @@ TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresOnceIntervalCrossed) {
 }
 
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerDoesNotFireBelowInterval) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     dev_->seed_lsns(3, {});
 
@@ -506,7 +505,7 @@ TEST_F(CraftRaftEntriesTest, CheckpointTriggerDoesNotFireBelowInterval) {
 // combined progress since the last trigger crosses it on the second call -- the interval tracks
 // cumulative distance from last_checkpoint_lsn_, not distance moved within a single apply.
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerAccumulatesAcrossCalls) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     dev_->seed_lsns(10, {});
 
@@ -524,7 +523,7 @@ TEST_F(CraftRaftEntriesTest, CheckpointTriggerAccumulatesAcrossCalls) {
 // Pins down the exact boundary (>=, not >): delta from last_checkpoint_lsn_ (-1) to commit_lsn (4)
 // is exactly 5, equal to the interval, not one past it.
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresExactlyAtIntervalBoundary) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     dev_->seed_lsns(4, {});
 
@@ -542,7 +541,7 @@ TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresExactlyAtIntervalBoundary) {
 // jump big enough to tell them apart: a second, small follow-up advance must NOT refire, which it
 // would if the baseline had been left at 4 instead of 50.
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerBaselineTracksActualReachedValue) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     dev_->seed_lsns(60, {});
 
@@ -572,7 +571,7 @@ TEST_F(CraftRaftEntriesTest, CheckpointTriggerNoOpsWhenUnwired) {
 // A checkpoint trigger failure is logged, not propagated -- best-effort, same posture as this
 // function's catch-up/fetch failure handling.
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerFailureDoesNotFailApply) {
-    dev_->set_checkpoint_trigger(&trigger_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
     dev_->set_checkpoint_lsn_interval(5);
     trigger_.fail_next = true;
     dev_->seed_lsns(10, {});

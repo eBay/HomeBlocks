@@ -365,13 +365,9 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
     return std::make_unique< HomeStoreCraftJournalBackend >(std::move(logstore), vol_ordinal, lba_size);
 }
 
-// ─── HomeStoreCraftCheckpointTrigger (SDSTOR-22888) ──────────────────────────
-//
 // Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
-
-class HomeStoreCraftCheckpointTrigger : public CraftCheckpointTrigger {
-public:
-    async_status trigger_cp_flush(bool force) override {
+checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
+    return [](bool force) -> async_status {
         if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
         // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
@@ -379,11 +375,7 @@ public:
         // flush on purpose). Only a force=true false return is a real failure worth surfacing.
         if (!force) co_return ok();
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-    }
-};
-
-unique< CraftCheckpointTrigger > make_homestore_checkpoint_trigger() {
-    return std::make_unique< HomeStoreCraftCheckpointTrigger >();
+    };
 }
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -787,18 +779,18 @@ bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapsho
 }
 
 void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
-    if (checkpoint_trigger_ == nullptr) {
+    if (!checkpoint_trigger_) {
         LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
              commit_lsn_snapshot);
         return;
     }
     // force=false: let this coalesce with any checkpoint already in flight rather than forcing
-    // back-to-back flushes under high commit throughput (see CraftCheckpointTrigger's doc comment).
+    // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
     // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
     auto self = shared_from_this();
     detail::detach([self, commit_lsn_snapshot]() -> async_status {
-        if (auto cp = co_await self->checkpoint_trigger_->trigger_cp_flush(false); !cp)
+        if (auto cp = co_await self->checkpoint_trigger_(false); !cp)
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
         co_return ok();
     }());
@@ -812,8 +804,8 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 // every subsequent write()/keep_alive() retries the advance. Never holds a lock across the co_await
 // read_slot() suspension point below (same rule fetch_data's doc comment already establishes).
 
-async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t const& write_fn,
-                                                  delete_index_fn_t const& delete_fn) {
+async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t write_fn,
+                                                  delete_index_fn_t delete_fn) {
     int64_t commit_lsn, last_append_lsn;
     {
         std::lock_guard lk{state_mu_};
@@ -822,15 +814,32 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
     }
+    // Tracks the highest lsn successfully applied so far, updated per-iteration below WITHOUT
+    // state_mu_. Written to the shared state_.commit_lsn exactly once, in
+    // RunningGuard's destructor, instead of per-iteration -- see the destructor's own comment for why
+    // this trades a per-iteration lock for a real (accepted) staleness window on the read path.
+    int64_t final_commit_lsn = commit_lsn;
+
     // Guaranteed reset on every exit path (stall, success, or error): a local RAII object's destructor
-    // runs when the coroutine frame unwinds, exactly like a plain function's locals on return.
+    // runs when the coroutine frame unwinds, exactly like a plain function's locals on return. Also
+    // runs the checkpoint-interval check here rather than only on the happy-path tail: folding it into
+    // this same critical section means every exit -- including an early error return mid-loop -- still
+    // gets a chance to fire the checkpoint (a slot that keeps failing on retry no longer permanently
+    // starves it), and merges what would otherwise be two separate state_mu_ acquisitions into one.
     struct RunningGuard {
         CraftReplDev* self;
+        int64_t* final_commit_lsn_ptr;
         ~RunningGuard() {
-            std::lock_guard lk{self->state_mu_};
-            self->commit_running_ = false;
+            bool should_checkpoint;
+            {
+                std::lock_guard lk{self->state_mu_};
+                self->state_.commit_lsn = *final_commit_lsn_ptr;
+                self->commit_running_ = false;
+                should_checkpoint = self->checkpoint_interval_crossed_locked(*final_commit_lsn_ptr);
+            }
+            if (should_checkpoint) self->fire_checkpoint_trigger(*final_commit_lsn_ptr);
         }
-    } guard{this};
+    } guard{this, &final_commit_lsn};
 
     int64_t const target = std::min(upto_lsn, last_append_lsn);
     for (int64_t lsn = commit_lsn + 1; lsn <= target; ++lsn) {
@@ -942,18 +951,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             }
         }
 
-        std::lock_guard lk{state_mu_};
-        state_.commit_lsn = lsn;
+        final_commit_lsn = lsn; // no lock -- see final_commit_lsn's own doc comment above
     }
 
-    int64_t final_commit_lsn;
-    bool should_checkpoint;
-    {
-        std::lock_guard lk{state_mu_};
-        final_commit_lsn = state_.commit_lsn;
-        should_checkpoint = checkpoint_interval_crossed_locked(final_commit_lsn);
-    }
-    if (should_checkpoint) fire_checkpoint_trigger(final_commit_lsn);
     co_return final_commit_lsn;
 }
 
@@ -969,14 +969,14 @@ async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
     delete_index_fn_t delete_fn = [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
         return indx_tbl_->delete_lba_range(s, e, freed);
     };
-    auto r = co_await commit_impl(upto_lsn, write_fn, delete_fn);
+    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
     co_return r;
 }
 
 #ifdef _PRERELEASE
 async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_fn_t write_fn,
                                                   delete_index_fn_t delete_fn) {
-    auto r = co_await commit_impl(upto_lsn, write_fn, delete_fn);
+    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
     co_return r;
 }
 #endif
