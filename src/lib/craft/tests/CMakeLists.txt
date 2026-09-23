@@ -168,6 +168,23 @@ add_dependencies(test_craft_raft_entries ${PROJECT_NAME}_core)
 
 add_test(NAME CraftRaftEntriesTest COMMAND test_craft_raft_entries)
 
+# Unit tests for CraftReplDev::pre_resolve_slots (S5 leader pre-resolution: SDSTOR-22907). Same
+# pattern: compile craft_repl_dev.cpp directly.
+add_executable(test_craft_pre_resolution)
+target_sources(test_craft_pre_resolution PRIVATE
+    test_craft_pre_resolution.cpp
+    ../craft_repl_dev.cpp
+)
+target_compile_definitions(test_craft_pre_resolution PRIVATE _PRERELEASE)
+target_sources(test_craft_pre_resolution PRIVATE ${HB_CONFIG_BINDUMP})
+target_link_libraries(test_craft_pre_resolution
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+add_dependencies(test_craft_pre_resolution ${PROJECT_NAME}_core)
+
+add_test(NAME CraftPreResolutionTest COMMAND test_craft_pre_resolution)
+
 # Heavy integration test for CraftReplDev::commit()/read() against a REAL VolumeIndexTable and real
 # data blocks (via a real, ordinarily-created volume) -- same pattern as
 # test_craft_homestore_backend.cpp (links the full library, real HomeStore bring-up).
