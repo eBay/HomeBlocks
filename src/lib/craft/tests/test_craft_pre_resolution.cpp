@@ -224,6 +224,24 @@ TEST_F(CraftPreResolutionTest, PassesConfiguredTimeoutToQuorumFetcher) {
     EXPECT_EQ(fetcher_.last_timeout_ms, 1234u);
 }
 
+// Guard shape mirrors write()'s own k_max_ooo_gap check (test_craft_write.cpp's GapCapFenceposts):
+// upto too far ahead of last_append_lsn is rejected (value_too_large) before ever calling the
+// fetcher, and upto near INT64_MAX trips the overflow-safe guard (invalid_argument) first.
+TEST_F(CraftPreResolutionTest, UptoGapCapFenceposts) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(0, {});
+
+    auto r1 = do_pre_resolve(/*upto=*/2'000'000);
+    ASSERT_FALSE(r1.has_value());
+    EXPECT_EQ(r1.error(), std::make_error_condition(std::errc::value_too_large));
+    EXPECT_EQ(fetcher_.call_count, 0);
+
+    auto r2 = do_pre_resolve(/*upto=*/INT64_MAX);
+    ASSERT_FALSE(r2.has_value());
+    EXPECT_EQ(r2.error(), std::make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(fetcher_.call_count, 0);
+}
+
 // ── outright fetch failure ────────────────────────────────────────────────────
 
 TEST_F(CraftPreResolutionTest, FetchFromQuorumFailsPropagatesErrorNoLocalMutation) {
@@ -246,6 +264,24 @@ TEST_F(CraftPreResolutionTest, ZeroRespondingMembersReturnsErrorNoLocalMutation)
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(5, {3});
     fetcher_.response = {}; // succeeds, but literally zero members responded
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
+    EXPECT_TRUE(dev_->is_missing(3)); // untouched
+    EXPECT_FALSE(journal_->has_slot(3));
+}
+
+// A non-empty response where every single member's reply is malformed is just as untrustworthy as
+// zero responding members -- must also fail closed, not fall through to mint Empty verdicts for
+// candidates nobody actually vouched for.
+TEST_F(CraftPreResolutionTest, AllMembersMalformedReturnsErrorNoLocalMutation) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {
+        QuorumSlotResponse{.slots = {JournalSlot{.lsn = 99, .is_empty = true}}}, // names an unrequested lsn
+    };
 
     auto r = do_pre_resolve(/*upto=*/5);
 

@@ -1662,6 +1662,19 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
     {
         std::lock_guard lk{state_mu_};
         term = state_.term;
+        // Same guard shape as write()'s own k_max_ooo_gap check: upto will eventually
+        // carry client/RAFT-controlled wire input (SDSTOR-22908), so it must be bounded against
+        // last_append_lsn before it drives candidates' size or either loop below.
+        static constexpr int64_t k_max_pre_resolve_gap = 1'000'000;
+        if (upto > INT64_MAX - k_max_pre_resolve_gap) {
+            LOGW("pre_resolve_slots rejected: upto={} exceeds safe LSN range", upto);
+            co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
+        }
+        if (upto - state_.last_append_lsn > k_max_pre_resolve_gap) {
+            LOGW("pre_resolve_slots rejected: upto={} too far ahead of last_append_lsn={}", upto,
+                 state_.last_append_lsn);
+            co_return std::unexpected(make_error_condition(std::errc::value_too_large));
+        }
         candidates.reserve(missing_lsns_.size() +
                            static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
         // missing_lsns_ is ordered, so once an entry exceeds upto every remaining entry does too --
@@ -1701,6 +1714,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
     data_by_lsn.reserve(candidates.size());
     std::unordered_set< int64_t > empty_by_quorum;
     empty_by_quorum.reserve(candidates.size());
+    int valid_member_count = 0;
     for (auto& member : *responses) {
         if (auto bad_lsn = validate_fetch_response(candidates, member.slots); bad_lsn) {
             // Reject only this member's response, not the whole quorum fetch -- a broadcast should
@@ -1710,6 +1724,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                  *bad_lsn);
             continue;
         }
+        ++valid_member_count;
         for (auto& slot : member.slots) {
             if (slot.is_empty) {
                 empty_by_quorum.insert(slot.lsn);
@@ -1719,6 +1734,14 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!empty_by_quorum.contains(slot.lsn) && !data_by_lsn.contains(slot.lsn))
                 data_by_lsn.emplace(slot.lsn, &slot);
         }
+    }
+    if (valid_member_count == 0) {
+        // Every responding member's reply was malformed. Fail closed rather than
+        // falling through to mint an Empty verdict for every candidate with nothing behind it.
+        LOGE("pre_resolve_slots: all {} responding member(s) sent a malformed reply -- no trustworthy "
+             "evidence for {} candidate(s)",
+             responses->size(), candidates.size());
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
     std::vector< int64_t > empty_slots;
