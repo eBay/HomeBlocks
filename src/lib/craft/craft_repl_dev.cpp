@@ -30,6 +30,7 @@
 #include <sisl/async/value_awaitable.hpp>   // value_awaitable<T>: lock-free completion-before-suspend-safe bridge
 
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1640,6 +1641,124 @@ async_status CraftReplDev::run_recovery() {
     }
     recovering_.store(false, std::memory_order_release);
     co_return r;
+}
+
+// ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
+//
+// candidates is the union of missing_lsns_ ∩ [0, upto] and (last_append_lsn, upto] minus empty_lsns_
+//
+// Read-only against missing_lsns_/last_append_lsn otherwise: missing_lsns_ entries are only erased once
+// data is genuinely written locally below; last_append_lsn only advances once the resulting
+// SyncRSCommitLSN entry commits (apply_sync_rs_commit_lsn's job, not this leader-side preparation).
+//
+// Known, accepted follow-up: a beyond-frontier candidate written here still gets re-marked missing and
+// re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has
+// no way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
+
+async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t upto) {
+    auto self = shared_from_this();
+    std::vector< int64_t > candidates;
+    uint64_t term;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+        candidates.reserve(missing_lsns_.size() +
+                           static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
+        for (int64_t lsn : missing_lsns_) {
+            if (lsn <= upto) candidates.push_back(lsn);
+        }
+        for (int64_t lsn = state_.last_append_lsn + 1; lsn <= upto; ++lsn) {
+            if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
+        }
+    }
+    if (candidates.empty()) co_return std::vector< int64_t >{};
+
+    if (peer_fetcher_ == nullptr) {
+        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_fetcher_ wired -- refusing to resolve",
+             candidates.size(), upto);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+
+    auto responses = co_await peer_fetcher_->fetch_from_quorum(candidates, peer_fetch_timeout_ms_);
+    if (!responses) {
+        LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
+        co_return std::unexpected(responses.error());
+    }
+
+    // Empty beats data even across members, regardless of response order: seeing Empty for an lsn purges
+    // any data an earlier-processed member already reported for it (data-then-empty order), and the guard
+    // on the emplace below blocks a later member's stale data from being (re-)inserted once an earlier
+    // member has already verdicted the same lsn Empty (empty-then-data order).
+    std::unordered_map< int64_t, JournalSlot* > data_by_lsn;
+    data_by_lsn.reserve(candidates.size());
+    std::unordered_set< int64_t > empty_by_quorum;
+    empty_by_quorum.reserve(candidates.size());
+    for (auto& member : *responses) {
+        if (auto bad_lsn = validate_fetch_response(candidates, member.slots); bad_lsn) {
+            // Reject only this member's response, not the whole quorum fetch -- a broadcast should
+            // tolerate one misbehaving member without losing legitimate evidence from the rest.
+            LOGW("pre_resolve_slots: a quorum member's response named lsn={} not requested (or duplicated) -- "
+                 "discarding that member's entire reply",
+                 *bad_lsn);
+            continue;
+        }
+        for (auto& slot : member.slots) {
+            if (slot.is_empty) {
+                empty_by_quorum.insert(slot.lsn);
+                data_by_lsn.erase(slot.lsn);
+                continue;
+            }
+            if (!empty_by_quorum.contains(slot.lsn) && !data_by_lsn.contains(slot.lsn))
+                data_by_lsn.emplace(slot.lsn, &slot);
+        }
+    }
+
+    std::vector< int64_t > empty_slots;
+    for (int64_t lsn : candidates) {
+        if (empty_by_quorum.contains(lsn)) {
+            empty_slots.push_back(lsn);
+            continue;
+        }
+        auto it = data_by_lsn.find(lsn);
+        if (it == data_by_lsn.end()) {
+            empty_slots.push_back(lsn); // no responding member reported data or Empty: quorum-lacks-evidence
+            continue;
+        }
+        JournalSlot* slot = it->second;
+        // Same alloc -> write_slot -> blkid-guarded cleanup-on-failure pattern as
+        // apply_sync_rs_commit_lsn's own catch-up loop -- see its comments for the HS_DATA_LINKED
+        // rationale this mirrors.
+        homestore::multi_blk_id blkid{};
+        bool blkid_allocated = false;
+        if (!slot->all_zeros) {
+            auto alloc_res = co_await journal_->alloc_write_data(slot->data, slot->len_bytes);
+            if (!alloc_res) {
+                LOGE("pre_resolve_slots: alloc_write_data failed lsn={}: {} -- leaving as unresolved", slot->lsn,
+                     alloc_res.error().message());
+                continue;
+            }
+            blkid = *alloc_res;
+            blkid_allocated = true;
+        }
+        auto res = co_await journal_->write_slot(slot->lsn, term, slot->lba_off_bytes, slot->len_bytes, blkid,
+                                                 slot->all_zeros, slot->csums);
+        if (!res) {
+            LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
+                 res.error().message());
+            if (blkid_allocated) {
+                detail::detach([self, blkid, lsn = slot->lsn]() -> async_status {
+                    if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                        LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
+                             fr.error().message());
+                    co_return ok();
+                }());
+            }
+            continue;
+        }
+        std::lock_guard lk{state_mu_};
+        missing_lsns_.erase(slot->lsn);
+    }
+    co_return empty_slots;
 }
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────

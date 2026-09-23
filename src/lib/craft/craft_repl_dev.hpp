@@ -167,7 +167,7 @@ public:
     // contract is "trust whichever subset of members responded" -- there is no replica-set
     // membership concept anywhere in this backend yet (S8/S9/S10 territory).
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
-                                                                                  uint32_t timeout_ms) = 0;
+                                                                                uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
