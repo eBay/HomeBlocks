@@ -1664,8 +1664,11 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
         term = state_.term;
         candidates.reserve(missing_lsns_.size() +
                            static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
+        // missing_lsns_ is ordered, so once an entry exceeds upto every remaining entry does too --
+        // stop instead of scanning the rest of the set.
         for (int64_t lsn : missing_lsns_) {
-            if (lsn <= upto) candidates.push_back(lsn);
+            if (lsn > upto) break;
+            candidates.push_back(lsn);
         }
         for (int64_t lsn = state_.last_append_lsn + 1; lsn <= upto; ++lsn) {
             if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
@@ -1683,6 +1686,11 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
     if (!responses) {
         LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
         co_return std::unexpected(responses.error());
+    }
+    if (responses->empty()) {
+        LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
+             candidates.size());
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
     // Empty beats data even across members, regardless of response order: seeing Empty for an lsn purges

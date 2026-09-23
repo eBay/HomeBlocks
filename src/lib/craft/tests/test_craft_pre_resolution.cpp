@@ -211,6 +211,19 @@ TEST_F(CraftPreResolutionTest, CandidatesExtendPastOwnAppendFrontierUpToUpto) {
     EXPECT_EQ(dev_->last_append_lsn(), 3); // unchanged -- apply_sync_rs_commit_lsn's job, not this one's
 }
 
+// set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_from_quorum verbatim.
+TEST_F(CraftPreResolutionTest, PassesConfiguredTimeoutToQuorumFetcher) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_fetch_timeout_ms(1234);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(fetcher_.last_timeout_ms, 1234u);
+}
+
 // ── outright fetch failure ────────────────────────────────────────────────────
 
 TEST_F(CraftPreResolutionTest, FetchFromQuorumFailsPropagatesErrorNoLocalMutation) {
@@ -224,6 +237,22 @@ TEST_F(CraftPreResolutionTest, FetchFromQuorumFailsPropagatesErrorNoLocalMutatio
     EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
     EXPECT_EQ(dev_->missing_count(), 0u);
     EXPECT_FALSE(journal_->has_slot(1));
+}
+
+// fetch_from_quorum can succeed with a genuinely empty response (CraftPeerFetcher's own contract: "a
+// non-responding member is simply absent from the result") -- zero responding members must fail closed,
+// not be treated the same as "some members responded, none had evidence" (which mints Empty below).
+TEST_F(CraftPreResolutionTest, ZeroRespondingMembersReturnsErrorNoLocalMutation) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {}; // succeeds, but literally zero members responded
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
+    EXPECT_TRUE(dev_->is_missing(3)); // untouched
+    EXPECT_FALSE(journal_->has_slot(3));
 }
 
 // ── data resolution ────────────────────────────────────────────────────────────
@@ -409,6 +438,7 @@ TEST_F(CraftPreResolutionTest, WriteSlotFailureLeavesLsnMissingNotInEmptySlots) 
     EXPECT_TRUE(r->empty()); // not verdicted Empty -- a quorum member DID have data for it
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(journal_->free_data_calls, 1); // the successful alloc_write_data is freed back, not leaked
 }
 
 } // namespace
