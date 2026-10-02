@@ -186,6 +186,10 @@ sisl::async::task< void > volume::destroy() {
         indx_tbl_ = nullptr;
     }
 
+    // Stop chunk selection and resize for this volume before its superblock goes away: a resize worker persists the
+    // new chunk list into the volume superblock.
+    volume_chunk_selector_->quiesce_chunks(vol_info_->ordinal);
+
     // destroy the superblock which will remove sb from meta svc;
     sb_.destroy();
 

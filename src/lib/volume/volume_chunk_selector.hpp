@@ -44,7 +44,9 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
     };
 
 private:
-    enum class ResizeOp { Idle, InProgress };
+    // Queued: a resize worker has been scheduled but has not started running yet.
+    // InProgress: the worker is running (allocating chunks / persisting the volume superblock).
+    enum class ResizeOp { Idle, Queued, InProgress };
 
     enum class ResizeResult {
         Busy,       // another thread is resizing
@@ -85,8 +87,18 @@ public:
     std::vector< chunk_num_t > allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size, uint32_t& pdev_id,
                                                     bool lazy_alloc = true);
 
-    // Called during destroy of volume or index.
+    // Called during destroy of volume, before its superblock is destroyed. Stops chunk selection and resize for the
+    // volume and waits for a running resize worker, so no resize can persist into the superblock afterwards.
+    void quiesce_chunks(uint64_t volume_ordinal);
+
+    // Called during destroy of volume or index. Quiesces the volume if not done already and returns its chunks to the
+    // free pool, asynchronously when write-back cache entries have to be evicted first.
     void release_chunks(uint64_t volume_ordinal);
+
+    // Overrides how a released chunk's index write-back cache entries are evicted. Used by tests; by default the
+    // homestore index service write-back cache is used when it is available.
+    using EvictChunkFn = std::function< void(const shared< HBChunk >&) >;
+    void set_evict_chunk_fn(EvictChunkFn fn) { m_evict_chunk_fn = std::move(fn); }
 
     // Called during recovery of volume or index .
     bool recover_chunks(uint64_t volume_ordinal, uint32_t pdev_id, uint64_t volume_size,
@@ -109,6 +121,7 @@ private:
     std::vector< shared< HBChunk > > allocate_init_chunks_from_pdev(uint64_t init_chunks, uint64_t total_chunks);
     std::vector< shared< HBChunk > > allocate_resize_chunks_from_pdev(uint32_t pdev, uint64_t num_chunks);
     ResizeResult resize_volume_num_chunks(homestore::blk_count_t nblks, shared< VolumeChunksInfo > volc);
+    void wait_for_quiesce(const VolumeChunksInfo& volc) const;
     void dump_per_pdev_chunks() const;
     std::string dump_chunks() const;
 
@@ -128,6 +141,7 @@ private:
     std::unordered_map< uint64_t, ChunkMap > m_per_dev_chunks;
     mutable std::shared_mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
+    EvictChunkFn m_evict_chunk_fn;
     std::string m_module_name;
 };
 

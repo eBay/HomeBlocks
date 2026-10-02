@@ -144,6 +144,12 @@ homestore::cshared< Chunk > VolumeChunkSelector::select_chunk(homestore::blk_cou
         const auto num_active = volc->num_active_chunks.load(std::memory_order_acquire);
         if (num_active == 0) { return nullptr; }
 
+        // Grow ahead of demand: start a resize when free space runs low (or the force-resize flip is set), but don't
+        // wait for it while the active chunks still have free blks.
+        if (num_active < volc->max_num_chunks && volc->resize_op.load(std::memory_order_acquire) == ResizeOp::Idle) {
+            (void)resize_volume_num_chunks(nblks, volc);
+        }
+
         for (uint64_t i = 0; i < num_active; ++i) {
             auto idx = volc->m_next_chunk_index.fetch_add(1, std::memory_order_relaxed) % num_active;
             auto chunk = volc->m_chunks[idx];
@@ -193,8 +199,7 @@ VolumeChunkSelector::ResizeResult VolumeChunkSelector::resize_volume_num_chunks(
 
     // Some other thread is in process of adding the chunks
     auto idle = ResizeOp::Idle;
-    auto in_progress = ResizeOp::InProgress;
-    if (!volc->resize_op.compare_exchange_strong(idle, in_progress)) { return ResizeResult::Busy; }
+    if (!volc->resize_op.compare_exchange_strong(idle, ResizeOp::Queued)) { return ResizeResult::Busy; }
 
     // TODO chunk select will have on_alloc_blk, on_free_blk
     // Only scan the published active prefix. Readers should treat
@@ -219,8 +224,8 @@ VolumeChunkSelector::ResizeResult VolumeChunkSelector::resize_volume_num_chunks(
     if (!force_resize) {
         auto usage_ratio = total_blks ? (float)available_blks / total_blks : 0.0f;
         if ((nblks < available_blks && usage_ratio > 0.5f)) {
-            // Check again if another thread already did the resize
-            LOGI("Another thread already completed the resize op.");
+            // Enough free blks in the active chunks, no resize needed yet.
+            LOGT("No resize needed for volume={} available={} total={}", volc->ordinal, available_blks, total_blks);
             volc->resize_op.store(ResizeOp::Idle, std::memory_order_release);
             return ResizeResult::NotNeeded;
         }
@@ -243,6 +248,15 @@ VolumeChunkSelector::ResizeResult VolumeChunkSelector::resize_volume_num_chunks(
          volc->ordinal, available_blks, total_blks);
 
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [volc, this]() mutable {
+        // Publish InProgress before checking releasing: quiesce_chunks() sets releasing before checking for
+        // InProgress, so either it waits for this worker or this worker sees releasing and bails out.
+        auto queued = ResizeOp::Queued;
+        if (!volc->resize_op.compare_exchange_strong(queued, ResizeOp::InProgress)) { return; }
+        if (volc->releasing.load()) {
+            volc->resize_op.store(ResizeOp::Idle);
+            return;
+        }
+
         const auto num_chunks_to_alloc =
             std::min(static_cast< uint64_t >(num_chunks_per_resize),
                      (volc->max_num_chunks - volc->num_active_chunks.load(std::memory_order_acquire)));
@@ -359,7 +373,9 @@ VolumeChunkSelector::allocate_resize_chunks_from_pdev(uint32_t pdev_id, uint64_t
     std::lock_guard lock(m_chunk_sel_mutex);
     std::vector< shared< HBChunk > > result;
     auto& chunks = m_per_dev_chunks[pdev_id];
-    RELEASE_ASSERT(num_chunks <= chunks.size(), "Not enough chunks for volume");
+    // The capacity check in resize_volume_num_chunks() doesn't reserve chunks; other volumes on this pdev may have
+    // taken them since. Hand out what is left (possibly none).
+    num_chunks = std::min< uint64_t >(num_chunks, chunks.size());
 
     // Allocate chunks from this pdev pool.
     uint32_t count = 0;
@@ -414,6 +430,26 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     return true;
 }
 
+// Wait until no selector is still walking this volume and no resize worker is running. A worker that is only queued
+// is not waited for: it may be queued on the very reactor we are blocking here, and once it runs it sees releasing and
+// bails out before taking any chunks.
+void VolumeChunkSelector::wait_for_quiesce(const VolumeChunksInfo& volc) const {
+    while (volc.inflight_selects.load() != 0 || volc.resize_op.load() == ResizeOp::InProgress) {
+        std::this_thread::yield();
+    }
+}
+
+void VolumeChunkSelector::quiesce_chunks(uint64_t volume_ordinal) {
+    shared< VolumeChunksInfo > volc;
+    {
+        std::unique_lock lock(m_chunk_sel_mutex);
+        volc = m_volume_chunks[volume_ordinal];
+        if (!volc) { return; }
+        volc->releasing.store(true);
+    }
+    wait_for_quiesce(*volc);
+}
+
 // Release the active chunks back to the per device chunk pool
 void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
     shared< VolumeChunksInfo > volc;
@@ -422,16 +458,19 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
         std::unique_lock lock(m_chunk_sel_mutex);
         volc = std::exchange(m_volume_chunks[volume_ordinal], nullptr);
         RELEASE_ASSERT(volc, "volume doesnt exists");
-        volc->releasing.store(true, std::memory_order_release);
+        volc->releasing.store(true);
     }
 
-    // Wait until no selector is still walking this volume and no resize is running
-    while (volc->inflight_selects.load(std::memory_order_acquire) != 0 ||
-           volc->resize_op.load(std::memory_order_acquire) != ResizeOp::Idle) {
-        std::this_thread::yield();
+    wait_for_quiesce(*volc);
+
+    auto evict_fn = m_evict_chunk_fn;
+    if (!evict_fn && homestore::hs() && homestore::hs()->has_index_service()) [[likely]] {
+        evict_fn = [](const shared< HBChunk >& chunk) {
+            homestore::hs()->index_service().wb_cache().evict_chunk_blkids(*chunk->get_internal_chunk());
+        };
     }
 
-    auto release_fn = [this, volume_ordinal, volc]() mutable {
+    auto release_fn = [this, volume_ordinal, volc, evict_fn]() mutable {
         std::string str;
         uint64_t cnt{};
 
@@ -441,9 +480,7 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
             fmt::format_to(std::back_inserter(str), "{} ", chunk->get_chunk_id());
             ++cnt;
 
-            if (homestore::hs() && homestore::hs()->has_index_service()) [[likely]] {
-                homestore::hs()->index_service().wb_cache().evict_chunk_blkids(*chunk->get_internal_chunk());
-            }
+            if (evict_fn) { evict_fn(chunk); }
 
             {
                 std::unique_lock lock{m_chunk_sel_mutex};
@@ -459,7 +496,7 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
         LOGDEBUG("Released chunks={}", str);
     };
 
-    if (homestore::hs() && homestore::hs()->has_index_service()) [[likely]] {
+    if (evict_fn) [[likely]] {
         // Clear wbc entries in a separate thread
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, std::move(release_fn));
     } else {

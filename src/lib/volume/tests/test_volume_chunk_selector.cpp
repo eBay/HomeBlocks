@@ -439,6 +439,146 @@ TEST_F(ChunkSelectorTest, RecoverReleaseReallocateTest) {
     EXPECT_EQ(pdev_id, 0u);
 }
 
+TEST_F(ChunkSelectorTest, ResizeClampsToFreePoolTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    // One pdev with 4 chunks of 16KB. vol0 may grow to 4 chunks and vol1 to 3, so the pool is overcommitted and a
+    // resize can ask for more chunks than are left
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 4 /*chunks per pdev*/);
+
+    uint32_t pdev_id{UINT32_MAX};
+    ASSERT_EQ(chunk_sel->allocate_init_chunks(0 /* ordinal */, 64 * Ki, pdev_id).size(), 1u);
+    ASSERT_EQ(chunk_sel->allocate_init_chunks(1 /* ordinal */, 48 * Ki, pdev_id).size(), 1u);
+    ASSERT_EQ(chunk_sel->num_free_chunks(), 2u);
+
+    homestore::blk_alloc_hints hints;
+
+    // vol0 wants 3 more chunks but only 2 are left; it must get those 2 instead of asserting
+    for (auto& c : chunk_sel->get_chunks(0)) {
+        c->get_internal_chunk()->set_available_blks(0);
+    }
+    hints.application_hint = 0;
+    EXPECT_NE(chunk_sel->select_chunk(1 /* nblks */, hints), nullptr);
+    EXPECT_EQ(chunk_sel->get_chunks(0).size(), 3u);
+    EXPECT_EQ(chunk_sel->num_free_chunks(), 0u);
+
+    // vol1 is full and the pool is empty, so it is out of space.
+    for (auto& c : chunk_sel->get_chunks(1)) {
+        c->get_internal_chunk()->set_available_blks(0);
+    }
+    hints.application_hint = 1;
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(chunk_sel->select_chunk(1 /* nblks */, hints), nullptr);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+}
+
+TEST_F(ChunkSelectorTest, ResizeAheadOfDemandTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+
+    uint32_t pdev_id{UINT32_MAX};
+    ASSERT_EQ(chunk_sel->allocate_init_chunks(0 /* ordinal */, 64 * Ki, pdev_id).size(), 1u);
+
+    // The only active chunk is less than half free but not full: select_chunk() must return it right away and grow
+    // the volume in the background
+    auto active = chunk_sel->get_chunks(0);
+    active[0]->get_internal_chunk()->set_available_blks(1);
+
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = 0;
+    EXPECT_EQ(chunk_sel->select_chunk(1 /* nblks */, hints), active[0]->get_internal_chunk());
+
+    wait_until([&] { return chunk_sel->get_chunks(0).size() > 1; });
+}
+
+TEST_F(ChunkSelectorTest, QuiesceWaitsForRunningResizeTest) {
+    std::promise< void > cb_entered_promise;
+    auto cb_entered = cb_entered_promise.get_future();
+    std::promise< void > allow_cb_exit_promise;
+    auto allow_cb_exit = allow_cb_exit_promise.get_future();
+    std::atomic< uint32_t > num_cb{0};
+
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [&, this](uint64_t, const std::vector< chunk_num_t >&) {
+            if (num_cb++ == 0) { cb_entered_promise.set_value(); }
+            allow_cb_exit.wait();
+        });
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free = chunk_sel->num_free_chunks();
+
+    uint32_t pdev_id{UINT32_MAX};
+    ASSERT_EQ(chunk_sel->allocate_init_chunks(0 /* ordinal */, 64 * Ki, pdev_id).size(), 1u);
+    for (auto& c : chunk_sel->get_chunks(0)) {
+        c->get_internal_chunk()->set_available_blks(0);
+    }
+
+    homestore::blk_alloc_hints hints;
+    hints.application_hint = 0;
+    std::thread selector([&] { (void)chunk_sel->select_chunk(1 /* nblks */, hints); });
+
+    // The resize worker is now persisting the new chunk list (volume superblock update)
+    ASSERT_EQ(cb_entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+    // quiesce_chunks() must not return while the worker can still touch the superblock.
+    auto quiesced = std::async(std::launch::async, [&] { chunk_sel->quiesce_chunks(0 /* ordinal */); });
+    EXPECT_EQ(quiesced.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+
+    allow_cb_exit_promise.set_value();
+    ASSERT_EQ(quiesced.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    selector.join();
+
+    // After quiesce: no new resize, and the worker did not publish its chunks to the dying volume
+    EXPECT_EQ(chunk_sel->select_chunk(1 /* nblks */, hints), nullptr);
+    EXPECT_EQ(num_cb.load(), 1u);
+    EXPECT_EQ(chunk_sel->get_chunks(0).size(), 1u);
+
+    chunk_sel->release_chunks(0 /* ordinal */);
+    wait_until([&] { return chunk_sel->num_free_chunks() == total_free; });
+}
+
+TEST_F(ChunkSelectorTest, AsyncReleaseWaitsForEvictionTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    // Stand-in for the index write-back cache eviction; blocks until the test allows it
+    auto allow_evict_promise = std::make_shared< std::promise< void > >();
+    std::shared_future< void > allow_evict = allow_evict_promise->get_future().share();
+    auto num_evicted = std::make_shared< std::atomic< uint32_t > >(0);
+    chunk_sel->set_evict_chunk_fn([allow_evict, num_evicted](const auto&) {
+        allow_evict.wait();
+        ++*num_evicted;
+    });
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free = chunk_sel->num_free_chunks();
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto ids = chunk_sel->allocate_init_chunks(0 /* ordinal */, 48 * Ki, pdev_id, false /* lazy alloc */);
+    ASSERT_EQ(ids.size(), 3u);
+
+    // release_chunks() returns without waiting for eviction, but the chunks must not be reusable until evicted
+    chunk_sel->release_chunks(0 /* ordinal */);
+    EXPECT_TRUE(chunk_sel->get_chunks(0).empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(chunk_sel->num_free_chunks(), total_free - ids.size());
+    EXPECT_EQ(num_evicted->load(), 0u);
+
+    allow_evict_promise->set_value();
+    wait_until([&] { return chunk_sel->num_free_chunks() == total_free; });
+    EXPECT_EQ(num_evicted->load(), ids.size());
+
+    // The released chunks are reset and can be handed to a new volume (allocation asserts they are unowned).
+    auto new_ids = chunk_sel->allocate_init_chunks(1 /* ordinal */, 160 * Ki, pdev_id, false /* lazy alloc */);
+    ASSERT_EQ(new_ids.size(), total_free);
+    for (auto id : ids) {
+        EXPECT_NE(std::find(new_ids.begin(), new_ids.end(), id), new_ids.end());
+    }
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
