@@ -579,6 +579,49 @@ TEST_F(ChunkSelectorTest, AsyncReleaseWaitsForEvictionTest) {
     }
 }
 
+TEST_F(ChunkSelectorTest, ShutdownSkipsEvictionOfPendingReleaseTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    // Stand-in for the index write-back cache eviction; blocks until the test allows it
+    auto evict_entered_promise = std::make_shared< std::promise< void > >();
+    auto evict_entered = evict_entered_promise->get_future();
+    auto allow_evict_promise = std::make_shared< std::promise< void > >();
+    std::shared_future< void > allow_evict = allow_evict_promise->get_future().share();
+    auto num_evicted = std::make_shared< std::atomic< uint32_t > >(0);
+    chunk_sel->set_evict_chunk_fn([evict_entered_promise, allow_evict, num_evicted](const auto&) {
+        if (num_evicted->fetch_add(1) == 0) { evict_entered_promise->set_value(); }
+        allow_evict.wait();
+    });
+
+    add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 10 /*chunks per pdev*/);
+    const auto total_free = chunk_sel->num_free_chunks();
+
+    uint32_t pdev_id{UINT32_MAX};
+    auto ids = chunk_sel->allocate_init_chunks(0 /* ordinal */, 48 * Ki, pdev_id, false /* lazy alloc */);
+    ASSERT_EQ(ids.size(), 3u);
+    EXPECT_FALSE(chunk_sel->has_pending_releases());
+
+    chunk_sel->release_chunks(0 /* ordinal */);
+    EXPECT_TRUE(chunk_sel->has_pending_releases());
+
+    // Shutdown starts while the release is evicting its first chunk
+    ASSERT_EQ(evict_entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    chunk_sel->start_shutdown();
+
+    // The release still runs, so shutdown has to keep waiting for it
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_TRUE(chunk_sel->has_pending_releases());
+    EXPECT_EQ(chunk_sel->num_free_chunks(), total_free - ids.size());
+
+    allow_evict_promise->set_value();
+    wait_until([&] { return !chunk_sel->has_pending_releases(); });
+
+    // Only the chunk already being evicted was evicted; the rest were just reset and returned to the free pool
+    EXPECT_EQ(num_evicted->load(), 1u);
+    EXPECT_EQ(chunk_sel->num_free_chunks(), total_free);
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);

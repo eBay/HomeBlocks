@@ -95,10 +95,18 @@ public:
     // free pool, asynchronously when write-back cache entries have to be evicted first.
     void release_chunks(uint64_t volume_ordinal);
 
-    // Overrides how a released chunk's index write-back cache entries are evicted. Used by tests; by default the
-    // homestore index service write-back cache is used when it is available.
+    // How a released chunk's index write-back cache entries are evicted. Only the index selector sets this: data chunk
+    // blkids can never be in the index write-back cache. Without it chunks are released synchronously.
     using EvictChunkFn = std::function< void(const shared< HBChunk >&) >;
     void set_evict_chunk_fn(EvictChunkFn fn) { m_evict_chunk_fn = std::move(fn); }
+
+    // Called when shutdown starts. Asynchronous releases skip write-back cache eviction from then on (the cache is
+    // memory only and gone after restart) and only reset the chunk allocators, so they finish quickly.
+    void start_shutdown() { m_stopping.store(true); }
+
+    // Shutdown must wait for these: they still touch homestore, and their allocator resets have to be persisted by
+    // homestore's final checkpoint.
+    bool has_pending_releases() const { return m_pending_releases.load() != 0; }
 
     // Called during recovery of volume or index .
     bool recover_chunks(uint64_t volume_ordinal, uint32_t pdev_id, uint64_t volume_size,
@@ -142,6 +150,8 @@ private:
     mutable std::shared_mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
     EvictChunkFn m_evict_chunk_fn;
+    std::atomic< bool > m_stopping{false};
+    std::atomic< uint32_t > m_pending_releases{0};
     std::string m_module_name;
 };
 

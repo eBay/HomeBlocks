@@ -15,7 +15,6 @@
 #include "volume_chunk_selector.hpp"
 #include "hb_internal.hpp"
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/index_service.hpp>
 
 namespace homeblocks {
 
@@ -464,11 +463,6 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
     wait_for_quiesce(*volc);
 
     auto evict_fn = m_evict_chunk_fn;
-    if (!evict_fn && homestore::hs() && homestore::hs()->has_index_service()) [[likely]] {
-        evict_fn = [](const shared< HBChunk >& chunk) {
-            homestore::hs()->index_service().wb_cache().evict_chunk_blkids(*chunk->get_internal_chunk());
-        };
-    }
 
     auto release_fn = [this, volume_ordinal, volc, evict_fn]() mutable {
         std::string str;
@@ -480,7 +474,8 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
             fmt::format_to(std::back_inserter(str), "{} ", chunk->get_chunk_id());
             ++cnt;
 
-            if (evict_fn) { evict_fn(chunk); }
+            // On shutdown only the allocator reset matters: the write-back cache doesn't survive a restart.
+            if (evict_fn && !m_stopping.load()) { evict_fn(chunk); }
 
             {
                 std::unique_lock lock{m_chunk_sel_mutex};
@@ -496,9 +491,14 @@ void VolumeChunkSelector::release_chunks(uint64_t volume_ordinal) {
         LOGDEBUG("Released chunks={}", str);
     };
 
-    if (evict_fn) [[likely]] {
+    if (evict_fn) {
         // Clear wbc entries in a separate thread
-        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, std::move(release_fn));
+        ++m_pending_releases;
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker,
+                                [this, release_fn = std::move(release_fn)]() mutable {
+                                    release_fn();
+                                    --m_pending_releases;
+                                });
     } else {
         release_fn();
     }

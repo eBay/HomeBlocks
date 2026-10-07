@@ -192,6 +192,7 @@ private:
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
     void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
     bool can_shutdown() const;
+    bool has_pending_chunk_releases() const;
 
     bool no_outstanding_vols() const;
 
