@@ -483,6 +483,12 @@ void HomeBlocksImpl::on_init_complete() {
         std::optional< meta_subtype_vec_t >({homestore::hs()->repl_service().get_meta_blk_name()}));
 
     homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
+
+    // Every index (recovered before repl devs) and volume has claimed its chunks by now, so chunks left in the free
+    // pools are unowned. Clear the ones a crash during volume destroy left with allocated blks, before they are reused.
+    // This runs before homestore starts its CP timer, so no CP flushes these allocators concurrently.
+    volume_chunk_selector_->reset_dirty_free_chunks();
+    index_chunk_selector_->reset_dirty_free_chunks();
 }
 
 void HomeBlocksImpl::init_cp() {}

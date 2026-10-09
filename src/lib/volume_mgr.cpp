@@ -29,12 +29,18 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
     {
         auto lg = std::scoped_lock(index_lock_);
         auto it = idx_tbl_map_.find(vol_ptr->id_str());
-        DEBUG_ASSERT(it != idx_tbl_map_.end(), "index pid: {} not exists in recovery path, not expected!",
-                     vol_ptr->id_str());
-        vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+        if (it != idx_tbl_map_.end()) {
+            vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
 
-        // don't need it after volume is initialized with index table;
-        idx_tbl_map_.erase(it);
+            // don't need it after volume is initialized with index table;
+            idx_tbl_map_.erase(it);
+        } else {
+            // A destroy that crashed after destroying the index table but before the volume superblock leaves the
+            // volume without index table; the destroy resumed below skips it. Any other volume must have one.
+            RELEASE_ASSERT(vol_ptr->is_destroying(), "index pid: {} not exists in recovery path, not expected!",
+                           vol_ptr->id_str());
+            LOGINFO("volume {} has no index table, it was destroyed before the crash", vol_ptr->id_str());
+        }
     }
 
     {
@@ -150,7 +156,8 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
         // 2. do volume destroy;
         co_await vol_ptr->destroy();
 #ifdef _PRERELEASE
-        if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
+        if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation") ||
+            iomgr_flip::instance()->test_flip("vol_destroy_crash_after_index_destroy")) {
             crash_simulated_ = true;
             co_return;
         }
