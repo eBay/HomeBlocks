@@ -22,6 +22,9 @@ table HomeBlksSettings{
     // homestore dataservice chunk size;
     hs_data_chunk_size_mb: uint32 = 2048;
 
+    // lazy chunk allocator on/off
+    dynamic_chunk_allocation: bool = true;
+
     // how often (in appended LSNs) the leader auto-proposes a SyncRSCommitLSN entry; also gates how
     // often a commit_lsn advance triggers a HomeStore checkpoint (SDSTOR-22888, CraftReplDev::
     // checkpoint_lsn_interval_), tying checkpoint cadence to this same periodic cadence;

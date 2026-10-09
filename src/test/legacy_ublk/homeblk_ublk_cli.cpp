@@ -63,6 +63,9 @@ SISL_OPTION_GROUP(homeblk_ublk,
                    ::cxxopts::value< uint32_t >(), "<mb>"),
                   (index_chunk_size_mb, "", "index_chunk_size_mb",
                    "homeblocks index chunk size in MB (for small devices)", ::cxxopts::value< uint32_t >(), "<mb>"),
+                  (dynamic_chunk_allocation, "", "dynamic_chunk_allocation",
+                   "lazily allocate volume data chunks (overrides dynamic config)", ::cxxopts::value< bool >(),
+                   "true or false"),
                   (device_id, "", "device_id", "ublk device id: -1 to assign, >=0 to recover a preserved device",
                    ::cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
 

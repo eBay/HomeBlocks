@@ -177,6 +177,12 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
         co_return std::unexpected(std::errc::operation_not_supported);
     }
 
+    // The volume is marked DESTROYING only once do_remove_volume runs, so shutdown could miss a remove accepted now.
+    if (is_shutting_down()) {
+        LOGE("Can't serve volume remove, system is shutting down.");
+        co_return std::unexpected(std::errc::operation_not_supported);
+    }
+
     auto vol = get_volume(id);
     if (!vol) {
         LOGE("volume with id {} not found, cannot remove", boost::uuids::to_string(id));
