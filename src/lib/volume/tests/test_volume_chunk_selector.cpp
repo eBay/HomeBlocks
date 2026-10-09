@@ -85,7 +85,8 @@ blk_num_t VChunk::get_total_blks() const { return m_internal_chunk->get_total_bl
 
 uint64_t VChunk::size() const { return m_internal_chunk->size(); }
 
-void VChunk::reset() {}
+// Stand-in for the blk allocator reset: the chunk is empty again
+void VChunk::reset() { m_internal_chunk->set_available_blks(m_internal_chunk->get_total_blks()); }
 
 cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk; }
 
@@ -577,6 +578,32 @@ TEST_F(ChunkSelectorTest, AsyncReleaseWaitsForEvictionTest) {
     for (auto id : ids) {
         EXPECT_NE(std::find(new_ids.begin(), new_ids.end(), id), new_ids.end());
     }
+}
+
+TEST_F(ChunkSelectorTest, ResetDirtyFreeChunksTest) {
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+
+    auto chunks = add_chunks_per_pdev(chunk_sel, 2 /*pdevs*/, 4 /*chunks per pdev*/);
+
+    // Volume 0 recovered chunks 0 and 1 (pdev 0); they are in use and must not be touched
+    ASSERT_TRUE(chunk_sel->recover_chunks(0 /* ordinal */, 0 /* pdev */, 32 * Ki, {0, 1}));
+    chunks[0]->set_available_blks(1);
+    chunks[1]->set_available_blks(0);
+
+    // Chunks 2 (pdev 0) and 5 (pdev 1) are unowned but were left with allocated blks by a crash during destroy
+    chunks[2]->set_available_blks(1);
+    chunks[5]->set_available_blks(0);
+
+    chunk_sel->reset_dirty_free_chunks();
+
+    EXPECT_EQ(chunks[0]->available_blks(), 1u);
+    EXPECT_EQ(chunks[1]->available_blks(), 0u);
+    for (auto& c : chunks) {
+        if (c->get_chunk_id() > 1) { EXPECT_EQ(c->available_blks(), c->get_total_blks()); }
+    }
+    EXPECT_EQ(chunk_sel->num_free_chunks(), chunks.size() - 2);
+    EXPECT_EQ(chunk_sel->get_chunks(0).size(), 2u);
 }
 
 TEST_F(ChunkSelectorTest, ShutdownSkipsEvictionOfPendingReleaseTest) {
