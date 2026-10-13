@@ -30,12 +30,30 @@ using Chunk = homestore::Chunk;
 class VolumeChunkSelector : public homestore::ChunkSelector {
     static constexpr homestore::chunk_num_t num_chunks_per_vol_init = 1;
     static constexpr homestore::chunk_num_t num_chunks_per_resize = 3;
-    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX;
+    static constexpr uint64_t INVALID_VOL_ORDINAL = UINT64_MAX; // not owned by any volume
 
     struct HBChunk : public homestore::VChunk {
         HBChunk(homestore::cshared< Chunk >& chunk) : homestore::VChunk(chunk) {}
         ~HBChunk() = default;
         uint64_t m_vol_ordinal{INVALID_VOL_ORDINAL};
+
+        void reset() {
+            m_vol_ordinal = INVALID_VOL_ORDINAL;
+            homestore::VChunk::reset();
+        }
+    };
+
+private:
+    // Queued: a resize worker has been scheduled but has not started running yet.
+    // InProgress: the worker is running (allocating chunks / persisting the volume superblock).
+    enum class ResizeOp { Idle, Queued, InProgress };
+
+    enum class ResizeResult {
+        Busy,       // another thread is resizing
+        Started,    // resize worker launched
+        NotNeeded,  // enough free blocks already
+        NoCapacity, // cannot add more chunks
+        Releasing
     };
 
     struct VolumeChunksInfo {
@@ -54,6 +72,10 @@ class VolumeChunkSelector : public homestore::ChunkSelector {
         std::atomic< uint32_t > m_next_chunk_index{0};
         uint64_t ordinal;
         uint32_t pdev;
+
+        std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
+        std::atomic< uint32_t > inflight_selects{};
+        std::atomic< bool > releasing{false};
     };
 
 public:
@@ -65,8 +87,26 @@ public:
     std::vector< chunk_num_t > allocate_init_chunks(uint64_t volume_ordinal, uint64_t volume_size, uint32_t& pdev_id,
                                                     bool lazy_alloc = true);
 
-    // Called during destroy of volume or index.
+    // Called during destroy of volume, before its superblock is destroyed. Stops chunk selection and resize for the
+    // volume and waits for a running resize worker, so no resize can persist into the superblock afterwards.
+    void quiesce_chunks(uint64_t volume_ordinal);
+
+    // Called during destroy of volume or index. Quiesces the volume if not done already and returns its chunks to the
+    // free pool, asynchronously when write-back cache entries have to be evicted first.
     void release_chunks(uint64_t volume_ordinal);
+
+    // How a released chunk's index write-back cache entries are evicted. Only the index selector sets this: data chunk
+    // blkids can never be in the index write-back cache. Without it chunks are released synchronously.
+    using EvictChunkFn = std::function< void(const shared< HBChunk >&) >;
+    void set_evict_chunk_fn(EvictChunkFn fn) { m_evict_chunk_fn = std::move(fn); }
+
+    // Called when shutdown starts. Asynchronous releases skip write-back cache eviction from then on (the cache is
+    // memory only and gone after restart) and only reset the chunk allocators, so they finish quickly.
+    void start_shutdown() { m_stopping.store(true); }
+
+    // Shutdown must wait for these: they still touch homestore, and their allocator resets have to be persisted by
+    // homestore's final checkpoint.
+    bool has_pending_releases() const { return m_pending_releases.load() != 0; }
 
     // Called during recovery of volume or index .
     bool recover_chunks(uint64_t volume_ordinal, uint32_t pdev_id, uint64_t volume_size,
@@ -88,16 +128,12 @@ public:
 private:
     std::vector< shared< HBChunk > > allocate_init_chunks_from_pdev(uint64_t init_chunks, uint64_t total_chunks);
     std::vector< shared< HBChunk > > allocate_resize_chunks_from_pdev(uint32_t pdev, uint64_t num_chunks);
-    void resize_volume_num_chunks(homestore::blk_count_t nblks, shared< VolumeChunksInfo > volc);
+    ResizeResult resize_volume_num_chunks(homestore::blk_count_t nblks, shared< VolumeChunksInfo > volc);
+    void wait_for_quiesce(const VolumeChunksInfo& volc) const;
     void dump_per_pdev_chunks() const;
     std::string dump_chunks() const;
 
 private:
-    enum class ResizeOp {
-        Idle,
-        InProgress,
-    };
-
     // Store volume chunks details with index as volume ordinal.
     std::vector< shared< VolumeChunksInfo > > m_volume_chunks;
 
@@ -111,9 +147,11 @@ private:
     // for allocation. This pool is used for allocation of chunks to volume.
     // Chunks once allocated to volume are removed from this pool.
     std::unordered_map< uint64_t, ChunkMap > m_per_dev_chunks;
-    mutable std::mutex m_chunk_sel_mutex;
+    mutable std::shared_mutex m_chunk_sel_mutex;
     UpdateVolSbCb m_update_vol_sb_cb;
-    std::atomic< ResizeOp > resize_op{ResizeOp::Idle};
+    EvictChunkFn m_evict_chunk_fn;
+    std::atomic< bool > m_stopping{false};
+    std::atomic< uint32_t > m_pending_releases{0};
     std::string m_module_name;
 };
 

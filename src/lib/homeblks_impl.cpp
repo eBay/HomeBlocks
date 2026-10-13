@@ -20,6 +20,7 @@
 #include <iomgr/drive.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/replication_service.hpp>
+#include <homestore/index_service.hpp>
 #include <sisl/options/options.h>
 #include "homeblks_impl.hpp"
 #include "listener.hpp"
@@ -61,6 +62,10 @@ home_blocks_stats HomeBlocksImpl::get_stats() const {
 std::future< void > HomeBlocksImpl::shutdown_start() {
     LOGI("Setting shutdown start flag");
     shutdown_started_.test_and_set();
+
+    // Pending chunk releases skip write-back cache eviction from now on; can_shutdown() waits for them.
+    if (volume_chunk_selector_) { volume_chunk_selector_->start_shutdown(); }
+    if (index_chunk_selector_) { index_chunk_selector_->start_shutdown(); }
 
     auto f = shutdown_promise_.get_future();
 
@@ -115,12 +120,23 @@ bool HomeBlocksImpl::no_outstanding_vols() const {
 
 bool HomeBlocksImpl::can_shutdown() const {
     // check if shutdown has started and no outstanding requests;
-    if (is_shutting_down() && no_outstanding_vols() && outstanding_reqs_.test_eq(0)) {
+    // A destroyed volume may still be releasing its chunks: that work touches homestore and its allocator resets must
+    // be persisted by homestore's final checkpoint, so homestore must not shut down before it is done.
+    if (is_shutting_down() && no_outstanding_vols() && outstanding_reqs_.test_eq(0) && !has_pending_chunk_releases()) {
         LOGI("Shutdown can proceed, outstanding requests: {}", outstanding_reqs_.get());
         return true;
     }
 
     LOGI("Shutdown cannot proceed, outstanding requests: {}", outstanding_reqs_.get());
+    return false;
+}
+
+bool HomeBlocksImpl::has_pending_chunk_releases() const {
+    if ((volume_chunk_selector_ && volume_chunk_selector_->has_pending_releases()) ||
+        (index_chunk_selector_ && index_chunk_selector_->has_pending_releases())) {
+        LOGI("Chunk releases of destroyed volumes are still pending");
+        return true;
+    }
     return false;
 }
 
@@ -275,6 +291,16 @@ hs_chunk_size_cfg_t HomeBlocksImpl::get_chunk_size() const {
     return hs_chunk_sz;
 }
 
+bool HomeBlocksImpl::dynamic_chunk_allocation() const {
+    if (SISL_OPTIONS.count("dynamic_chunk_allocation")) {
+        auto const on = SISL_OPTIONS["dynamic_chunk_allocation"].as< bool >();
+        LOGI("Using dynamic_chunk_allocation option value: {}", on);
+        return on;
+    }
+
+    return HB_DYNAMIC_CONFIG(dynamic_chunk_allocation);
+}
+
 void HomeBlocksImpl::init_homestore() {
     LOGI("Starting iomgr with {} threads", config_.threads);
     ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = config_.threads}).with_http_server();
@@ -297,6 +323,10 @@ void HomeBlocksImpl::init_homestore() {
         "index", [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
             // Todo: decide it later whether needed for index
         });
+    // Only index chunks hold btree nodes in the index write-back cache; data chunk blkids can never be in it.
+    index_chunk_selector_->set_evict_chunk_fn([](const auto& chunk) {
+        homestore::hs()->index_service().wb_cache().evict_chunk_blkids(*chunk->get_internal_chunk());
+    });
 
     using namespace homestore;
     // Note: timeline_consistency doesn't matter as we are using solo repl dev;
