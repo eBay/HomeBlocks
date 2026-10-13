@@ -202,6 +202,15 @@ sisl::async::task< void > volume::destroy() {
     // destroy the superblock which will remove sb from meta svc;
     sb_.destroy();
 
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_before_chunk_release")) {
+        // simulate crash after the volume superblock is destroyed but before its chunks are released; the chunks are
+        // unowned on next reboot with the volume's blks still allocated, and have to be reclaimed;
+        LOGINFO("volume destroy crash before chunk release simulation flip is set, aborting");
+        co_return;
+    }
+#endif
+
     // Release all the chunk's used by the volume. Superblock is destroyed before releasing
     // chunks, so that even after crash, these chunks will be available for other volumes.
     volume_chunk_selector_->release_chunks(vol_info_->ordinal);

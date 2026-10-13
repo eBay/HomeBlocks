@@ -482,7 +482,9 @@ void HomeBlocksImpl::on_init_complete() {
 
     // Every index (recovered before repl devs) and volume has claimed its chunks by now, so chunks left in the free
     // pools are unowned. Clear the ones a crash during volume destroy left with allocated blks, before they are reused.
-    // This runs before homestore starts its CP timer, so no CP flushes these allocators concurrently.
+    // No CP flushes the data allocators concurrently: the data service registers for CPs only after this. The CP the
+    // index service forces after its recovery can still be flushing index allocators, which is harmless: a free chunk's
+    // allocator was only loaded from disk and has nothing dirty to flush.
     volume_chunk_selector_->reset_dirty_free_chunks();
     index_chunk_selector_->reset_dirty_free_chunks();
 }

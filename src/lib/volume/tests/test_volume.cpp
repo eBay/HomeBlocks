@@ -97,6 +97,9 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
     g_helper->remove_flip("vol_fake_io_delay_simulation");
 
     g_helper->restart(2);
+
+    // the destroy resumed on reboot completes
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed(vol_ids));
 }
 
 TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
@@ -275,53 +278,20 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
             ASSERT_TRUE(vol_ptr == nullptr);
         }
     }
+
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed(vol_ids));
 }
 
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
+    auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 #ifdef _PRERELEASE
-    g_helper->set_flip_point("vol_destroy_crash_simulation");
+    // every volume crashes: each destroy checks the flip twice, in volume::destroy and in do_remove_volume
+    g_helper->set_flip_point("vol_destroy_crash_simulation", 2 * num_vols);
 #endif
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
         auto vol_mgr = hb;
-
-        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
-
-        for (uint32_t i = 0; i < num_vols; ++i) {
-            auto vinfo = gen_vol_info(i);
-            auto id = vinfo.id;
-            vol_ids.emplace_back(id);
-            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
-            ASSERT_TRUE(ret);
-
-            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
-            // verify the volume is there
-            ASSERT_TRUE(vol_ptr != nullptr);
-        }
-
-        for (uint32_t i = 0; i < num_vols; ++i) {
-            auto id = vol_ids[i];
-            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
-            ASSERT_TRUE(ret);
-        }
-    }
-
-    g_helper->restart(2);
-}
-
-TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
-    // Crash after the index table is destroyed but before the volume superblock is: recovery finds a volume being
-    // destroyed without index table and has to resume its destroy.
-#ifdef _PRERELEASE
-    g_helper->set_flip_point("vol_destroy_crash_after_index_destroy");
-#endif
-    std::vector< volume_id_t > vol_ids;
-    {
-        auto hb = g_helper->inst();
-        auto vol_mgr = hb;
-
-        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 
         for (uint32_t i = 0; i < num_vols; ++i) {
             auto vinfo = gen_vol_info(i);
@@ -345,14 +315,81 @@ TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
     g_helper->restart(2);
 
     // the resumed destroys complete and the volumes are gone
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed(vol_ids));
+}
+
+#ifdef _PRERELEASE
+TEST_F(VolumeTest, DestroyVolumeCrashBeforeChunkRelease) {
+    // Crash after the volume superblock is destroyed but before the chunks are released: after the restart nothing owns
+    // the chunks, but their allocators still hold the volume's blks. Recovery has to reclaim them.
+    auto vinfo = gen_vol_info(0);
+    auto const id = vinfo.id;
     auto hb = g_helper->inst();
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    for (auto const& id : vol_ids) {
-        while (hb->get_volume(id).value_or(nullptr) != nullptr && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto const used_before = hb->get_stats().used_capacity_bytes;
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->create_volume(std::move(vinfo))));
+    {
+        auto vol_ptr = hb->get_volume(id).value_or(nullptr);
+        ASSERT_TRUE(vol_ptr != nullptr);
+
+        // the contents don't matter, only the blks they take
+        auto const io_size = hb->max_vol_io_size();
+        auto data = sisl::make_byte_array(io_size, 512);
+        for (uint64_t i = 0; i < 4; ++i) {
+            sisl::sg_list sgs{.size = io_size, .iovs = {iovec{data->bytes(), io_size}}};
+            ASSERT_TRUE(homeblocks::detail::sync_get(homeblocks::async_write(vol_ptr, i * io_size, sgs)));
         }
-        ASSERT_TRUE(hb->get_volume(id).value_or(nullptr) == nullptr);
     }
+    ASSERT_GT(hb->get_stats().used_capacity_bytes, used_before);
+
+    // The volume is destroyed for good before the restart: only its chunks are left behind
+    g_helper->set_flip_point("vol_destroy_crash_before_chunk_release");
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(id)));
+    hb.reset();
+    g_helper->restart(2);
+
+    // The blks of the destroyed volume are free again
+    hb = g_helper->inst();
+    ASSERT_TRUE(hb->get_volume(id).value_or(nullptr) == nullptr);
+    ASSERT_EQ(hb->get_stats().used_capacity_bytes, used_before);
+}
+#endif
+
+TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
+    // Crash after the index table is destroyed but before the volume superblock is: recovery finds a volume being
+    // destroyed without index table and has to resume its destroy.
+    auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
+#ifdef _PRERELEASE
+    // every volume crashes: each destroy checks the flip twice, in volume::destroy and in do_remove_volume
+    g_helper->set_flip_point("vol_destroy_crash_after_index_destroy", 2 * num_vols);
+#endif
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb;
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
+            ASSERT_TRUE(ret);
+
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
+            // verify the volume is there
+            ASSERT_TRUE(vol_ptr != nullptr);
+        }
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto id = vol_ids[i];
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
+            ASSERT_TRUE(ret);
+        }
+    }
+
+    g_helper->restart(2);
+
+    // the resumed destroys complete and the volumes are gone
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed(vol_ids));
 }
 
 TEST_F(VolumeTest, ShutdownWithBackedOffRemoveVol) {

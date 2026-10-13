@@ -1,3 +1,4 @@
+#include <array>
 #include <string>
 #include <latch>
 #include <gtest/gtest.h>
@@ -129,8 +130,13 @@ public:
         flip::FlipFrequency freq;
         freq.set_count(2);
         freq.set_percent(100);
-        m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
+        m_fc.inject_noreturn_flip(flip_name, std::array< flip::FlipCondition, 1 >{null_cond}, freq);
         LOGI("Flip {} set", flip_name);
+    }
+
+    void remove_flip(const std::string flip_name) {
+        m_fc.remove_flip(flip_name);
+        LOGI("Flip {} removed", flip_name);
     }
 #endif
 
@@ -233,6 +239,9 @@ TEST_F(ChunkSelectorTest, ResizeNumChunksTest) {
 
     auto resized_chunks = chunk_sel->get_chunks(0);
     RELEASE_ASSERT_GT(resized_chunks.size(), initial_chunks.size(), "Resize op failed");
+
+    // The flip's remaining count would force a resize in a later test, whose worker outlives that test's selector
+    remove_flip("vol_num_chunks_force_resize_op");
 }
 #endif
 
