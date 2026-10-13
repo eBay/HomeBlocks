@@ -62,9 +62,11 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
+    bool fail_alloc{false};
     int free_data_calls{0};
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
+        if (fail_alloc) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return homestore::multi_blk_id{};
     }
 
@@ -475,6 +477,24 @@ TEST_F(CraftPreResolutionTest, WriteSlotFailureLeavesLsnMissingNotInEmptySlots) 
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_EQ(journal_->free_data_calls, 1); // the successful alloc_write_data is freed back, not leaked
+}
+
+// Distinct from the write_slot-failure path above: when alloc_write_data itself fails,
+// blkid_allocated stays false, so the cleanup path must NOT fire free_data (there was never a real
+// allocation to free).
+TEST_F(CraftPreResolutionTest, AllocWriteDataFailureLeavesLsnMissingNotInEmptySlots) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    journal_->fail_alloc = true;
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty()); // not verdicted Empty -- a quorum member DID have data for it
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(journal_->free_data_calls, 0); // alloc never succeeded -- nothing to free
 }
 
 } // namespace
