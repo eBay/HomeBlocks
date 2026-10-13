@@ -130,6 +130,12 @@ public:
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
+
+    // Not exercised by this file -- pre_resolve_slots's quorum broadcast is covered by
+    // test_craft_pre_resolution.cpp's own mock.
+    async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 // ── checkpoint trigger mock ───────────────────────────────────────────────────
