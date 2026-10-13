@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -169,6 +170,31 @@ public:
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
+};
+
+// ─── CraftRaftProposer ────────────────────────────────────────────────────────
+//
+// Abstraction over this partition's RAFT group (membership today; the SyncRSCommitLSN proposal path
+// lands with SDSTOR-22908's append()). Injected into CraftReplDev so unit tests can stub RAFT without a
+// live group. Default (null) fails closed: pre_resolve_slots refuses to verdict anything without
+// knowing the replica-set size.
+// TODO(S8): production binding over homestore::ReplDev, wired where CRAFT volumes are created.
+
+class CraftRaftProposer {
+public:
+    // Voting members of the replica set, INCLUDING this node. pre_resolve_slots's majority check
+    // (member_count/2 + 1, the leader counting itself) is computed against this.
+    virtual uint32_t member_count() const = 0;
+    virtual ~CraftRaftProposer() = default;
+};
+
+// pre_resolve_slots's result. empty_slots: every slot <= upto now verdicted Empty (freshly minted or
+// inherited from a responding member). first_unresolved: the lowest slot <= upto that is still neither
+// present locally nor verdicted Empty (a local alloc/write failure after a successful quorum fetch) --
+// the proposer must not propose past it. std::nullopt means everything <= upto is resolved.
+struct pre_resolution {
+    std::vector< int64_t > empty_slots;
+    std::optional< int64_t > first_unresolved;
 };
 
 // ─── checkpoint_trigger_fn_t ──────────────────────────────────────────────────
@@ -370,6 +396,10 @@ public:
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
+    // Wires this partition's RAFT group (replica-set membership for pre_resolve_slots's majority
+    // check). Called by the volume-creation path (S8) after construction; tests inject a mock.
+    void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
+
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
     void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
@@ -510,17 +540,23 @@ private:
     // a slot some responding member has real data for is written into this leader's own journal so it can
     // also correctly serve fetch_data() to others.
     //
-    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited). A slot whose local
-    // journal write fails after a successful quorum fetch is left out of both the return value and
-    // missing_lsns_/empty_lsns_ (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's own
-    // catch-up). The caller (append()/request_resolution(), SDSTOR-22908) must treat "still missing" as
-    // "not yet safe to propose past this slot", independent of whether the overall async_result succeeded.
+    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited) in empty_slots. A slot
+    // whose local journal write fails after a successful quorum fetch is left out of empty_slots and
+    // missing_lsns_/empty_lsns_ alike (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's own
+    // catch-up) and reported via first_unresolved instead: the caller (append()/request_resolution(),
+    // SDSTOR-22908) must not propose past it.
     //
-    // Fails closed (no partial resolution) if peer_fetcher_ is unset or the broadcast itself fails
-    // outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a replica's own
-    // best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an inability to
-    // consult the quorum at all must surface as an error, never be silently swallowed.
-    async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
+    // Empty verdicts require a MAJORITY of the replica set (raft_proposer_->member_count()/2 + 1, this
+    // leader counting itself) to have sent a valid reply -- "quorum lacks evidence" is only evidence once a
+    // quorum actually answered. Fails closed (no partial resolution) if peer_fetcher_ or raft_proposer_ is
+    // unset, the broadcast itself fails outright, or fewer than a majority replied (NO_QUORUM) -- unlike
+    // apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a replica's own best-effort, non-gating
+    // catch-up), this method exists to gate a RAFT proposal, so an inability to consult the quorum must
+    // surface as an error, never be silently swallowed.
+    //
+    // Fails STALE_TERM, writing nothing, if an InternalLogin moved state_.term while the quorum fetch was
+    // in flight -- see the .cpp for why that (and not a RAFT-leadership re-check) is the fence needed here.
+    async_result< pre_resolution > pre_resolve_slots(int64_t upto);
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
     // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
@@ -642,9 +678,10 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
-    std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
+    CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
+    CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the partition's RAFT group
+    uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    std::atomic< uint64_t > write_counter_{0};  // incremented per write(); triggers periodic SyncRSCommitLSN append
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
     // ONLY on a successful rebuild_overlay() (see recovery_faulted_ below for the failure path) --

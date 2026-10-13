@@ -1655,7 +1655,7 @@ async_status CraftReplDev::run_recovery() {
 // re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has
 // no way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
 
-async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t upto) {
+async_result< pre_resolution > CraftReplDev::pre_resolve_slots(int64_t upto) {
     auto self = shared_from_this();
     std::vector< int64_t > candidates;
     uint64_t term;
@@ -1687,23 +1687,44 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
         }
     }
-    if (candidates.empty()) co_return std::vector< int64_t >{};
+    if (candidates.empty()) co_return pre_resolution{};
 
     if (peer_fetcher_ == nullptr) {
         LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_fetcher_ wired -- refusing to resolve",
              candidates.size(), upto);
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
+    // Without the replica-set size there is no way to tell whether the responders below form a majority,
+    // so no quorum-lacks-evidence verdict could be trusted -- refuse up front, before the broadcast.
+    if (raft_proposer_ == nullptr || raft_proposer_->member_count() == 0) {
+        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but replica-set membership unknown -- refusing to "
+             "resolve",
+             candidates.size(), upto);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    uint32_t const majority = raft_proposer_->member_count() / 2 + 1;
 
     auto responses = co_await peer_fetcher_->fetch_from_quorum(candidates, peer_fetch_timeout_ms_);
     if (!responses) {
         LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
         co_return std::unexpected(responses.error());
     }
-    if (responses->empty()) {
-        LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
-             candidates.size());
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+    // term was snapshotted before the fetch; an InternalLogin may have applied while it was in flight. Writing
+    // the fetched slots now would journal them under the deposed session's term (which recovery uses to skip a
+    // stale tail), so stop here with nothing written -- the caller retries under the new term.
+    //
+    // RAFT leadership loss WITHOUT a new login needs no fence here: nothing below persists a verdict -- the
+    // Empty verdicts only take effect via the SyncRSCommitLSN proposal, which a deposed leader cannot commit --
+    // and any data written below is real data some member holds; if the new leader verdicts that slot Empty,
+    // apply_sync_rs_commit_lsn frees it (Empty beats data).
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_.term != term) {
+            LOGW("pre_resolve_slots: term moved {} -> {} during quorum fetch -- discarding the round", term,
+                 state_.term);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
     }
 
     // Empty beats data even across members, regardless of response order: seeing Empty for an lsn purges
@@ -1714,7 +1735,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
     data_by_lsn.reserve(candidates.size());
     std::unordered_set< int64_t > empty_by_quorum;
     empty_by_quorum.reserve(candidates.size());
-    int valid_member_count = 0;
+    uint32_t valid_member_count = 0;
     for (auto& member : *responses) {
         if (auto bad_lsn = validate_fetch_response(candidates, member.slots); bad_lsn) {
             // Reject only this member's response, not the whole quorum fetch -- a broadcast should
@@ -1735,16 +1756,23 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                 data_by_lsn.emplace(slot.lsn, &slot);
         }
     }
-    if (valid_member_count == 0) {
-        // Every responding member's reply was malformed. Fail closed rather than
-        // falling through to mint an Empty verdict for every candidate with nothing behind it.
-        LOGE("pre_resolve_slots: all {} responding member(s) sent a malformed reply -- no trustworthy "
-             "evidence for {} candidate(s)",
-             responses->size(), candidates.size());
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // The leader counts itself (it is a member and, by construction, lacks every candidate); a malformed
+    // reply counts for nothing. Same rule as craft_client's reference quorum(n) = n/2 + 1. Checked before
+    // ANY verdict is minted or slot written, so a sub-majority round leaves no local trace at all.
+    if (valid_member_count + 1 < majority) {
+        LOGE("pre_resolve_slots: {} valid reply(ies) of {} response(s) + this leader < majority {} of {} members -- "
+             "no trustworthy evidence for {} candidate(s)",
+             valid_member_count, responses->size(), majority, raft_proposer_->member_count(), candidates.size());
+        co_return std::unexpected(make_error_condition(craft::craft_error::NO_QUORUM));
     }
 
-    std::vector< int64_t > empty_slots;
+    pre_resolution result;
+    auto& empty_slots = result.empty_slots;
+    // Keeps the LOWEST failure explicitly rather than relying on candidates' ascending build order -- the
+    // proposer clamps to first_unresolved - 1, so a too-high value would let it propose past an unresolved slot.
+    auto mark_unresolved = [&result](int64_t lsn) {
+        if (!result.first_unresolved || lsn < *result.first_unresolved) result.first_unresolved = lsn;
+    };
     for (int64_t lsn : candidates) {
         if (empty_by_quorum.contains(lsn)) {
             empty_slots.push_back(lsn);
@@ -1766,6 +1794,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!alloc_res) {
                 LOGE("pre_resolve_slots: alloc_write_data failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                      alloc_res.error().message());
+                mark_unresolved(slot->lsn);
                 continue;
             }
             blkid = *alloc_res;
@@ -1784,12 +1813,13 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                     co_return ok();
                 }());
             }
+            mark_unresolved(slot->lsn);
             continue;
         }
         std::lock_guard lk{state_mu_};
         missing_lsns_.erase(slot->lsn);
     }
-    co_return empty_slots;
+    co_return result;
 }
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
