@@ -13,6 +13,7 @@
  *
  *********************************************************************************/
 
+#include <future>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -21,6 +22,7 @@
 #include <iomgr/iomgr_flip.hpp>
 #include "hb_internal.hpp"
 #include "test_common.hpp"
+#include <volume/volume.hpp>
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_volume_setup,
@@ -351,6 +353,46 @@ TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
         }
         ASSERT_TRUE(hb->get_volume(id).value_or(nullptr) == nullptr);
     }
+}
+
+TEST_F(VolumeTest, ShutdownWithBackedOffRemoveVol) {
+    // A remove that finds IO outstanding marks the volume DESTROYING and backs off, leaving the destroy to the reaper.
+    // Shutdown starting before the reaper gets to it must not wait for that destroy: it resumes on the next boot.
+    auto vinfo = gen_vol_info(0);
+    auto const id = vinfo.id;
+    volume_handle vol_ptr;
+    HomeBlocksImpl* hb_impl{nullptr};
+    {
+        auto hb = g_helper->inst();
+        ASSERT_TRUE(homeblocks::detail::sync_get(hb->create_volume(std::move(vinfo))));
+        vol_ptr = hb->get_volume(id).value_or(nullptr);
+        ASSERT_TRUE(vol_ptr != nullptr);
+
+        // an outstanding IO makes the remove back off
+        vol_ptr->inc_ref();
+        ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(id)));
+        while (!vol_ptr->is_destroying()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        hb_impl = dynamic_cast< HomeBlocksImpl* >(hb.get());
+        ASSERT_TRUE(hb_impl != nullptr);
+    }
+
+    // Shutdown waits for the outstanding IO, so hb_impl stays valid until the IO completes below
+    auto restarted = std::async(std::launch::async, []() { g_helper->restart(); });
+    while (!hb_impl->is_shutting_down()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    vol_ptr->dec_ref();
+    vol_ptr.reset();
+
+    // A hung shutdown can't be cancelled, so abort instead of failing the test
+    RELEASE_ASSERT(restarted.wait_for(std::chrono::seconds(60)) == std::future_status::ready,
+                   "shutdown hangs on volume {} left DESTROYING by a backed-off remove", boost::uuids::to_string(id));
+    restarted.get();
+
+    // the destroy resumed on reboot completes
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}));
 }
 
 int main(int argc, char* argv[]) {

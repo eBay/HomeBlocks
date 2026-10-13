@@ -136,6 +136,12 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
 // (which co_awaits the repl-dev removal and a forced index CP flush), so the reactor yields during those waits
 // instead of parking -- which is what lets the CP flush complete. Launched via detach from remove_volume.
 sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
+    // Hand-made RAII: release the count taken by remove_volume on every exit path
+    struct RemovalGuard {
+        std::atomic< uint32_t >& pending;
+        ~RemovalGuard() { pending.fetch_sub(1); }
+    } removal_guard{pending_vol_removals_};
+
     // 1. get the volume ptr from the map;
     volume_handle vol_ptr = nullptr;
     {
@@ -158,7 +164,6 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
 #ifdef _PRERELEASE
         if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation") ||
             iomgr_flip::instance()->test_flip("vol_destroy_crash_after_index_destroy")) {
-            crash_simulated_ = true;
             co_return;
         }
 #endif
@@ -184,12 +189,6 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
         co_return std::unexpected(std::errc::operation_not_supported);
     }
 
-    // The volume is marked DESTROYING only once do_remove_volume runs, so shutdown could miss a remove accepted now.
-    if (is_shutting_down()) {
-        LOGE("Can't serve volume remove, system is shutting down.");
-        co_return std::unexpected(std::errc::operation_not_supported);
-    }
-
     auto vol = get_volume(id);
     if (!vol) {
         LOGE("volume with id {} not found, cannot remove", boost::uuids::to_string(id));
@@ -197,6 +196,15 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     } else if ((*vol)->is_offline()) {
         LOGE("volume {} is offline, cannot remove", (*vol)->id_str());
         co_return std::unexpected(volume_error::OFFLINE);
+    }
+
+    // Shutdown waits for pending removals. Count this one before checking for shutdown: shutdown sets its flag before
+    // checking the count, so either shutdown waits for this removal or this removal sees the flag.
+    pending_vol_removals_.fetch_add(1);
+    if (is_shutting_down()) {
+        pending_vol_removals_.fetch_sub(1);
+        LOGE("Can't serve volume remove, system is shutting down.");
+        co_return std::unexpected(std::errc::operation_not_supported);
     }
 
     LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
