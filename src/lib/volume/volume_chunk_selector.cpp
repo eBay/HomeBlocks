@@ -429,6 +429,27 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     return true;
 }
 
+void VolumeChunkSelector::reset_dirty_free_chunks() {
+    std::unique_lock lock(m_chunk_sel_mutex);
+    std::string str;
+    uint64_t cnt{};
+
+    for (auto& [pdev, chunks] : m_per_dev_chunks) {
+        for (auto& [chunk_id, chunk] : chunks) {
+            if (chunk->available_blks() == chunk->get_total_blks()) { continue; }
+
+            fmt::format_to(std::back_inserter(str), "{} ", chunk_id);
+            ++cnt;
+            chunk->reset();
+        }
+    }
+
+    if (cnt) {
+        LOGI("Reset free chunks left dirty by an interrupted destroy module={} num_chunks={} chunks={}", m_module_name,
+             cnt, str);
+    }
+}
+
 // Wait until no selector is still walking this volume and no resize worker is running. A worker that is only queued
 // is not waited for: it may be queued on the very reactor we are blocking here, and once it runs it sees releasing and
 // bails out before taking any chunks.

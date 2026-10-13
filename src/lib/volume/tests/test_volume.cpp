@@ -308,6 +308,51 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
     g_helper->restart(2);
 }
 
+TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
+    // Crash after the index table is destroyed but before the volume superblock is: recovery finds a volume being
+    // destroyed without index table and has to resume its destroy.
+#ifdef _PRERELEASE
+    g_helper->set_flip_point("vol_destroy_crash_after_index_destroy");
+#endif
+    std::vector< volume_id_t > vol_ids;
+    {
+        auto hb = g_helper->inst();
+        auto vol_mgr = hb;
+
+        auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto vinfo = gen_vol_info(i);
+            auto id = vinfo.id;
+            vol_ids.emplace_back(id);
+            auto ret = homeblocks::detail::sync_get(vol_mgr->create_volume(std::move(vinfo)));
+            ASSERT_TRUE(ret);
+
+            auto vol_ptr = vol_mgr->get_volume(id).value_or(nullptr);
+            // verify the volume is there
+            ASSERT_TRUE(vol_ptr != nullptr);
+        }
+
+        for (uint32_t i = 0; i < num_vols; ++i) {
+            auto id = vol_ids[i];
+            auto ret = homeblocks::detail::sync_get(vol_mgr->remove_volume(id));
+            ASSERT_TRUE(ret);
+        }
+    }
+
+    g_helper->restart(2);
+
+    // the resumed destroys complete and the volumes are gone
+    auto hb = g_helper->inst();
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (auto const& id : vol_ids) {
+        while (hb->get_volume(id).value_or(nullptr) != nullptr && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        ASSERT_TRUE(hb->get_volume(id).value_or(nullptr) == nullptr);
+    }
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     char** orig_argv = argv;

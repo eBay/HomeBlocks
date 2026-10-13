@@ -186,6 +186,15 @@ sisl::async::task< void > volume::destroy() {
         indx_tbl_ = nullptr;
     }
 
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_after_index_destroy")) {
+        // simulate crash after the index table is destroyed but before the volume superblock is;
+        // volume should be able to resume destroy on next reboot without its index table;
+        LOGINFO("volume destroy crash after index destroy simulation flip is set, aborting");
+        co_return;
+    }
+#endif
+
     // Stop chunk selection and resize for this volume before its superblock goes away: a resize worker persists the
     // new chunk list into the volume superblock.
     volume_chunk_selector_->quiesce_chunks(vol_info_->ordinal);
