@@ -51,7 +51,7 @@ class HomeBlocksConan(ConanFile):
         self.test_requires("ublkpp/[^0.36]@oss/main")
 
     def requirements(self):
-        self.requires("homestore/[^8.0]@oss/dev", transitive_headers=True)
+        self.requires("homestore/[^8.3.5]@oss/dev", transitive_headers=True)
         self.requires("iomgr/[^13.0]@oss/dev", transitive_headers=True)
         self.requires("sisl/[^14.9]@oss/dev", transitive_headers=True)
         self.requires("craft_client/0.4.2@oss/dev", transitive_headers=True) # the extracted CRAFT wire + client + reference
