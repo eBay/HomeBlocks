@@ -1,7 +1,7 @@
 # CRAFT RPCs
 
-9 RPCs total. 5 client↔server (Login, Write, Read, KeepAlive, Resolve), 4 server↔server (2 via RAFT,
-2 non-RAFT). RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
+11 RPCs total. 6 client↔server (Login, Write, Read, KeepAlive, Resolve, Logout), 5 server↔server (3 via
+RAFT, 2 non-RAFT). RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
 
 > **Commit is not a separate RPC.** The commit watermark rides on `client_hdr.commit_lsn`, piggybacked
 > on Write / Read / KeepAlive; KeepAlive is its dedicated carrier (commit + watchdog reset). Readability
@@ -44,10 +44,13 @@ client_hdr: { term: uint64, commit_lsn: int64, all_committed_lsn: int64 }
 
 ```
 Request:  { volume_id: uuid, client_token: uint64 }
-Response: { members: [endpoint], dLSN: int64, term: uint64, lba_size: uint32 }
+Response: { members: [endpoint], dLSN: int64, term: uint64, lba_size: uint32, leader_hint: id }
 ```
 
-Client sends to the RAFT leader (a follower replies `NOT_LEADER` + leader endpoint). Leader runs the
+Client sends to the RAFT leader. A follower does **not** fail the call: it replies with a successful
+response carrying `term == 0` and `leader_hint` set to the current leader's id, and the client retries
+login there (the design's `ENOTLEADER` redirect, carried as a sentinel rather than as the
+`craft_error::NOT_LEADER` error the other RPCs return; see `login` in [api.md](api.md)). Leader runs the
 full login orchestration (GetRSCommitLSN → optional FetchData → SyncRSCommitLSN RAFT → InternalLogin
 RAFT) and responds once both RAFT entries commit. `volume_id` names the volume to establish the session
 on (the design's `login(client_token, vol_id)`): a multi-volume server routes by it, and it is the same
@@ -147,9 +150,24 @@ HomeBlocks handler: `CraftReplDev::request_resolution()`
 
 ---
 
+### 6. Logout (Unicast to leader)
+
+```
+Request:  { hdr: client_hdr }
+Response: { status: Status }
+```
+
+Explicit session teardown. Term-fenced (`hdr.term` must match the session term). The leader commits an
+`InternalLogout` RAFT entry (#11); once it applies, subsequent IOs from the old client fail with
+`STALE_TERM`. A follower replies `NOT_LEADER`.
+
+HomeBlocks handler: `CraftReplDev::logout()`
+
+---
+
 ## Server → Server (non-RAFT)
 
-### 6. GetRSCommitLSN (Broadcast, initiated by leader)
+### 7. GetRSCommitLSN (Broadcast, initiated by leader)
 
 ```
 Request:  { term: uint64, my_commit_lsn: int64, my_last_append_lsn: int64, is_login: bool }
@@ -167,7 +185,7 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ---
 
-### 7. FetchData (Unicast, from behind replica to an ahead peer)
+### 8. FetchData (Unicast, from behind replica to an ahead peer)
 
 ```
 Request:  { lsns: [int64] }
@@ -187,7 +205,7 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ## Server → Server (RAFT)
 
-### 8. SyncRSCommitLSN (RAFT proposal, from leader)
+### 9. SyncRSCommitLSN (RAFT proposal, from leader)
 
 ```
 RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [int64] }
@@ -208,7 +226,7 @@ watermark and verdicts.
 
 ---
 
-### 9. InternalLogin (RAFT proposal, from leader during login)
+### 10. InternalLogin (RAFT proposal, from leader during login)
 
 ```
 RAFT entry payload: { client_token: uint64, term: uint64 }
@@ -217,6 +235,20 @@ RAFT entry payload: { client_token: uint64, term: uint64 }
 Proposed after `SyncRSCommitLSN` commits. On apply each replica stores `client_token` and `term`,
 rejecting any subsequent IO from a different term. Proposed immediately after the `SyncRSCommitLSN`
 entry during the login sequence.
+
+---
+
+### 11. InternalLogout (RAFT proposal, from leader)
+
+```
+RAFT entry payload: not yet specified (S10)
+```
+
+Records logout or lease expiry: proposed by the leader on an explicit **Logout** (#6), or once the
+watchdog lease has lapsed. On apply each replica marks "no active client" and clears the session
+(`client_token`, `term`), so IO from the old client fails with `STALE_TERM`. A committed logout is what
+authorizes the leader to act as the stand-in client for detached recovery; it yields on the next
+committed `InternalLogin`.
 
 ---
 
@@ -235,7 +267,7 @@ previously answered as one.
   ride the same channel as the client plane: these calls are node-to-node, and HomeBlocks may prefer its existing
   inter-node RPC. See `craft_client/docs/peer-plane.md` for the interface (`craft_peer`) and what remains.
   Whatever it ends up being, it **must be timeout-bounded**: the catch-up call site
-  (`CraftPeerFetcher::fetch_from_peer`, used by `SyncRSCommitLSN` apply) already carries a `timeout_ms`
+  (`CraftPeerFetcher::fetch_data`, used by `SyncRSCommitLSN` apply) already carries a `timeout_ms`
   parameter (`peer_fetch_timeout_ms` in `home_blks_config.fbs`, default 5000ms) for the real transport to
   enforce — a peer that misses it is treated as unreachable, same as any other hard failure.
 
