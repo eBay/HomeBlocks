@@ -379,6 +379,23 @@ checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
     };
 }
 
+// Same callback-to-co_await bridge as HomeStoreCraftJournalBackend::write_slot: a one-shot iomgr timer completes a
+// shared value_awaitable. all_worker scope rather than the current-reactor overload because the caller (the
+// catch-up worker) may be resuming on a non-reactor thread. The `fired` guard keeps complete() exactly-once
+// even if the scoped one-shot is delivered on more than one matching reactor.
+sleep_fn_t make_iomgr_sleep_fn() {
+    return [](std::chrono::milliseconds duration) -> async_status {
+        auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
+        auto fired = std::make_shared< std::atomic< bool > >(false);
+        iomgr::schedule_oneshot(std::chrono::duration_cast< std::chrono::nanoseconds >(duration),
+                                iomgr::reactor_regex::all_worker, [va, fired]() {
+                                    if (!fired->exchange(true, std::memory_order_acq_rel)) va->complete(true);
+                                });
+        co_await *va;
+        co_return ok();
+    };
+}
+
 // ─── constructor ──────────────────────────────────────────────────────────────
 
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
@@ -388,6 +405,7 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
         lba_size_{lba_size},
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
+        sync_lsn_interval_{HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval)},
         watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
 
 CraftReplDev::~CraftReplDev() {
@@ -477,6 +495,8 @@ async_status CraftReplDev::truncate(int64_t lsn) {
         std::lock_guard lk{state_mu_};
         if (state_.last_append_lsn > lsn) state_.last_append_lsn = lsn;
         missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
+        // Slots above lsn are the next session's: their gaps are live in-flight writes, never catch-up's to fill.
+        catchup_target_ = std::min(catchup_target_, lsn);
     }
 
     // Step 4: prune any overlay entry referencing a now-rolled-back dLSN. Without this, a stale
@@ -749,6 +769,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_await commit(hdr.commit_lsn);
 
     touch_watchdog();
+
+    // Periodic SyncRSCommitLSN trigger: every sync_lsn_interval_ successful appends. Every replica counts
+    // (each sees every write); fire_background_sync() itself no-ops on a follower.
+    if (sync_lsn_interval_ != 0 &&
+        (write_counter_.fetch_add(1, std::memory_order_relaxed) + 1) % sync_lsn_interval_ == 0)
+        fire_background_sync("periodic");
 
     // Re-snapshot after the piggyback commit() above: the pre-commit snapshot captured earlier
     // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
@@ -1400,25 +1426,205 @@ void CraftReplDev::on_watchdog_tick() {
 #ifdef _PRERELEASE
     ++watchdog_fire_count_;
 #endif
-    int64_t last_append_lsn;
+    fire_background_sync("watchdog");
+}
+
+// ─── SyncRSCommitLSN proposal + triggers (S5 / SDSTOR-22908) ─────────────────
+
+async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr hdr, int64_t upto) {
+    // Same gates, in the same order, as write()/read()/keep_alive().
+    if (recovery_faulted_.load(std::memory_order_acquire)) {
+        LOGE("request_resolution rejected: partition permanently faulted after failed restart recovery upto={}", upto);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (recovering_.load(std::memory_order_acquire)) {
+        LOGW("request_resolution rejected: overlay rebuild in progress after restart upto={}", upto);
+        co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
+    }
+    if (upto < -1) {
+        LOGW("request_resolution rejected: invalid upto={}", upto);
+        co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
+    }
     uint64_t client_token;
     {
         std::lock_guard lk{state_mu_};
-        last_append_lsn = state_.last_append_lsn;
+        if (hdr.term != state_.term) {
+            LOGW("request_resolution rejected: stale term want={} got={} upto={}", state_.term, hdr.term, upto);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         client_token = state_.client_token;
     }
-    detail::detach(append(last_append_lsn, client_token));
+    // A follower gets NOT_LEADER from propose_sync before any resolution work (rpcs.md: it MUST NOT resolve).
+    co_return co_await propose_sync(upto, client_token);
 }
 
-async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr /* hdr */,
-                                                                          int64_t /* upto */) {
-    LOGW("CraftReplDev::request_resolution not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+async_status CraftReplDev::append(int64_t sync_to, uint64_t client_token) {
+    auto r = co_await propose_sync(sync_to, client_token);
+    if (!r) co_return std::unexpected(r.error());
+    co_return ok();
 }
 
-async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_token */) {
-    LOGW("CraftReplDev::append not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+async_result< craft::resolution_result > CraftReplDev::propose_sync(int64_t sync_to, uint64_t client_token) {
+    // Held across every co_await below -- the background triggers detach this, same lifetime reasoning as
+    // apply_sync_rs_commit_lsn.
+    auto self = shared_from_this();
+
+    if (raft_proposer_ == nullptr) {
+        LOGW("propose_sync: no RAFT group wired -- cannot propose SyncRSCommitLSN sync_to={}", sync_to);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    if (!raft_proposer_->is_leader()) co_return std::unexpected(make_error_condition(craft::craft_error::NOT_LEADER));
+    if (sync_to < -1) {
+        LOGW("propose_sync rejected: invalid sync_to={}", sync_to);
+        co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
+    }
+
+    auto pre = co_await pre_resolve_slots(sync_to);
+    if (!pre) co_return std::unexpected(pre.error());
+
+    // Never propose past an unresolved slot: on apply every replica would mark it Missing and stall below
+    // it anyway, but the entry would claim the replica set agreed on a watermark it never resolved.
+    int64_t const proposed = pre->first_unresolved ? *pre->first_unresolved - 1 : sync_to;
+    if (pre->first_unresolved)
+        LOGW("propose_sync: slot {} still unresolved after pre-resolution -- clamping rs_commit_lsn {} -> {}",
+             *pre->first_unresolved, sync_to, proposed);
+
+    // Only verdicts <= the clamped watermark ride the entry: apply_sync_rs_commit_lsn rejects the WHOLE entry
+    // (INVALID_ENTRY) if any empty_slots lsn exceeds rs_commit_lsn. Verdicts above it are simply re-derived by
+    // the next round.
+    std::vector< int64_t > verdicts;
+    verdicts.reserve(pre->empty_slots.size());
+    for (int64_t lsn : pre->empty_slots)
+        if (lsn <= proposed) verdicts.push_back(lsn);
+
+    bool skip;
+    {
+        std::lock_guard lk{state_mu_};
+        // Nothing new to agree on: the watermark is no further than this leader's last committed proposal and
+        // there are no fresh verdicts. Keeps an idle partition's watchdog ticks / repeated Resolves from
+        // appending identical RAFT entries.
+        skip = proposed < 0 || (verdicts.empty() && proposed <= last_proposed_rs_commit_lsn_);
+    }
+
+    if (!skip) {
+        CraftEntryHeader entry_hdr{CraftEntryType::SyncRSCommitLSN};
+        std::vector< uint8_t > key_buf(sync_rs_commit_lsn_key_size(verdicts.size()));
+        serialize_sync_rs_commit_lsn(key_buf.data(), proposed, client_token, verdicts);
+        auto r = co_await raft_proposer_->propose(
+            sisl::blob{reinterpret_cast< uint8_t* >(&entry_hdr), static_cast< uint32_t >(sizeof(entry_hdr))},
+            sisl::blob{key_buf.data(), static_cast< uint32_t >(key_buf.size())});
+        if (!r) {
+            LOGW("propose_sync: SyncRSCommitLSN rs_commit_lsn={} ({} verdict(s)) not committed: {}", proposed,
+                 verdicts.size(), r.error().message());
+            co_return std::unexpected(r.error());
+        }
+        LOGD("propose_sync: committed SyncRSCommitLSN rs_commit_lsn={} empty_slots={}", proposed, verdicts.size());
+    }
+
+    // Every Empty verdict <= proposed: earlier rounds' (already in empty_lsns_) plus this round's -- unioned in
+    // explicitly because this leader's own apply of the entry is detached and may not have landed yet.
+    std::set< int64_t > all_empty(verdicts.begin(), verdicts.end());
+    {
+        std::lock_guard lk{state_mu_};
+        if (!skip) last_proposed_rs_commit_lsn_ = std::max(last_proposed_rs_commit_lsn_, proposed);
+        for (int64_t lsn : empty_lsns_)
+            if (lsn <= proposed) all_empty.insert(lsn);
+    }
+    co_return craft::resolution_result{.resolved_upto = proposed,
+                                       .empty_slots = std::vector< int64_t >(all_empty.begin(), all_empty.end())};
+}
+
+async_result< int64_t > CraftReplDev::poll_rs_commit_lsn() {
+    if (peer_fetcher_ == nullptr || raft_proposer_ == nullptr || raft_proposer_->member_count() == 0) {
+        LOGW("poll_rs_commit_lsn: peer channel or replica-set membership not wired -- cannot poll");
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    uint32_t const majority = raft_proposer_->member_count() / 2 + 1;
+    uint64_t term;
+    int64_t rs_commit_lsn;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+        rs_commit_lsn = state_.last_append_lsn; // the leader is one of the quorum
+    }
+
+    auto responses =
+        co_await peer_fetcher_->get_rs_commit_lsn_from_quorum(term, /* is_login = */ false, peer_fetch_timeout_ms_);
+    if (!responses) {
+        LOGE("poll_rs_commit_lsn: get_rs_commit_lsn_from_quorum failed: {}", responses.error().message());
+        co_return std::unexpected(responses.error());
+    }
+    uint32_t valid_member_count = 0;
+    for (auto const& p : *responses) {
+        // -1 is the "nothing appended" sentinel; anything lower is malformed and doesn't count toward the majority.
+        if (p.last_append_lsn < -1 || p.commit_lsn < -1) {
+            LOGW("poll_rs_commit_lsn: discarding malformed reply commit_lsn={} last_append_lsn={}", p.commit_lsn,
+                 p.last_append_lsn);
+            continue;
+        }
+        ++valid_member_count;
+        rs_commit_lsn = std::max(rs_commit_lsn, p.last_append_lsn);
+    }
+    // Without a majority the max seen is not the quorum's max: a quorum-durable write could live entirely on
+    // the silent members. Fail the round rather than propose a watermark the quorum never reported.
+    if (valid_member_count + 1 < majority) {
+        LOGW("poll_rs_commit_lsn: {} valid reply(ies) + this leader < majority {} of {} members", valid_member_count,
+             majority, raft_proposer_->member_count());
+        co_return std::unexpected(make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    co_return rs_commit_lsn;
+}
+
+async_status CraftReplDev::background_sync(char const* reason) {
+    auto self = shared_from_this();
+    // Cleared on every exit, including an early error return -- otherwise one failed round would wedge every
+    // later periodic/watchdog trigger behind the coalescing check forever.
+    struct InFlightGuard {
+        std::atomic< bool >& flag;
+        ~InFlightGuard() { flag.store(false, std::memory_order_release); }
+    } in_flight_guard{background_sync_in_flight_};
+
+    auto rs_commit_lsn = co_await poll_rs_commit_lsn();
+    if (!rs_commit_lsn) {
+        LOGW("background SyncRSCommitLSN ({}): GetRSCommitLSN poll failed: {}", reason,
+             rs_commit_lsn.error().message());
+        co_return std::unexpected(rs_commit_lsn.error());
+    }
+    uint64_t client_token;
+    {
+        std::lock_guard lk{state_mu_};
+        client_token = state_.client_token;
+    }
+    // FIXME: proposing up to max(quorum.last_append_lsn) reaches into the live tail, where writes are still in
+    // flight. Pre-resolution can mark an in-flight slot Empty because a majority answered "absent", but that
+    // answer isn't binding: the delayed write can still land on a majority and be acked to the client before
+    // the verdict applies, and apply then discards it -- an acked write is lost. Login is safe (it quiesces and
+    // bumps the term); these rounds never quiesce. Candidate fix: cap sync_to at the client's piggybacked
+    // commit_lsn (everything below it is already resolved); longer term, make a responder's "absent" a promise
+    // to reject later writes to that slot. Open with szmyd -- see
+    // docs/agents/handoff/2026-10-14-001-craft-pre-resolution-inflight-write-race.md.
+    auto r = co_await append(*rs_commit_lsn, client_token);
+    if (!r) LOGW("background SyncRSCommitLSN ({}) up to {} failed: {}", reason, *rs_commit_lsn, r.error().message());
+    co_return r;
+}
+
+void CraftReplDev::fire_background_sync(char const* reason) {
+    // Followers see every write and every watchdog tick too -- staying silent here is the common case, not an error.
+    if (raft_proposer_ == nullptr || !raft_proposer_->is_leader()) return;
+    if (background_sync_in_flight_.exchange(true, std::memory_order_acq_rel)) {
+        LOGT("background SyncRSCommitLSN ({}) coalesced: a round is already in flight", reason);
+        return;
+    }
+    // weak_from_this, not shared_from_this: the watchdog tick can run while the destructor is blocked in
+    // watchdog_token_.cancel(wait=true), i.e. with the last shared_ptr already gone -- shared_from_this() would
+    // throw bad_weak_ptr there. Holding `self` across detach() keeps the object alive until background_sync()
+    // has taken its own reference (detach starts the task inline, before returning).
+    auto self = weak_from_this().lock();
+    if (!self) {
+        background_sync_in_flight_.store(false, std::memory_order_release);
+        return;
+    }
+    detail::detach(self->background_sync(reason));
 }
 
 // ─── fetch_data (S6) ──────────────────────────────────────────────────────────
@@ -1645,7 +1851,7 @@ async_status CraftReplDev::run_recovery() {
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
 //
-// candidates is the union of missing_lsns_ ∩ [0, upto] and (last_append_lsn, upto] minus empty_lsns_
+// candidates is the union of missing_lsns_ ∩ (commit_lsn, upto] and (last_append_lsn, upto] minus empty_lsns_
 //
 // Read-only against missing_lsns_/last_append_lsn otherwise: missing_lsns_ entries are only erased once
 // data is genuinely written locally below; last_append_lsn only advances once the resulting
@@ -1677,11 +1883,13 @@ async_result< pre_resolution > CraftReplDev::pre_resolve_slots(int64_t upto) {
         }
         candidates.reserve(missing_lsns_.size() +
                            static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
-        // missing_lsns_ is ordered, so once an entry exceeds upto every remaining entry does too --
-        // stop instead of scanning the rest of the set.
-        for (int64_t lsn : missing_lsns_) {
-            if (lsn > upto) break;
-            candidates.push_back(lsn);
+        // Start above commit_lsn explicitly: everything <= it is already resolved (present or Empty), since
+        // every commit_lsn advance stops at the first missing slot. That invariant means missing_lsns_
+        // shouldn't hold anything <= commit_lsn anyway, but bounding the scan here doesn't depend on it.
+        // missing_lsns_ is ordered, so once an entry exceeds upto every remaining entry does too.
+        for (auto it = missing_lsns_.lower_bound(state_.commit_lsn + 1); it != missing_lsns_.end() && *it <= upto;
+             ++it) {
+            candidates.push_back(*it);
         }
         for (int64_t lsn = state_.last_append_lsn + 1; lsn <= upto; ++lsn) {
             if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
@@ -1828,15 +2036,16 @@ async_result< pre_resolution > CraftReplDev::pre_resolve_slots(int64_t upto) {
 // all-or-nothing gate on this apply. SyncRSCommitLSN verdicts are only ever defined for slots the leader
 // pre-resolved up to rs_commit_lsn (S5). client_token is NOT checked against the current session. Past the
 // range check, every step is best-effort
-// forward progress: empty_slots are reconciled and the newly-spanned range is marked missing, catch-up
-// attempts to fill in what it can from a peer, and last_append_lsn advances regardless of whether catch-up
-// fully succeeded -- mirroring truncate()'s invariant that apply never reverts the watermark, only advances
+// forward progress: empty_slots are reconciled and the newly-spanned range is marked missing, the catch-up
+// worker (run_catchup) fills from peers -- looping with backoff until done when sleep_fn_ is wired, one pass
+// otherwise -- and last_append_lsn advances regardless of whether catch-up has finished -- mirroring
+// truncate()'s invariant that apply never reverts the watermark, only advances
 // it. commit_lsn is different: it's the local contiguous prefix (CRAFT-Design), so it only advances up to
 // the first still-unresolved Missing slot, skipping over Empty ones, even though rs_commit_lsn itself is a
 // watermark the whole replica set already agreed on. A peer's fetch_data response gets its own
 // all-or-nothing check (validate_fetch_response): unlike the range check above, this one can't gate the
 // whole apply (gap marking and last_append_lsn already advanced by the time the response arrives), so a
-// malformed response is instead treated exactly like a failed fetch
+// malformed response is instead treated exactly like a failed fetch -- the next pass retries it
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
@@ -1855,8 +2064,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     }
 
     std::unordered_set< int64_t > to_free;
-    std::vector< int64_t > to_fetch;
-    uint64_t term;
+    bool has_missing = false;
+    bool start_catchup = false;
     {
         std::lock_guard lk{state_mu_};
         // client_token is NOT gated against state_.client_token here. Per the login sequence (CRAFT-Design),
@@ -1867,7 +2076,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         // (MemCraftReplica::cold_apply_sync) discards the parameter outright for the same reason.
         // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
         // checks (see apply_internal_login's header comment), not from an equality check here.
-        term = state_.term;
 
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
@@ -1877,13 +2085,25 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
         // Everything newly spanned by this advance that isn't Empty-verdicted is a gap until catch-up
         // (below) resolves it -- same idiom write() uses for gaps opened by an out-of-order dlsn.
+        //
+        // FIXME: on the LEADER this re-marks missing the slots above its own frontier that pre_resolve_slots
+        // already wrote locally before proposing this entry, so catch-up fetches and write_slot()s them a
+        // second time -- the second write replaces the journal's block reference and leaks the first copy's
+        // blocks. Known and deliberately not fixed here; the retry loop makes it more likely to trigger.
         for (int64_t lsn = state_.last_append_lsn + 1; lsn <= rs_commit_lsn; ++lsn) {
             if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
         }
         state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
 
-        for (int64_t lsn : missing_lsns_) {
-            if (lsn <= rs_commit_lsn) to_fetch.push_back(lsn);
+        // Hand the fill to the single catch-up worker. If one is already running (an earlier entry's apply is
+        // still retrying), raising the target is all this apply does -- that worker fills up to it, so two
+        // overlapping applies never fetch and write the same slot.
+        catchup_target_ = std::max(catchup_target_, rs_commit_lsn);
+        auto it = missing_lsns_.lower_bound(state_.commit_lsn + 1);
+        has_missing = it != missing_lsns_.end() && *it <= catchup_target_;
+        if (has_missing && peer_fetcher_ != nullptr && !catchup_running_) {
+            catchup_running_ = true;
+            start_catchup = true;
         }
     }
 
@@ -1896,73 +2116,17 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    if (!to_fetch.empty()) {
-        if (peer_fetcher_ == nullptr) {
-            LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
-                 to_fetch.size());
-        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_); !fetched) {
-            LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
-                 fetched.error().message(), to_fetch.size());
-        } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
-            // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
-            // repeated) -- any deviation means the response itself can't be trusted, so none of it is
-            // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
-            // fine from a peer that has already proven unreliable.
-            LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
-                 "entire batch, leaving {} lsn(s) as missing",
-                 *bad_lsn, to_fetch.size());
-        } else {
-            for (auto& slot : *fetched) {
-                if (slot.is_empty) {
-                    std::lock_guard lk{state_mu_};
-                    empty_lsns_.insert(slot.lsn);
-                    missing_lsns_.erase(slot.lsn);
-                    continue;
-                }
-                // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
-                // journalling the block reference. all_zeros slots carry no data and skip alloc.
-                homestore::multi_blk_id blkid{};
-                bool blkid_allocated = false;
-                if (!slot.all_zeros) {
-                    auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
-                    if (!alloc_res) {
-                        LOGE("apply_sync_rs_commit_lsn: alloc_write_data failed lsn={}: {} -- leaving as missing",
-                             slot.lsn, alloc_res.error().message());
-                        continue;
-                    }
-                    blkid = *alloc_res;
-                    blkid_allocated = true;
-                }
-
-                // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
-                // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
-                // default instance. That's an implicit, undocumented dependency on HomeStore's current
-                // behavior -- see SDSTOR-25613.
-                auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
-                                                         slot.all_zeros, slot.csums);
-                if (!res) {
-                    LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
-                         res.error().message());
-                    if (blkid_allocated) {
-                        detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
-                            if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                                LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
-                                     lsn, fr.error().message());
-                            co_return ok();
-                        }());
-                    }
-                    continue;
-                }
-                std::lock_guard lk{state_mu_};
-                missing_lsns_.erase(slot.lsn);
-            }
-        }
-    }
+    if (has_missing && peer_fetcher_ == nullptr)
+        LOGW("apply_sync_rs_commit_lsn: lsn(s) <= {} missing but no peer_fetcher_ wired -- leaving as missing",
+             rs_commit_lsn);
+    if (start_catchup) co_await run_catchup();
 
     // commit_lsn (CRAFT-Design) is the LOCAL CONTIGUOUS prefix, distinct from rs_commit_lsn (the
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
-    // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
+    // Mirrors craft_client's reference MemCraftReplica::apply_up_to. run_catchup() also advances it after
+    // every pass; this covers the cases where no catch-up ran (nothing missing, unwired peer channel, or a
+    // worker already running for an earlier entry).
     //
     // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
     // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
@@ -1971,22 +2135,178 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     bool should_checkpoint;
     {
         std::lock_guard lk{state_mu_};
-        int64_t next = state_.commit_lsn + 1;
-        while (next <= rs_commit_lsn && !missing_lsns_.contains(next)) {
-            state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
-            ++next;
-        }
+        should_checkpoint = advance_commit_locked(rs_commit_lsn);
         commit_lsn_snapshot = state_.commit_lsn;
-        // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
-        // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
-        // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
-        // write()'s piggyback and keep_alive() (which don't go through this function) advance the
-        // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
-        should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
     if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
+}
+
+bool CraftReplDev::advance_commit_locked(int64_t upto) {
+    int64_t next = state_.commit_lsn + 1;
+    while (next <= upto && !missing_lsns_.contains(next)) {
+        state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
+        ++next;
+    }
+    // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
+    // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
+    // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
+    // write()'s piggyback and keep_alive() (which don't go through this function) advance the
+    // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
+    return checkpoint_interval_crossed_locked(state_.commit_lsn);
+}
+
+// ─── catch-up worker (CRAFT-Design: "loop until no missing slot <= N") ───────
+//
+// One worker per device fills every missing slot up to catchup_target_ (the highest applied rs_commit_lsn),
+// retrying with backoff until done. The wiki's resync loop guarantees the leader holds every non-Empty slot
+// <= N, so the loop terminates once a holder is reachable. A slot can also leave the missing set while the
+// worker sleeps -- a late write() fills it, truncate() drops it, or a later entry verdicts it Empty -- so every
+// pass recomputes what's left rather than trusting a list from an earlier pass.
+
+async_status CraftReplDev::run_catchup() {
+    auto self = shared_from_this();
+    static constexpr auto k_initial_backoff = std::chrono::milliseconds{100};
+    static constexpr uint64_t k_log_every_no_progress = 10;
+    auto backoff = k_initial_backoff;
+    uint64_t no_progress_passes = 0;
+
+    while (true) {
+        std::vector< int64_t > to_fetch;
+        uint64_t term;
+        int64_t target;
+        {
+            std::lock_guard lk{state_mu_};
+            target = catchup_target_;
+            auto const first = missing_lsns_.lower_bound(state_.commit_lsn + 1);
+            if (stopping_.load(std::memory_order_acquire) || first == missing_lsns_.end() || *first > target) {
+                catchup_running_ = false; // done (nothing left <= target) or stopped -- same critical section as the
+                break;                    // check, so an apply raising the target now starts a fresh worker
+            }
+            // A slot with a write() already in flight is left to that write; claim the rest so a late write() of
+            // the same dLSN can't also write it while this pass does (write() rejects a claimed dLSN).
+            for (auto it = first; it != missing_lsns_.end() && *it <= target; ++it) {
+                if (in_flight_write_dlsns_.insert(*it).second) to_fetch.push_back(*it);
+            }
+            term = state_.term;
+        }
+
+        size_t resolved = 0;
+        if (!to_fetch.empty()) {
+            auto r = co_await catchup_pass(to_fetch, term);
+            resolved = r ? *r : 0;
+            std::lock_guard lk{state_mu_};
+            for (int64_t lsn : to_fetch)
+                in_flight_write_dlsns_.erase(lsn);
+        }
+
+        int64_t commit_lsn_snapshot;
+        bool should_checkpoint;
+        bool target_raised;
+        {
+            std::lock_guard lk{state_mu_};
+            should_checkpoint = advance_commit_locked(catchup_target_);
+            commit_lsn_snapshot = state_.commit_lsn;
+            target_raised = catchup_target_ > target;
+        }
+        if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
+
+        if (!sleep_fn_) {
+            // No backoff wired: one pass per apply, as before the retry loop. Go again only if a newer apply raised
+            // the target while this pass ran (that apply saw this worker running and left the fill to it).
+            if (target_raised) continue;
+            std::lock_guard lk{state_mu_};
+            catchup_running_ = false;
+            break;
+        }
+        if (resolved > 0) {
+            backoff = k_initial_backoff;
+            no_progress_passes = 0;
+            continue;
+        }
+        if (++no_progress_passes % k_log_every_no_progress == 0)
+            LOGE("catch-up: {} consecutive passes filled nothing below target={} (commit_lsn={}) -- peers unreachable, "
+                 "or this member is past the journal-reclaim floor and needs the snapshot path",
+                 no_progress_passes, target, commit_lsn_snapshot);
+        co_await sleep_fn_(backoff);
+        backoff = std::min(backoff * 2, std::chrono::milliseconds{peer_fetch_timeout_ms_});
+    }
+    co_return ok();
+}
+
+async_result< size_t > CraftReplDev::catchup_pass(std::vector< int64_t > const& to_fetch, uint64_t term) {
+    auto self = shared_from_this();
+    auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_);
+    if (!fetched) {
+        LOGE("catch-up: fetch_data failed: {} -- {} lsn(s) still missing", fetched.error().message(), to_fetch.size());
+        co_return std::unexpected(fetched.error());
+    }
+    if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
+        // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
+        // repeated) -- any deviation means the response itself can't be trusted, so none of it is
+        // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
+        // fine from a peer that has already proven unreliable.
+        LOGE("catch-up: peer response lsn={} not requested (or duplicated) -- rejecting entire batch, {} lsn(s) "
+             "still missing",
+             *bad_lsn, to_fetch.size());
+        co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
+    }
+
+    size_t resolved = 0;
+    for (auto& slot : *fetched) {
+        {
+            // The worker slept or awaited since claiming this slot: a later entry may have verdicted it Empty (Empty
+            // beats data -- never write it), or truncate() may have dropped it. Either way it's no longer ours to fill.
+            std::lock_guard lk{state_mu_};
+            if (!missing_lsns_.contains(slot.lsn)) continue;
+            if (slot.is_empty) {
+                // The peer positively holds a prior leader verdict for this slot (fetch_data never reports Empty
+                // for data it merely lacks) -- obeying it is not a unilateral verdict.
+                empty_lsns_.insert(slot.lsn);
+                missing_lsns_.erase(slot.lsn);
+                ++resolved;
+                continue;
+            }
+        }
+        // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
+        // journalling the block reference. all_zeros slots carry no data and skip alloc.
+        homestore::multi_blk_id blkid{};
+        bool blkid_allocated = false;
+        if (!slot.all_zeros) {
+            auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
+            if (!alloc_res) {
+                LOGE("catch-up: alloc_write_data failed lsn={}: {} -- still missing", slot.lsn,
+                     alloc_res.error().message());
+                continue;
+            }
+            blkid = *alloc_res;
+            blkid_allocated = true;
+        }
+
+        // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+        // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+        // default instance. That's an implicit, undocumented dependency on HomeStore's current
+        // behavior -- see SDSTOR-25613.
+        auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
+                                                 slot.all_zeros, slot.csums);
+        if (!res) {
+            LOGE("catch-up: write_slot failed lsn={}: {} -- still missing", slot.lsn, res.error().message());
+            if (blkid_allocated) {
+                detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+                    if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                        LOGE("catch-up: free_data failed after write_slot failure lsn={}: {}", lsn,
+                             fr.error().message());
+                    co_return ok();
+                }());
+            }
+            continue;
+        }
+        std::lock_guard lk{state_mu_};
+        missing_lsns_.erase(slot.lsn);
+        ++resolved;
+    }
+    co_return resolved;
 }
 
 // ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────

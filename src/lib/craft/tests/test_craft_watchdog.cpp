@@ -28,6 +28,7 @@
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -53,9 +54,9 @@ static constexpr uint64_t k_test_watchdog_timeout_ms = 300; // ms; overrides cra
 // ── minimal journal mock ────────────────────────────────────────────────────────
 //
 // The watchdog never touches journal_ (touch_watchdog()/on_watchdog_tick() only read/write state_,
-// last_contact_ns_, and watchdog_token_; append() -- called fire-and-forget on expiry -- is still a
-// stub that never reaches journal_ either), so every method is an unreachable stub, same shape as
-// test_craft_truncate.cpp's mock.
+// last_contact_ns_, and watchdog_token_; the background SyncRSCommitLSN round it fires on expiry only
+// reaches journal_ via pre-resolution, which the proposer test below keeps candidate-free), so every
+// method is an unreachable stub, same shape as test_craft_truncate.cpp's mock.
 
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
@@ -76,6 +77,39 @@ public:
     }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+};
+
+// ── RAFT group + peer mocks (only for WatchdogTickProposesSyncRSCommitLSN) ─────
+//
+// The watchdog's background round runs on an iomgr worker thread, so everything the test thread reads back
+// is atomic. A single-member replica set needs no poll responders (leader alone is the majority).
+
+class MockCraftRaftProposer : public CraftRaftProposer {
+public:
+    std::atomic< int > propose_calls{0};
+    std::atomic< int64_t > last_rs_commit_lsn{-1};
+
+    uint32_t member_count() const override { return 1; }
+    bool is_leader() const override { return true; }
+    async_status propose(sisl::blob const&, sisl::blob const& key) override {
+        last_rs_commit_lsn.store(reinterpret_cast< SyncRSCommitLSNPayload const* >(key.cbytes())->rs_commit_lsn);
+        ++propose_calls;
+        co_return ok();
+    }
+};
+
+class MockCraftPeerFetcher : public CraftPeerFetcher {
+public:
+    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t, bool) override { co_return craft::lsn_pair{}; }
+    async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >&, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    async_result< std::vector< craft::lsn_pair > > get_rs_commit_lsn_from_quorum(uint64_t, bool, uint32_t) override {
+        co_return std::vector< craft::lsn_pair >{};
     }
 };
 
@@ -109,9 +143,9 @@ protected:
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-// append() is still a stub with no other observable side effect -- watchdog_fire_count() (test-only)
-// is how this confirms on_watchdog_tick() actually fired after a full interval of no write()/
-// keep_alive() activity.
+// No RAFT group is wired here, so the background round no-ops -- watchdog_fire_count() (test-only) is how
+// this confirms on_watchdog_tick() actually fired after a full interval of no write()/keep_alive() activity.
+// WatchdogTickProposesSyncRSCommitLSN below covers what a fired tick then does.
 TEST_F(CraftWatchdogTest, FiresAfterInactivity) {
     dev_->seed_term(7);
 
@@ -127,6 +161,29 @@ TEST_F(CraftWatchdogTest, FiresAfterInactivity) {
     // a loaded machine.
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_GE(dev_->watchdog_fire_count(), 1);
+}
+
+// With a RAFT group wired, a stale tick runs the full background round: GetRSCommitLSN poll, then a
+// SyncRSCommitLSN proposal up to max(quorum.last_append) -- here this single-member leader's own 3. Later
+// stale ticks find nothing new and propose nothing more (append()'s dedup), so the count settles at 1.
+TEST_F(CraftWatchdogTest, WatchdogTickProposesSyncRSCommitLSN) {
+    MockCraftRaftProposer raft;
+    MockCraftPeerFetcher peer;
+    dev_->set_raft_proposer(&raft);
+    dev_->set_peer_fetcher(&peer);
+    dev_->seed_term(7);
+    dev_->seed_lsns(3, {});
+
+    ASSERT_TRUE(do_keep_alive(7).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // > 300ms configured timeout
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // see FiresAfterInactivity
+
+    EXPECT_GE(dev_->watchdog_fire_count(), 1);
+    EXPECT_EQ(raft.propose_calls.load(), 1);
+    EXPECT_EQ(raft.last_rs_commit_lsn.load(), 3);
+
+    // The recurring timer still captures dev_; destroy it (cancel, wait=true) before raft/peer go out of scope.
+    dev_.reset();
 }
 
 // A keep_alive() before the interval elapses must refresh last_contact_ns_ -- no firing as long as

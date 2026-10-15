@@ -185,6 +185,23 @@ add_dependencies(test_craft_pre_resolution ${PROJECT_NAME}_core)
 
 add_test(NAME CraftPreResolutionTest COMMAND test_craft_pre_resolution)
 
+# Unit tests for CraftReplDev::append()/request_resolution() and the periodic/watchdog SyncRSCommitLSN
+# triggers (S5: SDSTOR-22908). Same pattern: compile craft_repl_dev.cpp directly.
+add_executable(test_craft_append)
+target_sources(test_craft_append PRIVATE
+    test_craft_append.cpp
+    ../craft_repl_dev.cpp
+)
+target_compile_definitions(test_craft_append PRIVATE _PRERELEASE)
+target_sources(test_craft_append PRIVATE ${HB_CONFIG_BINDUMP})
+target_link_libraries(test_craft_append
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+add_dependencies(test_craft_append ${PROJECT_NAME}_core)
+
+add_test(NAME CraftAppendTest COMMAND test_craft_append)
+
 # Heavy integration test for CraftReplDev::commit()/read() against a REAL VolumeIndexTable and real
 # data blocks (via a real, ordinarily-created volume) -- same pattern as
 # test_craft_homestore_backend.cpp (links the full library, real HomeStore bring-up).

@@ -24,9 +24,14 @@
 //   - commit_lsn/last_append_lsn advance directly when there's no gap to catch up on
 //   - fetch_data is invoked with exactly the missing LSNs when behind, and its response is persisted
 //   - a peer response naming an unrequested or duplicate LSN is rejected as a whole batch
-//   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_fetcher_ at all leaves the
-//     affected LSN(s) missing; commit_lsn stalls just below the first unresolved Missing slot (Empty
-//     slots are skipped over), never advancing past it regardless of rs_commit_lsn
+//   - with no sleep_fn_ wired, catch-up makes a single attempt: a failed fetch, a failed write_slot, or no
+//     peer_fetcher_ at all leaves the affected LSN(s) missing; commit_lsn stalls just below the first
+//     unresolved Missing slot (Empty slots are skipped over), never advancing past it regardless of rs_commit_lsn
+//   - with sleep_fn_ wired, catch-up loops until no missing slot <= rs_commit_lsn remains (CRAFT-Design's
+//     FetchData loop): backoff doubles from 100ms up to peer_fetch_timeout_ms; stop() ends the loop; an apply
+//     arriving while the worker runs only raises its target (no duplicate fetch); a slot claimed by the worker
+//     rejects a concurrent late write(); a slot verdicted Empty mid-fetch is not written; truncate() clamps the
+//     target so the next session's in-flight gaps are never fetched
 //   - commit_lsn never decrements
 //   - on_commit parses a real serialized SyncRSCommitLSN entry and dispatches correctly (and rejects
 //     malformed header/key blobs without touching state)
@@ -45,6 +50,8 @@
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
 
+#include <chrono>
+#include <functional>
 #include <gtest/gtest.h>
 #include <map>
 #include <optional>
@@ -73,6 +80,7 @@ static constexpr uint32_t k_page_size = 4096;
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
+    std::map< int64_t, int > write_counts; // write_slot calls per LSN, successful or not
     std::optional< int64_t > fail_on_write;
     int free_data_calls{0};
 
@@ -83,6 +91,7 @@ public:
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
+        ++write_counts[lsn];
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] =
@@ -111,6 +120,9 @@ public:
 // ── peer fetcher mock ─────────────────────────────────────────────────────────
 //
 // Records the LSN list it was last called with; returns a programmable response or an injected error.
+// For the catch-up retry tests: fail_first_n fails the first N calls; respond_with_requested answers each call
+// with a data slot for every LSN requested (instead of the fixed `response`); during_fetch runs inside the call,
+// i.e. while the catch-up worker is suspended on the fetch, with the LSNs it was asked for.
 
 class MockCraftPeerFetcher : public CraftPeerFetcher {
 public:
@@ -118,6 +130,10 @@ public:
     uint32_t last_timeout_ms{0};
     std::vector< JournalSlot > response;
     bool should_fail{false};
+    int fetch_calls{0};
+    int fail_first_n{0};
+    bool respond_with_requested{false};
+    std::function< void(std::vector< int64_t > const&) > during_fetch;
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
         co_return craft::lsn_pair{};
@@ -125,15 +141,32 @@ public:
 
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                           uint32_t timeout_ms) override {
+        ++fetch_calls;
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
-        if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (during_fetch) {
+            auto hook = during_fetch; // a hook may reset during_fetch itself
+            hook(lsns);
+        }
+        if (should_fail || fetch_calls <= fail_first_n)
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (respond_with_requested) {
+            std::vector< JournalSlot > slots;
+            for (int64_t lsn : lsns)
+                slots.push_back(JournalSlot{.lsn = lsn, .lba_off_bytes = 0, .len_bytes = k_page_size});
+            co_return slots;
+        }
         co_return response;
     }
 
     // Not exercised by this file -- pre_resolve_slots's quorum broadcast is covered by
     // test_craft_pre_resolution.cpp's own mock.
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+
+    // Not exercised by this file -- the background GetRSCommitLSN poll is covered by test_craft_append.cpp.
+    async_result< std::vector< craft::lsn_pair > > get_rs_commit_lsn_from_quorum(uint64_t, bool, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
@@ -204,9 +237,21 @@ protected:
             dev_->apply_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(empty_slots)));
     }
 
+    // Wires an immediate (non-sleeping) backoff that records each requested duration; on_sleep_, if set, runs
+    // inside each sleep (e.g. to call stop() after N retries).
+    void wire_immediate_sleep() {
+        dev_->set_sleep_fn([this](std::chrono::milliseconds d) -> async_status {
+            sleeps_.push_back(d);
+            if (on_sleep_) on_sleep_();
+            co_return ok();
+        });
+    }
+
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftPeerFetcher fetcher_;
     MockCraftCheckpointTrigger trigger_;
+    std::vector< std::chrono::milliseconds > sleeps_;
+    std::function< void() > on_sleep_;
     std::shared_ptr< CraftReplDev > dev_;
 };
 
@@ -478,6 +523,179 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
     EXPECT_FALSE(dev_->is_missing(1));
     EXPECT_TRUE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 1); // lsn=1 resolved; stalls at lsn=2, still missing
+}
+
+// ── catch-up retry loop (CRAFT-Design: "loop until no missing slot <= N") ─────
+
+// Unwired backoff keeps the single-attempt behaviour: one failed fetch, no retry.
+TEST_F(CraftRaftEntriesTest, CatchupUnwiredSleepMakesSingleAttempt) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.should_fail = true;
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetcher_.fetch_calls, 1);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+}
+
+// With backoff wired, failed fetches are retried until the slots fill; commit_lsn then reaches N.
+TEST_F(CraftRaftEntriesTest, CatchupRetriesUntilFilled) {
+    wire_immediate_sleep();
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.fail_first_n = 2;
+    fetcher_.respond_with_requested = true;
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetcher_.fetch_calls, 3);
+    EXPECT_EQ(
+        sleeps_,
+        (std::vector< std::chrono::milliseconds >{std::chrono::milliseconds{100}, std::chrono::milliseconds{200}}));
+    for (int64_t lsn = 3; lsn <= 5; ++lsn) {
+        EXPECT_TRUE(journal_->has_slot(lsn)) << lsn;
+        EXPECT_FALSE(dev_->is_missing(lsn)) << lsn;
+    }
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
+// A malformed peer response is a failed pass, not a give-up: the next pass refetches.
+TEST_F(CraftRaftEntriesTest, CatchupRetriesAfterMalformedResponse) {
+    wire_immediate_sleep();
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.response = {JournalSlot{.lsn = 99, .lba_off_bytes = 1, .len_bytes = 4}}; // unrequested lsn
+    fetcher_.during_fetch = [this](std::vector< int64_t > const&) {
+        if (fetcher_.fetch_calls == 2) fetcher_.respond_with_requested = true; // second pass gets a good answer
+    };
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetcher_.fetch_calls, 2);
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+}
+
+// Backoff doubles from 100ms and caps at peer_fetch_timeout_ms.
+TEST_F(CraftRaftEntriesTest, CatchupBackoffDoublesAndCaps) {
+    wire_immediate_sleep();
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_fetch_timeout_ms(300);
+    dev_->seed_lsns(2, {});
+    fetcher_.fail_first_n = 4;
+    fetcher_.respond_with_requested = true;
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0).has_value());
+
+    using ms = std::chrono::milliseconds;
+    EXPECT_EQ(sleeps_, (std::vector< ms >{ms{100}, ms{200}, ms{300}, ms{300}}));
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+}
+
+// A fetch that never succeeds loops until stop(); the slots stay missing, and a stopped device never starts
+// another worker.
+TEST_F(CraftRaftEntriesTest, CatchupStopEndsRetryLoop) {
+    wire_immediate_sleep();
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.should_fail = true;
+    on_sleep_ = [this] {
+        if (sleeps_.size() == 3) dev_->stop();
+    };
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetcher_.fetch_calls, 3);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/6, /*client_token=*/0).has_value());
+    EXPECT_EQ(fetcher_.fetch_calls, 3); // stopped: the new apply's worker exits before fetching
+}
+
+// An apply arriving while the worker is mid-fetch only raises the target -- it fetches nothing itself, and the
+// running worker then fills the raised range in a second pass. No slot is fetched or written twice.
+TEST_F(CraftRaftEntriesTest, CatchupOverlappingApplyHandsFillToRunningWorker) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.respond_with_requested = true;
+    int fetch_calls_seen_by_nested_apply = -1;
+    fetcher_.during_fetch = [this, &fetch_calls_seen_by_nested_apply](std::vector< int64_t > const&) {
+        fetcher_.during_fetch = nullptr; // only the first fetch runs the nested apply
+        ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/8, /*client_token=*/0).has_value());
+        fetch_calls_seen_by_nested_apply = fetcher_.fetch_calls;
+    };
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetch_calls_seen_by_nested_apply, 1); // the nested apply did not fetch
+    EXPECT_EQ(fetcher_.fetch_calls, 2);
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{6, 7, 8}));
+    for (int64_t lsn = 3; lsn <= 8; ++lsn)
+        EXPECT_EQ(journal_->write_counts[lsn], 1) << lsn;
+    EXPECT_EQ(dev_->commit_lsn(), 8);
+}
+
+// A late write() of a slot the worker has claimed is rejected rather than racing the fill -- the slot is
+// written exactly once.
+TEST_F(CraftRaftEntriesTest, CatchupClaimedSlotRejectsConcurrentLateWrite) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.respond_with_requested = true;
+    std::optional< std::error_condition > late_write_error;
+    fetcher_.during_fetch = [this, &late_write_error](std::vector< int64_t > const&) {
+        auto r = homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{0, -1, -1}, /*dlsn=*/3, /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}));
+        if (!r) late_write_error = r.error();
+    };
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    ASSERT_TRUE(late_write_error.has_value());
+    EXPECT_EQ(*late_write_error, std::make_error_condition(std::errc::operation_in_progress));
+    EXPECT_EQ(journal_->write_counts[3], 1);
+    EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// A slot verdicted Empty by a later entry while the worker was fetching it must not be written: Empty beats data.
+TEST_F(CraftRaftEntriesTest, CatchupSlotEmptiedMidFetchIsNotWritten) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.respond_with_requested = true;
+    fetcher_.during_fetch = [this](std::vector< int64_t > const&) {
+        fetcher_.during_fetch = nullptr;
+        ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    };
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0).has_value());
+
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
+// truncate() clamps the catch-up target: gaps the next session's writes open above the truncation point are
+// live in-flight writes and must never be fetched by catch-up, even though an earlier entry raised the target
+// past them.
+TEST_F(CraftRaftEntriesTest, CatchupTruncateClampsTarget) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.should_fail = true;
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/8, /*client_token=*/0).has_value()); // target 8, 3..8 still missing
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->truncate(4)).has_value());
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, /*dlsn=*/10, /*addr=*/0,
+                                                         /*len=*/k_page_size, sisl::sg_list{}))
+                    .has_value()); // opens gaps 5..9
+
+    fetcher_.should_fail = false;
+    fetcher_.respond_with_requested = true;
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/4, /*client_token=*/0).has_value());
+
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4}));
+    EXPECT_TRUE(dev_->is_missing(5)); // the next session's gap: untouched
 }
 
 // ── checkpoint trigger (SDSTOR-22888) ─────────────────────────────────────────

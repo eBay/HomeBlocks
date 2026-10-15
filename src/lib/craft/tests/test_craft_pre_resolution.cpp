@@ -139,6 +139,11 @@ public:
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
+
+    // Not exercised by this file -- the background GetRSCommitLSN poll is covered by test_craft_append.cpp.
+    async_result< std::vector< craft::lsn_pair > > get_rs_commit_lsn_from_quorum(uint64_t, bool, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 // ── RAFT group mock ───────────────────────────────────────────────────────────
@@ -150,6 +155,11 @@ class MockCraftRaftProposer : public CraftRaftProposer {
 public:
     uint32_t members{3};
     uint32_t member_count() const override { return members; }
+    // pre_resolve_slots never consults leadership or proposes -- that is propose_sync's job (test_craft_append.cpp).
+    bool is_leader() const override { return true; }
+    async_status propose(sisl::blob const&, sisl::blob const&) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 } // namespace
@@ -218,6 +228,23 @@ TEST_F(CraftPreResolutionTest, KnownGapCandidatesStrictlyFilteredToUpto) {
     EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3}));
     EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     EXPECT_TRUE(dev_->is_missing(7)); // above upto -- untouched
+}
+
+// The known-gap scan starts above commit_lsn: a missing_lsns_ entry at or below it (which the commit
+// invariant shouldn't allow, but seed_lsns can force) is never requested.
+TEST_F(CraftPreResolutionTest, KnownGapCandidatesStartAboveCommitLsn) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(8, {2, 4, 6});
+    dev_->seed_commit_lsn(4);
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 6, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/8);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{6}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{6}));
+    EXPECT_TRUE(dev_->is_missing(2)); // untouched
+    EXPECT_TRUE(dev_->is_missing(4)); // == commit_lsn: untouched
 }
 
 // upto can exceed this leader's own last_append_lsn (a client Resolve naming a dLSN this leader never
