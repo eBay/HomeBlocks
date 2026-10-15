@@ -72,7 +72,7 @@ independently journal writes broadcast by the client.
 - Updates `last_append_lsn = max(last_append_lsn, lsn)`
 - Handles out-of-order LSN arrival without blocking (gaps tracked as Missing); backed by the HomeStore logstore in **out-of-order mode** (`write_async(seq_num)`), not the append-only mode RAFT uses
 - Zero-copy: `data` buffer is not copied during the append path
-- **Thin (`all_zeros`) write:** `write(term, lsn, lba, len, all_zeros, data)` with `all_zeros=true` (WRITE_ZEROES / discard-to-zero) skips allocation and the data-service write; journal a metadata-only slot `{term, lsn, lba, len, all_zeros}`. Both forms take a dLSN and merge by highest-per-LBA. The client sets `all_zeros` after a client-side zero scan; the server does **not** re-scan a data write
+- **Thin (zero) write:** an **empty `data` buffer** is the signal (there is no `all_zeros` parameter, see [api.md](api.md)): a WRITE_ZEROES / discard-to-zero write skips allocation and the data-service write and journals a metadata-only slot `{term, lsn, lba, len, all_zeros}`. Both forms take a dLSN and merge by highest-per-LBA. The client sends an empty buffer after a client-side zero scan; the server does **not** re-scan a data write
 - Does NOT apply data to the LBA index (that is `commit`'s job; a zero write applies as an index delete / range unmap)
 - Unit tests cover: in-order writes, out-of-order writes, term rejection, a zero (`all_zeros`) write allocates no blocks and merges over/under a data write by dLSN
 
@@ -131,9 +131,9 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 
 **SyncRSCommitLSN:**
 - RAFT entry carries `{rs_commit_lsn, client_token, empty_slots[]}`
-- **Leader pre-resolution:** before proposing `N`, the leader resolves every unresolved slot ≤ `N`: fetch it from any holder, or record an `Empty` verdict on quorum-lacks evidence (leader counts itself; non-responders never count); it must not propose past an unresolved slot
+- **Leader pre-resolution:** before proposing `N`, the leader resolves every unresolved slot ≤ `N`: fetch it from any holder, or record an `Empty` verdict on quorum-lacks evidence; it must not propose past an unresolved slot. Quorum-lacks evidence means a **majority of the replica set's data members** positively lack the slot: the leader counts itself, non-responders never count, and arbiters (skinny mode) are excluded, since they are voters but hold no data. With N=3 that is the leader plus one confirming peer; with N=5, the leader plus two. Fewer confirmations leave the slot unresolved
 - On apply: `client_token` is carried on the entry but NOT checked against local state -- `SyncRSCommitLSN` applies before the `InternalLogin` that would establish it, so an equality-fence here would make login itself unreachable; ordering plus the term fence on subsequent IO provide exclusivity instead. Mark `empty_slots` Empty, **discarding any local data held there** (reconciliation); if behind, `fetch_data()` the remaining missing slots from peers; then advance `commit_lsn` to the contiguous prefix bounded by `rs_commit_lsn` (skipping `Empty` slots, never past an unresolved `Missing` one). **Apply never truncates** and replicas **never declare Empty unilaterally**
-- Peer catch-up (`CraftPeerFetcher::fetch_from_peer`) is **timeout-bounded**: every call passes `peer_fetch_timeout_ms` (`home_blks_config.fbs`, default 5000ms); a peer that misses the deadline is treated as a hard failure, same as any other fetch failure (best-effort — unresolved LSNs stay missing and `commit_lsn` stalls just below the first one). The interface only carries the deadline; enforcing it against a real wire call is S9's (the transport's)
+- Peer catch-up (`CraftPeerFetcher::fetch_data`) is **timeout-bounded**: every call passes `peer_fetch_timeout_ms` (`home_blks_config.fbs`, default 5000ms); a peer that misses the deadline is treated as a hard failure, same as any other fetch failure (best-effort — unresolved LSNs stay missing and `commit_lsn` stalls just below the first one). The interface only carries the deadline; enforcing it against a real wire call is S9's (the transport's)
 - `append(sync_to, client_token)` proposes this entry via RAFT
 - Triggers: periodic every N LSNs (configurable via `home_blks_config.fbs`, default 128), watchdog, login, **client-requested (after a failed sub-quorum write)** — the client's `Resolve` RPC lands on `CraftReplDev::request_resolution(term, upto)`, which runs this same leader pre-resolution and returns the Empty verdicts ≤ `upto` (`craft::resolution_result`). The client broadcasts it to every member (it cannot know the leader mid-session); a follower returns `NOT_LEADER`
 
@@ -215,17 +215,19 @@ restarts without losing LSN state.
 **Blocked by (full handlers):** S2, S3, S7
 
 As an I/O engineer, I want a `CraftConnector` class (analogous to `ScstConnector`) that
-receives NubloxProto RPCs and translates them 1-to-1 to `CraftReplDev` API calls, so that
+terminates the CRAFT client wire (the packed-binary protocol in `craft_client`'s `docs/wire.md`, see
+[rpcs.md](rpcs.md)) and translates each RPC 1-to-1 to a `CraftReplDev` API call, so that
 the RPC layer and storage layer have a clean boundary with no storage logic in the connector.
 
 **Acceptance criteria:**
 - `CraftConnector` class exists; transport is pluggable (CRAFT-1 spike determines final choice)
 - Client-facing handlers: `Login` (routes by the request's `volume_id`), `Write`, `Read`, `KeepAlive`,
-  `Resolve` (there is no `Commit` verb: the watermark rides on `client_hdr.commit_lsn`, see
+  `Resolve`, `Logout` (there is no `Commit` verb: the watermark rides on `client_hdr.commit_lsn`, see
   [rpcs.md](rpcs.md))
 - Server-to-server handlers: `GetRSCommitLSN`, `FetchData`, `GetLSNs` (used during login and resync)
-- Each handler translates NubloxProto types ↔ `CraftReplDev` types with no storage logic
-- Leader redirect: if a `Login` arrives at a follower, return leader endpoint
+- Each handler translates wire types ↔ `CraftReplDev` types with no storage logic
+- Leader redirect: if a `Login` arrives at a follower, reply with a successful response carrying `term == 0`
+  and `leader_hint` set to the leader's id (a sentinel, not a `NOT_LEADER` error; see rpcs.md's Login)
 - Term mismatch: return `ETERM` to client
 - Blocked on CRAFT-1 for the real transport; initial version uses direct function-call stubs
 - Integration test: end-to-end Login + Write + Read + Commit through the connector
