@@ -18,7 +18,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 |---|---|
 | [protocol.md](protocol.md) | Pointer to the canonical [CRAFT Design](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design) wiki page |
 | [api.md](api.md) | HomeBlocks C++ CRAFT API (`CraftReplDev` methods) |
-| [rpcs.md](rpcs.md) | All 9 RPCs (client↔server and server↔server) |
+| [rpcs.md](rpcs.md) | All 11 RPCs (client↔server and server↔server) |
 | wire.md | On-wire byte encoding of the client RPCs — **moved to the `craft_client` repo** (`docs/wire.md`), which now owns the wire protocol. |
 | transport.md | TCP transport binding behavior — **moved to the `craft_client` repo** (`docs/transport.md`). |
 | [states.md](states.md) | Pointer to the canonical wiki page (slot states, read eligibility) |
@@ -37,7 +37,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **Replica Set (RS)** | The set of HomeBlocks nodes that hold copies of one partition. Typically 3 nodes. |
 | **Partition** | The independent replica-set CRAFT replicates. A volume comprises one or more partitions; a given LBA maps to exactly one partition. |
 | **CraftReplDev** | New HomeBlocks replication device class (parallel to `ReplDisk`) that implements CRAFT. |
-| **CraftConnector** | New HomeBlocks RPC frontend (parallel to `ScstConnector`) that translates NubloxProto RPCs to `CraftReplDev` API calls. |
+| **CraftConnector** | New HomeBlocks RPC frontend (parallel to `ScstConnector`) that terminates the CRAFT client wire (packed binary, see [rpcs.md](rpcs.md)) and translates each RPC to a `CraftReplDev` API call. |
 | **SyncRSCommitLSN** | A RAFT log entry type. On apply, each replica fetches any missing data up to the encoded dLSN and advances `commit_lsn`. |
 | **InternalLogin** | A RAFT log entry type. On apply, stores the new `client_token` and enforces single-writer exclusivity. |
 | **Missing** | A dLSN slot that a replica knows about (from a peer or from the RAFT log) but has not yet received data for. |
