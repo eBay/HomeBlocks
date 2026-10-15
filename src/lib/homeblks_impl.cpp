@@ -90,23 +90,19 @@ uint64_t HomeBlocksImpl::shutdown_timer_nsecs() const {
 }
 
 bool HomeBlocksImpl::no_outstanding_vols() const {
+    // 1. check if a volume removal is still running. A DESTROYING volume without one (its remove backed off and was
+    // left to the reaper, which no longer runs removes once shutdown started) is not waited for: its DESTROYING state
+    // is persisted and the destroy resumes on the next boot.
+    if (auto const n = pending_vol_removals_.load(); n > 0) {
+        LOGI("Found {} volume removals in progress", n);
+        return false;
+    }
+
     // check if there are no volumes with outstanding requests;
     std::shared_lock lg(vol_lock_);
     for (auto const& vol_pair : vol_map_) {
         auto const& vol = vol_pair.second;
-        // 1. check if volume is under the process of being removed;
-        if (vol->is_destroying()) {
-#ifdef _PRERELEASE
-            if (crash_simulated_) {
-                LOGI("Skipping volume {} under destruction as crash simulation is enabled", vol->id_str());
-                continue; // skip volumes that are being removed due to crash simulation
-            }
-#endif
-            LOGI("Found outstanding volume {} that is under destruction.", vol->id_str());
-            return false;
-        }
-
-        // 2. if volume is not under destruction, check if it has outstanding requests;
+        // 2. check if volume has outstanding requests;
         if (vol->num_outstanding_reqs() > 0) {
             LOGI("Found outstanding volume {} that has outstanding requests: {}", vol->id_str(),
                  vol->num_outstanding_reqs());

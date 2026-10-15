@@ -256,6 +256,25 @@ public:
 
     shared< homeblocks::home_blocks > inst() { return hb_; }
 
+    // Waits until the volumes are gone, including destroys resumed by a restart, and their chunks are back in the free
+    // pools: index chunks are released asynchronously after the volume is gone.
+    bool wait_for_volumes_removed(std::vector< homeblocks::volume_id_t > const& ids,
+                                  std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto hb = std::dynamic_pointer_cast< homeblocks::HomeBlocksImpl >(hb_);
+        auto removed = [&]() {
+            for (auto const& id : ids) {
+                if (hb->get_volume(id).value_or(nullptr) != nullptr) { return false; }
+            }
+            return !hb->has_pending_chunk_releases();
+        };
+
+        auto const deadline = std::chrono::steady_clock::now() + timeout;
+        while (!removed() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return removed();
+    }
+
     void teardown() {
         LOGINFO("Tearing down test.");
         hb_->shutdown();
