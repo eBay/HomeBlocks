@@ -136,13 +136,11 @@ bool volume::init(bool is_recovery) {
 
         // Get the chunk id's from metablk and pass to chunk selector for recovery.
         std::vector< chunk_num_t > chunk_ids(sb_->get_chunk_ids(), sb_->get_chunk_ids() + sb_->num_chunks);
+        // Chunks it fails to claim stay in the free pool, where startup resets them as unowned: never continue
         bool success =
             volume_chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
-        if (!success) {
-            LOGI("Failed to recover chunks for volume name: {}, uuid: {}", vol_info_->name,
-                 boost::uuids::to_string(vol_info_->id));
-            return false;
-        }
+        RELEASE_ASSERT(success, "Failed to recover chunks for volume name: {}, uuid: {} ordinal: {}", vol_info_->name,
+                       boost::uuids::to_string(vol_info_->id), vol_info_->ordinal);
 
         LOGI("Recovered volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {}", vol_info_->name,
              boost::uuids::to_string(vol_info_->id), vol_info_->ordinal, vol_info_->size_bytes, sb_->pdev_id,

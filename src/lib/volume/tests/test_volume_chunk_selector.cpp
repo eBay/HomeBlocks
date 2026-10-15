@@ -615,6 +615,35 @@ TEST_F(ChunkSelectorTest, ResetDirtyFreeChunksTest) {
     EXPECT_EQ(chunk_sel->get_chunks(0).size(), 2u);
 }
 
+// recover_chunks fails on a superblock listing a chunk the selector doesn't know, or when it has no chunks at all. The
+// volume and index recovery paths assert on it: the listed chunks it didn't claim stay in the free pool, where the
+// startup reset wipes them under the live data.
+TEST_F(ChunkSelectorTest, RecoverChunksFailureTest) {
+    auto empty_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+    ASSERT_FALSE(empty_sel->recover_chunks(0 /* ordinal */, 0 /* pdev */, 16 * Ki, {0}));
+
+    auto chunk_sel =
+        std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
+    auto chunks = add_chunks_per_pdev(chunk_sel, 1 /*pdevs*/, 4 /*chunks per pdev*/);
+
+    // Chunk 2 holds the volume's data, but the superblock lists it after an unknown chunk
+    chunks[2]->set_available_blks(0);
+    ASSERT_FALSE(chunk_sel->recover_chunks(0 /* ordinal */, 0 /* pdev */, 64 * Ki, {0, 1, 100, 2}));
+
+    // The failed lookup of the unknown chunk leaves no trace among the selector's chunks
+    uint32_t num_chunks{0};
+    chunk_sel->foreach_chunks([&num_chunks](auto const& chunk) {
+        ASSERT_TRUE(chunk);
+        ++num_chunks;
+    });
+    EXPECT_EQ(num_chunks, chunks.size());
+
+    // Chunk 2 was never claimed, so the startup reset takes it for unowned and frees the volume's blks
+    chunk_sel->reset_dirty_free_chunks();
+    EXPECT_EQ(chunks[2]->available_blks(), chunks[2]->get_total_blks());
+}
+
 TEST_F(ChunkSelectorTest, ShutdownSkipsEvictionOfPendingReleaseTest) {
     auto chunk_sel =
         std::make_shared< VolumeChunkSelector >("test", [this](uint64_t, const std::vector< chunk_num_t >&) {});
