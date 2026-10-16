@@ -406,12 +406,13 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     std::string str;
     uint32_t indx = 0;
     for (auto& chunk_id : chunk_ids) {
-        // Add the chunks to the volume chunk list.
-        auto chunk = m_all_chunks[chunk_id];
-        if (!chunk) {
+        // Add the chunks to the volume chunk list
+        auto it = m_all_chunks.find(chunk_id);
+        if (it == m_all_chunks.end()) {
             LOGE("Chunk not found vol={} chunk_id={}", volume_ordinal, chunk_id);
             return false;
         }
+        auto chunk = it->second;
         RELEASE_ASSERT(chunk->m_vol_ordinal == INVALID_VOL_ORDINAL, "Chunk assigned to volume {}",
                        chunk->m_vol_ordinal);
         RELEASE_ASSERT(chunk->get_pdev_id() == pdev, "Invalid pdev for chunk");

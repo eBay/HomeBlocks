@@ -69,11 +69,10 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
         std::vector< chunk_num_t > chunk_ids(sb->get_chunk_ids(), sb->get_chunk_ids() + sb->index_num_chunks);
+        // Chunks it fails to claim stay in the free pool, where startup resets them as unowned: never continue
         bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, sb->max_size_bytes, chunk_ids);
-        if (!success) {
-            LOGI("Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
-                 boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
-        }
+        RELEASE_ASSERT(success, "Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
+                       boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
         idx_tbl_map_.emplace(pid_str, tbl);
         return tbl->index_table();
@@ -163,6 +162,7 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
         co_await vol_ptr->destroy();
 #ifdef _PRERELEASE
         if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation") ||
+            iomgr_flip::instance()->test_flip("vol_destroy_crash_before_chunk_release") ||
             iomgr_flip::instance()->test_flip("vol_destroy_crash_after_index_destroy")) {
             co_return;
         }

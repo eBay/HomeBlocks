@@ -136,13 +136,11 @@ bool volume::init(bool is_recovery) {
 
         // Get the chunk id's from metablk and pass to chunk selector for recovery.
         std::vector< chunk_num_t > chunk_ids(sb_->get_chunk_ids(), sb_->get_chunk_ids() + sb_->num_chunks);
+        // Chunks it fails to claim stay in the free pool, where startup resets them as unowned: never continue
         bool success =
             volume_chunk_selector_->recover_chunks(vol_info_->ordinal, sb_->pdev_id, vol_info_->size_bytes, chunk_ids);
-        if (!success) {
-            LOGI("Failed to recover chunks for volume name: {}, uuid: {}", vol_info_->name,
-                 boost::uuids::to_string(vol_info_->id));
-            return false;
-        }
+        RELEASE_ASSERT(success, "Failed to recover chunks for volume name: {}, uuid: {} ordinal: {}", vol_info_->name,
+                       boost::uuids::to_string(vol_info_->id), vol_info_->ordinal);
 
         LOGI("Recovered volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {}", vol_info_->name,
              boost::uuids::to_string(vol_info_->id), vol_info_->ordinal, vol_info_->size_bytes, sb_->pdev_id,
@@ -201,6 +199,15 @@ sisl::async::task< void > volume::destroy() {
 
     // destroy the superblock which will remove sb from meta svc;
     sb_.destroy();
+
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("vol_destroy_crash_before_chunk_release")) {
+        // simulate crash after the volume superblock is destroyed but before its chunks are released; the chunks are
+        // unowned on next reboot with the volume's blks still allocated, and have to be reclaimed;
+        LOGINFO("volume destroy crash before chunk release simulation flip is set, aborting");
+        co_return;
+    }
+#endif
 
     // Release all the chunk's used by the volume. Superblock is destroyed before releasing
     // chunks, so that even after crash, these chunks will be available for other volumes.
