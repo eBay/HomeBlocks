@@ -91,6 +91,8 @@ private:
     std::unique_ptr< sisl::IDReserver > ordinal_reserver_;
 
     sisl::atomic_counter< uint64_t > outstanding_reqs_{0};
+    // Removals accepted by remove_volume whose do_remove_volume has not finished yet; shutdown waits for them.
+    std::atomic< uint32_t > pending_vol_removals_{0};
     std::atomic_flag shutdown_started_{};
     std::atomic< bool > is_restricted_{false}; // avoid taking lock in IO path;
 
@@ -155,6 +157,7 @@ public:
     hs_chunk_size_cfg_t get_chunk_size() const;
     bool dynamic_chunk_allocation() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
+    bool has_pending_chunk_releases() const;
 
 public:
     // public static APIs;
@@ -192,7 +195,6 @@ private:
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
     void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
     bool can_shutdown() const;
-    bool has_pending_chunk_releases() const;
 
     bool no_outstanding_vols() const;
 
@@ -205,7 +207,6 @@ private:
     // If delay flip is not set, false will be returned;
     // If delay flip is set, it will delay the IOs for a given volume_handle
     bool delay_fake_io(volume_handle vol);
-    bool crash_simulated_{false};
 #endif
 };
 

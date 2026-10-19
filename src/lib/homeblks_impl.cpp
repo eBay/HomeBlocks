@@ -90,23 +90,19 @@ uint64_t HomeBlocksImpl::shutdown_timer_nsecs() const {
 }
 
 bool HomeBlocksImpl::no_outstanding_vols() const {
+    // 1. check if a volume removal is still running. A DESTROYING volume without one (its remove backed off and was
+    // left to the reaper, which no longer runs removes once shutdown started) is not waited for: its DESTROYING state
+    // is persisted and the destroy resumes on the next boot.
+    if (auto const n = pending_vol_removals_.load(); n > 0) {
+        LOGI("Found {} volume removals in progress", n);
+        return false;
+    }
+
     // check if there are no volumes with outstanding requests;
     std::shared_lock lg(vol_lock_);
     for (auto const& vol_pair : vol_map_) {
         auto const& vol = vol_pair.second;
-        // 1. check if volume is under the process of being removed;
-        if (vol->is_destroying()) {
-#ifdef _PRERELEASE
-            if (crash_simulated_) {
-                LOGI("Skipping volume {} under destruction as crash simulation is enabled", vol->id_str());
-                continue; // skip volumes that are being removed due to crash simulation
-            }
-#endif
-            LOGI("Found outstanding volume {} that is under destruction.", vol->id_str());
-            return false;
-        }
-
-        // 2. if volume is not under destruction, check if it has outstanding requests;
+        // 2. check if volume has outstanding requests;
         if (vol->num_outstanding_reqs() > 0) {
             LOGI("Found outstanding volume {} that has outstanding requests: {}", vol->id_str(),
                  vol->num_outstanding_reqs());
@@ -483,6 +479,14 @@ void HomeBlocksImpl::on_init_complete() {
         std::optional< meta_subtype_vec_t >({homestore::hs()->repl_service().get_meta_blk_name()}));
 
     homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
+
+    // Every index (recovered before repl devs) and volume has claimed its chunks by now, so chunks left in the free
+    // pools are unowned. Clear the ones a crash during volume destroy left with allocated blks, before they are reused.
+    // No CP flushes the data allocators concurrently: the data service registers for CPs only after this. The CP the
+    // index service forces after its recovery can still be flushing index allocators, which is harmless: a free chunk's
+    // allocator was only loaded from disk and has nothing dirty to flush.
+    volume_chunk_selector_->reset_dirty_free_chunks();
+    index_chunk_selector_->reset_dirty_free_chunks();
 }
 
 void HomeBlocksImpl::init_cp() {}

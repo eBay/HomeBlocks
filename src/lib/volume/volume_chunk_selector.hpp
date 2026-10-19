@@ -112,6 +112,11 @@ public:
     bool recover_chunks(uint64_t volume_ordinal, uint32_t pdev_id, uint64_t volume_size,
                         const std::vector< chunk_num_t >& chunk_ids);
 
+    // Called once at startup, after every volume and index has recovered its chunks. Chunks still in the free pool are
+    // unowned, so allocated blks in them are left over from a volume whose destroy crashed before resetting them.
+    // Resets those chunks so they are empty before they are handed out again.
+    void reset_dirty_free_chunks();
+
     // Called by homestore during start.
     void add_chunk(homestore::cshared< Chunk >&) override;
 

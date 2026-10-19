@@ -406,12 +406,13 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     std::string str;
     uint32_t indx = 0;
     for (auto& chunk_id : chunk_ids) {
-        // Add the chunks to the volume chunk list.
-        auto chunk = m_all_chunks[chunk_id];
-        if (!chunk) {
+        // Add the chunks to the volume chunk list
+        auto it = m_all_chunks.find(chunk_id);
+        if (it == m_all_chunks.end()) {
             LOGE("Chunk not found vol={} chunk_id={}", volume_ordinal, chunk_id);
             return false;
         }
+        auto chunk = it->second;
         RELEASE_ASSERT(chunk->m_vol_ordinal == INVALID_VOL_ORDINAL, "Chunk assigned to volume {}",
                        chunk->m_vol_ordinal);
         RELEASE_ASSERT(chunk->get_pdev_id() == pdev, "Invalid pdev for chunk");
@@ -427,6 +428,27 @@ bool VolumeChunkSelector::recover_chunks(uint64_t volume_ordinal, uint32_t pdev,
     LOGI("Recovered volume={} num_chunks={}", volume_ordinal, chunk_ids.size());
     LOGDEBUG("Recovered chunks={}", str);
     return true;
+}
+
+void VolumeChunkSelector::reset_dirty_free_chunks() {
+    std::unique_lock lock(m_chunk_sel_mutex);
+    std::string str;
+    uint64_t cnt{};
+
+    for (auto& [pdev, chunks] : m_per_dev_chunks) {
+        for (auto& [chunk_id, chunk] : chunks) {
+            if (chunk->available_blks() == chunk->get_total_blks()) { continue; }
+
+            fmt::format_to(std::back_inserter(str), "{} ", chunk_id);
+            ++cnt;
+            chunk->reset();
+        }
+    }
+
+    if (cnt) {
+        LOGI("Reset free chunks left dirty by an interrupted destroy module={} num_chunks={} chunks={}", m_module_name,
+             cnt, str);
+    }
 }
 
 // Wait until no selector is still walking this volume and no resize worker is running. A worker that is only queued

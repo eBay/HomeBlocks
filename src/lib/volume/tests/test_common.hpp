@@ -16,6 +16,7 @@
  * home_blocks Testing Binaries shared common define, apis and data structure;
  * */
 #pragma once
+#include <array>
 #include <fcntl.h>
 #include <future>
 #include <string>
@@ -256,6 +257,25 @@ public:
 
     shared< homeblocks::home_blocks > inst() { return hb_; }
 
+    // Waits until the volumes are gone, including destroys resumed by a restart, and their chunks are back in the free
+    // pools: index chunks are released asynchronously after the volume is gone.
+    bool wait_for_volumes_removed(std::vector< homeblocks::volume_id_t > const& ids,
+                                  std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto hb = std::dynamic_pointer_cast< homeblocks::HomeBlocksImpl >(hb_);
+        auto removed = [&]() {
+            for (auto const& id : ids) {
+                if (hb->get_volume(id).value_or(nullptr) != nullptr) { return false; }
+            }
+            return !hb->has_pending_chunk_releases();
+        };
+
+        auto const deadline = std::chrono::steady_clock::now() + timeout;
+        while (!removed() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return removed();
+    }
+
     void teardown() {
         LOGINFO("Tearing down test.");
         hb_->shutdown();
@@ -298,7 +318,7 @@ public:
         flip::FlipFrequency freq;
         freq.set_count(count);
         freq.set_percent(100);
-        m_fc.inject_noreturn_flip(flip_name, {null_cond}, freq);
+        m_fc.inject_noreturn_flip(flip_name, std::array< flip::FlipCondition, 1 >{null_cond}, freq);
         LOGI("Flip {} set", flip_name);
     }
 
@@ -307,7 +327,7 @@ public:
         flip::FlipFrequency freq;
         freq.set_count(count);
         freq.set_percent(percent);
-        m_fc.inject_delay_flip(flip_name, {null_cond}, freq, delay_usec);
+        m_fc.inject_delay_flip(flip_name, std::array< flip::FlipCondition, 1 >{null_cond}, freq, delay_usec);
         LOGDEBUG("Flip {} set", flip_name);
     }
 
@@ -327,7 +347,8 @@ public:
 
         flip::FlipCondition dont_care_cond;
         fc->create_condition("", flip::Operator::DONT_CARE, (int)1, &dont_care_cond);
-        fc->inject_retval_flip< long >("set_minimum_chunk_size", {dont_care_cond}, freq, chunk_size);
+        fc->inject_retval_flip< long >("set_minimum_chunk_size", std::array< flip::FlipCondition, 1 >{dont_care_cond},
+                                       freq, chunk_size);
 #endif
     }
 

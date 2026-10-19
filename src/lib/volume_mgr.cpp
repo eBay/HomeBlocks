@@ -29,12 +29,18 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
     {
         auto lg = std::scoped_lock(index_lock_);
         auto it = idx_tbl_map_.find(vol_ptr->id_str());
-        DEBUG_ASSERT(it != idx_tbl_map_.end(), "index pid: {} not exists in recovery path, not expected!",
-                     vol_ptr->id_str());
-        vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+        if (it != idx_tbl_map_.end()) {
+            vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
 
-        // don't need it after volume is initialized with index table;
-        idx_tbl_map_.erase(it);
+            // don't need it after volume is initialized with index table;
+            idx_tbl_map_.erase(it);
+        } else {
+            // A destroy that crashed after destroying the index table but before the volume superblock leaves the
+            // volume without index table; the destroy resumed below skips it. Any other volume must have one.
+            RELEASE_ASSERT(vol_ptr->is_destroying(), "index pid: {} not exists in recovery path, not expected!",
+                           vol_ptr->id_str());
+            LOGINFO("volume {} has no index table, it was destroyed before the crash", vol_ptr->id_str());
+        }
     }
 
     {
@@ -63,11 +69,10 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 
         LOGI("Recovering index table for  index_uuid: {}, parent_uuid: {}", boost::uuids::to_string(sb->uuid), pid_str);
         std::vector< chunk_num_t > chunk_ids(sb->get_chunk_ids(), sb->get_chunk_ids() + sb->index_num_chunks);
+        // Chunks it fails to claim stay in the free pool, where startup resets them as unowned: never continue
         bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, sb->max_size_bytes, chunk_ids);
-        if (!success) {
-            LOGI("Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
-                 boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
-        }
+        RELEASE_ASSERT(success, "Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
+                       boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
         idx_tbl_map_.emplace(pid_str, tbl);
         return tbl->index_table();
@@ -130,6 +135,12 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
 // (which co_awaits the repl-dev removal and a forced index CP flush), so the reactor yields during those waits
 // instead of parking -- which is what lets the CP flush complete. Launched via detach from remove_volume.
 sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
+    // Hand-made RAII: release the count taken by remove_volume on every exit path
+    struct RemovalGuard {
+        std::atomic< uint32_t >& pending;
+        ~RemovalGuard() { pending.fetch_sub(1); }
+    } removal_guard{pending_vol_removals_};
+
     // 1. get the volume ptr from the map;
     volume_handle vol_ptr = nullptr;
     {
@@ -150,8 +161,9 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
         // 2. do volume destroy;
         co_await vol_ptr->destroy();
 #ifdef _PRERELEASE
-        if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
-            crash_simulated_ = true;
+        if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation") ||
+            iomgr_flip::instance()->test_flip("vol_destroy_crash_before_chunk_release") ||
+            iomgr_flip::instance()->test_flip("vol_destroy_crash_after_index_destroy")) {
             co_return;
         }
 #endif
@@ -177,12 +189,6 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
         co_return std::unexpected(std::errc::operation_not_supported);
     }
 
-    // The volume is marked DESTROYING only once do_remove_volume runs, so shutdown could miss a remove accepted now.
-    if (is_shutting_down()) {
-        LOGE("Can't serve volume remove, system is shutting down.");
-        co_return std::unexpected(std::errc::operation_not_supported);
-    }
-
     auto vol = get_volume(id);
     if (!vol) {
         LOGE("volume with id {} not found, cannot remove", boost::uuids::to_string(id));
@@ -190,6 +196,15 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     } else if ((*vol)->is_offline()) {
         LOGE("volume {} is offline, cannot remove", (*vol)->id_str());
         co_return std::unexpected(volume_error::OFFLINE);
+    }
+
+    // Shutdown waits for pending removals. Count this one before checking for shutdown: shutdown sets its flag before
+    // checking the count, so either shutdown waits for this removal or this removal sees the flag.
+    pending_vol_removals_.fetch_add(1);
+    if (is_shutting_down()) {
+        pending_vol_removals_.fetch_sub(1);
+        LOGE("Can't serve volume remove, system is shutting down.");
+        co_return std::unexpected(std::errc::operation_not_supported);
     }
 
     LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
