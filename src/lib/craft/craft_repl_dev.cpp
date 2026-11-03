@@ -1516,9 +1516,9 @@ async_status CraftReplDev::watchdog_sync() {
     {
         std::lock_guard lk{state_mu_};
         target = std::min(target, client_commit_lsn_);
+        // Also covers target == -1 (no client commit yet): last_proposed_sync_lsn_ starts at -1
         if (target <= last_proposed_sync_lsn_) co_return ok(); // nothing newly confirmed since the last sync
     }
-    if (target < 0) co_return ok();
 
     if (auto r = co_await append(target, client_token, term); !r) {
         LOGW("watchdog_sync: append({}) failed: {}", target, r.error().message());
