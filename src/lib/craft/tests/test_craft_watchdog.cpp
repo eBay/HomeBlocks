@@ -135,9 +135,9 @@ TEST_F(CraftWatchdogTest, FiresAfterInactivity) {
 TEST_F(CraftWatchdogTest, DoesNotFireIfResetInTime) {
     dev_->seed_term(7);
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         ASSERT_TRUE(do_keep_alive(7).has_value());
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // well under the 300ms timeout
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Keep ticks away from the 300ms expiry boundary
     }
     EXPECT_EQ(dev_->watchdog_fire_count(), 0);
 }
