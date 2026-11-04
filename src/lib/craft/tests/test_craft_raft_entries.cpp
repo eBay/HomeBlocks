@@ -136,6 +136,10 @@ public:
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
+
+    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 // ── checkpoint trigger mock ───────────────────────────────────────────────────
@@ -777,6 +781,92 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// ── proposal completion (make_homestore_raft_proposer's ctx) ──────────────────
+
+TEST_F(CraftRaftEntriesTest, OnCommitCompletesOwnProposalOk) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 3); // and it was applied
+}
+
+TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
+    std::vector< uint8_t > empty_header;
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+}
+
+TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::NOT_LEADER, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+TEST_F(CraftRaftEntriesTest, OnErrorOtherFailsProposalWithInternalError) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+TEST_F(CraftRaftEntriesTest, OnRollbackFailsProposalWithNotLeader) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_rollback(1, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+// value_awaitable must complete exactly once: a later report for the same proposal is dropped.
+TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_rollback(1, {}, {}, ctx);
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+// A ctx this backend didn't create (or none, as on a follower) is left alone.
+TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
+    auto const foreign = intrusive< homestore::repl_req_ctx >{new homestore::repl_req_ctx()};
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, foreign);
+    dev_->test_listener().on_rollback(1, {}, {}, foreign);
+
+    EXPECT_FALSE(take_test_proposal_outcome(foreign).has_value());
 }
 
 } // namespace

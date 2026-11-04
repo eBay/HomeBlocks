@@ -379,6 +379,64 @@ checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
     };
 }
 
+// ─── HomeStore RAFT proposer ──────────────────────────────────────────────────
+
+namespace {
+// One in-flight proposal: owns the entry bytes until HomeStore is done with them, and carries the
+// completion CraftRaftListener's on_commit / on_error fulfil. Same bridge as volume.hpp's repl_result_ctx.
+struct craft_propose_ctx : public homestore::repl_req_ctx {
+    std::vector< uint8_t > header;
+    std::vector< uint8_t > key;
+    sisl::async::value_awaitable< status > promise_;
+    std::atomic< bool > completed_{false}; // value_awaitable must complete exactly once
+};
+
+// No-op unless ctx is one of ours -- followers and log replay see a null ctx. First outcome wins, should
+// HomeStore ever report more than one (e.g. on_rollback then on_error).
+void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    if (p == nullptr || p->completed_.exchange(true, std::memory_order_acq_rel)) return;
+    p->promise_.complete(std::move(s));
+}
+
+class HomeStoreCraftRaftProposer : public CraftRaftProposer {
+public:
+    explicit HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd) : rd_{std::move(rd)} {}
+
+    bool is_leader() const override { return rd_->is_leader(); }
+    uint32_t member_count() const override { return static_cast< uint32_t >(rd_->get_replication_quorum().size()); }
+
+    async_status propose(sisl::blob header, sisl::blob key) override {
+        auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
+        ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
+        ctx->key.assign(key.cbytes(), key.cbytes() + key.size());
+        rd_->async_alloc_write(sisl::blob{ctx->header.data(), static_cast< uint32_t >(ctx->header.size())},
+                               sisl::blob{ctx->key.data(), static_cast< uint32_t >(ctx->key.size())},
+                               sisl::sg_list{} /* key-only entry */, ctx);
+        co_return co_await ctx->promise_;
+    }
+
+private:
+    shared< homestore::repl_dev > rd_;
+};
+} // namespace
+
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd) {
+    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd));
+}
+
+#ifdef _PRERELEASE
+intrusive< homestore::repl_req_ctx > make_test_proposal_ctx() {
+    return intrusive< craft_propose_ctx >{new craft_propose_ctx()};
+}
+
+std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_req_ctx > const& ctx) {
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    if (p == nullptr || !p->promise_.await_ready()) return std::nullopt;
+    return p->promise_.await_resume();
+}
+#endif
+
 // ─── constructor ──────────────────────────────────────────────────────────────
 
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
@@ -388,6 +446,7 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
         lba_size_{lba_size},
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
+        sync_lsn_interval_{static_cast< int64_t >(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval))},
         watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
 
 CraftReplDev::~CraftReplDev() {
@@ -601,6 +660,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // There is no other per-call bound to validate against here -- see keep_alive()'s doc comment.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
         if (empty_lsns_.contains(dlsn)) {
             LOGW("write rejected: slot is permanently empty dlsn={}", dlsn);
             co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
@@ -749,6 +810,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_await commit(hdr.commit_lsn);
 
     touch_watchdog();
+    maybe_trigger_periodic_sync();
 
     // Re-snapshot after the piggyback commit() above: the pre-commit snapshot captured earlier
     // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
@@ -1054,6 +1116,8 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         // Reject malformed negative values -- see write()'s doc comment.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
     // Best-effort piggyback, same reasoning as write()'s: read()'s own success does not depend on
     // whether commit() advances further, so a genuine commit() fault here is swallowed rather than
@@ -1294,6 +1358,8 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
         // before consuming this floor, not this layer.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
 
     touch_watchdog();
@@ -1367,11 +1433,10 @@ void CraftReplDev::touch_watchdog() {
 
 // Runs every watchdog_timeout_ns_/2 once armed (iomgr::timer_token's recurring timer, not a one-shot
 // that reschedules itself) -- checks whether last_contact_ns_ is stale (elapsed >= the FULL
-// watchdog_timeout_ns_, not the tick interval) and, if so, proposes a SyncRSCommitLSN entry via
-// append(), fire-and-forget (detail::detach -- this runs in a plain timer-callback context, not a
-// coroutine caller awaiting a result). If the client stays silent this fires on every tick once past
-// the threshold, not just once, matching the old design's intent ("a permanently-silent client keeps
-// getting append() attempts, not just one").
+// watchdog_timeout_ns_, not the tick interval) and, if so and this member leads, detaches
+// watchdog_sync() (GetRSCommitLSN poll, then append()) -- this runs in a plain timer-callback context,
+// not a coroutine caller awaiting a result. Every stale tick tries again; watchdog_sync() skips once
+// the quorum's max last_append has already been proposed, so a silent client costs one RAFT entry.
 //
 // A recurring timer (vs the old one-shot-that-reschedules-itself) needs none of the generation
 // counter / in-flight counter / shutting-down flag the previous design required: iomgr's recurring
@@ -1400,25 +1465,207 @@ void CraftReplDev::on_watchdog_tick() {
 #ifdef _PRERELEASE
     ++watchdog_fire_count_;
 #endif
-    int64_t last_append_lsn;
+    // Only the leader proposes; followers' ticks just detect staleness.
+    if (raft_proposer_ == nullptr || !raft_proposer_->is_leader()) return;
+    if (sync_in_flight_.load(std::memory_order_acquire) || watchdog_round_in_flight_.load(std::memory_order_acquire))
+        return;
+    // A tick can race the destructor's cancel(wait=true): the refcount may already be zero, where
+    // shared_from_this() would throw. Held across detach so watchdog_sync() can take its own reference.
+    auto self = weak_from_this().lock();
+    if (!self) return;
+    detail::detach(watchdog_sync());
+}
+
+// Client gone quiet: sync to what any responder holds, capped at the client's confirmed prefix
+// (client_commit_lsn_). A delayed write can still land after the poll, so the round must not reach
+// anything the client hasn't resolved.
+async_status CraftReplDev::watchdog_sync() {
+    auto self = shared_from_this();
+    // One round at a time, poll included: a poll slower than the tick interval must not let later ticks
+    // pile up more rounds, each holding `self` and so delaying teardown.
+    bool expected = false;
+    if (!watchdog_round_in_flight_.compare_exchange_strong(expected, true)) co_return ok();
+    struct RoundGuard {
+        CraftReplDev* dev;
+        ~RoundGuard() { dev->watchdog_round_in_flight_.store(false, std::memory_order_release); }
+    } round_guard{this};
+
+    if (peer_fetcher_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+    uint64_t term, client_token;
+    int64_t target;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+        client_token = state_.client_token;
+        target = state_.last_append_lsn;
+    }
+
+    auto polled = co_await peer_fetcher_->poll_quorum_lsns(term, /* is_login = */ false, peer_fetch_timeout_ms_);
+    if (!polled) {
+        LOGW("watchdog_sync: quorum poll failed: {}", polled.error().message());
+        co_return std::unexpected(polled.error());
+    }
+    if (1 + polled->size() < quorum_size()) {
+        LOGW("watchdog_sync: {} responder(s) + self < quorum {} -- not syncing", polled->size(), quorum_size());
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    for (auto const& p : *polled)
+        target = std::max(target, p.last_append_lsn);
+
+    {
+        std::lock_guard lk{state_mu_};
+        target = std::min(target, client_commit_lsn_);
+        // Also covers target == -1 (no client commit yet): last_proposed_sync_lsn_ starts at -1
+        if (target <= last_proposed_sync_lsn_) co_return ok(); // nothing newly confirmed since the last sync
+    }
+
+    if (auto r = co_await append(target, client_token, term); !r) {
+        LOGW("watchdog_sync: append({}) failed: {}", target, r.error().message());
+        co_return std::unexpected(r.error());
+    }
+    co_return ok();
+}
+
+void CraftReplDev::maybe_trigger_periodic_sync() {
+    if (raft_proposer_ == nullptr || sync_lsn_interval_ <= 0) return;
+    if (sync_in_flight_.load(std::memory_order_acquire)) return;
+    if (!raft_proposer_->is_leader()) return;
+
+    int64_t sync_to;
+    uint64_t client_token, term;
+    {
+        std::lock_guard lk{state_mu_};
+        // Cadence: every sync_lsn_interval_ appended LSNs since the last attempt (not the last proposal,
+        // which can stall below an unresolved hole and would then retrigger on every write).
+        if (state_.last_append_lsn - last_periodic_sync_lsn_ < sync_lsn_interval_) return;
+        last_periodic_sync_lsn_ = state_.last_append_lsn;
+        // Only what the client has confirmed: nothing at or below its commit_lsn is still in flight, so the
+        // round can't vote a write the client may yet count as acknowledged Empty.
+        sync_to = std::min(state_.last_append_lsn, client_commit_lsn_);
+        if (sync_to <= last_proposed_sync_lsn_) return; // nothing newly confirmed
+        client_token = state_.client_token;
+        term = state_.term; // the session client_commit_lsn_ belongs to
+    }
+    detail::detach(append(sync_to, client_token, term));
+}
+
+async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr hdr, int64_t upto) {
+    if (recovery_faulted_.load(std::memory_order_acquire)) {
+        LOGE("request_resolution rejected: partition permanently faulted after failed restart recovery");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (recovering_.load(std::memory_order_acquire)) {
+        LOGW("request_resolution rejected: overlay rebuild in progress after restart");
+        co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
+    }
+    if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // NOT_LEADER before STALE_TERM, as in craft_client's reference: the client broadcasts to every member.
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
     uint64_t client_token;
     {
         std::lock_guard lk{state_mu_};
-        last_append_lsn = state_.last_append_lsn;
+        if (hdr.term != state_.term) {
+            LOGW("request_resolution rejected: stale term want={} got={}", state_.term, hdr.term);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         client_token = state_.client_token;
     }
-    detail::detach(append(last_append_lsn, client_token));
+    if (upto < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+
+    // hdr.term, not a fresh read: if InternalLogin applies before append() checks, this old-session request
+    // must fail STALE_TERM rather than run inside the new session.
+    co_return co_await append(upto, client_token, hdr.term);
 }
 
-async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr /* hdr */,
-                                                                          int64_t /* upto */) {
-    LOGW("CraftReplDev::request_resolution not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
-}
+// ─── append: propose SyncRSCommitLSN (S5 / SDSTOR-22908) ─────────────────────
 
-async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_token */) {
-    LOGW("CraftReplDev::append not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, uint64_t client_token, uint64_t term) {
+    if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    if (sync_to < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    // Checked, not adopted: a caller's session that InternalLogin has since replaced must not run here.
+    // pre_resolve_slots() and the pre-propose check below re-verify it after every await.
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_.term != term) {
+            LOGW("append: term moved past the caller's ({} -> {}) -- abandoning sync_to={}", term, state_.term,
+                 sync_to);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
+    }
+
+    // Triggers detach this; keep the device alive across the awaits below.
+    auto self = shared_from_this();
+
+    bool expected = false;
+    if (!sync_in_flight_.compare_exchange_strong(expected, true)) {
+        LOGD("append: another append() in flight -- skipping sync_to={}", sync_to);
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_in_progress));
+    }
+    struct SyncInFlightGuard {
+        CraftReplDev* dev;
+        ~SyncInFlightGuard() { dev->sync_in_flight_.store(false, std::memory_order_release); }
+    } in_flight_guard{this};
+
+    auto pre = co_await pre_resolve_slots(sync_to, term);
+    if (!pre) co_return std::unexpected(pre.error());
+
+    // Never propose past an unresolved slot.
+    int64_t target = sync_to;
+    if (!pre->unresolved.empty())
+        target = std::min(target, *std::min_element(pre->unresolved.begin(), pre->unresolved.end()) - 1);
+    std::vector< int64_t > verdicts;
+    for (int64_t lsn : pre->empty_slots)
+        if (lsn <= target) verdicts.push_back(lsn);
+
+    // Already covered by a committed entry, nothing new to say -- skip the RAFT round.
+    bool skip;
+    {
+        std::lock_guard lk{state_mu_};
+        skip = target <= last_proposed_sync_lsn_ && verdicts.empty();
+    }
+
+    if (!skip) {
+        // Pre-resolution awaited: re-check right before proposing.
+        if (!raft_proposer_->is_leader())
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+        {
+            std::lock_guard lk{state_mu_};
+            if (state_.term != term) co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
+
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(verdicts.size()));
+        serialize_sync_rs_commit_lsn(key.data(), target, client_token, verdicts);
+
+        if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                                      sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
+            !r) {
+            LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            co_return std::unexpected(r.error());
+        }
+    }
+
+    // Every Empty verdict <= target, earlier rounds' included, so a client that lost a reply still learns them.
+    // TODO: make empty_lsns_ a std::set (like missing_lsns_) so this is begin()..upper_bound(target), already
+    // sorted and unique, instead of a full scan plus sort/unique.
+    craft::resolution_result result{.resolved_upto = target, .empty_slots = {}};
+    {
+        std::lock_guard lk{state_mu_};
+        if (!skip) last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, target);
+        for (int64_t lsn : empty_lsns_)
+            if (lsn <= target) result.empty_slots.push_back(lsn);
+    }
+    result.empty_slots.insert(result.empty_slots.end(), verdicts.begin(), verdicts.end());
+    std::sort(result.empty_slots.begin(), result.empty_slots.end());
+    result.empty_slots.erase(std::unique(result.empty_slots.begin(), result.empty_slots.end()),
+                             result.empty_slots.end());
+    LOGD("append: SyncRSCommitLSN resolved_upto={} (asked {}) verdicts={}", target, sync_to, verdicts.size());
+    co_return result;
 }
 
 // ─── fetch_data (S6) ──────────────────────────────────────────────────────────
@@ -1534,7 +1781,14 @@ async_status CraftReplDev::rebuild_overlay() {
 
 void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                                                 std::vector< homestore::multi_blk_id > const& /* blkids */,
-                                                cintrusive< homestore::repl_req_ctx >& /* ctx */) {
+                                                cintrusive< homestore::repl_req_ctx >& ctx) {
+    // Completes this member's own proposal on every exit: ok once dispatched, an error if the entry didn't parse.
+    struct ProposalCompleter {
+        cintrusive< homestore::repl_req_ctx >& ctx;
+        status outcome{std::unexpected(make_error_condition(volume_error::INVALID_ENTRY))};
+        ~ProposalCompleter() { complete_proposal(ctx, std::move(outcome)); }
+    } completer{ctx};
+
     if (header.size() < sizeof(CraftEntryHeader)) {
         LOGE("on_commit lsn={} header too small ({} bytes)", lsn, header.size());
         return;
@@ -1576,6 +1830,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // before starting the next -- not independent detached tasks.
         detail::detach(
             owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token, std::move(*empty_slots)));
+        completer.outcome = ok();
         break;
     }
     case CraftEntryType::InternalLogin: {
@@ -1587,12 +1842,30 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
         // Pure in-memory state transition (no co_await) -- called directly, not detached.
         owner_->apply_internal_login(login_payload->client_token, login_payload->term);
+        completer.outcome = ok();
         break;
     }
     default:
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
         break;
     }
+}
+
+void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, sisl::blob const& /* header */,
+                                               sisl::blob const& /* key */,
+                                               cintrusive< homestore::repl_req_ctx >& ctx) {
+    LOGW("proposal failed to replicate: {}", enum_name(err));
+    complete_proposal(ctx,
+                      std::unexpected(err == homestore::ReplServiceError::NOT_LEADER
+                                          ? craft::make_error_condition(craft::craft_error::NOT_LEADER)
+                                          : make_error_condition(volume_error::INTERNAL_ERROR)));
+}
+
+void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const& /* header */,
+                                                  sisl::blob const& /* key */,
+                                                  cintrusive< homestore::repl_req_ctx >& ctx) {
+    LOGW("on_rollback lsn={}", lsn);
+    complete_proposal(ctx, std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER)));
 }
 
 // Fired by HomeStore wherever this partition's repl_dev is recovered on restart. Fire-and-forget,
@@ -1655,13 +1928,11 @@ async_status CraftReplDev::run_recovery() {
 // re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has
 // no way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
 
-async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t upto) {
+async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term) {
     auto self = shared_from_this();
     std::vector< int64_t > candidates;
-    uint64_t term;
     {
         std::lock_guard lk{state_mu_};
-        term = state_.term;
         // Same guard shape as write()'s own k_max_ooo_gap check: upto will eventually
         // carry client/RAFT-controlled wire input (SDSTOR-22908), so it must be bounded against
         // last_append_lsn before it drives candidates' size or either loop below.
@@ -1675,6 +1946,11 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                  state_.last_append_lsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
+        if (state_.term != term) {
+            LOGW("pre_resolve_slots: term moved past the caller's ({} -> {}) -- abandoning upto={}", term, state_.term,
+                 upto);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         candidates.reserve(missing_lsns_.size() +
                            static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
         // missing_lsns_ is ordered, so once an entry exceeds upto every remaining entry does too --
@@ -1687,18 +1963,38 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
         }
     }
-    if (candidates.empty()) co_return std::vector< int64_t >{};
+    if (candidates.empty()) co_return PreResolution{};
 
-    if (peer_fetcher_ == nullptr) {
-        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_fetcher_ wired -- refusing to resolve",
+    if (peer_fetcher_ == nullptr || raft_proposer_ == nullptr) {
+        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but peer_fetcher_/raft_proposer_ not wired -- "
+             "refusing to resolve",
              candidates.size(), upto);
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    if (!raft_proposer_->is_leader()) {
+        LOGW("pre_resolve_slots: not leader -- refusing to resolve upto={}", upto);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
     }
 
     auto responses = co_await peer_fetcher_->fetch_from_quorum(candidates, peer_fetch_timeout_ms_);
     if (!responses) {
         LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
         co_return std::unexpected(responses.error());
+    }
+
+    // Checked again: leadership or the session may have changed during the fetch -- bail before any
+    // local write rather than journal under a stale term.
+    if (!raft_proposer_->is_leader()) {
+        LOGW("pre_resolve_slots: lost leadership during quorum fetch -- abandoning upto={}", upto);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_.term != term) {
+            LOGW("pre_resolve_slots: term changed during quorum fetch ({} -> {}) -- abandoning upto={}", term,
+                 state_.term, upto);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
     }
     if (responses->empty()) {
         LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
@@ -1744,15 +2040,27 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
-    std::vector< int64_t > empty_slots;
+    // Every candidate is a slot this leader lacks, so it counts itself among the members lacking it.
+    bool const quorum_lacks = 1 + static_cast< uint32_t >(valid_member_count) >= quorum_size();
+    if (!quorum_lacks)
+        LOGW("pre_resolve_slots: {} valid responder(s) + self < quorum {} of {} -- no fresh Empty verdicts",
+             valid_member_count, quorum_size(), raft_proposer_->member_count());
+
+    auto const term_changed = [this, term] {
+        std::lock_guard lk{state_mu_};
+        return state_.term != term;
+    };
+
+    PreResolution result;
     for (int64_t lsn : candidates) {
         if (empty_by_quorum.contains(lsn)) {
-            empty_slots.push_back(lsn);
+            result.empty_slots.push_back(lsn);
             continue;
         }
         auto it = data_by_lsn.find(lsn);
         if (it == data_by_lsn.end()) {
-            empty_slots.push_back(lsn); // no responding member reported data or Empty: quorum-lacks-evidence
+            // No responding member reported data or Empty: Empty only on quorum-lacks evidence.
+            (quorum_lacks ? result.empty_slots : result.unresolved).push_back(lsn);
             continue;
         }
         JournalSlot* slot = it->second;
@@ -1766,10 +2074,21 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!alloc_res) {
                 LOGE("pre_resolve_slots: alloc_write_data failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                      alloc_res.error().message());
+                result.unresolved.push_back(slot->lsn);
                 continue;
             }
             blkid = *alloc_res;
             blkid_allocated = true;
+        }
+        // Each slot's IO is another await: a new session must never see this one's slots journalled, nor
+        // missing_lsns_ touched. Nothing references blkid yet, so it's safe to free here.
+        if (term_changed()) {
+            if (blkid_allocated) {
+                if (auto fr = co_await journal_->free_data(blkid); !fr)
+                    LOGE("pre_resolve_slots: free_data failed lsn={}: {}", slot->lsn, fr.error().message());
+            }
+            LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", slot->lsn);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
         auto res = co_await journal_->write_slot(slot->lsn, term, slot->lba_off_bytes, slot->len_bytes, blkid,
                                                  slot->all_zeros, slot->csums);
@@ -1784,12 +2103,22 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                     co_return ok();
                 }());
             }
+            result.unresolved.push_back(slot->lsn);
             continue;
         }
-        std::lock_guard lk{state_mu_};
-        missing_lsns_.erase(slot->lsn);
+        {
+            // Term checked in the same critical section as the erase. If it changed during write_slot, the
+            // entry stays journalled (blkid not freed -- the journal references it, same as write()'s
+            // post-flight) under its stale term for the next login to truncate; missing_lsns_ is untouched.
+            std::lock_guard lk{state_mu_};
+            if (state_.term != term) {
+                LOGW("pre_resolve_slots: term changed during write_slot -- abandoning at lsn={}", slot->lsn);
+                co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            }
+            missing_lsns_.erase(slot->lsn);
+        }
     }
-    co_return empty_slots;
+    co_return result;
 }
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
@@ -1970,6 +2299,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
     std::lock_guard lk{state_mu_};
     state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
+    // A new session starts with no confirmed prefix of its own.
+    if (term > state_.term) client_commit_lsn_ = -1;
     // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
     // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting
     // log order blindly.
