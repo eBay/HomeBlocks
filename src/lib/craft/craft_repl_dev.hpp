@@ -462,6 +462,10 @@ public:
     // (counted before the leader check, so it's independent of whether a CraftRaftProposer is wired).
     int watchdog_fire_count() const { return watchdog_fire_count_; }
 
+    // Cancels the watchdog and waits for any in-progress tick to finish (the same cancel the destructor
+    // does). A tick holds its own reference to the device, so tests call this before dropping theirs.
+    void stop_watchdog() { watchdog_token_.cancel(/* wait = */ true); }
+
     // Overrides the periodic SyncRSCommitLSN cadence read from sync_rs_commit_lsn_interval at construction.
     void set_sync_lsn_interval(int64_t n) { sync_lsn_interval_ = n; }
 

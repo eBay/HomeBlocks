@@ -84,7 +84,7 @@ public:
 //
 // poll_quorum_lsns returns `polled` (one entry per responding peer); fetch_from_quorum reports one
 // responder holding nothing, so any slot beyond the leader's frontier is verdicted Empty. Called on the
-// reactor thread: tests read state only after dev_.reset() (cancel(wait=true) joins any in-flight tick).
+// reactor thread: tests read state only after destroy_dev() (stop_watchdog() joins any in-flight tick).
 
 class MockCraftQuorumPoller : public CraftPeerFetcher {
 public:
@@ -121,7 +121,7 @@ protected:
     }
 
     void TearDown() override {
-        dev_.reset();
+        destroy_dev();
         HB_SETTINGS_FACTORY().modifiable_settings([this](auto& s) { s.craft_watchdog_timeout_ms = orig_timeout_ms_; });
     }
 
@@ -139,6 +139,14 @@ protected:
         dev_->set_raft_proposer(&proposer_);
         dev_->seed_term(term);
         ASSERT_TRUE(do_keep_alive(term, client_commit_lsn).has_value());
+    }
+
+    // Stops the watchdog, then drops dev_. A tick in progress holds its own reference, so a bare reset()
+    // can leave the device (and its pointers to fetcher_ and proposer_) alive after this fixture is gone.
+    void destroy_dev() {
+        if (!dev_) return;
+        dev_->stop_watchdog();
+        dev_.reset();
     }
 
     uint64_t orig_timeout_ms_{0};
@@ -203,7 +211,7 @@ TEST_F(CraftWatchdogTest, LeaderStaleTickProposesUpToClientCommitOnce) {
     arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // several stale ticks past the 300ms timeout
-    dev_.reset();                                                 // joins any in-flight tick before the mocks are read
+    destroy_dev();                                                // joins any in-flight tick before the mocks are read
 
     EXPECT_GE(fetcher_.poll_calls.load(), 2);
     ASSERT_EQ(proposer_.proposed.size(), 1u);
@@ -219,7 +227,7 @@ TEST_F(CraftWatchdogTest, StaleTickWithoutClientCommitProposesNothing) {
     arm_as_leader(7);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));
-    dev_.reset();
+    destroy_dev();
 
     EXPECT_GE(fetcher_.poll_calls.load(), 1);
     EXPECT_TRUE(proposer_.proposed.empty());
@@ -231,7 +239,7 @@ TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));
     EXPECT_GE(dev_->watchdog_fire_count(), 1);
-    dev_.reset();
+    destroy_dev();
 
     EXPECT_EQ(fetcher_.poll_calls.load(), 0);
     EXPECT_TRUE(proposer_.proposed.empty());
@@ -249,7 +257,7 @@ TEST_F(CraftWatchdogTest, SlowPollDoesNotOverlapRounds) {
 
     fetcher_.poll_gate.complete(true); // the held round resumes here and ends (no client commit: no proposal)
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    dev_.reset(); // the gate is always completed before teardown, so no round is left suspended
+    destroy_dev(); // the gate is always completed before teardown, so no round is left suspended
 
     EXPECT_GE(fired_while_held, 2);
     EXPECT_EQ(polls_while_held, 1);
@@ -266,7 +274,7 @@ TEST_F(CraftWatchdogTest, StaleTickWithoutQuorumDoesNotPropose) {
     arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));
-    dev_.reset();
+    destroy_dev();
 
     EXPECT_GE(fetcher_.poll_calls.load(), 1);
     EXPECT_TRUE(proposer_.proposed.empty());
