@@ -9,7 +9,8 @@ import io_test
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run long-running tests.')
-    parser.add_argument('--test_suit', help='Test suits to run', default='io_long_running')
+    parser.add_argument('--test_suit', '--test_suits', dest='test_suit', help='Test suits to run',
+                        default='io_long_running')
     args, service_args = parser.parse_known_args()
     return args, service_args
 
