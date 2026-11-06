@@ -64,8 +64,12 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
     if (vol_ptr->is_destroying()) {
         // resume volume destroying;
         LOGINFO("volume {} is in destroying state, resume destroy", vol_ptr->id_str());
-        // fire-and-forget: remove_volume is a coroutine whose work is scheduled on a worker; start it detached.
-        detail::detach(remove_volume(id));
+        start_volume_removal(id);
+    } else if (vol_ptr->is_craft() && !vol_ptr->rd()) {
+        // Its RAFT group was destroyed while this node was down, or with the destroy still pending at the crash (when
+        // HomeStore drops the group without calling on_destroy): the replica goes with it.
+        LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
+        start_volume_removal(id);
     }
 }
 
@@ -456,23 +460,37 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
         co_return std::unexpected(volume_error::OFFLINE);
     }
 
+    LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
+    if (!start_volume_removal(id)) { co_return std::unexpected(std::errc::operation_not_supported); }
+    co_return ok();
+}
+
+bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
+    if (is_restricted()) {
+        LOGE("Can't remove volume {}, system is in restricted mode.", boost::uuids::to_string(id));
+        return false;
+    }
     // Shutdown waits for pending removals. Count this one before checking for shutdown: shutdown sets its flag before
     // checking the count, so either shutdown waits for this removal or this removal sees the flag.
     pending_vol_removals_.fetch_add(1);
     if (is_shutting_down()) {
         pending_vol_removals_.fetch_sub(1);
-        LOGE("Can't serve volume remove, system is shutting down.");
-        co_return std::unexpected(std::errc::operation_not_supported);
+        LOGE("Can't remove volume {}, system is shutting down.", boost::uuids::to_string(id));
+        return false;
     }
 
-    LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
     // volume::destroy() co_awaits a forced CP flush (IndexTable::destroy) and the repl-dev removal, so it must
     // run as a coroutine on the worker reactor (detach) -- a blocking callable would park the reactor and the
     // flush it awaits could never run. See do_remove_volume.
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker,
                             [this, id]() { detail::detach(do_remove_volume(id)); });
+    return true;
+}
 
-    co_return ok();
+void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
+    if (!get_volume(id)) { return; } // never created here, or already removed
+    LOGINFO("volume {}: its RAFT group was destroyed, removing the local replica", boost::uuids::to_string(id));
+    start_volume_removal(id);
 }
 
 result< volume_handle > HomeBlocksImpl::get_volume(const volume_id_t& id) const {

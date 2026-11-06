@@ -289,6 +289,7 @@ private:
     bool init(bool is_recovery);
     bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
     void attach_craft_dev(shared< homestore::home_log_store > journal);
+    void reopen_craft_journal();
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 
@@ -312,6 +313,7 @@ private:
     std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
     shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
+    bool journal_open_{false}; // CRAFT: this boot created or reopened the volume's journal
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

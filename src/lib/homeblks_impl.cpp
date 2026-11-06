@@ -541,9 +541,7 @@ void HomeBlocksImpl::vol_gc() {
 
     for (auto& vol : vols_to_remove) {
         LOGI("Garbage Collecting removed volume with id: {}", vol->id_str());
-        // remove_volume is a coroutine (async_status) whose actual work is scheduled on a worker; we don't await
-        // it here, so start it fire-and-forget (an un-awaited lazy task would otherwise never run).
-        detail::detach(remove_volume(vol->id()));
+        start_volume_removal(vol->id());
     }
 }
 

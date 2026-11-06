@@ -97,6 +97,7 @@ public:
     void on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
                   cintrusive< homestore::repl_req_ctx >& ctx) override;
     void on_log_replay_done(homestore::group_id_t const&) override { replaying_ = false; }
+    void on_destroy(homestore::group_id_t const& group_id) override;
 
 private:
     // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).

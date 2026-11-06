@@ -157,6 +157,10 @@ bool volume::init(bool is_recovery) {
              boost::uuids::to_string(vol_info_->id), vol_info_->ordinal, vol_info_->size_bytes, sb_->pdev_id,
              chunk_ids.size());
         // index table will be recovered via in subsequent callback with init_index_table API;
+
+        // A CRAFT volume without its RAFT group, or being destroyed, is torn down: its journal stays unopened, and
+        // HomeStore purges it.
+        if (is_craft() && rd_ && sb_->state != volume_state::DESTROYING) { reopen_craft_journal(); }
     }
 
     // set the in memory state from superblock;
@@ -197,6 +201,7 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
     sb_->repl_mode = replication_mode::CRAFT;
     sb_->journal_logdev_id = logdev_id;
     sb_->journal_store_id = journal->get_store_id();
+    journal_open_ = true;
     // First write of the superblock: from here on the volume exists, and a replayed CreateVolume finds it.
     state_change(volume_state::ONLINE);
 
@@ -205,6 +210,21 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
          vol_info_->name, id_str(), ordinal(), vol_info_->size_bytes, pdev_id, chunk_ids.size(), logdev_id,
          sb_->journal_store_id);
     return true;
+}
+
+// Reopens the volume's journal at load, ahead of the log store service start: HomeStore purges every logdev nobody
+// reopened. The store itself opens during the log replay, and the CraftReplDev is attached then.
+void volume::reopen_craft_journal() {
+    auto& logstores = homestore::logstore_service();
+    logstores.open_logdev(sb_->journal_logdev_id, craft_journal_flush_mode);
+    journal_open_ = true;
+    detail::detach([](sisl::async::task< shared< homestore::home_log_store > > open,
+                      volume_handle vol) -> sisl::async::task< void > {
+        vol->attach_craft_dev(co_await std::move(open));
+        LOGI("CRAFT volume: {} uuid: {} reattached to its journal", vol->vol_info_->name, vol->id_str());
+    }(logstores.open_log_store(sb_->journal_logdev_id, sb_->journal_store_id, false /* append_mode */, nullptr,
+                               nullptr),
+                                     shared_from_this()));
 }
 
 void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
@@ -220,14 +240,15 @@ sisl::async::task< void > volume::destroy() {
     LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
     destroy_started_ = true;
 
-    // 1. destroy the repl dev;
-    if (rd_) {
+    // 1. destroy the repl dev. A CRAFT volume's RAFT group is destroyed through RAFT, by whoever removes the partition;
+    // every member's teardown follows it, so this one leaves the group alone.
+    if (rd_ && !is_craft()) {
         LOGI("Destroying repl dev for volume: {}", vol_info_->name);
         // remove_repl_dev is a coroutine (async_status); co_await it (rather than a blocking sync_get) so this
         // path can run on an iomgr reactor without parking it. Best-effort during destroy, result ignored.
         (void)co_await homestore::hs()->repl_service().remove_repl_dev(id());
-        rd_ = nullptr;
     }
+    rd_ = nullptr;
 
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
@@ -245,6 +266,15 @@ sisl::async::task< void > volume::destroy() {
         co_await indx_tbl_->destroy();
         index_chunk_selector_->release_chunks(vol_info_->ordinal);
         indx_tbl_ = nullptr;
+    }
+
+    // The CRAFT journal, if this boot opened it. One left unopened (a destroy resumed after a crash) is purged by
+    // HomeStore when it starts.
+    if (journal_open_) {
+        LOGI("Destroying journal for volume: {}, uuid: {}", vol_info_->name, id_str());
+        homestore::logstore_service().remove_log_store(sb_->journal_logdev_id, sb_->journal_store_id);
+        homestore::logstore_service().destroy_log_dev(sb_->journal_logdev_id);
+        journal_open_ = false;
     }
 
 #ifdef _PRERELEASE

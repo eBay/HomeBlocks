@@ -153,6 +153,9 @@ public:
     // the RAFT commit thread. `replaying`: the commit is a log replay at restart.
     void on_create_volume_commit(int64_t lsn, sisl::blob const& key, cintrusive< homestore::repl_req_ctx > const& ctx,
                                  bool replaying);
+    // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
+    // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
+    void on_craft_group_destroyed(volume_id_t const& id);
 
     void start_reaper_thread();
 
@@ -208,6 +211,8 @@ private:
     // Coroutine driving the actual volume teardown (co_awaits volume::destroy); launched via detach on a
     // worker reactor by remove_volume so the reactor yields during the destroy's CP flush instead of parking.
     sisl::async::task< void > do_remove_volume(volume_id_t id);
+    // Starts a volume's teardown (do_remove_volume) on a worker. False if the system is restricted or shutting down.
+    bool start_volume_removal(volume_id_t const& id);
 
     uint64_t gc_timer_nsecs() const;
 

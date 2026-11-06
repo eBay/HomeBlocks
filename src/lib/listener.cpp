@@ -82,6 +82,8 @@ void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl
     }
 }
 
+void CraftGroupListener::on_destroy(homestore::group_id_t const& group_id) { hb_->on_craft_group_destroyed(group_id); }
+
 void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
