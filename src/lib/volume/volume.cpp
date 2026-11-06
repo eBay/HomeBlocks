@@ -215,11 +215,13 @@ sisl::async::task< void > volume::destroy() {
 }
 
 void volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
-    // Update the volume superblk with latest set of chunk id's.
-    uint32_t pdev_id = sb_->pdev_id;
+    // Update the volume superblk with latest set of chunk id's. resize() value-initializes the header, so carry every
+    // field (state, ...) over and rewrite only the chunk list.
+    auto const hdr = *sb_;
     sb_.resize(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
-    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal, pdev_id,
-              chunk_ids);
+    *sb_ = hdr;
+    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal,
+              hdr.pdev_id, chunk_ids);
     sb_.write();
 }
 

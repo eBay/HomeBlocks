@@ -172,7 +172,7 @@ public:
     explicit volume(volume_info&& info, shared< VolumeChunkSelector > vol_chunk_sel,
                     shared< VolumeChunkSelector > index_chunk_sel) :
             sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
-        vol_info_ = std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        vol_info_ = std::make_shared< volume_info >(std::move(info));
         metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     }
     explicit volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
