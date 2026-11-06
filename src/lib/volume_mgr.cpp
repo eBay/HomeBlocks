@@ -458,6 +458,11 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     } else if ((*vol)->is_offline()) {
         LOGE("volume {} is offline, cannot remove", (*vol)->id_str());
         co_return std::unexpected(volume_error::OFFLINE);
+    } else if ((*vol)->is_craft()) {
+        // A CRAFT volume goes through its RAFT group, which every member's replica follows; removing a single replica
+        // would leave the group behind. That removal is not exposed yet.
+        LOGE("volume {} is a CRAFT volume, remove_volume does not support it yet", (*vol)->id_str());
+        co_return std::unexpected(std::errc::operation_not_supported);
     }
 
     LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
@@ -548,6 +553,11 @@ static result< uint32_t > io_precheck(volume_handle const& vol, uint64_t addr, u
     auto hb = HomeBlocksImpl::instance();
     if (hb->is_restricted()) {
         LOGE("Can't serve {}, system is in restricted mode.", op);
+        return std::unexpected(std::errc::operation_not_supported);
+    }
+    if (vol->is_craft()) {
+        // A CRAFT volume's data rides the CRAFT API; a legacy op would propose a data entry into its RAFT group.
+        LOGE("Can't serve {} on CRAFT volume {}, use the CRAFT API.", op, vol->id_str());
         return std::unexpected(std::errc::operation_not_supported);
     }
     if (vol->is_offline()) {
