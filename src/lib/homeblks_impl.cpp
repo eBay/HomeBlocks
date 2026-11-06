@@ -200,6 +200,12 @@ public:
 
     // this will be called by homestore when create_repl_dev is called;
     std::shared_ptr< homestore::repl_dev_listener > create_repl_dev_listener(homestore::group_id_t group_id) override {
+        if (hb_->is_craft()) {
+            // HomeStore loads a recovered group's repl dev before asking for its listener, and creates a new group's
+            // (on create or join) only after.
+            bool const recovered = homestore::hs()->repl_service().get_repl_dev(group_id).has_value();
+            return std::make_shared< CraftGroupListener >(hb_, group_id, recovered);
+        }
         return std::make_shared< HBListener >(hb_);
 #if 0
         std::scoped_lock lock_guard(_repl_sm_map_lock);

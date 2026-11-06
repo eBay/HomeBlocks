@@ -600,7 +600,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitDispatchesSyncRSCommitLSN) {
     auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, /*empty_slots=*/{});
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     // last_append_lsn advances unconditionally
     EXPECT_EQ(dev_->last_append_lsn(), 7);
@@ -611,7 +611,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsHeaderTooSmall) {
     auto key_buf = make_sync_rs_commit_lsn_key(7, 0, {});
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
 }
@@ -621,7 +621,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMalformedSyncRSCommitLSNKey) {
     std::vector< uint8_t > short_key(sizeof(SyncRSCommitLSNPayload) - 1, 0);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
 
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
 }
@@ -635,7 +635,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMismatchedEmptySlotsCount) {
     reinterpret_cast< SyncRSCommitLSNPayload* >(key_buf.data())->num_empty_slots = 5;
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
 }
@@ -646,7 +646,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitIgnoresUnrecognizedEntryType) {
     std::vector< uint8_t > key_buf;
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
 }
@@ -658,7 +658,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitDispatchesInternalLogin) {
     auto key_buf = make_internal_login_key(/*client_token=*/42, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->client_token(), 42u);
     EXPECT_EQ(dev_->term(), 5u);
@@ -669,7 +669,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginWrongSize) {
     std::vector< uint8_t > short_key(sizeof(InternalLoginPayload) - 1, 0);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
 
     EXPECT_EQ(dev_->client_token(), 0u); // untouched
     EXPECT_EQ(dev_->term(), 0u);         // untouched
@@ -683,7 +683,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginKeyTooLarge) {
     std::vector< uint8_t > long_key(sizeof(InternalLoginPayload) + 1, 0);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(long_key), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(long_key), {}, ctx);
 
     EXPECT_EQ(dev_->client_token(), 0u); // untouched
     EXPECT_EQ(dev_->term(), 0u);         // untouched
@@ -698,9 +698,9 @@ TEST_F(CraftRaftEntriesTest, SecondInternalLoginReplacesSession) {
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/1);
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
     auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/2);
-    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
 
     EXPECT_EQ(dev_->client_token(), 2u);
     EXPECT_EQ(dev_->term(), 2u);
@@ -711,9 +711,9 @@ TEST_F(CraftRaftEntriesTest, InternalLoginTermNeverRegresses) {
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
     auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/3);
-    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
 
     EXPECT_EQ(dev_->term(), 5u);
 }
@@ -726,9 +726,9 @@ TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegr
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
     auto key2 = make_internal_login_key(/*client_token=*/99, /*term=*/3); // lower term, different token
-    dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
 
     EXPECT_EQ(dev_->term(), 5u);          // guarded against regression
     EXPECT_EQ(dev_->client_token(), 99u); // overwritten regardless
@@ -740,7 +740,7 @@ TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     auto r = homeblocks::detail::sync_get(
         dev_->write(craft::client_hdr{.term = 5, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
@@ -756,7 +756,7 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     auto r = homeblocks::detail::sync_get(
         dev_->write(craft::client_hdr{.term = 4, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/1,
@@ -773,7 +773,7 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     auto key_buf = make_internal_login_key(/*client_token=*/7, /*term=*/1);
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     auto stale = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0); // the old default -- would have been a mismatch
     ASSERT_TRUE(stale.has_value());

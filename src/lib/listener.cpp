@@ -52,4 +52,43 @@ HBListener::get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
 
 void HBListener::on_destroy(const homestore::group_id_t& group_id) {}
 
+static bool is_create_volume(sisl::blob const& header) {
+    return header.size() >= sizeof(CraftEntryHeader) &&
+        reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type == CraftEntryType::CreateVolume;
+}
+
+volume_handle CraftGroupListener::craft_volume(int64_t lsn) const {
+    if (auto vol = hb_->get_volume(group_id_); vol && (*vol)->craft_dev()) { return *vol; }
+    LOGW("group={} lsn={}: no CRAFT volume on this node (yet), entry dropped", boost::uuids::to_string(group_id_), lsn);
+    return nullptr;
+}
+
+void CraftGroupListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                                   std::vector< homestore::multi_blk_id > const& blkids,
+                                   cintrusive< homestore::repl_req_ctx >& ctx) {
+    if (is_create_volume(header)) {
+        hb_->on_create_volume_commit(lsn, key, ctx, replaying_.load());
+    } else if (auto vol = craft_volume(lsn)) {
+        vol->craft_dev()->raft_listener().on_commit(lsn, header, key, blkids, ctx);
+    }
+}
+
+void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                                     cintrusive< homestore::repl_req_ctx >& ctx) {
+    if (is_create_volume(header)) {
+        create_volume_ctx::complete(ctx, std::unexpected(std::errc::operation_canceled));
+    } else if (auto vol = craft_volume(lsn)) {
+        vol->craft_dev()->raft_listener().on_rollback(lsn, header, key, ctx);
+    }
+}
+
+void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
+                                  cintrusive< homestore::repl_req_ctx >& ctx) {
+    if (is_create_volume(header)) {
+        create_volume_ctx::complete(ctx, std::unexpected(error));
+    } else if (auto vol = craft_volume(-1)) {
+        vol->craft_dev()->raft_listener().on_error(error, header, key, ctx);
+    }
+}
+
 } // namespace homeblocks
