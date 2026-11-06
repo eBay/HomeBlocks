@@ -789,12 +789,17 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // In both orderings free_data is either unnecessary or wrong. blkid is intentionally not freed.
     // CraftJournalEntry.term lets recovery skip the stale entry; the next login truncates it durably.
     bool stale_post_flight = false;
+    bool voided_post_flight = false;
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
+        } else if (empty_lsns_.contains(dlsn)) {
+            // Voted Empty while this write was in flight.
+            LOGW("write discarded post-flight: slot verdicted Empty while in flight dlsn={}", dlsn);
+            voided_post_flight = true;
         } else {
             missing_lsns_.erase(dlsn);
             snapshot = {state_.commit_lsn, state_.last_append_lsn};
@@ -802,6 +807,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     }
 
     if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
+    if (voided_post_flight) {
+        // Apply didn't free this slot (it was still missing then), so free its blocks here.
+        if (auto fr = co_await journal_->free_slot(dlsn); !fr)
+            LOGE("free_slot failed for voided write dlsn={}: {}", dlsn, fr.error().message());
+        co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
+    }
 
     // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
     // it to the index.

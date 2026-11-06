@@ -963,6 +963,29 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
     EXPECT_TRUE(dev_->is_missing(5));
 }
 
+// A verdict voting slot 0 Empty applies while write(0) is inside write_slot. The write must not be acked (every
+// replica discards the slot), and its blocks are freed once: apply skipped them, since the slot was still missing.
+TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsRejectedAndFreed) {
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, {0});
+    journal_->on_write = [&](int64_t lsn) {
+        if (lsn != 0) return;
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    };
+
+    auto w = do_write(0);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    EXPECT_FALSE(dev_->is_missing(0));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
 // ── failures ──────────────────────────────────────────────────────────────────
 
 TEST_F(CraftAppendTest, PreResolutionFailurePropagatesWithoutProposal) {
