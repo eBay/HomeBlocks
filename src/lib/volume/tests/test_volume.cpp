@@ -230,6 +230,17 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
     g_helper->restart(2);
 }
 
+// This instance runs legacy volumes (the default DISABLED mode): a CRAFT volume needs one in CRAFT mode.
+TEST_F(VolumeTest, CraftVolumeNeedsCraftMode) {
+    auto vinfo = gen_vol_info(0);
+    auto const id = vinfo.id;
+    vinfo.repl_mode = replication_mode::CRAFT;
+    auto ret = homeblocks::detail::sync_get(g_helper->inst()->create_volume(std::move(vinfo)));
+    ASSERT_FALSE(ret);
+    EXPECT_EQ(ret.error(), std::errc::not_supported);
+    EXPECT_FALSE(g_helper->inst()->get_volume(id));
+}
+
 TEST_F(VolumeTest, CreateVolumeThenRecover) {
     std::vector< volume_id_t > vol_ids;
     {
