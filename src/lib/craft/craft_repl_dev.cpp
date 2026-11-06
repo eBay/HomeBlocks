@@ -856,12 +856,13 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
     // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
-    auto self = shared_from_this();
-    detail::detach([self, commit_lsn_snapshot]() -> async_status {
+    // Parameters, not captures: a coroutine lambda's captures live in the temporary closure, which is gone by
+    // the time the coroutine resumes.
+    detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot) -> async_status {
         if (auto cp = co_await self->checkpoint_trigger_(false); !cp)
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
         co_return ok();
-    }());
+    }(shared_from_this(), commit_lsn_snapshot));
 }
 
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
@@ -2123,12 +2124,13 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                  res.error().message());
             if (blkid_allocated) {
-                detail::detach([self, blkid, lsn = slot->lsn]() -> async_status {
-                    if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                        LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
-                             fr.error().message());
-                    co_return ok();
-                }());
+                detail::detach(
+                    [](shared< CraftReplDev > self, homestore::multi_blk_id blkid, int64_t lsn) -> async_status {
+                        if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                            LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
+                                 fr.error().message());
+                        co_return ok();
+                    }(self, blkid, slot->lsn));
             }
             result.unresolved.push_back(slot->lsn);
             continue;
@@ -2301,12 +2303,13 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
                          res.error().message());
                     if (blkid_allocated) {
-                        detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+                        detail::detach([](shared< CraftReplDev > self, homestore::multi_blk_id blkid,
+                                          int64_t lsn) -> async_status {
                             if (auto fr = co_await self->journal_->free_data(blkid); !fr)
                                 LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
                                      lsn, fr.error().message());
                             co_return ok();
-                        }());
+                        }(self, blkid, slot.lsn));
                     }
                     continue;
                 }
