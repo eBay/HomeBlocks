@@ -16,10 +16,17 @@
 #include "volume.hpp"
 #include "lib/homeblks_impl.hpp"
 #include "coro_helpers.hpp"
+#include "home_blks_config.hpp"
+#include <homestore/logstore/log_store.hpp>
+#include <homestore/logstore_service.hpp>
 #include <homestore/replication_service.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homeblocks {
+
+// The CRAFT journal is write-through, like every CRAFT journal test: flushed inline on append, the timer as backstop.
+static constexpr auto craft_journal_flush_mode = static_cast< homestore::flush_mode_t >(
+    static_cast< uint32_t >(homestore::flush_mode_t::TIMER) | static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
 
 uint64_t volume::get_index_size() {
     // Get approximate index size based on volume size. additional space for interior nodes.
@@ -66,8 +73,12 @@ volume::volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSele
                shared< VolumeChunkSelector > index_chunk_sel) :
         sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
     sb_.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // Older layouts are not supported (the chunk list moved with every added field): fail loudly, never misparse.
+    RELEASE_ASSERT(sb_->magic == VOL_SB_MAGIC && sb_->version == VOL_SB_VER,
+                   "unsupported volume superblock, magic: {:#x} version: {:#x}", sb_->magic, sb_->version);
     // generate volume info from sb;
     vol_info_ = std::make_shared< volume_info >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
+    vol_info_->repl_mode = sb_->repl_mode;
     metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     m_state_ = sb_->state;
     LOGI("volume superblock loaded from disk, vol_info : {}", vol_info_->to_string());
@@ -151,6 +162,58 @@ bool volume::init(bool is_recovery) {
     // set the in memory state from superblock;
     m_state_ = sb_->state;
     return true;
+}
+
+bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
+    auto rd = homestore::hs()->repl_service().get_repl_dev(id());
+    if (!rd) {
+        LOGE("No RAFT group for CRAFT volume: {}, uuid: {}, error: {}", vol_info_->name, id_str(), rd.error());
+        return false;
+    }
+    rd_ = rd.value();
+
+    uint32_t pdev_id;
+    auto chunk_ids =
+        volume_chunk_selector_->allocate_init_chunks(ordinal(), vol_info_->size_bytes, pdev_id, dynamic_chunk_alloc);
+    if (chunk_ids.empty()) {
+        LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name, id_str());
+        return false;
+    }
+
+    // The volume's own journal: a dedicated logdev keeps its flush and truncation independent of the RAFT log's.
+    auto& logstores = homestore::logstore_service();
+    auto const logdev_id = logstores.create_new_logdev(craft_journal_flush_mode);
+    auto journal = (logdev_id != 0) ? logstores.create_new_log_store(logdev_id, false /* append_mode */) : nullptr;
+    if (!journal || !init_index_table(orphan_idx != nullptr, std::move(orphan_idx))) {
+        LOGE("Failed to create the journal or index of volume: {}, uuid: {}", vol_info_->name, id_str());
+        if (logdev_id != 0) { logstores.destroy_log_dev(logdev_id); }
+        volume_chunk_selector_->release_chunks(ordinal());
+        return false;
+    }
+
+    sb_.create(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
+    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal, pdev_id,
+              chunk_ids);
+    sb_->repl_mode = replication_mode::CRAFT;
+    sb_->journal_logdev_id = logdev_id;
+    sb_->journal_store_id = journal->get_store_id();
+    // First write of the superblock: from here on the volume exists, and a replayed CreateVolume finds it.
+    state_change(volume_state::ONLINE);
+
+    attach_craft_dev(std::move(journal));
+    LOGI("Created CRAFT volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {} journal: {}/{}",
+         vol_info_->name, id_str(), ordinal(), vol_info_->size_bytes, pdev_id, chunk_ids.size(), logdev_id,
+         sb_->journal_store_id);
+    return true;
+}
+
+void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
+    auto const lba_size = static_cast< uint32_t >(vol_info_->page_size);
+    craft_dev_ = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
+                                      lba_size, indx_tbl_);
+    craft_dev_->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
+    craft_dev_->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
+    craft_dev_->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
 }
 
 sisl::async::task< void > volume::destroy() {

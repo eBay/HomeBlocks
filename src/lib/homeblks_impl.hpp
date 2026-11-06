@@ -77,9 +77,9 @@ private:
     mutable std::shared_mutex vol_lock_;
     std::map< volume_id_t, volume_handle > vol_map_;
 
-    // index table map which only used during recovery;
+    // index table map which only used during recovery: volume id -> {table, the ordinal its chunks were recovered under}
     mutable std::shared_mutex index_lock_;
-    std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
+    std::unordered_map< std::string, std::pair< shared< VolumeIndexTable >, uint64_t > > idx_tbl_map_;
 
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
@@ -147,6 +147,11 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::multi_blk_id >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
+    // CRAFT: applies a committed CreateVolume entry on this member, creating its local replica of the volume. Runs on
+    // the RAFT commit thread. `replaying`: the commit is a log replay at restart.
+    void on_create_volume_commit(int64_t lsn, sisl::blob const& key, cintrusive< homestore::repl_req_ctx > const& ctx,
+                                 bool replaying);
+
     void start_reaper_thread();
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
@@ -182,6 +187,8 @@ private:
     dev_type get_device_type(std::string const& devname);
 
     void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
+
+    status create_craft_volume_local(CreateVolumeEntry&& entry);
 
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);

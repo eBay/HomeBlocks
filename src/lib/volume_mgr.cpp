@@ -13,6 +13,8 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <algorithm>
+#include <optional>
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
 #include <homestore/crc.hpp>
@@ -30,7 +32,7 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         auto lg = std::scoped_lock(index_lock_);
         auto it = idx_tbl_map_.find(vol_ptr->id_str());
         if (it != idx_tbl_map_.end()) {
-            vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+            vol_ptr->init_index_table(true /*is_recovery*/, it->second.first /* table */);
 
             // don't need it after volume is initialized with index table;
             idx_tbl_map_.erase(it);
@@ -73,8 +75,9 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
         bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, sb->max_size_bytes, chunk_ids);
         RELEASE_ASSERT(success, "Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
                        boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
+        uint64_t const ordinal = sb->ordinal;
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
-        idx_tbl_map_.emplace(pid_str, tbl);
+        idx_tbl_map_.emplace(pid_str, std::pair{tbl, ordinal});
         return tbl->index_table();
     }
 }
@@ -125,6 +128,94 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
 
     dec_ref();
     co_return vol_ptr;
+}
+
+void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
+                                             cintrusive< homestore::repl_req_ctx > const& ctx, bool replaying) {
+    auto entry = parse_create_volume(key);
+    if (!entry) {
+        LOGE("lsn={}: malformed CreateVolume entry ({} bytes), ignored", lsn, key.size());
+        create_volume_ctx::complete(ctx, std::unexpected(volume_error::INVALID_ENTRY));
+        return;
+    }
+    auto const id_str = boost::uuids::to_string(entry->id);
+    if (std::find(entry->members.begin(), entry->members.end(), our_uuid()) == entry->members.end()) {
+        LOGE("vol={} lsn={}: this node is not a member of the volume, CreateVolume ignored", id_str, lsn);
+        create_volume_ctx::complete(ctx, std::unexpected(std::errc::invalid_argument));
+        return;
+    }
+    if (auto vol = get_volume(entry->id)) {
+        if ((*vol)->is_destroying()) {
+            // An earlier replica of the same volume, its group destroyed, is still being removed here.
+            LOGE("vol={} lsn={}: its previous replica is still being removed, CreateVolume fails here", id_str, lsn);
+            create_volume_ctx::complete(ctx, std::unexpected(std::errc::operation_in_progress));
+            return;
+        }
+        // Already applied here: a replay, or a commit re-delivered after a restart.
+        create_volume_ctx::complete(ctx, ok());
+        return;
+    }
+    if (replaying) {
+        // Replay re-applies entries that committed before the restart. Its volume superblock is written before the
+        // commit completes, so a missing one means the create failed here back then. Leave it failed: a journal (a
+        // logdev) must not be created while the log store service replays.
+        LOGW("vol={} lsn={}: CreateVolume failed here before the restart, not retried by the replay", id_str, lsn);
+        return;
+    }
+
+    auto const st = create_craft_volume_local(std::move(*entry));
+    if (!st) { LOGE("vol={} lsn={}: failed to create the volume locally: {}", id_str, lsn, st.error().message()); }
+    create_volume_ctx::complete(ctx, st);
+}
+
+status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
+    volume_info info{entry.id, entry.size_bytes, entry.page_size, std::move(entry.name)};
+    info.repl_mode = replication_mode::CRAFT;
+    info.members = std::move(entry.members);
+    auto const id_str = boost::uuids::to_string(info.id);
+
+    // A create that crashed between its index table and its superblock left the table behind (recovered without a
+    // volume). Reuse it, under the ordinal its chunks were recovered with: a second table for the same volume would
+    // compete with it at the next recovery.
+    std::optional< std::pair< shared< VolumeIndexTable >, uint64_t > > orphan_idx;
+    {
+        auto lg = std::scoped_lock(index_lock_);
+        if (auto it = idx_tbl_map_.find(id_str); it != idx_tbl_map_.end()) {
+            orphan_idx = std::move(it->second);
+            idx_tbl_map_.erase(it);
+        }
+    }
+
+    {
+        auto lg = std::scoped_lock(vol_lock_);
+        if (orphan_idx) {
+            if (ordinal_reserver_->is_reserved(orphan_idx->second)) {
+                LOGE("vol={}: ordinal {} of its leftover index table is taken", id_str, orphan_idx->second);
+                return std::unexpected(volume_error::INTERNAL_ERROR);
+            }
+            info.ordinal = orphan_idx->second;
+            ordinal_reserver_->reserve(info.ordinal);
+        } else {
+            info.ordinal = ordinal_reserver_->reserve();
+        }
+        if (info.ordinal >= MAX_NUM_VOLUMES) {
+            ordinal_reserver_->unreserve(info.ordinal);
+            LOGE("vol={}: no free volume ordinal", id_str);
+            return std::unexpected(std::errc::no_space_on_device);
+        }
+    }
+
+    auto const ordinal = info.ordinal;
+    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                         dynamic_chunk_allocation(),
+                                         orphan_idx ? std::move(orphan_idx->first) : nullptr);
+    auto lg = std::scoped_lock(vol_lock_);
+    if (!vol) {
+        ordinal_reserver_->unreserve(ordinal);
+        return std::unexpected(volume_error::INTERNAL_ERROR);
+    }
+    vol_map_.emplace(vol->id(), vol);
+    return ok();
 }
 
 //
