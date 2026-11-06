@@ -42,9 +42,13 @@
 //   - InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- old or
 //     new token, the apply proceeds the same either way
 //
+// CreateVolume (SDSTOR-22894) codec tests verify a serialized entry round-trips, and a key whose size
+// disagrees with its declared member/name counts is rejected.
+//
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
 
+#include <boost/uuid/random_generator.hpp>
 #include <gtest/gtest.h>
 #include <map>
 #include <optional>
@@ -777,6 +781,43 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// ── CreateVolume codec (SDSTOR-22894) ─────────────────────────────────────────
+
+CreateVolumeEntry make_create_volume_entry() {
+    auto gen = boost::uuids::random_generator();
+    return CreateVolumeEntry{
+        .id = gen(), .size_bytes = 1 << 30, .page_size = 4096, .members = {gen(), gen(), gen()}, .name = "vol_7"};
+}
+
+std::vector< uint8_t > serialize(CreateVolumeEntry const& e) {
+    std::vector< uint8_t > buf(create_volume_key_size(e.members.size(), e.name.size()));
+    serialize_create_volume(buf.data(), e);
+    return buf;
+}
+
+TEST(CreateVolumeCodecTest, RoundTrip) {
+    auto const in = make_create_volume_entry();
+    auto buf = serialize(in);
+    auto const out = parse_create_volume(as_blob(buf));
+    ASSERT_TRUE(out);
+    EXPECT_EQ(out->id, in.id);
+    EXPECT_EQ(out->size_bytes, in.size_bytes);
+    EXPECT_EQ(out->page_size, in.page_size);
+    EXPECT_EQ(out->members, in.members);
+    EXPECT_EQ(out->name, in.name);
+}
+
+TEST(CreateVolumeCodecTest, RejectsKeyWhoseSizeDisagreesWithItsCounts) {
+    auto buf = serialize(make_create_volume_entry());
+    auto truncated = std::vector< uint8_t >(buf.begin(), buf.end() - 1);
+    EXPECT_FALSE(parse_create_volume(as_blob(truncated)));
+    auto padded = buf;
+    padded.push_back(0);
+    EXPECT_FALSE(parse_create_volume(as_blob(padded)));
+    auto prefix_only = std::vector< uint8_t >(buf.begin(), buf.begin() + sizeof(CreateVolumePayload) - 1);
+    EXPECT_FALSE(parse_create_volume(as_blob(prefix_only)));
 }
 
 } // namespace

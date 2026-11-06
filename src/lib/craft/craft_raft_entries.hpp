@@ -17,13 +17,15 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <vector>
 
+#include <boost/uuid/uuid.hpp>
 #include <sisl/fds/buffer.hpp>
 
 // ─── CRAFT RAFT entry types ───────────────────────────────────────────────────
 //
-// Two entry types ride the RAFT log in the CRAFT backend. Neither carries
+// Three entry types ride the RAFT log in the CRAFT backend. None carries
 // volume write data — write data travels point-to-point via the client broadcast
 // and is journalled locally. These entries carry only control-plane metadata:
 //
@@ -35,9 +37,13 @@
 //     by the leader as step 4 of the login sequence; applied by every replica.
 //     All subsequent IO with a mismatched term is rejected STALE_TERM.
 //
+//   CreateVolume — the partition's first entry: proposed by the member that formed
+//     the RAFT group; every member creates its local volume when it commits.
+//     Applied by the volume layer (the partition has no CraftReplDev before it).
+//
 // Wire layout:
 //   header blob → CraftEntryHeader  (discriminant only)
-//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload
+//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload | CreateVolumePayload
 //
 // For SyncRSCommitLSN the key blob is variable-length: the fixed
 // SyncRSCommitLSNPayload struct is followed immediately by
@@ -48,7 +54,7 @@
 
 namespace homeblocks {
 
-ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin);
+ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, CreateVolume);
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
@@ -72,7 +78,28 @@ struct InternalLoginPayload {
     uint64_t client_token;
     uint64_t term;
 };
+
+// ─── key blob: CreateVolume ───────────────────────────────────────────────────
+
+// Fixed prefix. Immediately followed by num_members × member uuid, then name_len name bytes. No ordinal: that is
+// local to each node. The uuid is raw bytes: a packed field can't bind to uuid's copy operations.
+struct CreateVolumePayload {
+    uint8_t id[sizeof(boost::uuids::uuid)];
+    uint64_t size_bytes;
+    uint32_t page_size;
+    uint16_t num_members;
+    uint16_t name_len;
+};
 #pragma pack(pop)
+
+// Decoded CreateVolume entry.
+struct CreateVolumeEntry {
+    boost::uuids::uuid id;
+    uint64_t size_bytes{0};
+    uint32_t page_size{0};
+    std::vector< boost::uuids::uuid > members;
+    std::string name;
+};
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +142,48 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 
     const auto* src = reinterpret_cast< const int64_t* >(p + 1);
     return std::vector< int64_t >(src, src + empty_count);
+}
+
+inline size_t create_volume_key_size(size_t num_members, size_t name_len) {
+    return sizeof(CreateVolumePayload) + num_members * sizeof(boost::uuids::uuid) + name_len;
+}
+
+// Writes e into buf. Caller must size buf via create_volume_key_size(e.members.size(), e.name.size()) first, and keep
+// both counts within uint16_t.
+inline void serialize_create_volume(uint8_t* buf, CreateVolumeEntry const& e) {
+    auto* p = reinterpret_cast< CreateVolumePayload* >(buf);
+    std::memcpy(p->id, &e.id, sizeof(p->id));
+    p->size_bytes = e.size_bytes;
+    p->page_size = e.page_size;
+    p->num_members = static_cast< uint16_t >(e.members.size());
+    p->name_len = static_cast< uint16_t >(e.name.size());
+    auto* tail = reinterpret_cast< uint8_t* >(p + 1);
+    for (auto const& m : e.members) {
+        std::memcpy(tail, &m, sizeof(m));
+        tail += sizeof(m);
+    }
+    if (!e.name.empty()) { std::memcpy(tail, e.name.data(), e.name.size()); }
+}
+
+// `key` is persisted RAFT log data replayed on apply: validated against its declared counts before anything is
+// trusted, like parse_empty_slots. Returns std::nullopt if the entry doesn't parse.
+inline std::optional< CreateVolumeEntry > parse_create_volume(sisl::blob const& key) {
+    if (key.size() < sizeof(CreateVolumePayload)) { return std::nullopt; }
+    const auto* p = reinterpret_cast< const CreateVolumePayload* >(key.cbytes());
+    if (key.size() != create_volume_key_size(p->num_members, p->name_len)) { return std::nullopt; }
+
+    CreateVolumeEntry e;
+    std::memcpy(&e.id, p->id, sizeof(p->id));
+    e.size_bytes = p->size_bytes;
+    e.page_size = p->page_size;
+    const auto* tail = reinterpret_cast< const uint8_t* >(p + 1);
+    e.members.resize(p->num_members);
+    for (auto& m : e.members) {
+        std::memcpy(&m, tail, sizeof(m));
+        tail += sizeof(m);
+    }
+    e.name.assign(reinterpret_cast< const char* >(tail), p->name_len);
+    return e;
 }
 
 } // namespace homeblocks
