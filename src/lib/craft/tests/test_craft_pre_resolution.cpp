@@ -231,7 +231,7 @@ TEST_F(CraftPreResolutionTest, CandidatesExtendPastOwnAppendFrontierUpToUpto) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{4, 5, 6}));
     EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4, 5, 6}));
-    EXPECT_EQ(dev_->last_append_lsn(), 3); // unchanged -- apply_sync_rs_commit_lsn's job, not this one's
+    EXPECT_EQ(dev_->last_append_lsn(), 3); // unchanged -- Empty verdicts are recorded by apply, not here
 }
 
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_from_quorum verbatim.
@@ -692,6 +692,39 @@ TEST_F(CraftPreResolutionTest, DataFromSingleHolderWrittenBelowQuorum) {
     EXPECT_FALSE(dev_->is_missing(3));
 }
 
+// ── slots with a write in flight (H1) ─────────────────────────────────────────
+
+// A slot whose write() is still in flight is that write's to finish: pre-resolution neither journals a peer's
+// copy over it nor votes it Empty.
+TEST_F(CraftPreResolutionTest, InFlightSlotWithPeerDataIsUnresolvedAndNotWritten) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 10, .len_bytes = 4}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+TEST_F(CraftPreResolutionTest, InFlightSlotLackedByQuorumIsUnresolvedNotEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {QuorumSlotResponse{}}; // self + 1 responder lack 3: a quorum of 3
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
 // ── append() (SDSTOR-22908) ────────────────────────────────────────────────────
 //
 // append() is pre-resolution plus a SyncRSCommitLSN proposal, so it reuses this file's fixture. Proposals
@@ -858,6 +891,76 @@ TEST_F(CraftAppendTest, ReplyIncludesEarlierRoundsVerdicts) {
     EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3, 6, 7}));
     ASSERT_EQ(proposer_.proposed.size(), 2u);
     EXPECT_EQ(decode(proposer_.proposed[1]).empty_slots, (std::vector< int64_t >{6, 7}));
+}
+
+// Slots pre-resolution fills above the frontier are recorded like write()'s, so applying the entry doesn't
+// mark them missing again: commit reaches the watermark without a second fetch or write (C2a).
+TEST_F(CraftAppendTest, FilledSlotsAboveFrontierCommitWithoutRefetch) {
+    dev_->seed_lsns(5, {});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 6, .lba_off_bytes = 0, .len_bytes = 4},
+                                                      JournalSlot{.lsn = 7, .lba_off_bytes = 0, .len_bytes = 4}}}};
+    std::map< int64_t, int > writes;
+    journal_->on_write = [&](int64_t lsn) { ++writes[lsn]; };
+
+    auto r = do_append(7);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 7);
+    EXPECT_EQ(dev_->last_append_lsn(), 7);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+    EXPECT_EQ(dev_->commit_lsn(), 7);
+    EXPECT_EQ(writes[6], 1);
+    EXPECT_EQ(writes[7], 1);
+}
+
+// N=5, one responder: 3 stays unresolved while 6 and 7 are filled. A later round asks only about 3; it never
+// fetches and writes 6 and 7 again, leaking the earlier copies' blocks (H2).
+TEST_F(CraftAppendTest, UnresolvedHoleDoesNotRewriteFilledSlots) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 6, .lba_off_bytes = 0, .len_bytes = 4},
+                                                      JournalSlot{.lsn = 7, .lba_off_bytes = 0, .len_bytes = 4}}}};
+    std::map< int64_t, int > writes;
+    journal_->on_write = [&](int64_t lsn) { ++writes[lsn]; };
+
+    auto first = do_append(7);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->resolved_upto, 2);
+
+    fetcher_.response = {QuorumSlotResponse{}}; // a responder answers only for the slots it's asked about
+    auto second = do_append(7);
+
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3}));
+    EXPECT_EQ(writes[6], 1);
+    EXPECT_EQ(writes[7], 1);
+}
+
+// A committed SyncRSCommitLSN(5) settled 4 and 5 as present, but this node's catch-up failed so it still lacks
+// them. A later round where a quorum lacks them must not vote them Empty: the earlier entry already settled
+// them (C2b).
+TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
+    dev_->seed_lsns(3, {});
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {});
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    ASSERT_TRUE(dev_->is_missing(4)); // catch-up failed: the mock's fetch_data is unsupported
+    ASSERT_TRUE(dev_->is_missing(5));
+
+    auto r = do_append(5); // the one responder lacks 4 and 5 too: self + 1 is a quorum of 3
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->resolved_upto, 3);
+    for (auto const& entry : proposer_.proposed)
+        EXPECT_TRUE(decode(entry).empty_slots.empty());
+    EXPECT_FALSE(dev_->is_empty_slot(4));
+    EXPECT_TRUE(dev_->is_missing(4));
+    EXPECT_TRUE(dev_->is_missing(5));
 }
 
 // ── failures ──────────────────────────────────────────────────────────────────

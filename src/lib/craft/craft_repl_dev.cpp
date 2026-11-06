@@ -573,6 +573,11 @@ void CraftReplDev::seed_term(uint64_t term) {
     state_.term = term;
 }
 
+void CraftReplDev::seed_in_flight(int64_t lsn) {
+    std::lock_guard lk{state_mu_};
+    in_flight_write_dlsns_.insert(lsn);
+}
+
 void CraftReplDev::seed_empty(std::initializer_list< int64_t > empty) {
     std::lock_guard lk{state_mu_};
     empty_lsns_.clear();
@@ -1040,6 +1045,14 @@ void CraftReplDev::retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t 
         auto it = overlay_.find(l);
         if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
     }
+}
+
+CraftReplDev::SlotClaim CraftReplDev::claim_slot_write_locked(int64_t lsn) {
+    if (in_flight_write_dlsns_.contains(lsn)) return SlotClaim::in_flight;
+    if (empty_lsns_.contains(lsn) || (lsn <= state_.last_append_lsn && !missing_lsns_.contains(lsn)))
+        return SlotClaim::held;
+    in_flight_write_dlsns_.insert(lsn);
+    return SlotClaim::claimed;
 }
 
 void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
@@ -1914,15 +1927,13 @@ async_status CraftReplDev::run_recovery() {
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
 //
-// candidates is the union of missing_lsns_ ∩ [0, upto] and (last_append_lsn, upto] minus empty_lsns_
+// candidates is the union of missing_lsns_ ∩ [0, upto] and (last_append_lsn, upto] minus empty_lsns_.
 //
-// Read-only against missing_lsns_/last_append_lsn otherwise: missing_lsns_ entries are only erased once
-// data is genuinely written locally below; last_append_lsn only advances once the resulting
-// SyncRSCommitLSN entry commits (apply_sync_rs_commit_lsn's job, not this leader-side preparation).
-//
-// Known, accepted follow-up: a beyond-frontier candidate written here still gets re-marked missing and
-// re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has
-// no way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
+// A slot written here is recorded the way write() records one: erased from missing_lsns_, last_append_lsn
+// advanced, and any gap below it marked missing. So applying the entry doesn't mark it missing again, and
+// fetch_data serves it (C2a). Each write claims its slot first, so write() and apply catch-up never journal it
+// too; a slot with a write already in flight is left unresolved (H1). A slot at or below an applied
+// SyncRSCommitLSN is never voted Empty: that entry already settled it as present (C2b).
 
 async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term) {
     auto self = shared_from_this();
@@ -1984,6 +1995,10 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         LOGW("pre_resolve_slots: lost leadership during quorum fetch -- abandoning upto={}", upto);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
     }
+    // At or below settled_floor, an applied (or this leader's committed) SyncRSCommitLSN already settled every
+    // slot, so one this leader still lacks there was settled present and never gets a fresh Empty (C2b).
+    int64_t settled_floor;
+    std::unordered_set< int64_t > in_flight; // candidates with a write() outstanding: that write's to finish (H1)
     {
         std::lock_guard lk{state_mu_};
         if (state_.term != term) {
@@ -1991,6 +2006,9 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                  state_.term, upto);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
+        settled_floor = std::max(applied_sync_lsn_, last_proposed_sync_lsn_);
+        for (int64_t lsn : candidates)
+            if (in_flight_write_dlsns_.contains(lsn)) in_flight.insert(lsn);
     }
     if (responses->empty()) {
         LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
@@ -2049,17 +2067,30 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 
     PreResolution result;
     for (int64_t lsn : candidates) {
+        if (in_flight.contains(lsn)) {
+            result.unresolved.push_back(lsn);
+            continue;
+        }
         if (empty_by_quorum.contains(lsn)) {
             result.empty_slots.push_back(lsn);
             continue;
         }
         auto it = data_by_lsn.find(lsn);
         if (it == data_by_lsn.end()) {
-            // No responding member reported data or Empty: Empty only on quorum-lacks evidence.
-            (quorum_lacks ? result.empty_slots : result.unresolved).push_back(lsn);
+            // No responding member reported data or Empty: Empty only on quorum-lacks evidence, and only above
+            // what an applied entry already settled.
+            (quorum_lacks && lsn > settled_floor ? result.empty_slots : result.unresolved).push_back(lsn);
             continue;
         }
         JournalSlot* slot = it->second;
+        SlotClaim claim;
+        {
+            std::lock_guard lk{state_mu_};
+            claim = claim_slot_write_locked(lsn);
+        }
+        if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write started after the fetch
+        if (claim != SlotClaim::claimed) continue;                         // held: it landed meanwhile
+        SlotWriteClaim const release{this, lsn};
         // Same alloc -> write_slot -> blkid-guarded cleanup-on-failure pattern as
         // apply_sync_rs_commit_lsn's own catch-up loop -- see its comments for the HS_DATA_LINKED
         // rationale this mirrors.
@@ -2112,6 +2143,10 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                 co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
             }
             missing_lsns_.erase(slot->lsn);
+            // Record a slot filled above the frontier the way write() does (C2a).
+            for (int64_t gap = state_.last_append_lsn + 1; gap < slot->lsn; ++gap)
+                if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
+            state_.last_append_lsn = std::max(state_.last_append_lsn, slot->lsn);
         }
     }
     co_return result;
@@ -2175,6 +2210,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                 co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
             }
         }
+        applied_sync_lsn_ = std::max(applied_sync_lsn_, rs_commit_lsn);
 
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
@@ -2232,6 +2268,14 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     missing_lsns_.erase(slot.lsn);
                     continue;
                 }
+                // Leave a slot with a write in flight to that write, and skip one that landed meanwhile (H1).
+                SlotClaim claim;
+                {
+                    std::lock_guard lk{state_mu_};
+                    claim = claim_slot_write_locked(slot.lsn);
+                }
+                if (claim != SlotClaim::claimed) continue;
+                SlotWriteClaim const release{this, slot.lsn};
                 // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
                 // journalling the block reference. all_zeros slots carry no data and skip alloc.
                 homestore::multi_blk_id blkid{};

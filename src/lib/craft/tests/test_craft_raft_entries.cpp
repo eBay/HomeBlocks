@@ -415,6 +415,22 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
     EXPECT_EQ(dev_->last_append_lsn(), 2);
 }
 
+// Catch-up leaves a slot whose write() is still in flight to that write, rather than journaling a peer's copy
+// alongside it (H1).
+TEST_F(CraftRaftEntriesTest, CatchUpSkipsSlotWithWriteInFlight) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {JournalSlot{.lsn = 3, .lba_off_bytes = 10, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+}
+
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_data verbatim.
 TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
     dev_->set_peer_fetcher(&fetcher_);

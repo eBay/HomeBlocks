@@ -441,6 +441,8 @@ public:
     void seed_empty(std::initializer_list< int64_t > empty);
     // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
     void seed_term(uint64_t term);
+    // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
+    void seed_in_flight(int64_t lsn);
     // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
     // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
     homestore::repl_dev_listener& test_listener() { return raft_listener_; }
@@ -669,6 +671,20 @@ private:
     // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.
     void retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn);
 
+    // Claims lsn for one journal write, so pre-resolution, apply catch-up and write() never journal the same slot
+    // (H1). in_flight: another write is outstanding; held: the slot is already journaled or Empty. Caller holds
+    // state_mu_; a claim is released by a SlotWriteClaim.
+    enum class SlotClaim { claimed, in_flight, held };
+    SlotClaim claim_slot_write_locked(int64_t lsn);
+    struct SlotWriteClaim {
+        CraftReplDev* dev;
+        int64_t lsn;
+        ~SlotWriteClaim() {
+            std::lock_guard lk{dev->state_mu_};
+            dev->in_flight_write_dlsns_.erase(lsn);
+        }
+    };
+
     // Records write()/keep_alive() activity and, on the first call after login, arms the watchdog's
     // recurring iomgr timer (iomgr::timer_token) that periodically checks for staleness -- see
     // on_watchdog_tick()'s doc comment for the full design and why a RECURRING timer (as opposed to
@@ -704,8 +720,8 @@ private:
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
-    // dlsns currently between "claimed as non-idempotent" and "write_slot has completed" in write() --
-    // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
+    // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
+    // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
                                   // in_flight_write_dlsns_, last_checkpoint_lsn_, and client_commit_lsn_
@@ -740,6 +756,7 @@ private:
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
     std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
     int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
+    int64_t applied_sync_lsn_{-1}; // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)
     int64_t last_periodic_sync_lsn_{-1}; // last_append_lsn at the last periodic trigger (guarded by state_mu_)
     // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
     // resolved prefix, so nothing at or below it is still in flight.
