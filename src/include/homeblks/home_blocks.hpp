@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <boost/uuid/uuid.hpp>
@@ -91,6 +92,10 @@ struct volume_info {
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
     replication_mode repl_mode{replication_mode::DISABLED};
+    // CRAFT: the partition's replica set (each member's svc id, see home_blocks_config::on_svc_id). create_volume
+    // forms the RAFT group from it; this node must be a member. Only used at creation: the RAFT group persists and
+    // owns membership from then on.
+    std::vector< peer_id_t > members{};
 
     volume_info() = default;
     volume_info(const volume_info&) = delete;
@@ -100,7 +105,8 @@ struct volume_info {
             page_size(rhs.page_size),
             name(std::move(rhs.name)),
             ordinal(rhs.ordinal),
-            repl_mode(rhs.repl_mode) {}
+            repl_mode(rhs.repl_mode),
+            members(std::move(rhs.members)) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
             id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name, uint64_t ord) :
@@ -111,8 +117,9 @@ struct volume_info {
     }
     auto operator==(volume_info const& rhs) const { return id == rhs.id; }
     std::string to_string() const {
-        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={}",
-                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode));
+        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={} members={}",
+                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode),
+                           members.size());
     }
 };
 
@@ -268,6 +275,14 @@ struct home_blocks_config {
     // result<peer_id_t> may carry an error (e.g. OM unreachable), which fails init_homeblocks. Empty -> a random
     // svc id is generated on first boot.
     std::function< async_result< peer_id_t >() > on_svc_id{};
+
+    // Replication backend of every volume. DISABLED: legacy single-node volumes. CRAFT: every volume is a CRAFT
+    // partition replicated by its own RAFT group, and repl_svc_port and lookup_peer are required.
+    replication_mode repl_mode{replication_mode::DISABLED};
+    uint16_t repl_svc_port{0}; // CRAFT: this node's RAFT port
+    // CRAFT: resolves a member's RAFT {host, port}. Called off-reactor whenever the RAFT layer (re)connects to that
+    // member, so it may block (e.g. an RPC to the OM). Return an empty host if the member is unknown.
+    std::function< std::pair< std::string, uint16_t >(peer_id_t const&) > lookup_peer{};
 };
 
 // Opaque handle to a running homeblocks instance. Obtained only from init_homeblocks().

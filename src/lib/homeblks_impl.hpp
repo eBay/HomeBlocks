@@ -158,6 +158,9 @@ public:
     bool dynamic_chunk_allocation() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
     bool has_pending_chunk_releases() const;
+    home_blocks_config const& config() const { return config_; }
+    // CRAFT process mode: every volume is a CRAFT partition replicated by its own RAFT group.
+    bool is_craft() const { return config_.repl_mode == replication_mode::CRAFT; }
 
 public:
     // public static APIs;
