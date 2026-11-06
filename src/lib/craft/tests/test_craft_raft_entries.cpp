@@ -285,6 +285,38 @@ TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataFreesBlock) {
     EXPECT_EQ(journal_->free_data_calls, 1);
 }
 
+// A verdict for a slot this replica already applied (<= commit_lsn) must not free its blocks: the index still
+// points at them. Apply refuses and faults the partition instead (C3).
+TEST_F(CraftRaftEntriesTest, EmptySlotAtOrBelowCommitLsnFaultsInsteadOfFreeing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
+// Freeing an Empty slot's blocks also retires its overlay entry: apply moves commit_lsn past the slot directly,
+// so commit never visits it to retire the entry, and reads would keep serving the slot (C3).
+TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataRetiresOverlay) {
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/5 * k_page_size, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+    ASSERT_TRUE(w.has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(5), 0);
+
+    auto r = do_apply(/*rs_commit_lsn=*/0, /*client_token=*/0, /*empty_slots=*/{0});
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    EXPECT_EQ(dev_->overlay_lsn_for(5), -1);
+}
+
 // Double-free guard: an lsn already verdicted Empty by a prior apply must not be re-freed if it
 // appears again in a later (redundant/overlapping) SyncRSCommitLSN's empty_slots -- nothing in the
 // protocol strictly forbids this, and re-adding it here would double-free the same blkid.

@@ -1085,7 +1085,7 @@ TEST_F(CraftCommitTest, RestartRecoveryGatesClientIoUntilOverlayRebuilt) {
 // overlay -- entries at and above the failing lsn were never populated, so a naive "always clear
 // recovering_" would let a subsequent read for an LBA only covered by one of those entries silently
 // fall through to stale, already-superseded state with no error. recovering_ itself is deliberately
-// left set (never cleared) on this path too -- recovery_faulted_ is the flag that actually governs
+// left set (never cleared) on this path too -- faulted_ is the flag that actually governs
 // client-facing rejection from here on (checked first, ahead of recovering_, by every entry point), but
 // leaving recovering_ set as well is a defensive belt-and-suspenders, not a load-bearing distinction.
 TEST_F(CraftCommitTest, FailedRestartRecoveryPermanentlyFaultsThePartition) {
@@ -1095,11 +1095,11 @@ TEST_F(CraftCommitTest, FailedRestartRecoveryPermanentlyFaultsThePartition) {
     journal_->add_data_slot(1, /* lba = */ 0, /* nlbas = */ 1, /* blk_num = */ 700, {11});
     journal_->fail_on_read = 1;
 
-    EXPECT_FALSE(dev_->is_recovery_faulted());
+    EXPECT_FALSE(dev_->is_faulted());
     // read_gate stays open (default) -- run_recovery() runs to completion (with a failure) synchronously
     // within this call, same as every other trigger_on_restart() use in this file.
     dev_->trigger_on_restart();
-    EXPECT_TRUE(dev_->is_recovery_faulted());
+    EXPECT_TRUE(dev_->is_faulted());
 
     static std::vector< uint8_t > buf(k_page_size, 0xAA);
     sisl::sg_list wdata;

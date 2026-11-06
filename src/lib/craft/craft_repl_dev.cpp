@@ -598,10 +598,10 @@ async_status CraftReplDev::logout(craft::client_hdr /* hdr */) {
 
 async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                                     sisl::sg_list data) {
-    // Checked ahead of recovering_: a faulted restart recovery is permanent, not a "still starting up,
-    // try again shortly" condition -- see recovery_faulted_'s doc comment.
-    if (recovery_faulted_.load(std::memory_order_acquire)) {
-        LOGE("write rejected: partition permanently faulted after failed restart recovery dlsn={}", dlsn);
+    // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
+    // try again shortly" condition -- see faulted_'s doc comment.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("write rejected: partition permanently faulted dlsn={}", dlsn);
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
     if (recovering_.load(std::memory_order_acquire)) {
@@ -914,18 +914,6 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
         }
         if (is_missing) break; // stall at the first hole -- not an error
 
-        // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals
-        // retiring_lsn -- shared by the data-apply path below and the is_empty path further down (a
-        // higher-dLSN overlay entry for the same LBA, from a later append not yet committed, must
-        // survive either way -- see the original comment this was factored out of).
-        auto retire_overlay_range = [this](lba_t start_lba, lba_t end_lba, int64_t retiring_lsn) {
-            std::lock_guard lk{overlay_mu_};
-            for (lba_t l = start_lba; l <= end_lba; ++l) {
-                auto it = overlay_.find(l);
-                if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
-            }
-        };
-
         if (!is_empty) {
             auto slot_r = co_await journal_->read_slot(lsn);
             if (!slot_r) co_return std::unexpected(slot_r.error());
@@ -1046,6 +1034,14 @@ async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_
 
 // ─── overlay population (shared by write() and rebuild_overlay()) ───────────
 
+void CraftReplDev::retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn) {
+    std::lock_guard lk{overlay_mu_};
+    for (lba_t l = start_lba; l <= end_lba; ++l) {
+        auto it = overlay_.find(l);
+        if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
+    }
+}
+
 void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
                                     homestore::multi_blk_id const& blkid,
                                     std::vector< homestore::csum_t > const& csums) {
@@ -1096,10 +1092,10 @@ void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlba
 
 async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                       uint64_t len, sisl::sg_list dest) {
-    // Checked ahead of recovering_: a faulted restart recovery is permanent, not a "still starting up,
-    // try again shortly" condition -- see recovery_faulted_'s doc comment.
-    if (recovery_faulted_.load(std::memory_order_acquire)) {
-        LOGE("read rejected: partition permanently faulted after failed restart recovery");
+    // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
+    // try again shortly" condition -- see faulted_'s doc comment.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("read rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
     if (recovering_.load(std::memory_order_acquire)) {
@@ -1331,10 +1327,10 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
 }
 
 async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) {
-    // Checked ahead of recovering_: a faulted restart recovery is permanent, not a "still starting up,
-    // try again shortly" condition -- see recovery_faulted_'s doc comment.
-    if (recovery_faulted_.load(std::memory_order_acquire)) {
-        LOGE("keep_alive rejected: partition permanently faulted after failed restart recovery");
+    // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
+    // try again shortly" condition -- see faulted_'s doc comment.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("keep_alive rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
     if (recovering_.load(std::memory_order_acquire)) {
@@ -1551,8 +1547,8 @@ void CraftReplDev::maybe_trigger_periodic_sync() {
 }
 
 async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr hdr, int64_t upto) {
-    if (recovery_faulted_.load(std::memory_order_acquire)) {
-        LOGE("request_resolution rejected: partition permanently faulted after failed restart recovery");
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("request_resolution rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
     if (recovering_.load(std::memory_order_acquire)) {
@@ -1895,7 +1891,7 @@ void CraftReplDev::CraftRaftListener::on_restart() {
 // Awaits rebuild_overlay() to completion. On success, clears recovering_ -- the volume resumes
 // accepting client I/O against a now-complete overlay. On FAILURE (e.g. a corrupt journal record),
 // does the opposite of what a naive "always clear, log and move on" version would: leaves recovering_
-// set and additionally sets recovery_faulted_ (checked first, ahead of recovering_, by every client-
+// set and additionally sets faulted_ (checked first, ahead of recovering_, by every client-
 // facing entry point), so the partition permanently rejects I/O with INTERNAL_ERROR instead of quietly
 // resuming against an overlay that stopped partway through -- entries at and above the failing LSN
 // were never populated, so any subsequent read for an LBA only covered by one of those entries would
@@ -1907,9 +1903,9 @@ async_status CraftReplDev::run_recovery() {
     auto r = co_await rebuild_overlay();
     if (!r) {
         LOGE("rebuild_overlay failed during restart recovery: {} -- partition permanently faulted, will "
-             "not accept client I/O (see recovery_faulted_'s doc comment)",
+             "not accept client I/O (see faulted_'s doc comment)",
              r.error().message());
-        recovery_faulted_.store(true, std::memory_order_release);
+        faulted_.store(true, std::memory_order_release);
         co_return r;
     }
     recovering_.store(false, std::memory_order_release);
@@ -2168,6 +2164,18 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         // checks (see apply_internal_login's header comment), not from an equality check here.
         term = state_.term;
 
+        // A verdict can't void a slot this replica already applied to its index: freeing it would leave the
+        // index pointing at free blocks. Something upstream is wrong, so fault instead of applying (C3).
+        for (int64_t lsn : empty_slots) {
+            if (lsn <= state_.commit_lsn && !empty_lsns_.contains(lsn)) {
+                LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} -- faulting the "
+                     "partition rather than freeing indexed blocks",
+                     lsn, state_.commit_lsn);
+                faulted_.store(true, std::memory_order_release);
+                co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+            }
+        }
+
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
             if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
@@ -2188,6 +2196,12 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
     if (!to_free.empty()) {
         for (int64_t lsn : to_free) {
+            // Retire the overlay entry before freeing: commit never visits this slot to retire it, since the
+            // commit_lsn advance below steps over it directly.
+            if (auto slot = co_await journal_->read_slot(lsn); slot && slot->len_bytes >= lba_size_) {
+                lba_t const start_lba = static_cast< lba_t >(slot->lba_off_bytes) / lba_size_;
+                retire_overlay_range(start_lba, start_lba + slot->len_bytes / lba_size_ - 1, lsn);
+            }
             if (auto fr = co_await journal_->free_slot(lsn); !fr) {
                 LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn,
                      fr.error().message());

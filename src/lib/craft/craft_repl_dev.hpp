@@ -496,12 +496,12 @@ public:
 
     // Test-only observability for the SDSTOR-22905 restart-recovery gate (see recovering_'s doc
     // comment): true from the moment on_restart() fires until run_recovery()'s rebuild_overlay() call
-    // completes successfully (see is_recovery_faulted() for the failure outcome instead).
+    // completes successfully (see is_faulted() for the failure outcome instead).
     bool is_recovering() const { return recovering_.load(std::memory_order_acquire); }
 
-    // Test-only observability for recovery_faulted_: true if a restart's rebuild_overlay() ever failed,
-    // permanently. Never transitions back to false.
-    bool is_recovery_faulted() const { return recovery_faulted_.load(std::memory_order_acquire); }
+    // Test-only observability for faulted_: true once the partition is permanently faulted. Never
+    // transitions back to false.
+    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
 #endif
 
 private:
@@ -664,6 +664,11 @@ private:
     void populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
                           homestore::multi_blk_id const& blkid, std::vector< homestore::csum_t > const& csums);
 
+    // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals retiring_lsn.
+    // A higher-dLSN entry for the same LBA (a later append not yet committed) survives. Used when commit applies
+    // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.
+    void retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn);
+
     // Records write()/keep_alive() activity and, on the first call after login, arms the watchdog's
     // recurring iomgr timer (iomgr::timer_token) that periodically checks for staleness -- see
     // on_watchdog_tick()'s doc comment for the full design and why a RECURRING timer (as opposed to
@@ -682,7 +687,7 @@ private:
 
     // Awaits rebuild_overlay() to completion. On SUCCESS, clears recovering_ so the volume resumes
     // accepting client I/O against a now-complete overlay. On FAILURE, does NOT clear recovering_ --
-    // instead sets recovery_faulted_ (checked ahead of recovering_ by every client-facing entry point),
+    // instead sets faulted_ (checked ahead of recovering_ by every client-facing entry point),
     // permanently rejecting I/O rather than resuming against a silently incomplete overlay. This is the
     // coroutine CraftRaftListener::on_restart() detaches, rather than detaching rebuild_overlay()
     // directly, specifically so this outcome-dependent branching has somewhere to live.
@@ -743,7 +748,7 @@ private:
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
-    // ONLY on a successful rebuild_overlay() (see recovery_faulted_ below for the failure path) --
+    // ONLY on a successful rebuild_overlay() (see faulted_ below for the failure path) --
     // write()/read()/keep_alive() all reject with volume_error::OFFLINE while this is set, per
     // SDSTOR-22905: the overlay must be fully rebuilt before the volume accepts new client I/O.
     //
@@ -765,14 +770,16 @@ private:
     // writers, and HomeStore's OWN calling contract (not a runtime property of this class) is what
     // ensures they run as one complete cycle before any next one -- see run_recovery()'s comment.
     std::atomic< bool > recovering_{false};
-    // Set (never cleared) by run_recovery() if rebuild_overlay() fails -- a failed rebuild leaves
-    // overlay_ silently INCOMPLETE (some LSNs applied, then it bailed), so resuming client I/O against
-    // it (as recovering_ alone clearing would do) could serve stale pre-write data with no error at
-    // all. write()/read()/keep_alive() check this FIRST, ahead of recovering_, and reject with
-    // volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
+    // Set (never cleared) when this partition can no longer serve correct data:
+    //   - run_recovery(), if rebuild_overlay() fails: overlay_ is silently INCOMPLETE (some LSNs applied,
+    //     then it bailed), so resuming client I/O could serve stale pre-write data with no error at all;
+    //   - apply_sync_rs_commit_lsn(), if an Empty verdict names a slot already applied to the index:
+    //     freeing it would leave the index pointing at free blocks.
+    // write()/read()/keep_alive()/request_resolution() check this FIRST, ahead of recovering_, and reject
+    // with volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
     // data corruption. There is deliberately no self-recovery path: an operator (or a future re-sync-
     // from-peer mechanism) must intervene.
-    std::atomic< bool > recovery_faulted_{false};
+    std::atomic< bool > faulted_{false};
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()
