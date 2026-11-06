@@ -18,6 +18,7 @@
 #include <atomic>
 #include <future>
 #include <map>
+#include <set>
 #include <string>
 #include <sisl/fds/id_reserver.hpp>
 #include <sisl/logging/logging.h>
@@ -76,6 +77,7 @@ private:
     /// volume management
     mutable std::shared_mutex vol_lock_;
     std::map< volume_id_t, volume_handle > vol_map_;
+    std::set< volume_id_t > creating_vols_; // CRAFT creates in flight on this node (guarded by vol_lock_)
 
     // index table map which only used during recovery: volume id -> {table, the ordinal its chunks were recovered under}
     mutable std::shared_mutex index_lock_;
@@ -189,6 +191,13 @@ private:
     void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
 
     status create_craft_volume_local(CreateVolumeEntry&& entry);
+
+    // CRAFT create_volume on the member that receives it. form_craft_volume blocks (group formation, then the wait
+    // for CreateVolume), so it runs on a thread of its own, never on a reactor.
+    async_result< volume_handle > create_craft_volume(volume_info info);
+    status validate_craft_volume(volume_info const& info) const;
+    result< volume_handle > form_craft_volume(volume_info info);
+    void remove_craft_group(volume_id_t const& id);
 
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);

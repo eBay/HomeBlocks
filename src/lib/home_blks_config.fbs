@@ -45,6 +45,11 @@ table HomeBlksSettings{
     // client wire, so an unbounded len would allow a malformed frame to drive an unbounded index
     // range operation or a multi-GiB allocation.
     craft_max_io_len_mb: uint64 = 128;
+
+    // CRAFT create_volume: how long (in milliseconds) the member that formed the RAFT group waits for the
+    // volume's CreateVolume entry to commit and apply locally before it gives up and destroys the group.
+    // Also bounds the wait for that destroy.
+    craft_create_volume_timeout_ms: uint32 = 30000;
 }
 
 root_type HomeBlksSettings;
