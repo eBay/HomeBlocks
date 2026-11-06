@@ -145,8 +145,8 @@ HomeBlocks/
   control plane (`create_volume` / `remove_volume` / `get_volume` / `volume_ids` / stats).
 - **`volume_handle`** (`std::shared_ptr<volume>`) -- opaque handle to **one replica device**; the CRAFT free
   functions take it. In production the client holds one handle per member.
-- **`home_blocks_config`** -- bring-up config (devices, reactor threads, memory budget, and a cold-boot
-  `on_svc_id` identity hook).
+- **`home_blocks_config`** -- bring-up config (devices, reactor threads, memory budget, a cold-boot
+  `on_svc_id` identity hook, and for CRAFT volumes the replication mode, RAFT port and peer lookup).
 - **`login` / `async_write` / `async_read` / `keep_alive`** -- CRAFT client free functions over a
   `volume_handle`. `login` orchestrates the full session setup (returns `LoginResult` with `term`, `dLSN`,
   `lba_size`, and member list). `async_write` takes a `client_hdr` and client-assigned dLSN; an empty
@@ -182,13 +182,17 @@ std::shared_ptr<home_blocks> hb = *hb_res;
 
 ### Volumes and I/O (in a coroutine)
 
-Each `volume_handle` is a handle to **one replica**. In production, call `create_volume` (or `get_volume`)
-once per member and hold all handles; the examples below show one replica for clarity.
+Each `volume_handle` is a handle to **one replica**. In production, `create_volume` on one member creates the
+volume on every member of its RAFT group (see [docs/craft/api.md](docs/craft/api.md)), and the client holds
+each member's handle (`get_volume` on that member); the examples below show one replica for clarity.
 
 ```cpp
 sisl::async::task<void> demo(std::shared_ptr<home_blocks> hb) {
-    // create_volume returns a handle to one replica device.
-    auto vol = co_await hb->create_volume(volume_info{uuid, /*size*/ 1ull << 30, /*page_size*/ 4096, "vol1"});
+    // create_volume returns a handle to this member's replica.
+    volume_info info{uuid, /*size*/ 1ull << 30, /*page_size*/ 4096, "vol1"};
+    info.repl_mode = replication_mode::CRAFT;
+    info.members = {member_a, member_b, member_c}; // this node and its peers
+    auto vol = co_await hb->create_volume(std::move(info));
     if (!vol) co_return;                            // vol.error()
 
     // Login: unicast to the leader -- returns {term, dLSN, lba_size, member list}.
