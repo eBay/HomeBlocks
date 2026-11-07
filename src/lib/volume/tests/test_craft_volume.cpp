@@ -207,6 +207,24 @@ TEST_F(CraftVolumeTest, GroupDestroyedAcrossRestartRemovesReplica) {
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
 }
 
+// After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in production,
+// a second here). A create retry in that window must not return it as created.
+TEST_F(CraftVolumeTest, CreateRetryWhileGroupIsDestroyedIsInProgress) {
+    auto const info = craft_vol_info("craft_vol_retry_destroyed");
+    auto const id = info.id;
+    ASSERT_TRUE(create(clone(info)));
+    ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+
+    ASSERT_TRUE(hb()->get_volume(id)); // still here, waiting for the reaper
+    auto retry = create(clone(info));
+    ASSERT_FALSE(retry);
+    EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
+
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
+    ASSERT_TRUE(wait_for_group_gone(id));
+    ASSERT_TRUE(create(clone(info)));
+}
+
 #ifdef _PRERELEASE
 // A failed create rolls back: the group is destroyed and nothing remains, so the same volume can be created again.
 // One failure after the group formed and before CreateVolume is proposed, one in the apply of a committed CreateVolume.
@@ -219,6 +237,12 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
         g_helper->remove_flip(flip);
         ASSERT_FALSE(vol) << flip;
         EXPECT_FALSE(hb()->get_volume(id)) << flip;
+
+        // A retry while the rolled-back group waits for the reaper leaves it alone and reports the removal in progress.
+        ASSERT_NE(group(id), nullptr) << flip;
+        auto retry = create(clone(info));
+        ASSERT_FALSE(retry) << flip;
+        EXPECT_EQ(retry.error(), std::errc::operation_in_progress) << flip;
 
         ASSERT_TRUE(wait_for_group_gone(id)) << flip;
         ASSERT_TRUE(create(clone(info))) << flip;

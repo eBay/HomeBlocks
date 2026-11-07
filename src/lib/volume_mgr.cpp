@@ -147,16 +147,28 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
     co_return vol_ptr;
 }
 
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for HomeStore's
+// reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+static bool is_going_away(homestore::repl_dev const& group) {
+    auto const stage = group.get_stage();
+    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
+        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
+}
+
 // CRAFT create on the member that receives it: forms the partition's RAFT group with every member, then replicates the
 // volume itself through the group's first entry, CreateVolume. Returns once that entry committed and this member
 // created its replica; the other members create theirs as they apply it.
 async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info info) {
     if (auto const valid = validate_craft_volume(info); !valid) { co_return std::unexpected(valid.error()); }
     auto const id = info.id;
+    // Looked up before taking vol_lock_, so this never calls into HomeStore while holding it.
+    auto const group = homestore::hs()->repl_service().get_repl_dev(id);
     {
         auto lg = std::scoped_lock(vol_lock_);
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
-            if (it->second->is_destroying()) {
+            // A replica whose group is gone or going is removed with it: e.g. a failed create whose CreateVolume still
+            // committed before its rollback's destroy. Not a volume to hand back, whatever its parameters.
+            if (it->second->is_destroying() || (it->second->is_craft() && (!group || is_going_away(**group)))) {
                 LOGE("vol={}: its previous replica is still being removed", boost::uuids::to_string(id));
                 co_return std::unexpected(std::errc::operation_in_progress);
             }
@@ -233,13 +245,20 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     auto const id = info.id;
     auto const id_str = boost::uuids::to_string(id);
 
+    // An earlier group of this volume is still being destroyed, e.g. by a failed create's rollback: wait for it to go.
+    // create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again restarts its reap
+    // (or, if that destroy is refused, revives it).
+    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old && is_going_away(**old)) {
+        LOGE("vol={}: an earlier RAFT group of this volume is still being destroyed", id_str);
+        return std::unexpected(std::errc::operation_in_progress);
+    }
+
     // 1. Form the group: this node creates it, wins its first election, then adds every other member.
     std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
     auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
     if (!rd) {
         LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
-        // An existing group is not this create's to remove: e.g. an earlier create's destroy is still pending.
-        if (rd.error() != homestore::ReplServiceError::SERVER_ALREADY_EXISTS) { remove_craft_group(id); }
+        remove_craft_group(id);
         return std::unexpected(rd.error());
     }
 
