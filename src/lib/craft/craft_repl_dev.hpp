@@ -91,6 +91,10 @@ struct JournalSlot {
 // One replica-set member's fetch_data-shaped reply to a pre-resolution broadcast (S5 / SDSTOR-22907).
 // Reuses JournalSlot's existing four-way per-LSN contract (is_empty / present+data / present+zero /
 // omitted-not-held-here) as-is.
+//
+// TODO(S7): carries no peer id, nor do poll_quorum_lsns()'s replies, so a duplicate reply, self or a learner
+// counts toward quorum like a distinct voter. Tag replies with the member, drop duplicates and self, and fail
+// closed if member_count() < 1 (quorum_size() would be 1).
 struct QuorumSlotResponse {
     std::vector< JournalSlot > slots;
 };
@@ -750,13 +754,16 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
+    // TODO(S8): raw pointers the device doesn't own, yet background work (append, pre-resolution, the watchdog,
+    // apply catch-up) uses them after awaits while holding only the device. Whoever wires them must make them
+    // outlive every round, e.g. by giving the device ownership (shared_ptr setters).
     CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
     uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
     std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
     int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
-    int64_t applied_sync_lsn_{-1}; // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)
+    int64_t applied_sync_lsn_{-1};       // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)
     int64_t last_periodic_sync_lsn_{-1}; // last_append_lsn at the last periodic trigger (guarded by state_mu_)
     // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
     // resolved prefix, so nothing at or below it is still in flight.

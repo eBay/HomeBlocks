@@ -203,8 +203,8 @@ TEST_F(CraftWatchdogTest, NoLoginNeverArms) {
 // ── leader sync (SDSTOR-22908) ────────────────────────────────────────────────
 
 // A stale tick on the leader polls the quorum, then syncs to min(quorum max last_append, the client's
-// commit_lsn) -- once: later stale ticks find that watermark already proposed. A peer holds up to 8, but
-// the client only confirmed 5, so 6..8 (possibly still in flight) are never examined.
+// commit_lsn) -- once: later stale ticks see nothing newly confirmed and don't poll again. A peer holds up to 8,
+// but the client only confirmed 5, so 6..8 (possibly still in flight) are never examined.
 TEST_F(CraftWatchdogTest, LeaderStaleTickProposesUpToClientCommitOnce) {
     dev_->seed_lsns(5, {});
     fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
@@ -213,23 +213,41 @@ TEST_F(CraftWatchdogTest, LeaderStaleTickProposesUpToClientCommitOnce) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // several stale ticks past the 300ms timeout
     destroy_dev();                                                // joins any in-flight tick before the mocks are read
 
-    EXPECT_GE(fetcher_.poll_calls.load(), 2);
+    EXPECT_EQ(fetcher_.poll_calls.load(), 1);
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     auto const e = decode(proposer_.proposed[0]);
     EXPECT_EQ(e.rs_commit_lsn, 5);
     EXPECT_TRUE(e.empty_slots.empty());
 }
 
-// A client that never sent a commit_lsn has confirmed nothing: the watchdog polls but proposes nothing.
+// The skip isn't permanent: once the client confirms more (here 7), the next stale round polls and syncs to it.
+TEST_F(CraftWatchdogTest, StaleTickPollsAgainOnceClientConfirmsMore) {
+    dev_->seed_lsns(8, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620)); // first stale round syncs to 5
+    ASSERT_TRUE(do_keep_alive(7, /*client_commit_lsn=*/7).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(620)); // stale again: the next round syncs to 7
+    destroy_dev();
+
+    EXPECT_EQ(fetcher_.poll_calls.load(), 2);
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 5);
+    EXPECT_EQ(decode(proposer_.proposed[1]).rs_commit_lsn, 7);
+}
+
+// A client that never sent a commit_lsn has confirmed nothing: the watchdog neither polls nor proposes.
 TEST_F(CraftWatchdogTest, StaleTickWithoutClientCommitProposesNothing) {
     dev_->seed_lsns(5, {});
     fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
     arm_as_leader(7);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    EXPECT_GE(dev_->watchdog_fire_count(), 1);
     destroy_dev();
 
-    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_EQ(fetcher_.poll_calls.load(), 0);
     EXPECT_TRUE(proposer_.proposed.empty());
 }
 
@@ -246,16 +264,20 @@ TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {
 }
 
 // A poll slower than the tick interval: later stale ticks must not start overlapping rounds (each would hold
-// the device alive). Once the slow poll completes and its round ends, ticks start rounds again.
+// the device alive). Once the slow poll completes and its round ends, ticks start rounds again. N=5 with one
+// responder, so every round falls short of quorum and later ticks still have something to confirm.
 TEST_F(CraftWatchdogTest, SlowPollDoesNotOverlapRounds) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
     fetcher_.hold_first_poll = true;
-    arm_as_leader(7);
+    arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(900)); // several stale ticks while poll 1 is held
     int const fired_while_held = dev_->watchdog_fire_count();
     int const polls_while_held = fetcher_.poll_calls.load();
 
-    fetcher_.poll_gate.complete(true); // the held round resumes here and ends (no client commit: no proposal)
+    fetcher_.poll_gate.complete(true); // the held round resumes here and ends (short of quorum: no proposal)
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     destroy_dev(); // the gate is always completed before teardown, so no round is left suspended
 

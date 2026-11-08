@@ -406,6 +406,9 @@ public:
     bool is_leader() const override { return rd_->is_leader(); }
     uint32_t member_count() const override { return static_cast< uint32_t >(rd_->get_replication_quorum().size()); }
 
+    // TODO(S7): no deadline. Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs()
+    // skips the proposer), so a leader without quorum waits out the outage holding append()'s gate. Add a
+    // one-shot timer (craft_raft_propose_timeout_ms) completing with timed_out; the entry may still commit.
     async_status propose(sisl::blob header, sisl::blob key) override {
         auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
         ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
@@ -1520,6 +1523,9 @@ async_status CraftReplDev::watchdog_sync() {
         term = state_.term;
         client_token = state_.client_token;
         target = state_.last_append_lsn;
+        // The target can't pass client_commit_lsn_, which only moves when the client talks to this leader. If that's
+        // already proposed, the poll can't confirm anything new, so skip it rather than poll every idle tick.
+        if (client_commit_lsn_ <= last_proposed_sync_lsn_) co_return ok();
     }
 
     auto polled = co_await peer_fetcher_->poll_quorum_lsns(term, /* is_login = */ false, peer_fetch_timeout_ms_);
@@ -1568,6 +1574,9 @@ void CraftReplDev::maybe_trigger_periodic_sync() {
         client_token = state_.client_token;
         term = state_.term; // the session client_commit_lsn_ belongs to
     }
+    // TODO: detach() runs the round inline until its first suspension, so the write() that triggered it acks only
+    // after the round's checks, candidate scan and RAFT submission. Hand it to a worker reactor instead (needs a
+    // test seam: test_craft_pre_resolution doesn't start iomgr).
     detail::detach(append(sync_to, client_token, term));
 }
 
@@ -1621,6 +1630,9 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     // Triggers detach this; keep the device alive across the awaits below.
     auto self = shared_from_this();
 
+    // TODO(S7): a Resolve that lands here gets operation_in_progress, and the client doesn't retry until its next
+    // failed write; background rounds stop at the client's commit_lsn, so the failed slot stays unresolved
+    // meanwhile. Make Resolve wait for the running round (S7's sync_round_done_ latch) instead.
     bool expected = false;
     if (!sync_in_flight_.compare_exchange_strong(expected, true)) {
         LOGD("append: another append() in flight -- skipping sync_to={}", sync_to);
@@ -2101,7 +2113,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             claim = claim_slot_write_locked(lsn);
         }
         if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write started after the fetch
-        if (claim != SlotClaim::claimed) continue;                         // held: it landed meanwhile
+        if (claim != SlotClaim::claimed) continue;                           // held: it landed meanwhile
         SlotWriteClaim const release{this, lsn};
         // Same alloc -> write_slot -> blkid-guarded cleanup-on-failure pattern as
         // apply_sync_rs_commit_lsn's own catch-up loop -- see its comments for the HS_DATA_LINKED
