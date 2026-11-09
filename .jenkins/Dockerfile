@@ -1,5 +1,5 @@
 # ##########   #######   ############
-FROM hub.tess.io/sds/sds_develop:7.x-latest
+FROM hub.tess.io/sds/sds_develop:8.x-latest
 LABEL description="Automated HomeBlocks compilation"
 
 WORKDIR /output
