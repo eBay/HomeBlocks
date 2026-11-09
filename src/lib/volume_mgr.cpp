@@ -70,6 +70,10 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         // HomeStore drops the group without calling on_destroy): the replica goes with it.
         LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
         start_volume_removal(id);
+    } else if (vol_ptr->is_craft()) {
+        // Only now that its index table is installed: the CraftReplDev attached when the journal replays keeps it. A
+        // CRAFT volume torn down above leaves its journal unopened, and HomeStore purges it.
+        vol_ptr->reopen_craft_journal();
     }
 }
 

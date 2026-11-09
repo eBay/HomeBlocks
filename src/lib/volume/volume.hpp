@@ -234,6 +234,10 @@ public:
     // the far side of the wire.
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
+    // CRAFT recovery: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and attaches
+    // the CraftReplDev once HomeStore's log replay opens the journal's store. Call it after init_index_table: the
+    // device keeps the index table it is given.
+    void reopen_craft_journal();
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -289,7 +293,6 @@ private:
     bool init(bool is_recovery);
     bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
     void attach_craft_dev(shared< homestore::home_log_store > journal);
-    void reopen_craft_journal();
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 

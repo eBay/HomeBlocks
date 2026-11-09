@@ -157,10 +157,6 @@ bool volume::init(bool is_recovery) {
              boost::uuids::to_string(vol_info_->id), vol_info_->ordinal, vol_info_->size_bytes, sb_->pdev_id,
              chunk_ids.size());
         // index table will be recovered via in subsequent callback with init_index_table API;
-
-        // A CRAFT volume without its RAFT group, or being destroyed, is torn down: its journal stays unopened, and
-        // HomeStore purges it.
-        if (is_craft() && rd_ && sb_->state != volume_state::DESTROYING) { reopen_craft_journal(); }
     }
 
     // set the in memory state from superblock;
@@ -228,12 +224,16 @@ void volume::reopen_craft_journal() {
 }
 
 void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
+    // The device keeps the index table it is given; without one it could neither apply commits nor serve reads.
+    RELEASE_ASSERT(indx_tbl_ != nullptr, "CRAFT volume: {} uuid: {} has no index table to attach its device to",
+                   vol_info_->name, id_str());
     auto const lba_size = static_cast< uint32_t >(vol_info_->page_size);
-    craft_dev_ = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
-                                      lba_size, indx_tbl_);
-    craft_dev_->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
-    craft_dev_->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
-    craft_dev_->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
+    auto dev = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
+                                    lba_size, indx_tbl_);
+    dev->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
+    dev->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
+    dev->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
+    craft_dev_ = std::move(dev); // published only once configured
 }
 
 sisl::async::task< void > volume::destroy() {
