@@ -118,10 +118,11 @@ public:
 class volume : public std::enable_shared_from_this< volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
+    static constexpr uint64_t MAX_NAME_LEN = 99; // the longest name the superblock keeps; it truncates longer ones
 private:
     static constexpr uint64_t VOL_SB_MAGIC = 0xc01fadeb; // different from old release;
     static constexpr uint64_t VOL_SB_VER = 0x4;          // 0x4: repl_mode and the CRAFT journal ids
-    static constexpr uint64_t VOL_NAME_SIZE = 100;
+    static constexpr uint64_t VOL_NAME_SIZE = MAX_NAME_LEN + 1;
     static constexpr homestore::csum_t init_crc_16 = 0x8005;
 
     struct vol_sb_t {

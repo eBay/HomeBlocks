@@ -179,7 +179,7 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
             // A retry of a create that already succeeded here.
             auto const& existing = *it->second->info();
             if (it->second->is_craft() && existing.size_bytes == info.size_bytes &&
-                existing.page_size == info.page_size) {
+                existing.page_size == info.page_size && existing.name == info.name) {
                 co_return it->second;
             }
             LOGE("vol={}: already exists with different parameters: {}", boost::uuids::to_string(id),
@@ -221,9 +221,11 @@ status HomeBlocksImpl::validate_craft_volume(volume_info const& info) const {
              boost::uuids::to_string(our_uuid()), info.members.size());
         return std::unexpected(std::errc::invalid_argument);
     }
+    // The whole name must fit the superblock: a retry, also after a restart, is matched against the stored one.
     if (info.page_size == 0 || info.page_size > std::numeric_limits< uint32_t >::max() ||
-        info.name.size() > std::numeric_limits< uint16_t >::max()) {
-        LOGE("vol={}: invalid page size {} or name length {}", id_str, info.page_size, info.name.size());
+        info.name.size() > volume::MAX_NAME_LEN) {
+        LOGE("vol={}: invalid page size {} or name length {} (at most {})", id_str, info.page_size, info.name.size(),
+             volume::MAX_NAME_LEN);
         return std::unexpected(std::errc::invalid_argument);
     }
     return ok();

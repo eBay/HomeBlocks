@@ -113,6 +113,13 @@ TEST_F(CraftVolumeTest, CreateRetryReturnsTheVolume) {
     auto clash = create(std::move(other));
     ASSERT_FALSE(clash);
     EXPECT_EQ(clash.error(), std::errc::invalid_argument);
+
+    // Same id, another name: not a retry either.
+    auto renamed = clone(info);
+    renamed.name += "_other";
+    auto rename_clash = create(std::move(renamed));
+    ASSERT_FALSE(rename_clash);
+    EXPECT_EQ(rename_clash.error(), std::errc::invalid_argument);
     EXPECT_EQ(hb()->get_volume(id).value_or(nullptr), *first);
 }
 
@@ -141,6 +148,9 @@ TEST_F(CraftVolumeTest, CreateRejectsInvalidRequests) {
     auto not_craft = craft_vol_info("not_craft");
     not_craft.repl_mode = replication_mode::DISABLED;
     expect_rejected(std::move(not_craft));
+
+    // Longer than the superblock keeps: it would come back truncated after a restart.
+    expect_rejected(craft_vol_info(std::string(volume::MAX_NAME_LEN + 1, 'n')));
 }
 
 TEST_F(CraftVolumeTest, LegacyOpsRejected) {
@@ -163,9 +173,9 @@ TEST_F(CraftVolumeTest, LegacyOpsRejected) {
 }
 
 TEST_F(CraftVolumeTest, RestartReattachesJournal) {
-    auto info = craft_vol_info("craft_vol_restart");
+    auto const info = craft_vol_info("craft_vol_restart");
     auto const id = info.id;
-    ASSERT_TRUE(create(std::move(info)));
+    ASSERT_TRUE(create(clone(info)));
 
     // Twice: a journal HomeStore purged as unopened at the first restart would be gone at the second.
     for (int i = 0; i < 2; ++i) {
@@ -176,6 +186,11 @@ TEST_F(CraftVolumeTest, RestartReattachesJournal) {
         EXPECT_NE((*vol)->craft_dev(), nullptr) << "journal not reattached after restart " << i;
         EXPECT_NE(group(id), nullptr);
     }
+
+    // A retry of the original create still matches the recovered volume, its name read back from the superblock.
+    auto retry = create(clone(info));
+    ASSERT_TRUE(retry) << retry.error().message();
+    EXPECT_EQ(*retry, hb()->get_volume(id).value_or(nullptr));
 
     // Creating after a restart: a new journal logdev, now that the log store service has started.
     auto after = create(craft_vol_info("craft_vol_after_restart"));

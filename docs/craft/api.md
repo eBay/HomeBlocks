@@ -295,7 +295,8 @@ auto vol = co_await hb->create_volume(std::move(info));
 
 A failure, or no commit within `craft_create_volume_timeout_ms` (default 30s), destroys the group again: a
 member that already created its replica removes it when the group is destroyed. Retrying a create that
-succeeded returns the volume. A concurrent create of the same volume fails with `operation_in_progress`, and so
+succeeded (same id, size, page size and name; a name is at most 99 bytes) returns the volume; any other create with
+that id fails with `invalid_argument`. A concurrent create of the same volume fails with `operation_in_progress`, and so
 does one made while an earlier RAFT group of the volume is still being destroyed: HomeStore reaps a destroyed group,
 and the replicas follow it, `repl_dev_cleanup_interval_sec` (a minute by default) after its destroy commits.
 
