@@ -724,6 +724,9 @@ private:
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
+    // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
+    // to commit_lsn when the run ends. Guarded by state_mu_.
+    int64_t indexing_lsn_{-1};
     // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;

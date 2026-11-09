@@ -301,6 +301,37 @@ TEST_F(CraftRaftEntriesTest, EmptySlotAtOrBelowCommitLsnFaultsInsteadOfFreeing) 
     EXPECT_TRUE(dev_->is_faulted());
 }
 
+// A slot commit_impl() has started indexing is covered too, though commit_lsn only moves when the run ends: a
+// verdict landing mid-run must fault, not free blocks the index references (F).
+TEST_F(CraftRaftEntriesTest, EmptySlotBeingIndexedFaultsInsteadOfFreeing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(2);
+    journal_->slots[3] = JournalSlot{.lsn = 3,
+                                     .lba_off_bytes = 0,
+                                     .len_bytes = k_page_size,
+                                     .blkid = homestore::multi_blk_id{500, 1, 1},
+                                     .csums = {7}};
+
+    std::optional< status > apply_r;
+    auto c = homeblocks::detail::sync_get(dev_->commit_with(
+        3,
+        [&](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status {
+            // lsn 3 is being indexed; commit_lsn is still 2.
+            apply_r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+            return ok();
+        },
+        [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); }));
+
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(*c, 3);
+    ASSERT_TRUE(apply_r.has_value());
+    ASSERT_FALSE(apply_r->has_value());
+    EXPECT_EQ(apply_r->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
 // Freeing an Empty slot's blocks also retires its overlay entry: apply moves commit_lsn past the slot directly,
 // so commit never visits it to retire the entry, and reads would keep serving the slot (C3).
 TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataRetiresOverlay) {

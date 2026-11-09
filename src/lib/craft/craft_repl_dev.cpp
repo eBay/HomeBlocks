@@ -917,6 +917,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             {
                 std::lock_guard lk{self->state_mu_};
                 self->state_.commit_lsn = *final_commit_lsn_ptr;
+                self->indexing_lsn_ = *final_commit_lsn_ptr; // drop a slot that failed before reaching the index
                 self->commit_running_ = false;
                 should_checkpoint = self->checkpoint_interval_crossed_locked(*final_commit_lsn_ptr);
             }
@@ -931,6 +932,8 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             std::lock_guard lk{state_mu_};
             is_missing = missing_lsns_.contains(lsn);
             is_empty = empty_lsns_.contains(lsn);
+            // Same lock as apply's Empty guard: once set, a verdict for lsn faults instead of freeing.
+            if (!is_missing && !is_empty) indexing_lsn_ = lsn;
         }
         if (is_missing) break; // stall at the first hole -- not an error
 
@@ -2224,13 +2227,13 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         // checks (see apply_internal_login's header comment), not from an equality check here.
         term = state_.term;
 
-        // A verdict can't void a slot this replica already applied to its index: freeing it would leave the
-        // index pointing at free blocks. Something upstream is wrong, so fault instead of applying (C3).
+        // A verdict can't void a slot this replica already applied to its index, or one a running commit_impl() has
+        // started indexing: freeing it would leave the index pointing at free blocks.
         for (int64_t lsn : empty_slots) {
-            if (lsn <= state_.commit_lsn && !empty_lsns_.contains(lsn)) {
-                LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} -- faulting the "
-                     "partition rather than freeing indexed blocks",
-                     lsn, state_.commit_lsn);
+            if (lsn <= std::max(state_.commit_lsn, indexing_lsn_) && !empty_lsns_.contains(lsn)) {
+                LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} (indexing_lsn={}) "
+                     "-- faulting the partition rather than freeing indexed blocks",
+                     lsn, state_.commit_lsn, indexing_lsn_);
                 faulted_.store(true, std::memory_order_release);
                 co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
             }
