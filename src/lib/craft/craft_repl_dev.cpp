@@ -474,6 +474,11 @@ CraftReplDev::~CraftReplDev() {
 // write() which updates state_ under the same lock.
 
 async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
+    // Same as fetch_data(): a faulted member answers nothing, so it can't count toward anyone's quorum.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("get_rs_commit_lsn rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     craft::lsn_pair pair{};
     {
         std::lock_guard lk{state_mu_};
@@ -1506,6 +1511,8 @@ void CraftReplDev::on_watchdog_tick() {
 #ifdef _PRERELEASE
     ++watchdog_fire_count_;
 #endif
+    // A faulted leader can't run a round (append() refuses), so don't poll the quorum for one.
+    if (faulted_.load(std::memory_order_acquire)) return;
     // Only the leader proposes; followers' ticks just detect staleness.
     if (raft_proposer_ == nullptr || !raft_proposer_->is_leader()) return;
     if (sync_in_flight_.load(std::memory_order_acquire) || watchdog_round_in_flight_.load(std::memory_order_acquire))
@@ -1629,6 +1636,11 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
 // ─── append: propose SyncRSCommitLSN (S5 / SDSTOR-22908) ─────────────────────
 
 async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, uint64_t client_token, uint64_t term) {
+    // Covers every trigger: a faulted leader's state is missing a committed entry, so it can't plan a round.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("append rejected: partition permanently faulted sync_to={}", sync_to);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     if (!raft_proposer_->is_leader())
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
@@ -1738,6 +1750,12 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
 
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
+    // A faulted partition's slots no longer match the replica set's, so they can't be evidence for anyone's
+    // resolution. Failing makes it a non-responder, which only makes other members' rounds more cautious.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("fetch_data rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     enum class SlotKind { Empty, Present, Absent };
 
     std::vector< SlotKind > kinds;

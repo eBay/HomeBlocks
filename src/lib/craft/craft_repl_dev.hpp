@@ -806,12 +806,13 @@ private:
     // Set (never cleared) when this partition can no longer serve correct data:
     //   - run_recovery(), if rebuild_overlay() fails: overlay_ is silently INCOMPLETE (some LSNs applied,
     //     then it bailed), so resuming client I/O could serve stale pre-write data with no error at all;
-    //   - apply_sync_rs_commit_lsn(), if an Empty verdict names a slot already applied to the index:
-    //     freeing it would leave the index pointing at free blocks.
+    //   - apply_sync_rs_commit_lsn(), if an Empty verdict names a slot already applied to the index, or one
+    //     commit_impl() is indexing: freeing it would leave the index pointing at free blocks.
     // write()/read()/keep_alive()/request_resolution() check this FIRST, ahead of recovering_, and reject
     // with volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
-    // data corruption. There is deliberately no self-recovery path: an operator (or a future re-sync-
-    // from-peer mechanism) must intervene.
+    // data corruption. fetch_data()/get_rs_commit_lsn() reject too, so peers treat it as down, and append()
+    // and the watchdog stop proposing. There is deliberately no self-recovery path: an operator (or a future
+    // re-sync-from-peer mechanism) must intervene.
     std::atomic< bool > faulted_{false};
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction

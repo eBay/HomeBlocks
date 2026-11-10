@@ -332,6 +332,27 @@ TEST_F(CraftRaftEntriesTest, EmptySlotBeingIndexedFaultsInsteadOfFreeing) {
     EXPECT_TRUE(dev_->is_faulted());
 }
 
+// Once faulted, the partition stops answering peers and stops proposing: its slots and watermarks no longer
+// match the replica set's.
+TEST_F(CraftRaftEntriesTest, FaultedPartitionStopsAnsweringPeersAndProposing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+    ASSERT_FALSE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    ASSERT_TRUE(dev_->is_faulted());
+
+    auto const faulted = make_error_condition(volume_error::INTERNAL_ERROR);
+    auto fetched = homeblocks::detail::sync_get(dev_->fetch_data({3}));
+    ASSERT_FALSE(fetched.has_value());
+    EXPECT_EQ(fetched.error(), faulted);
+    auto polled = homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/false));
+    ASSERT_FALSE(polled.has_value());
+    EXPECT_EQ(polled.error(), faulted);
+    auto appended = homeblocks::detail::sync_get(dev_->append(/*sync_to=*/5, /*client_token=*/0, dev_->term()));
+    ASSERT_FALSE(appended.has_value());
+    EXPECT_EQ(appended.error(), faulted);
+}
+
 // Freeing an Empty slot's blocks also retires its overlay entry: apply moves commit_lsn past the slot directly,
 // so commit never visits it to retire the entry, and reads would keep serving the slot (C3).
 TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataRetiresOverlay) {
