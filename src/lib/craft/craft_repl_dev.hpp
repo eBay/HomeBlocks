@@ -670,6 +670,10 @@ private:
     void populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
                           homestore::multi_blk_id const& blkid, std::vector< homestore::csum_t > const& csums);
 
+    // populate_overlay() for one journaled slot. blkid is this replica's own block reference for it (a fetched slot's
+    // blkid is the peer's). A slot shorter than a page is a malformed record: logged, no entry.
+    void populate_overlay_from_slot(int64_t lsn, JournalSlot const& slot, homestore::multi_blk_id const& blkid);
+
     // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals retiring_lsn.
     // A higher-dLSN entry for the same LBA (a later append not yet committed) survives. Used when commit applies
     // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.

@@ -1114,6 +1114,19 @@ void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlba
     }
 }
 
+void CraftReplDev::populate_overlay_from_slot(int64_t lsn, JournalSlot const& slot,
+                                              homestore::multi_blk_id const& blkid) {
+    // Skipped rather than published: populate_overlay() walks blkid, not nlbas, and commit_impl() rejects
+    // nlbas == 0, so nothing would ever retire the entry.
+    uint32_t const nlbas = static_cast< uint32_t >(slot.len_bytes / lba_size_);
+    if (nlbas == 0) {
+        LOGE("slot lsn={} has len_bytes={} (nlbas=0) -- malformed record, no overlay entry", lsn, slot.len_bytes);
+        return;
+    }
+    populate_overlay(lsn, static_cast< lba_t >(slot.lba_off_bytes) / lba_size_, nlbas, slot.all_zeros, blkid,
+                     slot.csums);
+}
+
 // ─── read() ───────────────────────────────────────────────────────────────────
 //
 // Serves [addr, addr+len) as of read_lsn from the LBA index (committed, <= commit_lsn) merged with
@@ -1795,19 +1808,8 @@ async_status CraftReplDev::rebuild_overlay() {
 
         auto slot_r = co_await journal_->read_slot(lsn);
         if (!slot_r) co_return std::unexpected(slot_r.error());
-        auto& slot = *slot_r;
-
-        lba_t const start_lba = static_cast< lba_t >(slot.lba_off_bytes) / lba_size_;
-        uint32_t const nlbas = static_cast< uint32_t >(slot.len_bytes / lba_size_);
-        // Matching commit_impl()'s identical guard: nlbas==0 produces start_lba + 0 - 1 underflow
-        // inside populate_overlay()'s any end_lba computation. A restart path should skip and continue
-        // (rather than abort the entire rebuild) since the replayed journal is not being mutated.
-        if (nlbas == 0) {
-            LOGE("rebuild_overlay: slot lsn={} has len_bytes={} (nlbas=0) -- malformed record, skipping", lsn,
-                 slot.len_bytes);
-            continue;
-        }
-        populate_overlay(lsn, start_lba, nlbas, slot.all_zeros, slot.blkid, slot.csums);
+        // A malformed record is skipped, not fatal: the replayed journal isn't being mutated.
+        populate_overlay_from_slot(lsn, *slot_r, slot_r->blkid);
     }
 
     co_return ok();
@@ -2175,6 +2177,9 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             for (int64_t gap = state_.last_append_lsn + 1; gap < slot->lsn; ++gap)
                 if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
             state_.last_append_lsn = std::max(state_.last_append_lsn, slot->lsn);
+            // Readable like a write()'s slot until commit indexes it. Under state_mu_, so an Empty verdict either
+            // finds the slot missing or retires this entry.
+            populate_overlay_from_slot(slot->lsn, *slot, blkid);
         }
     }
     co_return result;
@@ -2341,6 +2346,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                 }
                 std::lock_guard lk{state_mu_};
                 missing_lsns_.erase(slot.lsn);
+                // Readable until commit indexes it, same as pre_resolve_slots' fills.
+                populate_overlay_from_slot(slot.lsn, slot, blkid);
             }
         }
     }

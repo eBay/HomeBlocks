@@ -725,6 +725,23 @@ TEST_F(CraftPreResolutionTest, InFlightSlotLackedByQuorumIsUnresolvedNotEmpty) {
     EXPECT_TRUE(dev_->is_missing(3));
 }
 
+// A slot pre-resolution fills gets an overlay entry like a write()'s slot: commit is stalled below it at the
+// unresolved slot 3, so the overlay is the only place a read can find it (E/Q).
+TEST_F(CraftPreResolutionTest, FilledSlotAboveUnresolvedSlotIsInOverlay) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(4, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{
+                             .lsn = 5, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(journal_->has_slot(5));
+    EXPECT_EQ(dev_->overlay_lsn_for(2), 5);
+}
+
 // ── append() (SDSTOR-22908) ────────────────────────────────────────────────────
 //
 // append() is pre-resolution plus a SyncRSCommitLSN proposal, so it reuses this file's fixture. Proposals

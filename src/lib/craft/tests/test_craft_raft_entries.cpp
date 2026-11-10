@@ -462,6 +462,22 @@ TEST_F(CraftRaftEntriesTest, CatchUpSkipsSlotWithWriteInFlight) {
     EXPECT_EQ(dev_->commit_lsn(), 2);
 }
 
+// A slot catch-up fills above one still missing gets an overlay entry: commit stops at the hole, so the overlay
+// is the only place a read can find it (E/Q).
+TEST_F(CraftRaftEntriesTest, CatchUpFilledSlotAboveHoleIsInOverlay) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3, 5});
+    fetcher_.response = {
+        JournalSlot{.lsn = 5, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(dev_->overlay_lsn_for(2), 5);
+}
+
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_data verbatim.
 TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
     dev_->set_peer_fetcher(&fetcher_);
