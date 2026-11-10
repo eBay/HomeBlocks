@@ -61,7 +61,9 @@ public:
         return c;
     }
 
-    result< volume_handle > create(volume_info info) { return homeblocks::detail::sync_get(hb()->create_volume(std::move(info))); }
+    result< volume_handle > create(volume_info info) {
+        return homeblocks::detail::sync_get(hb()->create_volume(std::move(info)));
+    }
 
     shared< home_blocks > hb() { return g_helper->inst(); }
 
@@ -222,8 +224,8 @@ TEST_F(CraftVolumeTest, GroupDestroyedAcrossRestartRemovesReplica) {
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
 }
 
-// After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in production,
-// a second here). A create retry in that window must not return it as created.
+// After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in
+// production, a second here). A create retry in that window must not return it as created.
 TEST_F(CraftVolumeTest, CreateRetryWhileGroupIsDestroyedIsInProgress) {
     auto const info = craft_vol_info("craft_vol_retry_destroyed");
     auto const id = info.id;

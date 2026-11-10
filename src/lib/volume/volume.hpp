@@ -317,7 +317,7 @@ private:
     std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
     shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
-    bool journal_open_{false}; // CRAFT: this boot created or reopened the volume's journal
+    bool journal_open_{false};                  // CRAFT: this boot created or reopened the volume's journal
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

@@ -79,7 +79,8 @@ private:
     std::map< volume_id_t, volume_handle > vol_map_;
     std::set< volume_id_t > creating_vols_; // CRAFT creates in flight on this node (guarded by vol_lock_)
 
-    // index table map which only used during recovery: volume id -> {table, the ordinal its chunks were recovered under}
+    // index table map which only used during recovery: volume id -> {table, the ordinal its chunks were recovered
+    // under}
     mutable std::shared_mutex index_lock_;
     std::unordered_map< std::string, std::pair< shared< VolumeIndexTable >, uint64_t > > idx_tbl_map_;
 

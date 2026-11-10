@@ -226,7 +226,8 @@ static std::vector< pid_t > start_members(std::vector< std::string > const& args
         child_args.push_back(fmt::format("--replica_num={}", i));
         child_args.push_back(fmt::format("--shm_name={}", shm_name));
         if (SISL_OPTIONS.count("config_path")) {
-            child_args.push_back(fmt::format("--config_path={}_{}", SISL_OPTIONS["config_path"].as< std::string >(), i));
+            child_args.push_back(
+                fmt::format("--config_path={}_{}", SISL_OPTIONS["config_path"].as< std::string >(), i));
         }
 
         std::vector< char* > argv;
@@ -267,8 +268,8 @@ int main(int argc, char* argv[]) {
         g_barrier = std::make_unique< MemberBarrier >(SISL_OPTIONS["shm_name"].as< std::string >(), false);
     }
 
-    g_helper = std::make_unique< test_common::HBTestHelper >(fmt::format("test_craft_volume_multi_{}", me()), args,
-                                                             orig_argv);
+    g_helper =
+        std::make_unique< test_common::HBTestHelper >(fmt::format("test_craft_volume_multi_{}", me()), args, orig_argv);
     auto const id = member_id(me());
     g_helper->set_config_hook([id](home_blocks_config& cfg) {
         cfg.app_mem_size_mb = 4 * 1024; // three of them on one host

@@ -219,8 +219,8 @@ void volume::reopen_craft_journal() {
         vol->attach_craft_dev(co_await std::move(open));
         LOGI("CRAFT volume: {} uuid: {} reattached to its journal", vol->vol_info_->name, vol->id_str());
     }(logstores.open_log_store(sb_->journal_logdev_id, sb_->journal_store_id, false /* append_mode */, nullptr,
-                               nullptr),
-                                     shared_from_this()));
+                                         nullptr),
+                                         shared_from_this()));
 }
 
 void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {

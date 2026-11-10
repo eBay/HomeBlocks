@@ -151,8 +151,8 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
     co_return vol_ptr;
 }
 
-// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for HomeStore's
-// reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
+// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
 static bool is_going_away(homestore::repl_dev const& group) {
     auto const stage = group.get_stage();
     return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
@@ -241,8 +241,8 @@ static intrusive< create_volume_ctx > make_create_volume_ctx(volume_info const& 
     auto ctx = intrusive< create_volume_ctx >{new create_volume_ctx()};
     ctx->hdr_buf_ = sisl::io_blob_safe{static_cast< uint32_t >(sizeof(CraftEntryHeader)), 0};
     reinterpret_cast< CraftEntryHeader* >(ctx->hdr_buf_.bytes())->type = CraftEntryType::CreateVolume;
-    ctx->key_buf_ = sisl::io_blob_safe{
-        static_cast< uint32_t >(create_volume_key_size(entry.members.size(), entry.name.size())), 0};
+    ctx->key_buf_ =
+        sisl::io_blob_safe{static_cast< uint32_t >(create_volume_key_size(entry.members.size(), entry.name.size())), 0};
     serialize_create_volume(ctx->key_buf_.bytes(), entry);
     return ctx;
 }
@@ -252,8 +252,8 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     auto const id_str = boost::uuids::to_string(id);
 
     // An earlier group of this volume is still being destroyed, e.g. by a failed create's rollback: wait for it to go.
-    // create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again restarts its reap
-    // (or, if that destroy is refused, revives it).
+    // create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again restarts its
+    // reap (or, if that destroy is refused, revives it).
     if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old && is_going_away(**old)) {
         LOGE("vol={}: an earlier RAFT group of this volume is still being destroyed", id_str);
         return std::unexpected(std::errc::operation_in_progress);
@@ -268,8 +268,8 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
         return std::unexpected(rd.error());
     }
 
-    // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before in
-    // this process (a create retried after its group was destroyed), that layer still holds the old group's leader
+    // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before
+    // in this process (a create retried after its group was destroyed), that layer still holds the old group's leader
     // flag, so it may not have waited: wait for the leadership itself before proposing.
     auto const timeout = std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
     auto const deadline = std::chrono::steady_clock::now() + timeout;
@@ -313,8 +313,7 @@ void HomeBlocksImpl::remove_craft_group(volume_id_t const& id) {
 
     auto const timeout = std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
     if (fut.wait_for(timeout) != std::future_status::ready) {
-        LOGE("vol={}: destroying its RAFT group did not finish in {}ms", boost::uuids::to_string(id),
-             timeout.count());
+        LOGE("vol={}: destroying its RAFT group did not finish in {}ms", boost::uuids::to_string(id), timeout.count());
     } else if (auto const st = fut.get(); !st) {
         LOGE("vol={}: failed to destroy its RAFT group: {}", boost::uuids::to_string(id), st.error().message());
     }
@@ -402,9 +401,9 @@ status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
     }
 
     auto const ordinal = info.ordinal;
-    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
-                                         dynamic_chunk_allocation(),
-                                         orphan_idx ? std::move(orphan_idx->first) : nullptr);
+    auto vol =
+        volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                  dynamic_chunk_allocation(), orphan_idx ? std::move(orphan_idx->first) : nullptr);
     auto lg = std::scoped_lock(vol_lock_);
     if (!vol) {
         ordinal_reserver_->unreserve(ordinal);
