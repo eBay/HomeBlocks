@@ -684,6 +684,8 @@ private:
     // state_mu_; a claim is released by a SlotWriteClaim.
     enum class SlotClaim { claimed, in_flight, held };
     SlotClaim claim_slot_write_locked(int64_t lsn);
+    // What claim_slot_write_locked() would return, without claiming (claimed: free to claim). Caller holds state_mu_.
+    SlotClaim peek_slot_write_locked(int64_t lsn) const;
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;

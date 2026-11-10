@@ -742,6 +742,38 @@ TEST_F(CraftPreResolutionTest, FilledSlotAboveUnresolvedSlotIsInOverlay) {
     EXPECT_EQ(dev_->overlay_lsn_for(2), 5);
 }
 
+// A write() that finishes during the quorum fetch means this leader now holds the slot, so the round must not
+// count it as lacking the slot and vote it Empty.
+TEST_F(CraftPreResolutionTest, SlotWrittenDuringFetchIsNotVotedEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    // The leader's own write to 3 lands mid-fetch.
+    fetcher_.on_fetch = [this] { dev_->seed_lsns(5, {}); };
+    // Self + 1 responder lacking 3 would be a quorum of 3.
+    fetcher_.response = {QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_TRUE(r->unresolved.empty());
+}
+
+// A responder's Empty was already committed, so it wins even over a write() still in flight here: the round
+// reports it instead of leaving the slot unresolved.
+TEST_F(CraftPreResolutionTest, InheritedEmptyWinsOverInFlightWrite) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(r->unresolved.empty());
+}
+
 // ── append() (SDSTOR-22908) ────────────────────────────────────────────────────
 //
 // append() is pre-resolution plus a SyncRSCommitLSN proposal, so it reuses this file's fixture. Proposals

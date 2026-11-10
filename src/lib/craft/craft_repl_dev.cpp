@@ -1061,12 +1061,17 @@ void CraftReplDev::retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t 
     }
 }
 
-CraftReplDev::SlotClaim CraftReplDev::claim_slot_write_locked(int64_t lsn) {
+CraftReplDev::SlotClaim CraftReplDev::peek_slot_write_locked(int64_t lsn) const {
     if (in_flight_write_dlsns_.contains(lsn)) return SlotClaim::in_flight;
     if (empty_lsns_.contains(lsn) || (lsn <= state_.last_append_lsn && !missing_lsns_.contains(lsn)))
         return SlotClaim::held;
-    in_flight_write_dlsns_.insert(lsn);
     return SlotClaim::claimed;
+}
+
+CraftReplDev::SlotClaim CraftReplDev::claim_slot_write_locked(int64_t lsn) {
+    auto const claim = peek_slot_write_locked(lsn);
+    if (claim == SlotClaim::claimed) in_flight_write_dlsns_.insert(lsn);
+    return claim;
 }
 
 void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
@@ -2023,7 +2028,6 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     // At or below settled_floor, an applied (or this leader's committed) SyncRSCommitLSN already settled every
     // slot, so one this leader still lacks there was settled present and never gets a fresh Empty (C2b).
     int64_t settled_floor;
-    std::unordered_set< int64_t > in_flight; // candidates with a write() outstanding: that write's to finish (H1)
     {
         std::lock_guard lk{state_mu_};
         if (state_.term != term) {
@@ -2032,8 +2036,6 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
         settled_floor = std::max(applied_sync_lsn_, last_proposed_sync_lsn_);
-        for (int64_t lsn : candidates)
-            if (in_flight_write_dlsns_.contains(lsn)) in_flight.insert(lsn);
     }
     if (responses->empty()) {
         LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
@@ -2092,20 +2094,28 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 
     PreResolution result;
     for (int64_t lsn : candidates) {
-        if (in_flight.contains(lsn)) {
-            result.unresolved.push_back(lsn);
-            continue;
-        }
+        // A responder's Empty was already committed, so it wins over anything local.
         if (empty_by_quorum.contains(lsn)) {
             result.empty_slots.push_back(lsn);
             continue;
         }
         auto it = data_by_lsn.find(lsn);
         if (it == data_by_lsn.end()) {
-            // No responding member reported data or Empty: Empty only on quorum-lacks evidence, and only above
-            // what an applied entry already settled.
-            (quorum_lacks && lsn > settled_floor ? result.empty_slots : result.unresolved).push_back(lsn);
-            continue;
+            // Checked now, not before the fetch: a write() in flight owns the slot, and one that finished means
+            // this leader holds it rather than lacking it.
+            SlotClaim local;
+            {
+                std::lock_guard lk{state_mu_};
+                local = peek_slot_write_locked(lsn);
+            }
+            if (local == SlotClaim::in_flight) {
+                result.unresolved.push_back(lsn);
+            } else if (local == SlotClaim::claimed) {
+                // No responding member reported data or Empty: Empty only on quorum-lacks evidence, and only
+                // above what an applied entry already settled.
+                (quorum_lacks && lsn > settled_floor ? result.empty_slots : result.unresolved).push_back(lsn);
+            }
+            continue; // held: this leader has it now
         }
         JournalSlot* slot = it->second;
         SlotClaim claim;
@@ -2113,7 +2123,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             std::lock_guard lk{state_mu_};
             claim = claim_slot_write_locked(lsn);
         }
-        if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write started after the fetch
+        if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write() in flight owns the slot
         if (claim != SlotClaim::claimed) continue;                           // held: it landed meanwhile
         SlotWriteClaim const release{this, lsn};
         // Same alloc -> write_slot -> blkid-guarded cleanup-on-failure pattern as
