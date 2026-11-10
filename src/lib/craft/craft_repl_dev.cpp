@@ -544,6 +544,8 @@ async_status CraftReplDev::truncate(int64_t lsn) {
         std::lock_guard lk{state_mu_};
         if (state_.last_append_lsn > lsn) state_.last_append_lsn = lsn;
         missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
+        // The periodic cadence counts from the append frontier, so its baseline can't sit above the new one.
+        last_periodic_sync_lsn_ = std::min(last_periodic_sync_lsn_, lsn);
     }
 
     // Step 4: prune any overlay entry referencing a now-rolled-back dLSN. Without this, a stale

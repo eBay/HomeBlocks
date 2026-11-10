@@ -336,10 +336,10 @@ public:
     // unused until S9 needs them (matches craft_client's own reference implementation today).
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
 
-    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn;
-    // prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back write -- leaving it
-    // would let a later read serve stale data from a write that no longer exists in the journal). Called
-    // only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
+    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn and
+    // the periodic-sync baseline; prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back
+    // write -- leaving it would let a later read serve stale data from a write that no longer exists in the
+    // journal). Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
     // FIXME(S4/S7): before dropping entries here, force a completed checkpoint --
     // co_await checkpoint_trigger_(true). Once entries above/below lsn are gone, the journal is
     // no longer a durable record of them; if HomeStore's checkpoint has only been requested and not yet

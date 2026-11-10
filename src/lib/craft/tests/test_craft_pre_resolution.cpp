@@ -1236,6 +1236,23 @@ TEST_F(CraftAppendTest, PeriodicTriggerThrottledWhileHoleUnresolved) {
     EXPECT_EQ(proposer_.proposed.size(), 1u); // still clamped at 0: nothing new to propose
 }
 
+// truncate() rolls the append frontier back below the periodic baseline: the baseline must follow it down, or
+// periodic rounds stay off until writes climb back past where it was.
+TEST_F(CraftAppendTest, TruncateClampsPeriodicBaseline) {
+    dev_->set_sync_lsn_interval(4);
+    // Nothing confirmed by the client, so two attempts move the baseline to 7 without proposing.
+    for (int64_t dlsn = 0; dlsn <= 7; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+    ASSERT_TRUE(proposer_.proposed.empty());
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->truncate(1)).has_value());
+
+    for (int64_t dlsn = 2; dlsn <= 5; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn, 0, /*commit_lsn=*/dlsn - 1).has_value());
+    ASSERT_EQ(proposer_.proposed.size(), 1u); // 4 past the clamped baseline (1)
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 4);
+}
+
 // The piggybacked commit_lsn never regresses on a stale/reordered message, ignores the "not sent" -1, and
 // starts over when InternalLogin opens a new session.
 TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
