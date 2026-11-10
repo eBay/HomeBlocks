@@ -640,6 +640,26 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringFailedAllocStopsBeforeNextClaim)
     EXPECT_EQ(allocs, 1); // slot 4 was never claimed
 }
 
+// Filling a slot above the frontier would open a gap; at the missing_lsns_ cap it's left unresolved, as write()
+// rejects it. Filling an existing gap is still allowed, so the set can drain.
+TEST_F(CraftPreResolutionTest, MissingCapLeavesGapOpeningFillUnresolved) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {2, 3});
+    dev_->set_max_missing_lsns(1); // still at the cap once 3 is filled
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
+                  JournalSlot{.lsn = 8, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size}}}};
+
+    auto r = do_pre_resolve(/*upto=*/8);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{8}));
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(journal_->has_slot(8));
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_EQ(dev_->missing_count(), 1u); // just 2: no gap opened for 6..7
+}
+
 // ── membership-aware quorum ───────────────────────────────────────────────────
 
 // N=5: self + 1 responder = 2 < quorum 3 -- not enough evidence to mint Empty.
@@ -753,8 +773,9 @@ TEST_F(CraftPreResolutionTest, FilledSlotAboveUnresolvedSlotIsInOverlay) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(4, {3});
     dev_->seed_in_flight(3);
-    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{
-                             .lsn = 5, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}}}};
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {
+            JournalSlot{.lsn = 5, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}}}};
 
     auto r = do_pre_resolve(/*upto=*/5);
 

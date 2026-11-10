@@ -713,8 +713,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // >= 1 entry), not just dlsn > last_append_lsn: a gap-fill (dlsn <= last_append_lsn) or a
         // zero-gap in-order write (dlsn == last_append_lsn + 1) must stay exempt, or the set could
         // never drain once full.
-        static constexpr size_t k_max_missing_lsns = 2'000'000;
-        if (dlsn > state_.last_append_lsn + 1 && missing_lsns_.size() >= k_max_missing_lsns) {
+        if (missing_at_capacity_locked(dlsn)) {
             LOGW("write rejected: missing_lsns_ at capacity ({}) dlsn={}", missing_lsns_.size(), dlsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
@@ -1079,6 +1078,10 @@ CraftReplDev::SlotClaim CraftReplDev::claim_slot_write_locked(int64_t lsn) {
     auto const claim = peek_slot_write_locked(lsn);
     if (claim == SlotClaim::claimed) in_flight_write_dlsns_.insert(lsn);
     return claim;
+}
+
+bool CraftReplDev::missing_at_capacity_locked(int64_t lsn) const {
+    return lsn > state_.last_append_lsn + 1 && missing_lsns_.size() >= max_missing_lsns_;
 }
 
 void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
@@ -2119,6 +2122,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     };
 
     PreResolution result;
+    size_t capped = 0; // slots left unresolved by the missing_lsns_ cap
     for (int64_t lsn : candidates) {
         // A responder's Empty was already committed, so it wins over anything local.
         if (empty_by_quorum.contains(lsn)) {
@@ -2144,7 +2148,8 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             continue; // held: this leader has it now
         }
         JournalSlot* slot = it->second;
-        SlotClaim claim;
+        SlotClaim claim{};
+        bool at_capacity;
         {
             std::lock_guard lk{state_mu_};
             // A failed write above continues without a term check; claiming here would block the new session's
@@ -2153,7 +2158,14 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                 LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", lsn);
                 co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
             }
-            claim = claim_slot_write_locked(lsn);
+            // Same cap write() enforces: journaling this slot would open a gap past it.
+            at_capacity = missing_at_capacity_locked(lsn);
+            if (!at_capacity) claim = claim_slot_write_locked(lsn);
+        }
+        if (at_capacity) {
+            result.unresolved.push_back(lsn);
+            ++capped;
+            continue;
         }
         if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write() in flight owns the slot
         if (claim != SlotClaim::claimed) continue;                           // held: it landed meanwhile
@@ -2220,6 +2232,8 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             populate_overlay_from_slot(slot->lsn, *slot, blkid);
         }
     }
+    if (capped > 0)
+        LOGW("pre_resolve_slots: missing_lsns_ at capacity -- left {} slot(s) above the frontier unresolved", capped);
     co_return result;
 }
 

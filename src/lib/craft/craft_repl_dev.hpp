@@ -475,6 +475,9 @@ public:
     // Overrides the periodic SyncRSCommitLSN cadence read from sync_rs_commit_lsn_interval at construction.
     void set_sync_lsn_interval(int64_t n) { sync_lsn_interval_ = n; }
 
+    // Overrides the missing_lsns_ capacity, so tests can reach it without millions of entries.
+    void set_max_missing_lsns(size_t n) { max_missing_lsns_ = n; }
+
     // Highest watermark a committed append() proposed, or -1.
     int64_t last_proposed_sync_lsn() const {
         std::lock_guard lk{state_mu_};
@@ -686,6 +689,9 @@ private:
     SlotClaim claim_slot_write_locked(int64_t lsn);
     // What claim_slot_write_locked() would return, without claiming (claimed: free to claim). Caller holds state_mu_.
     SlotClaim peek_slot_write_locked(int64_t lsn) const;
+    // True if journaling lsn would open a new gap while missing_lsns_ is at capacity. Filling a gap, or appending
+    // right after the frontier, is always allowed so the set can drain. Caller holds state_mu_.
+    bool missing_at_capacity_locked(int64_t lsn) const;
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;
@@ -728,6 +734,7 @@ private:
     // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
     // insert one LSN at a time under state_mu_, which is O(gap width) instead of O(log ranges).
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
+    size_t max_missing_lsns_{2'000'000};       // see missing_at_capacity_locked(); overridden only by tests
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
     // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
