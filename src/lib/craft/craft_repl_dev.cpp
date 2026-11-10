@@ -805,7 +805,10 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             voided_post_flight = true;
         } else {
             missing_lsns_.erase(dlsn);
-            snapshot = {state_.commit_lsn, state_.last_append_lsn};
+            // Locally readable ahead of commit() indexing it. Under state_mu_, so an Empty verdict either voids this
+            // write above or retires this entry.
+            populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_),
+                             all_zeros, blkid, csums);
         }
     }
 
@@ -817,11 +820,6 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
     }
 
-    // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
-    // it to the index.
-    populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_), all_zeros,
-                     blkid, csums);
-
     // Best-effort piggyback: advance commit_lsn toward the client's own view of it. Every outcome --
     // a stall at a gap, or even a genuine commit() fault -- is ignored here; the write itself already
     // succeeded, and the next write/keep_alive retries the advance. keep_alive() is where a real
@@ -831,9 +829,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     touch_watchdog();
     maybe_trigger_periodic_sync();
 
-    // Re-snapshot after the piggyback commit() above: the pre-commit snapshot captured earlier
-    // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
-    // reflect whatever progress commit() just made, not a view from before this call's own piggyback ran.
+    // Snapshot after the piggyback commit() above, so the ack reflects whatever progress it just made.
     {
         std::lock_guard lock{state_mu_};
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
