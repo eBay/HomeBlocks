@@ -618,6 +618,28 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) 
     EXPECT_TRUE(dev_->is_missing(4));
 }
 
+// A slot whose allocation fails after the term moved is skipped, but the round must not go on to claim the next
+// slot in the new session: the claim would turn away that session's own write to it.
+TEST_F(CraftPreResolutionTest, TermChangedDuringFailedAllocStopsBeforeNextClaim) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 10, .len_bytes = 4},
+                                                      JournalSlot{.lsn = 4, .lba_off_bytes = 10, .len_bytes = 4}}}};
+    journal_->fail_alloc = true;
+    int allocs = 0;
+    journal_->on_alloc = [&] {
+        ++allocs;
+        dev_->seed_term(2);
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5, /*term=*/1);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(allocs, 1); // slot 4 was never claimed
+}
+
 // ── membership-aware quorum ───────────────────────────────────────────────────
 
 // N=5: self + 1 responder = 2 < quorum 3 -- not enough evidence to mint Empty.

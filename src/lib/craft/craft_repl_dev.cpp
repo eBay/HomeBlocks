@@ -2145,6 +2145,12 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         SlotClaim claim;
         {
             std::lock_guard lk{state_mu_};
+            // A failed write above continues without a term check; claiming here would block the new session's
+            // own write to this slot.
+            if (state_.term != term) {
+                LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", lsn);
+                co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            }
             claim = claim_slot_write_locked(lsn);
         }
         if (claim == SlotClaim::in_flight) result.unresolved.push_back(lsn); // a write() in flight owns the slot
