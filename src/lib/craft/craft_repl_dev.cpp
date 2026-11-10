@@ -1718,7 +1718,13 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     craft::resolution_result result{.resolved_upto = target, .empty_slots = {}};
     {
         std::lock_guard lk{state_mu_};
+        // The entry committed whichever session is current now, so the watermark moves either way.
         if (!skip) last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, target);
+        // The reply doesn't: if InternalLogin replaced the caller's session during the awaits above, it's gone.
+        if (state_.term != term) {
+            LOGW("append: term moved past the caller's ({} -> {}) after resolving to {}", term, state_.term, target);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         for (int64_t lsn : empty_lsns_)
             if (lsn <= target) result.empty_slots.push_back(lsn);
     }

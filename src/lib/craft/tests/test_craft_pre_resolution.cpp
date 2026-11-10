@@ -856,6 +856,40 @@ TEST_F(CraftAppendTest, CallerTermReplacedByLoginIsRejected) {
     EXPECT_TRUE(do_append(5).has_value()); // the gate was never claimed: a current-session round proceeds
 }
 
+// The entry commits, but InternalLogin replaces the caller's session before append() resumes: the reply belongs to
+// that session, so it's STALE_TERM, while the watermark still moves since the entry did commit.
+TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->test_listener().on_commit(1, h, k, {}, ctx);
+        dev_->seed_term(2);
+    };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
+}
+
+// An allocation failure lets pre-resolution return without noticing the term moved; with nothing to propose,
+// append() must still not answer for the replaced session.
+TEST_F(CraftAppendTest, TermChangeBeforeSkippedProposalFailsWithStaleTerm) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {0});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 0, .lba_off_bytes = 10, .len_bytes = 4}}}};
+    journal_->fail_alloc = true;
+    journal_->on_alloc = [this] { dev_->seed_term(2); };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
 TEST_F(CraftPreResolutionTest, CallerTermReplacedByLoginIsRejected) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_term(2);
