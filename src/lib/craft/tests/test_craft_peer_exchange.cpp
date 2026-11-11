@@ -83,7 +83,11 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
-    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    int free_data_calls{0};
+    async_status free_data(homestore::multi_blk_id) override {
+        ++free_data_calls;
+        co_return ok();
+    }
 
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
@@ -391,6 +395,56 @@ TEST_F(CraftPeerExchangeTest, FetchDataReadErrorPropagates) {
 
     auto r = do_fetch_data({1, 2, 3});
     EXPECT_FALSE(r.has_value()); // error propagated; partial result discarded
+}
+
+// A replica that MISSED the login poll is never fenced, so an old-session write at or below the login watermark keeps
+// going. If the login's Sync verdicts that slot Empty and its InternalLogin admits the new term (it drains only writes
+// above the watermark) before the write finishes, the write is void: it must fail, stay out of the overlay, keep its
+// slot Empty, and give back its blocks (review on #199).
+TEST_F(CraftPeerExchangeTest, OldWriteVoidedWhileInFlightOnAnUnfencedReplicaIsDiscarded) {
+    auto commit = [this](int64_t raft_lsn, CraftEntryType type, std::vector< uint8_t > key) {
+        std::vector< uint8_t > hdr(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(hdr.data())->type = type;
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->test_listener().on_commit(raft_lsn, sisl::blob{hdr.data(), static_cast< uint32_t >(hdr.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    };
+    homeblocks::detail::wait_list waiters;
+    journal_->write_waiters = &waiters;
+    journal_->write_released = false;
+    dev_->seed_term(3);
+
+    std::vector< uint8_t > buf(k_page_size, 0xAB);
+    sisl::sg_list sg;
+    sg.size = buf.size();
+    sg.iovs.push_back(iovec{buf.data(), buf.size()});
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach(
+        [](CraftReplDev& d, sisl::sg_list sg, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+            o = co_await d.write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, 0, 0,
+                                 k_page_size, std::move(sg));
+            co_return ok();
+        }(*dev_, sg, w));
+    ASSERT_FALSE(w.has_value()); // admitted (no poll reached this replica), suspended in write_slot
+
+    // The login commits: Sync rs=0 verdicting slot 0 Empty, then InternalLogin term 4 with rs=0 (nothing above it).
+    std::vector< uint8_t > sync(sync_rs_commit_lsn_key_size(1));
+    serialize_sync_rs_commit_lsn(sync.data(), 0, 0, {0});
+    commit(1, CraftEntryType::SyncRSCommitLSN, std::move(sync));
+    std::vector< uint8_t > login(sizeof(InternalLoginPayloadV2));
+    *reinterpret_cast< InternalLoginPayloadV2* >(login.data()) = {.client_token = 9, .term = 4, .rs_commit_lsn = 0};
+    commit(2, CraftEntryType::InternalLogin, std::move(login));
+    ASSERT_EQ(dev_->term(), 4u);
+    ASSERT_TRUE(dev_->is_empty_slot(0));
+
+    journal_->write_released = true;
+    waiters.notify_all();
+    ASSERT_TRUE(w.has_value());
+    ASSERT_FALSE(w->has_value());
+    EXPECT_EQ(w->error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1) << "voided data must not be readable";
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    EXPECT_EQ(journal_->free_data_calls, 1) << "its blocks are given back";
 }
 
 } // namespace

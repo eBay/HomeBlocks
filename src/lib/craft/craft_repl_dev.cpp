@@ -753,6 +753,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // In both orderings free_data is either unnecessary or wrong. blkid is intentionally not freed.
     // CraftJournalEntry.term lets recovery skip the stale entry; the next login truncates it durably.
     bool stale_post_flight = false;
+    bool voided = false; // the slot was verdicted Empty while this write was journalling
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
@@ -762,11 +763,28 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         } else {
             snapshot = {state_.commit_lsn, state_.last_append_lsn};
         }
-        // The slot is journalled here either way, so publish it as held: a login's final round must see it
-        // (fetch_data reports it, an Empty verdict frees its blocks), and the login's truncation removes it if it
-        // lies above rs_commit_lsn. That truncation cannot have run yet: it waits for this write (in-flight guard,
-        // released only when this call returns).
-        missing_lsns_.erase(dlsn);
+        if (stale_post_flight && empty_lsns_.contains(dlsn)) {
+            // A replica that missed the login poll was never fenced, so this old-session write at or below the login
+            // watermark ran on while the login's SyncRSCommitLSN verdicted its slot Empty (the verdict found the slot
+            // missing, so freed nothing) and its InternalLogin admitted the new term (it drains only writes ABOVE
+            // the watermark). The slot is void: never publish it (the overlay would serve voided data while an earlier
+            // gap keeps commit_lsn below it) and give back its blocks (review on #199).
+            voided = true;
+        } else {
+            // Otherwise the slot is journalled here either way, so publish it as held: a login's final round must see
+            // it (fetch_data reports it, an Empty verdict frees its blocks), and the login's truncation removes it if
+            // it lies above rs_commit_lsn. That truncation cannot have run yet: it waits for this write (in-flight
+            // guard, released only when this call returns).
+            missing_lsns_.erase(dlsn);
+        }
+    }
+
+    if (voided) {
+        if (blkid_allocated) {
+            if (auto fr = co_await journal_->free_data(blkid); !fr)
+                LOGE("free_data failed for voided write dlsn={}: {}", dlsn, fr.error().message());
+        }
+        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
     }
 
     // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
