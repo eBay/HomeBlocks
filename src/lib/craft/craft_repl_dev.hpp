@@ -158,6 +158,13 @@ public:
     virtual async_result< int64_t > tail_lsn() {
         co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
     }
+    // Journal reclaim (S8b): drop every entry with lsn <= upto. Their data blocks are NOT freed -- the index
+    // references them now. Default: not_supported (the reclaim runner then stops trying).
+    virtual async_status reclaim_upto(int64_t /* upto */) {
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    }
+    // Highest lsn already reclaimed (-1: none). Read once at restart.
+    virtual int64_t reclaimed_upto() const { return -1; }
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -500,6 +507,29 @@ public:
     // without a store nothing is persisted and a restart recovers nothing (the pre-S8 behaviour, still what the
     // light unit tests use).
     void set_state_store(unique< CraftStateStore > store) { state_store_ = std::move(store); }
+    // ── journal reclaim (S8b, docs/craft/resync.md §4.8) ──
+    // Entries at or below the floor are dropped from the journal:
+    //     floor = min(durable_commit_lsn, all_committed_lsn, lowest pin - 1)
+    //   - durable_commit_lsn: below it the index is durable, so local restart no longer needs the entries;
+    //   - all_committed_lsn: every member has committed below it, so no peer's catch-up needs them. It is client
+    //     input; taking the min with our own durable frontier keeps a bogus value from reclaiming anything not
+    //     yet durable HERE. Too large a value can only force a lagging peer onto the snapshot path (liveness, not
+    //     safety -- fetch_range reports reclaimed_below);
+    //   - pins: a snapshot source (b') pins the entries it still has to stream.
+    // Recomputed after each durable checkpoint, each keep_alive and each pin release; one runner at a time.
+    //
+    // Pins the journal from from_lsn up: no entry >= from_lsn is reclaimed while the returned handle lives.
+    // Returns nullptr if from_lsn is already reclaimed (or being reclaimed) -- the caller must fall back.
+    std::shared_ptr< void > pin_journal(int64_t from_lsn);
+    int64_t reclaim_floor() const {
+        std::lock_guard lk{state_mu_};
+        return reclaim_floor_locked();
+    }
+    int64_t reclaimed_upto() const {
+        std::lock_guard lk{state_mu_};
+        return reclaimed_upto_;
+    }
+
     // The image last handed to the store (or being handed to it). Test observability.
     CraftDurableState durable_state() const {
         std::lock_guard lk{state_mu_};
@@ -710,6 +740,11 @@ private:
     // frontier covers replacing_lsn (see the .cpp).
     async_status release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks);
     async_status free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks);
+
+    // ── journal reclaim (S8b) ──
+    int64_t reclaim_floor_locked() const;
+    void request_reclaim();
+    async_status run_reclaim();
     // Shared admission check for write/read/keep_alive. Must be called with state_mu_ held.
     bool admits_term_locked(uint64_t term) const { return term == state_.term && state_.term >= state_.fence_term; }
 
@@ -936,6 +971,14 @@ private:
     // Blocks superseded by an index write, waiting for the durable frontier to reach the replacing slot (first).
     // Guarded by state_mu_. Lost on a crash (a bounded leak).
     std::vector< std::pair< int64_t, homestore::blk_id > > deferred_frees_;
+
+    // ── journal reclaim (S8b), all guarded by state_mu_ ──
+    std::multiset< int64_t > reclaim_pins_; // from_lsn of every live pin_journal() handle
+    int64_t reclaimed_upto_{-1};            // entries <= this are gone from the journal
+    int64_t persisted_durable_commit_{-1};  // durable_commit_lsn as last persisted successfully (the floor's input)
+    int64_t reclaim_inflight_upto_{-1};     // target of the reclaim currently running (pins must stay above it)
+    bool reclaim_running_{false};
+    bool reclaim_unsupported_{false}; // backend said not_supported: stop asking
 };
 
 } // namespace homeblocks

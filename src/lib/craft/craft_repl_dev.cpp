@@ -375,6 +375,15 @@ public:
     // The log store's tail: the highest seq_num written and not rolled back.
     async_result< int64_t > tail_lsn() override { co_return static_cast< int64_t >(logstore_->tail_lsn()); }
 
+    // home_log_store::truncate drops every entry <= upto (reads of them fail from then on); the log device
+    // releases the space at its next device truncation.
+    async_status reclaim_upto(int64_t upto) override {
+        if (!logstore_->truncate(static_cast< homestore::logstore_seq_num_t >(upto)))
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        co_return ok();
+    }
+    int64_t reclaimed_upto() const override { return static_cast< int64_t >(logstore_->truncated_upto()); }
+
 private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
@@ -848,7 +857,7 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
         }
         if (auto r = co_await self->persist_state(); !r) {
             LOGE("persisting durable commit_lsn={} failed: {}", commit_lsn_snapshot, r.error().message());
-            co_return ok();
+            co_return ok(); // not durable: the waiting blocks and the reclaim floor wait for the next frontier
         }
         // The frontier is durable: a restart never re-applies a slot <= it, so the blocks those slots replaced can go.
         std::vector< homestore::blk_id > releasable;
@@ -862,6 +871,7 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
             d.erase(keep, d.end());
         }
         co_await self->free_blocks(commit_lsn_snapshot, std::move(releasable));
+        self->request_reclaim();
         co_return ok();
     }(shared_from_this(), commit_lsn_snapshot));
 }
@@ -1400,6 +1410,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
     }
 
     touch_watchdog();
+    request_reclaim(); // all_committed_lsn may have moved the floor
 
     // Unlike write()'s piggyback, advancing the frontier IS this call's entire purpose -- a genuine
     // commit() fault (not a stall, which is never an error) propagates to the caller instead of being
@@ -1575,6 +1586,27 @@ CraftReplDev::retry_delay_fn_t CraftReplDev::iomgr_retry_delay() {
 
 async_result< FetchRangeResult > CraftReplDev::fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes) {
     FetchRangeResult out;
+    // S8b: slots at or below the reclaim point are gone from this journal. Report it (the requester needs a
+    // snapshot for them, not a retry) and serve whatever is above it -- under a pin, so a reclaim that starts while
+    // this fetch reads cannot remove a slot it is about to read (review on #202). A pin refused because a reclaim
+    // moved past the first slot means the clip is stale: redo it.
+    std::shared_ptr< void > pin;
+    std::vector< LsnRange > const requested = std::move(ranges);
+    for (;;) {
+        int64_t reclaimed;
+        {
+            std::lock_guard lk{state_mu_};
+            reclaimed = std::max(reclaimed_upto_, reclaim_inflight_upto_);
+        }
+        ranges.clear();
+        out.reclaimed_below = -1;
+        for (auto [lo, hi] : requested) {
+            if (lo <= reclaimed) out.reclaimed_below = reclaimed + 1;
+            if (hi > reclaimed) ranges.emplace_back(std::max(lo, reclaimed + 1), hi);
+        }
+        if (ranges.empty()) break;
+        if ((pin = pin_journal(ranges.front().first))) break;
+    }
     uint64_t bytes = 0;
     int64_t scanned = 0;
     for (size_t ri = 0; ri < ranges.size(); ++ri) {
@@ -2023,16 +2055,24 @@ async_status CraftReplDev::run_persist() {
             gen = persist_req_gen_;
         }
         auto r = co_await state_store_->persist(image);
+        bool frontier_moved = false;
         {
             std::lock_guard lk{state_mu_};
             persist_done_gen_ = gen;
             if (r) {
                 persist_ok_gen_ = gen;
+                // Whatever round makes a durable frontier durable -- the checkpoint's own, or a later Sync / login one
+                // after the checkpoint's failed -- is what the reclaim floor follows (review on #202).
+                if (image.durable_commit_lsn > persisted_durable_commit_) {
+                    persisted_durable_commit_ = image.durable_commit_lsn;
+                    frontier_moved = true;
+                }
             } else {
                 LOGE("persisting durable partition state failed: {}", r.error().message());
             }
         }
         persist_wait_.notify_all(); // never under state_mu_: woken waiters re-take it in their predicate
+        if (frontier_moved) request_reclaim();
     }
 }
 
@@ -2065,6 +2105,8 @@ async_status CraftReplDev::restore_state() {
         missing_lsns_.clear(); // rebuild_overlay marks every slot above commit_lsn the journal does not hold
         replay_upto_ = std::max(*tail, d.durable_commit_lsn);
         last_checkpoint_lsn_ = d.durable_commit_lsn;
+        reclaimed_upto_ = journal_->reclaimed_upto();
+        persisted_durable_commit_ = d.durable_commit_lsn;
     }
     {
         std::lock_guard lk{apply_mu_};
@@ -2075,6 +2117,79 @@ async_status CraftReplDev::restore_state() {
          d.term, d.fence_term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(),
          d.last_applied_raft_idx);
     co_return ok();
+}
+
+// ─── journal reclaim (S8b / docs/craft/resync.md §4.8) ───────────────────────
+
+int64_t CraftReplDev::reclaim_floor_locked() const {
+    // Without a state store a restart recovers nothing from disk, so the journal is the only copy: never reclaim.
+    if (!state_store_) return -1;
+    int64_t floor = std::min(persisted_durable_commit_, state_.all_committed_lsn);
+    if (!reclaim_pins_.empty()) floor = std::min(floor, *reclaim_pins_.begin() - 1);
+    return floor;
+}
+
+std::shared_ptr< void > CraftReplDev::pin_journal(int64_t from_lsn) {
+    {
+        std::lock_guard lk{state_mu_};
+        if (from_lsn <= std::max(reclaimed_upto_, reclaim_inflight_upto_)) return nullptr;
+        reclaim_pins_.insert(from_lsn);
+    }
+    std::weak_ptr< CraftReplDev > weak = weak_from_this();
+    // The handle's deleter releases the pin; it may outlive the device (weak), and releasing can raise the floor.
+    return std::shared_ptr< void >(reinterpret_cast< void* >(1), [weak, from_lsn](void*) {
+        auto self = weak.lock();
+        if (!self) return;
+        {
+            std::lock_guard lk{self->state_mu_};
+            self->reclaim_pins_.erase(self->reclaim_pins_.find(from_lsn));
+        }
+        self->request_reclaim();
+    });
+}
+
+void CraftReplDev::request_reclaim() {
+    {
+        std::lock_guard lk{state_mu_};
+        if (reclaim_running_ || reclaim_unsupported_ || reclaim_floor_locked() <= reclaimed_upto_) return;
+        reclaim_running_ = true;
+    }
+    detail::detach(run_reclaim());
+}
+
+// One runner: reclaims to the current floor, and again while the floor keeps rising. reclaim_inflight_upto_ is
+// set before the journal call so a pin_journal() racing with it refuses a range that is about to disappear.
+async_status CraftReplDev::run_reclaim() {
+    auto self = shared_from_this();
+    for (;;) {
+        int64_t floor;
+        {
+            std::lock_guard lk{state_mu_};
+            floor = reclaim_floor_locked();
+            if (floor <= reclaimed_upto_) {
+                reclaim_running_ = false;
+                co_return ok();
+            }
+            reclaim_inflight_upto_ = floor;
+        }
+        auto r = co_await journal_->reclaim_upto(floor);
+        std::lock_guard lk{state_mu_};
+        reclaim_inflight_upto_ = -1;
+        if (!r) {
+            if (r.error() == std::errc::operation_not_supported) {
+                reclaim_unsupported_ = true;
+            } else {
+                LOGE("journal reclaim to {} failed: {} -- retried on the next trigger", floor, r.error().message());
+            }
+            reclaim_running_ = false;
+            co_return r;
+        }
+        reclaimed_upto_ = floor;
+        // Verdicts at or below the floor are long committed (floor <= durable commit <= commit_lsn) and nothing
+        // reads them again: drop them so empty_lsns_ stays bounded by the unreclaimed window.
+        std::erase_if(empty_lsns_, [floor](int64_t lsn) { return lsn <= floor; });
+        LOGD("journal reclaimed to {}", floor);
+    }
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────

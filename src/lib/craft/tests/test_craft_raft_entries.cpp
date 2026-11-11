@@ -111,7 +111,11 @@ public:
         co_return ok();
     }
 
-    async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
+    TestGate* read_gate{nullptr}; // when set, read_slot suspends until the gate opens
+    async_result< JournalSlot > read_slot(int64_t lsn) override {
+        if (read_gate) co_await read_gate->wait();
+        co_return co_await mock_read_slot(*this, lsn);
+    }
 
     async_status truncate_to(int64_t lsn) override {
         if (fail_truncate) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -137,6 +141,21 @@ public:
     }
 
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
+
+    // Journal reclaim (S8b).
+    int reclaim_calls{0};
+    bool fail_reclaim{false};
+    int64_t reclaimed{-1};
+    TestGate* reclaim_gate{nullptr};
+    async_status reclaim_upto(int64_t upto) override {
+        ++reclaim_calls;
+        if (reclaim_gate) co_await reclaim_gate->wait();
+        if (fail_reclaim) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        std::erase_if(slots, [upto](auto const& kv) { return kv.first <= upto; });
+        reclaimed = upto;
+        co_return ok();
+    }
+    int64_t reclaimed_upto() const override { return reclaimed; }
 
     bool fail_tail{false};
     async_result< int64_t > tail_lsn() override {
@@ -325,6 +344,9 @@ public:
     }
     auto apply_abort(uint64_t upto) { return homeblocks::detail::sync_get(dev_->apply_login_aborted(upto)); }
     async_status persist(CraftReplDev& dev) { return dev.persist_state(); }
+    async_status sync(CraftReplDev& dev, int64_t rs, std::vector< int64_t > empties) {
+        return dev.apply_sync_rs_commit_lsn(rs, 0, std::move(empties));
+    }
 
     // Simulates a restart: a fresh device over a copy of this journal and of the persisted image, recovered
     // through the production restart path. The fetcher, when given, is wired before recovery runs.
@@ -2106,6 +2128,240 @@ TEST_F(CraftRaftEntriesTest, SyncAdvanceAppliesSlotsToTheIndex) {
     ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/2, /*client_token=*/0).has_value());
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_EQ(applied, (std::vector< lba_t >{0, 1, 2})) << "every slot reached the index"; // zero_slot: lba 0..2
+}
+
+// ══ S8b: journal reclaim ═════════════════════════════════════════════════════
+
+namespace s8b {
+// Durable frontier `durable` (a flushed checkpoint, persisted) over journal slots 0..last.
+void make_durable(CraftRaftEntriesTest& t, CraftReplDev& dev, MockCraftJournalBackend& j,
+                  MockCraftCheckpointTrigger& trig, int64_t durable, int64_t last,
+                  std::vector< int64_t > empties = {}) {
+    for (int64_t l = 0; l <= last; ++l)
+        j.slots[l] = page_slot(l);
+    dev.set_checkpoint_trigger(std::ref(trig));
+    dev.set_checkpoint_lsn_interval(1);
+    dev.seed_lsns(last, {});
+    ASSERT_TRUE(homeblocks::detail::sync_get(t.sync(dev, durable, std::move(empties))).has_value());
+}
+auto keep_alive_acl(CraftReplDev& dev, int64_t acl) {
+    return homeblocks::detail::sync_get(
+        dev.keep_alive(craft::client_hdr{.term = dev.term(), .commit_lsn = -1, .all_committed_lsn = acl}));
+}
+} // namespace s8b
+
+// The floor is min(durable commit, all_committed_lsn): nothing is reclaimed until both are known, and it follows
+// the lower of the two.
+TEST_F(CraftRaftEntriesTest, ReclaimFollowsTheLowerFloor) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, /*durable=*/10, /*last=*/12);
+    EXPECT_EQ(journal_->reclaim_calls, 0); // all_committed_lsn still unknown
+
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 6).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 6);
+    EXPECT_FALSE(journal_->has_slot(6));
+    EXPECT_TRUE(journal_->has_slot(7));
+
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 50).has_value()); // a client value above our durable frontier
+    EXPECT_EQ(dev_->reclaim_floor(), 10);
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+    EXPECT_TRUE(journal_->has_slot(11));
+}
+
+// Without a state store nothing about the journal is recoverable from elsewhere: never reclaim.
+TEST_F(CraftRaftEntriesTest, NoReclaimWithoutStateStore) {
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaim_floor(), -1);
+    EXPECT_EQ(journal_->reclaim_calls, 0);
+}
+
+// A durable frontier whose persist failed is not a floor.
+TEST_F(CraftRaftEntriesTest, UnpersistedDurableCommitDoesNotRaiseTheFloor) {
+    auto* store = wire_store(*dev_);
+    dev_->seed_term(1);
+    store->fail_persist = true;
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    store->fail_persist = false;
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaim_floor(), -1);
+    EXPECT_EQ(journal_->reclaim_calls, 0);
+}
+
+// A pin holds the floor below it; releasing it lets reclaim catch up. A pin on a reclaimed range is refused.
+TEST_F(CraftRaftEntriesTest, PinHoldsTheReclaimFloor) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    auto pin = dev_->pin_journal(4);
+    ASSERT_NE(pin, nullptr);
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 3);
+    EXPECT_TRUE(journal_->has_slot(4));
+
+    EXPECT_EQ(dev_->pin_journal(2), nullptr);
+    pin.reset();
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+}
+
+// A pin taken while a reclaim is in flight must stay above the range being dropped; fetch_range reports that
+// range as reclaimed already.
+TEST_F(CraftRaftEntriesTest, PinAndFetchRespectAReclaimInFlight) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    TestGate gate;
+    journal_->reclaim_gate = &gate;
+    homeblocks::detail::detach(
+        dev_->keep_alive(craft::client_hdr{.term = 1, .commit_lsn = -1, .all_committed_lsn = 10}));
+    EXPECT_EQ(journal_->reclaim_calls, 1);
+    EXPECT_EQ(dev_->pin_journal(8), nullptr);
+    auto f = homeblocks::detail::sync_get(dev_->fetch_range({{9, 12}}, 1 << 20));
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->reclaimed_below, 11);
+    ASSERT_EQ(f->slots.size(), 2u);
+    EXPECT_EQ(f->slots.front().lsn, 11);
+
+    journal_->reclaim_gate = nullptr;
+    gate.open();
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+    EXPECT_NE(dev_->pin_journal(11), nullptr);
+}
+
+// fetch_range serves what is above the reclaim point and reports the rest; a request entirely below it gets no slots.
+TEST_F(CraftRaftEntriesTest, FetchRangeReportsReclaimedSlots) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 6).has_value());
+
+    auto f = homeblocks::detail::sync_get(dev_->fetch_range({{2, 3}, {5, 8}}, 1 << 20));
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->reclaimed_below, 7);
+    ASSERT_EQ(f->slots.size(), 2u);
+    EXPECT_EQ(f->slots[0].lsn, 7);
+    EXPECT_EQ(f->slots[1].lsn, 8);
+
+    f = homeblocks::detail::sync_get(dev_->fetch_range({{0, 4}}, 1 << 20));
+    ASSERT_TRUE(f.has_value());
+    EXPECT_EQ(f->reclaimed_below, 7);
+    EXPECT_TRUE(f->slots.empty());
+}
+
+// A failed reclaim leaves the journal as it was and is retried on the next trigger.
+TEST_F(CraftRaftEntriesTest, FailedReclaimIsRetried) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    journal_->fail_reclaim = true;
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), -1);
+
+    journal_->fail_reclaim = false;
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+}
+
+// A backend without reclaim support is asked once, then left alone.
+TEST_F(CraftRaftEntriesTest, UnsupportedReclaimIsNotRetried) {
+    struct NoReclaimJournal : MockCraftJournalBackend {
+        int asked{0};
+        async_status reclaim_upto(int64_t upto) override {
+            ++asked;
+            return CraftJournalBackend::reclaim_upto(upto);
+        }
+    };
+    auto j = std::make_unique< NoReclaimJournal >();
+    auto* jraw = j.get();
+    auto dev = CraftReplDev::create(volume_id_t{}, std::move(j), k_page_size, nullptr);
+    wire_store(*dev);
+    dev->seed_term(1);
+    s8b::make_durable(*this, *dev, *jraw, trigger_, 10, 12);
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev, 10).has_value());
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev, 10).has_value());
+    EXPECT_EQ(jraw->asked, 1);
+    EXPECT_EQ(dev->reclaimed_upto(), -1);
+}
+
+// Verdicts at or below the reclaim point are dropped from memory.
+TEST_F(CraftRaftEntriesTest, ReclaimDropsOldVerdicts) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12, {3, 9});
+    ASSERT_TRUE(dev_->is_empty_slot(3));
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 5).has_value());
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+    EXPECT_TRUE(dev_->is_empty_slot(9));
+}
+
+// After a restart the reclaim point comes from the journal itself, and the floor from the persisted frontier.
+TEST_F(CraftRaftEntriesTest, RestartRecoversReclaimPoint) {
+    auto img = sample_state();
+    auto j = std::make_unique< MockCraftJournalBackend >();
+    j->slots = zero_slots({2, 3, 7});
+    j->reclaimed = 1;
+    auto dev = CraftReplDev::create(volume_id_t{}, std::move(j), k_page_size, nullptr);
+    wire_store(*dev)->saved = img;
+    dev->trigger_on_restart();
+    ASSERT_FALSE(dev->is_recovery_faulted());
+    EXPECT_EQ(dev->reclaimed_upto(), 1);
+    EXPECT_EQ(dev->pin_journal(1), nullptr);
+    EXPECT_NE(dev->pin_journal(2), nullptr);
+}
+
+// A pin handle may outlive its device.
+TEST_F(CraftRaftEntriesTest, PinOutlivingDeviceIsHarmless) {
+    wire_store(*dev_);
+    auto pin = dev_->pin_journal(0);
+    ASSERT_NE(pin, nullptr);
+    dev_.reset();
+    pin.reset();
+    SUCCEED();
+}
+
+// ── review on #202 ──
+
+// A fetch pins what it serves: a reclaim that starts while it reads stops below the fetched range, and catches up
+// once the fetch is done.
+TEST_F(CraftRaftEntriesTest, FetchRangePinsTheRangeItServes) {
+    wire_store(*dev_);
+    dev_->seed_term(1);
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    TestGate gate;
+    journal_->read_gate = &gate;
+    std::optional< result< FetchRangeResult > > f;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< FetchRangeResult > >& o) -> async_status {
+        o = co_await d.fetch_range({{5, 8}}, 1 << 20);
+        co_return ok();
+    }(*dev_, f));
+    ASSERT_FALSE(f.has_value()); // reading slot 5
+
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 4) << "held below the fetch's pin";
+
+    journal_->read_gate = nullptr;
+    gate.open();
+    ASSERT_TRUE(f.has_value() && f->has_value());
+    EXPECT_EQ((*f)->slots.size(), 4u);
+    EXPECT_EQ((*f)->reclaimed_below, -1);
+    EXPECT_EQ(dev_->reclaimed_upto(), 10) << "the released pin let the reclaim catch up";
+}
+
+// A durable frontier whose own persist failed raises the floor as soon as any later persist round succeeds.
+TEST_F(CraftRaftEntriesTest, LaterPersistMakesTheFrontierAFloor) {
+    auto* store = wire_store(*dev_);
+    dev_->seed_term(1);
+    store->fail_persist = true;
+    s8b::make_durable(*this, *dev_, *journal_, trigger_, 10, 12);
+    store->fail_persist = false;
+    ASSERT_TRUE(s8b::keep_alive_acl(*dev_, 10).has_value());
+    ASSERT_EQ(dev_->reclaimed_upto(), -1);
+
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(0)); // persists the image
+    EXPECT_EQ(dev_->reclaim_floor(), 10);
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
 }
 
 } // namespace

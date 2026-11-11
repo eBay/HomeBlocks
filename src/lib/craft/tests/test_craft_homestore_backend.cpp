@@ -149,6 +149,25 @@ TEST_F(CraftHomeStoreBackendTest, TailLsnFollowsWritesAndRollback) {
     EXPECT_EQ(*t, 1);
 }
 
+// S8b journal reclaim against the real log store: entries <= upto become unreadable, later ones stay, and the
+// reclaim point is reported back (restart reads it from here).
+TEST_F(CraftHomeStoreBackendTest, ReclaimUptoDropsTheJournalPrefix) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    for (int64_t lsn = 0; lsn <= 4; ++lsn) {
+        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
+                                                                  std::vector< homestore::csum_t >{}));
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(backend->reclaimed_upto(), -1);
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->reclaim_upto(2)).has_value());
+    EXPECT_EQ(backend->reclaimed_upto(), 2);
+    EXPECT_FALSE(homeblocks::detail::sync_get(backend->read_slot(2)).has_value());
+    EXPECT_TRUE(homeblocks::detail::sync_get(backend->read_slot(3)).has_value());
+}
+
 // read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
 TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     auto logstore = make_logstore();
