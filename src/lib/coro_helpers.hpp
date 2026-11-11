@@ -73,8 +73,9 @@ inline void detach(sisl::async::task< T > task) {
 
 // A list of coroutines waiting for a condition, resumed by notify_all(). wait_until(pred) suspends only if
 // pred() is false, and the check-then-park is atomic with respect to notify_all() (both take mu_), so a
-// notification can never be missed. Waiters resume inline on the notifying thread and re-check pred via
-// the caller's loop (see usage). pred() may take other locks; lock order is wait_list::mu_ first.
+// notification can never be missed. Waiters resume inline on the notifying thread on EVERY notify_all(),
+// whether or not pred() now holds, so callers must loop: `while (!pred()) co_await wl.wait_until(pred);`.
+// pred() may take other locks; lock order is wait_list::mu_ first.
 class wait_list {
 public:
     struct awaiter {

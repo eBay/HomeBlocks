@@ -755,6 +755,9 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // succeeded, and the next write/keep_alive retries the advance. keep_alive() is where a real
     // commit() error actually surfaces (advancing the frontier is its entire purpose).
     co_await commit(hdr.commit_lsn);
+#ifdef _PRERELEASE
+    if (test_post_commit_hook_) co_await test_post_commit_hook_(); // lets a test suspend a write right here
+#endif
 
     touch_watchdog();
 
@@ -763,6 +766,12 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // reflect whatever progress commit() just made, not a view from before this call's own piggyback ran.
     {
         std::lock_guard lock{state_mu_};
+        // The piggyback commit() can suspend; a login (or its local fence) may have landed meanwhile. A write
+        // whose term is no longer admitted must not report success: the login is about to truncate it.
+        if (!admits_term_locked(hdr.term)) {
+            LOGW("write discarded after piggyback commit: term no longer admitted dlsn={}", dlsn);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
 
@@ -1995,9 +2004,26 @@ async_status CraftReplDev::run_catch_up() {
                     {
                         // Skip a slot that was filled (write gap-fill) or verdicted Empty since the request was
                         // built: installing it now would duplicate data or resurrect a voided slot.
+                        // Also claim the slot in in_flight_write_dlsns_, the same per-dLSN ownership write() takes:
+                        // while catch-up installs it, a client gap-fill for the same dLSN is rejected (and vice
+                        // versa), so the two can never journal independently allocated blocks for one slot.
                         std::lock_guard lk{state_mu_};
-                        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn)) continue;
+                        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn) ||
+                            in_flight_write_dlsns_.contains(slot.lsn))
+                            continue;
+                        in_flight_write_dlsns_.insert(slot.lsn);
                     }
+                    struct ClaimGuard {
+                        CraftReplDev* self;
+                        int64_t lsn;
+                        ~ClaimGuard() {
+                            {
+                                std::lock_guard lk{self->state_mu_};
+                                self->in_flight_write_dlsns_.erase(lsn);
+                            }
+                            self->write_drain_.notify_all();
+                        }
+                    } claim{this, slot.lsn};
                     if (slot.is_empty) {
                         std::lock_guard lk{state_mu_};
                         empty_lsns_.insert(slot.lsn);
@@ -2128,10 +2154,14 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
         // after the rollback would recreate the stale tail. Wait for them (they cannot be acked: their
         // post-flight term check now fails).
         int64_t const rs = *rs_commit_lsn;
-        co_await write_drain_.wait_until([this, rs] {
+        auto drained = [this, rs] {
             std::lock_guard lk{state_mu_};
             return in_flight_write_dlsns_.upper_bound(rs) == in_flight_write_dlsns_.end();
-        });
+        };
+        // notify_all() wakes every waiter on ANY completion, so re-check after each wake-up: with writes 7 and
+        // 8 in flight above watermark 5, the completion of 7 alone must not start the truncation.
+        while (!drained())
+            co_await write_drain_.wait_until(drained);
         if (auto r = co_await truncate(rs); !r) {
             // The session is NOT admitted: admitting it over an untruncated stale tail could mix the two
             // sessions' data in one slot. The replica keeps rejecting the new term until it is repaired.

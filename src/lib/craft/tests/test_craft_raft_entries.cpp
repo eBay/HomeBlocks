@@ -91,7 +91,8 @@ public:
     int free_data_calls{0};
     std::optional< int64_t > truncated_to; // last truncate_to() argument, if any
     bool fail_truncate{false};
-    TestGate* write_gate{nullptr}; // when set, write_slot suspends until the gate opens
+    TestGate* write_gate{nullptr};              // when set, write_slot suspends until the gate opens
+    std::map< int64_t, TestGate* > write_gates; // per-lsn variant of write_gate
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -101,6 +102,7 @@ public:
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
         if (write_gate) co_await write_gate->wait();
+        if (auto it = write_gates.find(lsn); it != write_gates.end()) co_await it->second->wait();
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] =
@@ -1100,6 +1102,89 @@ TEST_F(CraftRaftEntriesTest, LoginFencesAndWaitsForInFlightWriteAboveWatermark) 
     ASSERT_TRUE(journal_->truncated_to.has_value());
     EXPECT_EQ(*journal_->truncated_to, 5);
     EXPECT_EQ(dev_->term(), 4u);
+}
+
+// ── second review round (PR #196) ─────────────────────────────────────────────────────────────────
+
+namespace {
+// Starts a write and records its result once it completes (it may suspend on a gate first).
+void start_write(CraftReplDev& dev, uint64_t term, int64_t dlsn, std::optional< result< craft::lsn_pair > >& out) {
+    homeblocks::detail::detach(
+        [](CraftReplDev& d, uint64_t t, int64_t l, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+            o = co_await d.write(craft::client_hdr{.term = t, .commit_lsn = -1, .all_committed_lsn = -1}, l, 0,
+                                 k_page_size, sisl::sg_list{});
+            co_return ok();
+        }(dev, term, dlsn, out));
+}
+} // namespace
+
+// Two writes in flight above the watermark: the first one finishing must NOT start the truncation.
+TEST_F(CraftRaftEntriesTest, LoginDrainsEveryInFlightWriteNotJustTheFirst) {
+    TestGate g7, g8;
+    journal_->write_gates = {{7, &g7}, {8, &g8}};
+    dev_->seed_term(3);
+    dev_->seed_lsns(/*last_append=*/5, {});
+    std::optional< result< craft::lsn_pair > > w7, w8;
+    start_write(*dev_, 3, 7, w7);
+    start_write(*dev_, 3, 8, w8);
+
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 4, /*rs=*/5));
+    g7.open();
+    ASSERT_TRUE(w7.has_value());
+    EXPECT_FALSE(journal_->truncated_to.has_value()); // write 8 still in flight
+
+    g8.open();
+    ASSERT_TRUE(w8.has_value());
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 5);
+    EXPECT_FALSE(w7->has_value()); // neither fenced write reported success
+    EXPECT_FALSE(w8->has_value());
+}
+
+// A write that passed its checks and is suspended in its piggyback commit when the login fences must not
+// report success: the login is about to truncate it.
+TEST_F(CraftRaftEntriesTest, WriteFencedDuringPiggybackCommitReportsStaleTerm) {
+    TestGate gate;
+    dev_->test_post_commit_hook_ = [&gate]() -> async_status {
+        co_await gate.wait();
+        co_return ok();
+    };
+    dev_->seed_term(3);
+    dev_->seed_lsns(/*last_append=*/5, {});
+    std::optional< result< craft::lsn_pair > > w;
+    start_write(*dev_, 3, 6, w);
+    ASSERT_FALSE(w.has_value()); // held right after its piggyback commit
+
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 4, /*rs=*/5));
+    EXPECT_FALSE(journal_->truncated_to.has_value()); // waiting for the held write
+    gate.open();
+
+    ASSERT_TRUE(w.has_value());
+    ASSERT_FALSE(w->has_value());
+    EXPECT_EQ(w->error(), make_error_condition(volume_error::STALE_TERM));
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 5);
+    dev_->test_post_commit_hook_ = nullptr;
+}
+
+// While catch-up installs a slot, a client write for the same dLSN is rejected rather than racing it.
+TEST_F(CraftRaftEntriesTest, ClientWriteRejectedWhileCatchUpInstallsSameSlot) {
+    TestGate gate;
+    journal_->write_gates = {{3, &gate}};
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(1);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.response = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = 1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    // catch-up is now suspended inside write_slot(3), holding the claim on slot 3
+    auto r = write_at(*dev_, 1, 3);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::operation_in_progress));
+
+    gate.open();
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
 }
 
 } // namespace

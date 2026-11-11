@@ -419,6 +419,8 @@ public:
     void seed_term(uint64_t term);
     // Sets the login fence directly (PR C's get_rs_commit_lsn(is_login) is what raises it in production).
     void seed_fence_term(uint64_t fence_term);
+    // Awaited by write() right after its piggyback commit() (test-only), to hold a write at that point.
+    std::function< async_status() > test_post_commit_hook_;
     // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
     // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
     homestore::repl_dev_listener& test_listener() { return raft_listener_; }
