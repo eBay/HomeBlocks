@@ -73,7 +73,9 @@ volume::volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSele
                shared< VolumeChunkSelector > index_chunk_sel) :
         sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
     sb_.load(buf, static_cast< homestore::meta_blk* >(cookie));
-    // Older layouts are not supported (the chunk list moved with every added field): fail loudly, never misparse.
+    // Older layouts are not supported (the chunk list moved with every added field): fail loudly, never misparse. Not
+    // fault containment either: a volume left unloaded would lose its journal, which HomeStore purges as unopened, and
+    // its chunks, which startup resets as unowned.
     RELEASE_ASSERT(sb_->magic == VOL_SB_MAGIC && sb_->version == VOL_SB_VER,
                    "unsupported volume superblock, magic: {:#x} version: {:#x}", sb_->magic, sb_->version);
     // generate volume info from sb;

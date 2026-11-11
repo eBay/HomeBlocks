@@ -35,6 +35,13 @@ namespace homeblocks {
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
     auto vol_ptr = volume::make_volume(buf, cookie, volume_chunk_selector_, index_chunk_selector_);
     auto id = vol_ptr->id();
+    // A volume works only in the mode it was created in, and a CRAFT volume loaded without the RAFT service finds no
+    // group and is torn down below. Only a restart in its mode fixes that: stop before anything changes on disk,
+    // whatever the FC setting.
+    RELEASE_ASSERT(vol_ptr->is_craft() == is_craft(),
+                   "volume {} was created in {} mode, but HomeBlocks runs in {} mode: restart it in {} mode",
+                   vol_ptr->id_str(), enum_name(vol_ptr->info()->repl_mode), enum_name(config_.repl_mode),
+                   enum_name(vol_ptr->info()->repl_mode));
 
     {
         auto lg = std::scoped_lock(index_lock_);
