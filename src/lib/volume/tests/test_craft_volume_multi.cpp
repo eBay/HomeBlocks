@@ -68,6 +68,7 @@ class MemberBarrier {
         bip::interprocess_condition cv;
         uint32_t arrived{0};
         uint64_t generation{0};
+        int64_t value{0};
     };
 
 public:
@@ -101,6 +102,16 @@ public:
         auto const deadline =
             boost::posix_time::microsec_clock::universal_time() + boost::posix_time::seconds(timeout_sec);
         return state_->cv.timed_wait(lk, deadline, [this, gen] { return state_->generation != gen; });
+    }
+
+    // A value one member hands the others: they read it after the next sync.
+    void publish(int64_t v) {
+        bip::scoped_lock< bip::interprocess_mutex > lk{state_->mtx};
+        state_->value = v;
+    }
+    int64_t published() {
+        bip::scoped_lock< bip::interprocess_mutex > lk{state_->mtx};
+        return state_->value;
     }
 
 private:
@@ -232,6 +243,7 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     if (me() == 0) {
         auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
         ASSERT_TRUE(vol) << vol.error().message();
+        g_barrier->publish(group(id)->get_last_commit_lsn()); // covers CreateVolume, applied here
     }
     ASSERT_TRUE(wait_until([&id] { return group(id) != nullptr; }));
     if (me() != 1) {
@@ -239,8 +251,14 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     }
     ASSERT_TRUE(sync());
 
-    // Member 1 may apply CreateVolume only now: its flip stays set until it is done here, so that apply fails too.
+    // Member 1 has applied CreateVolume, and failed to, once it committed as far as member 0: HomeStore advances the
+    // commit LSN after the apply.
     if (me() == 1) {
+        auto const created_at = g_barrier->published();
+        ASSERT_TRUE(wait_until([&id, created_at] {
+            auto const rd = group(id);
+            return rd != nullptr && rd->get_last_commit_lsn() >= created_at;
+        }));
         ASSERT_FALSE(hb()->get_volume(id));
         auto retry = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
         ASSERT_FALSE(retry);
