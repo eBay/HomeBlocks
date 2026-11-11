@@ -826,8 +826,9 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
     // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
-    auto self = shared_from_this();
-    detail::detach([self, commit_lsn_snapshot]() -> async_status {
+    // A captureless coroutine taking its state as parameters: the frame owns them. (A capturing lambda's closure is
+    // a temporary destroyed at the end of this statement, while the detached frame still refers to it.)
+    detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot) -> async_status {
         auto cp = co_await self->checkpoint_trigger_(false);
         if (!cp) {
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
@@ -845,10 +846,54 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
             auto& empties = self->durable_.empty_lsns;
             empties.erase(empties.begin(), empties.upper_bound(commit_lsn_snapshot));
         }
-        if (auto r = co_await self->persist_state(); !r)
+        if (auto r = co_await self->persist_state(); !r) {
             LOGE("persisting durable commit_lsn={} failed: {}", commit_lsn_snapshot, r.error().message());
+            co_return ok();
+        }
+        // The frontier is durable: a restart never re-applies a slot <= it, so the blocks those slots replaced can go.
+        std::vector< homestore::blk_id > releasable;
+        {
+            std::lock_guard lk{self->state_mu_};
+            auto& d = self->deferred_frees_;
+            auto const keep = std::stable_partition(
+                d.begin(), d.end(), [commit_lsn_snapshot](auto const& e) { return e.first > commit_lsn_snapshot; });
+            for (auto it = keep; it != d.end(); ++it)
+                releasable.push_back(it->second);
+            d.erase(keep, d.end());
+        }
+        co_await self->free_blocks(commit_lsn_snapshot, std::move(releasable));
         co_return ok();
-    }());
+    }(shared_from_this(), commit_lsn_snapshot));
+}
+
+// ─── superseded blocks (S8) ──────────────────────────────────────────────────
+//
+// A block an index write replaces belongs to an OLDER slot. With restart recovery (a state store), freeing it at
+// once is unsafe: until a checkpoint covering the replacing slot is durable, a restart re-applies the older slot
+// from the journal and would point the index at a block that may already belong to someone else (review on #201).
+// So the free waits until the durable commit frontier reaches the replacing slot (fire_checkpoint_trigger releases
+// them). A crash before that leaks the waiting blocks (bounded by the window since the last durable checkpoint) --
+// never corruption. Without a state store there is no restart replay, so blocks are freed at once, as before.
+async_status CraftReplDev::release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks) {
+    if (blocks.empty()) co_return ok();
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_store_) {
+            for (auto const& b : blocks)
+                deferred_frees_.emplace_back(replacing_lsn, b);
+            co_return ok();
+        }
+    }
+    co_await free_blocks(replacing_lsn, std::move(blocks));
+    co_return ok();
+}
+
+async_status CraftReplDev::free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks) {
+    for (auto const& blk : blocks) {
+        if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{blk}); !fr)
+            LOGE("free_data failed reclaiming blk={} lsn={}: {}", blk.to_string(), lsn, fr.error().message());
+    }
+    co_return ok();
 }
 
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
@@ -946,11 +991,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                 // Reclaim inline, same as write()'s own free_data call sites -- free errors are
                 // logged but non-fatal (the block is merely leaked, not corrupted).
                 if (replaying) freed.clear();
-                for (auto const& blk : freed) {
-                    if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{blk}); !fr)
-                        LOGE("free_data failed reclaiming blk={} lsn={}: {}", blk.to_string(), lsn,
-                             fr.error().message());
-                }
+                co_await release_superseded(lsn, std::move(freed));
             } else {
                 // Decompose the slot's blkid into per-LBA single-block BlockInfo entries -- same shape
                 // as write()'s own overlay-population decomposition and volume.cpp's non-CRAFT path.
@@ -980,12 +1021,12 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                 // old_blkid == new_blkid means this slot was already applied (crash-replay of an
                 // idempotent commit before commit_lsn was durably persisted): the index already holds
                 // this exact blkid, so freeing it here would free a block the index still references.
+                std::vector< homestore::blk_id > superseded;
                 for (auto const& [_, info] : blocks_info) {
                     if (replaying || !info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
-                    if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{info.old_blkid}); !fr)
-                        LOGE("free_data failed reclaiming blk={} lsn={}: {}", info.old_blkid.to_string(), lsn,
-                             fr.error().message());
+                    superseded.push_back(info.old_blkid);
                 }
+                co_await release_superseded(lsn, std::move(superseded));
             }
 
             retire_overlay_range(start_lba, end_lba, lsn);
@@ -1018,6 +1059,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
+#ifdef _PRERELEASE
+    if (test_write_fn_) co_return co_await commit_impl(upto_lsn, test_write_fn_, test_delete_fn_);
+#endif
     if (!indx_tbl_) {
         // No index configured (write-path-only tests): nothing to apply, no-op safely.
         std::lock_guard lk{state_mu_};
@@ -1787,13 +1831,18 @@ async_status CraftReplDev::drain_apply_queue() {
         }
         // A failed apply is logged by the apply itself and does not stop the queue: a RAFT entry is
         // committed, so later entries must still apply, in order.
-        if (auto r = co_await next.fn(); !r) {
-            LOGE("drain_apply_queue: apply of raft lsn={} failed: {}", next.raft_lsn, r.error().message());
-        }
+        bool const applied = static_cast< bool >(co_await next.fn());
+        if (!applied) LOGE("drain_apply_queue: apply of raft lsn={} failed", next.raft_lsn);
         {
             std::lock_guard lk{state_mu_};
             state_.last_applied_raft_idx = std::max(state_.last_applied_raft_idx, next.raft_lsn);
-            durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, next.raft_lsn);
+            // The durable index stops advancing at the first entry that failed to apply (review on #201): a restart
+            // then re-applies from it -- e.g. an InternalLogin whose truncation failed gets another chance instead of
+            // being skipped for good. The entries after it are re-applied too; every apply is replay-safe. In this
+            // process the queue moves on: a committed entry cannot be un-committed, and the next login repairs.
+            if (!applied) apply_failed_ = true;
+            if (!apply_failed_)
+                durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, next.raft_lsn);
         }
         // After the entry's own durable effects (each apply persists what it must, ahead of the change), so a
         // restart re-applies an entry rather than skip one that never reached disk. A failure here only means the
@@ -2162,12 +2211,14 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                  res.error().message());
             if (blkid_allocated) {
-                detail::detach([self, blkid, lsn = slot->lsn]() -> async_status {
-                    if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                        LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
-                             fr.error().message());
-                    co_return ok();
-                }());
+                // Captureless: the detached frame must own its state (see fire_checkpoint_trigger).
+                detail::detach(
+                    [](shared< CraftReplDev > self, homestore::multi_blk_id blkid, int64_t lsn) -> async_status {
+                        if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                            LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
+                                 fr.error().message());
+                        co_return ok();
+                    }(self, blkid, slot->lsn));
             }
             continue;
         }
@@ -2220,6 +2271,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
         // checks (see apply_internal_login's header comment), not from an equality check here.
 
+        // A verdict at or below commit_lsn is for a slot already resolved and applied (after a restart: at or below
+        // the durable frontier, whose verdicts were dropped from the image). Re-freeing its journal record's blocks
+        // would free them twice (review on #201), so such verdicts are ignored.
+        std::erase_if(empty_slots, [this](int64_t lsn) { return lsn <= state_.commit_lsn; });
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
             if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
@@ -2481,13 +2536,12 @@ async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint6
     if (!res) {
         LOGE("catch-up: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn, res.error().message());
         if (blkid_allocated) {
-            detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+            // Captureless: the detached frame must own its state (see fire_checkpoint_trigger).
+            detail::detach([](shared< CraftReplDev > self, homestore::multi_blk_id blkid, int64_t lsn) -> async_status {
                 if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                    LOGE("catch-up: free_data failed after write_slot failure lsn={}: "
-                         "{}",
-                         lsn, fr.error().message());
+                    LOGE("catch-up: free_data failed after write_slot failure lsn={}: {}", lsn, fr.error().message());
                 co_return ok();
-            }());
+            }(self, blkid, slot.lsn));
         }
         co_return false;
     }
@@ -2501,6 +2555,14 @@ async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint6
     }
     if (voided_meanwhile) {
         LOGW("catch-up: lsn={} verdicted Empty during install -- reclaiming", slot.lsn);
+        // The verdict may still be on its way to disk (the Sync that installed it persists before ITS frees). Free
+        // only once it is durable: otherwise a crash replays that Sync with no memory of the verdict, finds this
+        // installed record, and frees the same blocks again (review on #201). If persisting fails, leak.
+        if (auto pr = co_await persist_state(); !pr) {
+            LOGE("catch-up: persisting verdict for lsn={} failed: {} -- not reclaiming", slot.lsn,
+                 pr.error().message());
+            co_return true;
+        }
         if (auto fr = co_await journal_->free_slot(slot.lsn); !fr)
             LOGE("catch-up: free_slot failed lsn={}: {} -- blocks may leak", slot.lsn, fr.error().message());
     }
@@ -2519,7 +2581,11 @@ async_status CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
     // so a read of such an LBA returned the older index value (H9 in docs/craft/resync.md). It also made
     // commit_lsn useless as a durable frontier for restart (S8). A commit() already running is left to finish;
     // the next write/keep_alive/Sync carries the advance further, as for every other commit() caller.
-    if (indx_tbl_) {
+    bool has_index = indx_tbl_ != nullptr;
+#ifdef _PRERELEASE
+    has_index = has_index || static_cast< bool >(test_write_fn_);
+#endif
+    if (has_index) {
         if (auto r = co_await commit(rs_commit_lsn); !r)
             LOGE("advance_commit_after_sync: commit({}) failed: {}", rs_commit_lsn, r.error().message());
         co_return ok();

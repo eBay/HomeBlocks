@@ -1972,7 +1972,7 @@ TEST_F(CraftRaftEntriesTest, RestartReplayDoesNotFreeReplacedBlocks) {
     ASSERT_TRUE(c.has_value());
     EXPECT_EQ(*c, 4);
     EXPECT_EQ(deletes, 3);                    // slots 2, 3 (replayed) and 4
-    EXPECT_EQ(r.journal->free_data_calls, 1); // only slot 4's replaced block is freed
+    EXPECT_EQ(r.journal->free_data_calls, 0); // replayed: never freed; slot 4: deferred until a durable frontier
 }
 
 // End to end: state persisted by one device restores another.
@@ -1996,6 +1996,116 @@ TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterRestart) {
     EXPECT_EQ(r.dev->last_append_lsn(), 4);
     EXPECT_TRUE(r.dev->is_missing(3));
     EXPECT_TRUE(r.dev->is_empty_slot(4));
+}
+
+// ── review on #201 (second round) ──
+
+// With a state store, a block an index write supersedes is freed only once a durable checkpoint covers the slot
+// that replaced it: until then a restart could re-apply the older slot, which still needs its block.
+TEST_F(CraftRaftEntriesTest, SupersededBlocksWaitForTheDurableFrontier) {
+    wire_store(*dev_);
+    journal_->slots = zero_slots({0, 1});
+    dev_->seed_lsns(/*last_append=*/1, {});
+    auto delete_fn = [](lba_t, lba_t, std::vector< homestore::blk_id >& freed) -> status {
+        freed.push_back(homestore::blk_id{7, 1, 0});
+        return ok();
+    };
+    auto write_fn = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+
+    // A checkpoint that only coalesced proves nothing: the blocks keep waiting.
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    trigger_.flushed = false;
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(0, write_fn, delete_fn)).has_value());
+    EXPECT_EQ(journal_->free_data_calls, 0);
+
+    // A flushed checkpoint at commit 1 makes both replacing slots durable: both waiting blocks are freed.
+    trigger_.flushed = true;
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(1, write_fn, delete_fn)).has_value());
+    EXPECT_EQ(dev_->durable_state().durable_commit_lsn, 1);
+    EXPECT_EQ(journal_->free_data_calls, 2);
+}
+
+// Without a state store there is no restart replay, so superseded blocks are freed at once, as before S8.
+TEST_F(CraftRaftEntriesTest, SupersededBlocksFreedAtOnceWithoutAStore) {
+    journal_->slots = zero_slots({0});
+    dev_->seed_lsns(/*last_append=*/0, {});
+    auto delete_fn = [](lba_t, lba_t, std::vector< homestore::blk_id >& freed) -> status {
+        freed.push_back(homestore::blk_id{7, 1, 0});
+        return ok();
+    };
+    auto write_fn = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(0, write_fn, delete_fn)).has_value());
+    EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
+// Once an entry fails to apply, the persisted applied index stops advancing: a restart re-applies from the failed
+// entry (here an InternalLogin whose truncation failed) instead of skipping it for good. The queue itself goes on.
+TEST_F(CraftRaftEntriesTest, FailedApplyFreezesThePersistedRaftIndex) {
+    auto* store = wire_store(*dev_);
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(1));
+    ASSERT_EQ(store->saved->last_applied_raft_idx, 1);
+
+    dev_->seed_lsns(/*last_append=*/8, {});
+    journal_->fail_truncate = true;
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/6));
+    EXPECT_EQ(dev_->term(), 0u); // not admitted
+    commit_entry(*dev_, 3, CraftEntryType::LoginAborted, make_login_aborted_key(2));
+    EXPECT_EQ(dev_->aborted_upto(), 2u);         // later entries still apply
+    EXPECT_EQ(dev_->last_applied_raft_idx(), 3); // in memory
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 1) << "a restart re-applies from the failed InternalLogin";
+    EXPECT_EQ(store->saved->aborted_upto, 2u); // what later entries made durable still is
+}
+
+// A verdict for a slot at or below commit_lsn (after a restart: at or below the durable frontier, whose verdicts were
+// dropped from the image) is ignored: freeing that slot's journal record again would be a double free.
+TEST_F(CraftRaftEntriesTest, SyncIgnoresVerdictsAtOrBelowCommit) {
+    journal_->slots = zero_slots({0, 1, 2, 3, 4, 5});
+    journal_->slots[3].all_zeros = false;
+    dev_->seed_lsns(/*last_append=*/5, {});
+    dev_->seed_commit_lsn(4);
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    EXPECT_EQ(journal_->free_slot_calls, 0);
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+}
+
+// Catch-up that finds its freshly installed slot verdicted Empty frees it only once the verdict is durable: if
+// persisting fails, the blocks are leaked rather than risk a second free when a restart replays the Sync.
+TEST_F(CraftRaftEntriesTest, CatchUpFreesAVoidedSlotOnlyOnceTheVerdictIsDurable) {
+    auto* store = wire_store(*dev_);
+    TestGate gate;
+    journal_->write_gates[3] = &gate;
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.response = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = 1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    commit_entry(*dev_, 2, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {3})); // voids 3
+    ASSERT_TRUE(dev_->is_empty_slot(3));
+
+    store->fail_persist = true;
+    journal_->write_gates.clear();
+    gate.open();
+    EXPECT_EQ(journal_->free_slot_calls, 0) << "not freed: the verdict could not be made durable";
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+
+    store->fail_persist = false;
+}
+
+// H9 (review on #201): the Sync advance applies every slot it passes to the index -- here a fake one through the
+// commit() seam -- instead of only moving commit_lsn. Missing-slot catch-up advances through the same function.
+TEST_F(CraftRaftEntriesTest, SyncAdvanceAppliesSlotsToTheIndex) {
+    journal_->slots = zero_slots({0, 1, 2});
+    dev_->seed_lsns(/*last_append=*/2, {});
+    std::vector< lba_t > applied;
+    dev_->set_index_fns_for_test([](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); },
+                                 [&applied](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
+                                     applied.push_back(s);
+                                     return ok();
+                                 });
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/2, /*client_token=*/0).has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(applied, (std::vector< lba_t >{0, 1, 2})) << "every slot reached the index"; // zero_slot: lba 0..2
 }
 
 } // namespace

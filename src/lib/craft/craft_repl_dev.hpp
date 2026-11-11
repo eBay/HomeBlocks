@@ -536,6 +536,12 @@ public:
     // logic (in-order apply, stall at a gap, Empty-slot skip, overlay retirement) against a fake
     // index instead of a real VolumeIndexTable.
     async_result< int64_t > commit_with(int64_t upto_lsn, write_index_fn_t write_fn, delete_index_fn_t delete_fn);
+    // Test seam: makes commit() itself (and so every caller of it, e.g. the Sync / catch-up advance) apply through
+    // these instead of a real index -- the light suite has no VolumeIndexTable.
+    void set_index_fns_for_test(write_index_fn_t write_fn, delete_index_fn_t delete_fn) {
+        test_write_fn_ = std::move(write_fn);
+        test_delete_fn_ = std::move(delete_fn);
+    }
 
     // Test seam for read(): runs the same read algorithm, but the index read operation is injected
     // rather than routed through indx_tbl_, so tests can exercise read()'s logic (index/overlay merge,
@@ -700,6 +706,10 @@ private:
     // journal -- commit_lsn = durable_commit_lsn, last_append_lsn = max(journal tail, sync_watermark), the missing
     // set from a walk of the journal above commit_lsn, Empty verdicts and control fields from the image.
     async_status restore_state();
+    // Frees blocks an index write superseded -- at once without a state store, otherwise once the durable commit
+    // frontier covers replacing_lsn (see the .cpp).
+    async_status release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks);
+    async_status free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks);
     // Shared admission check for write/read/keep_alive. Must be called with state_mu_ held.
     bool admits_term_locked(uint64_t term) const { return term == state_.term && state_.term >= state_.fence_term; }
 
@@ -896,6 +906,8 @@ private:
     iomgr::timer_token watchdog_token_;
 #ifdef _PRERELEASE
     std::atomic< int > watchdog_fire_count_{0}; // test-only; never present in production binaries
+    write_index_fn_t test_write_fn_;            // set_index_fns_for_test
+    delete_index_fn_t test_delete_fn_;
 #endif
     checkpoint_trigger_fn_t checkpoint_trigger_{}; // empty until production wiring; unit tests inject a mock
     int64_t checkpoint_lsn_interval_{128};         // commit_lsn delta between checkpoint triggers; see
@@ -913,6 +925,7 @@ private:
     uint64_t persist_done_gen_{0};
     uint64_t persist_ok_gen_{0};
     bool persist_running_{false};
+    bool apply_failed_{false};       // an apply failed in this process: durable_.last_applied_raft_idx stops advancing
     detail::wait_list persist_wait_; // notified (never under state_mu_) whenever persist_done_gen_ moves
     // Slots at or below this were journalled before the last restart and may already be in the durable index (a
     // checkpoint can run between our triggers, so the index can be ahead of durable_commit_lsn). Re-applying such
@@ -920,6 +933,9 @@ private:
     // which the replay re-applies right after. Leaking those blocks is bounded by the replay window; freeing
     // them would corrupt. Guarded by state_mu_; -1 = no replay window.
     int64_t replay_upto_{-1};
+    // Blocks superseded by an index write, waiting for the durable frontier to reach the replacing slot (first).
+    // Guarded by state_mu_. Lost on a crash (a bounded leak).
+    std::vector< std::pair< int64_t, homestore::blk_id > > deferred_frees_;
 };
 
 } // namespace homeblocks
