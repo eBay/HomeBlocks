@@ -216,10 +216,14 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     auto const id = info.id;
     auto vol = create(std::move(info));
     ASSERT_TRUE(vol);
+    // A CRAFT op the replica serves until then: no session, so it changes nothing.
+    craft::client_hdr const hdr{0 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    auto alive = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
+    ASSERT_TRUE(alive) << alive.error().message();
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
     // From the destroy on, not only once the reaper removes the replica, its CRAFT ops are refused.
-    auto early = homeblocks::detail::sync_get(homeblocks::login(*vol, 1 /* client_token */));
+    auto early = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_FALSE(early);
     EXPECT_EQ(early.error(), std::errc::operation_not_supported);
 
@@ -228,9 +232,9 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
 
     // The replica's CRAFT device went with it: a CRAFT op through a handle kept from before is refused.
     EXPECT_EQ((*vol)->craft_dev(), nullptr);
-    auto login = homeblocks::detail::sync_get(homeblocks::login(*vol, 1 /* client_token */));
-    ASSERT_FALSE(login);
-    EXPECT_EQ(login.error(), std::errc::operation_not_supported);
+    auto late = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
+    ASSERT_FALSE(late);
+    EXPECT_EQ(late.error(), std::errc::operation_not_supported);
 }
 
 // Same, but the node restarts right after the destroy committed: whether the reaper ran first (on_destroy) or HomeStore
