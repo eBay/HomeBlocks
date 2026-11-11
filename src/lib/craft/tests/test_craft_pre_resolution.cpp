@@ -141,9 +141,13 @@ protected:
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+        dev_->set_data_member_count(3); // N=3: the leader plus the two members the mock answers for
     }
 
-    auto do_pre_resolve(int64_t upto) { return homeblocks::detail::sync_get(dev_->pre_resolve_slots(upto)); }
+    // Login rounds may verdict (may_verdict=true); fill-only rounds may not.
+    auto do_pre_resolve(int64_t upto, bool may_verdict = true) {
+        return homeblocks::detail::sync_get(dev_->pre_resolve_slots(upto, may_verdict));
+    }
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftQuorumFetcher fetcher_;
@@ -161,7 +165,7 @@ TEST_F(CraftPreResolutionTest, NoUnresolvedSlotsReturnsEmptyWithoutCallingFetche
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty());
+    EXPECT_TRUE(r->empty_slots.empty());
     EXPECT_EQ(fetcher_.call_count, 0);
 }
 
@@ -189,7 +193,7 @@ TEST_F(CraftPreResolutionTest, KnownGapCandidatesStrictlyFilteredToUpto) {
 
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3}));
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     EXPECT_TRUE(dev_->is_missing(7)); // above upto -- untouched
 }
 
@@ -209,7 +213,7 @@ TEST_F(CraftPreResolutionTest, CandidatesExtendPastOwnAppendFrontierUpToUpto) {
 
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{4, 5, 6}));
-    EXPECT_EQ(*r, (std::vector< int64_t >{4, 5, 6}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4, 5, 6}));
     EXPECT_EQ(dev_->last_append_lsn(), 3); // unchanged -- apply_sync_rs_commit_lsn's job, not this one's
 }
 
@@ -303,7 +307,7 @@ TEST_F(CraftPreResolutionTest, SinglePresentDataSlotWrittenAndErasedFromMissing)
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty());
+    EXPECT_TRUE(r->empty_slots.empty());
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
 }
@@ -316,7 +320,7 @@ TEST_F(CraftPreResolutionTest, SinglePresentZeroWriteSlotWrittenAndErasedFromMis
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty());
+    EXPECT_TRUE(r->empty_slots.empty());
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
 }
@@ -331,7 +335,7 @@ TEST_F(CraftPreResolutionTest, SlotInheritedEmptyFromOneRespondingPeer) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     // Empty verdict stays leader-preliminary until this leader's own proposal commits -- local state is
     // apply_sync_rs_commit_lsn's job, not this one's.
     EXPECT_TRUE(dev_->is_missing(3));
@@ -347,7 +351,7 @@ TEST_F(CraftPreResolutionTest, QuorumLacksEvidenceMintsNewEmptyVerdict) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_FALSE(journal_->has_slot(3));
 }
@@ -363,7 +367,7 @@ TEST_F(CraftPreResolutionTest, DataFromOnlyOnePeerAmongMultipleStillUsed) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty());
+    EXPECT_TRUE(r->empty_slots.empty());
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
 }
@@ -383,7 +387,7 @@ TEST_F(CraftPreResolutionTest, EmptyBeatsDataAcrossPeers) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
 }
@@ -402,7 +406,7 @@ TEST_F(CraftPreResolutionTest, EmptyBeatsDataAcrossPeersReverseOrder) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
 }
@@ -418,7 +422,7 @@ TEST_F(CraftPreResolutionTest, DuplicateEmptyVerdictsAcrossPeersDeduped) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
 }
 
 // ── mixed batch ────────────────────────────────────────────────────────────────
@@ -435,7 +439,7 @@ TEST_F(CraftPreResolutionTest, MixedBatchAggregatesEachCandidateIndependentlyInA
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{4, 5}));
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4, 5}));
     EXPECT_TRUE(journal_->has_slot(3));
 }
 
@@ -456,8 +460,8 @@ TEST_F(CraftPreResolutionTest, PerPeerUnrequestedOrDuplicateLsnDiscardsOnlyThatP
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, (std::vector< int64_t >{3, 4})); // 3 -> quorum-lacks-evidence, 4 -> inherited empty
-    EXPECT_FALSE(journal_->has_slot(3));           // A's data was discarded along with the rest of its reply
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3, 4})); // 3 -> quorum-lacks-evidence, 4 -> inherited empty
+    EXPECT_FALSE(journal_->has_slot(3)); // A's data was discarded along with the rest of its reply
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_TRUE(dev_->is_missing(4));
 }
@@ -473,7 +477,8 @@ TEST_F(CraftPreResolutionTest, WriteSlotFailureLeavesLsnMissingNotInEmptySlots) 
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty()); // not verdicted Empty -- a quorum member DID have data for it
+    EXPECT_TRUE(r->empty_slots.empty()); // not verdicted Empty -- a quorum member DID have data for it
+    EXPECT_EQ(r->resolved_upto, 2);      // 3 is unresolved, so nothing at or above it may be proposed
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_EQ(journal_->free_data_calls, 1); // the successful alloc_write_data is freed back, not leaked
@@ -491,10 +496,142 @@ TEST_F(CraftPreResolutionTest, AllocWriteDataFailureLeavesLsnMissingNotInEmptySl
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_TRUE(r.has_value());
-    EXPECT_TRUE(r->empty()); // not verdicted Empty -- a quorum member DID have data for it
+    EXPECT_TRUE(r->empty_slots.empty()); // not verdicted Empty -- a quorum member DID have data for it
+    EXPECT_EQ(r->resolved_upto, 2);      // 3 is unresolved, so nothing at or above it may be proposed
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_EQ(journal_->free_data_calls, 0); // alloc never succeeded -- nothing to free
+}
+
+// ── quorum counting, may_verdict, resolved_upto (docs/craft/resync.md §4.2) ──────────────────────────
+
+// No candidates: everything up to upto is already resolved.
+TEST_F(CraftPreResolutionTest, NoCandidatesResolvesThroughUpto) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {});
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 5);
+}
+
+TEST_F(CraftPreResolutionTest, AllCandidatesResolvedReachesUpto) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 5);
+    EXPECT_TRUE(journal_->has_slot(3));
+}
+
+// Fill-only rounds (may_verdict=false) never mint a fresh Empty: a slot nobody holds stays unresolved and
+// caps resolved_upto below it.
+TEST_F(CraftPreResolutionTest, FillOnlyRoundNeverMintsEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {}}, QuorumSlotResponse{.slots = {}}};
+
+    auto r = do_pre_resolve(/*upto=*/5, /*may_verdict=*/false);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->resolved_upto, 2);
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// A committed tombstone on a member is already decided, so a fill-only round still inherits it.
+TEST_F(CraftPreResolutionTest, FillOnlyRoundStillInheritsCommittedTombstone) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5, /*may_verdict=*/false);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->resolved_upto, 5);
+}
+
+// Unknown replica-set size: no quorum can be established, so no fresh verdict even in a login round.
+TEST_F(CraftPreResolutionTest, UnknownMemberCountNeverMintsEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_data_member_count(0);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {}}, QuorumSlotResponse{.slots = {}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->resolved_upto, 2);
+}
+
+// N=5: the leader plus one omitting responder is 2 < quorum 3, so not enough evidence (the two silent
+// members could both hold an acked write).
+TEST_F(CraftPreResolutionTest, MinorityLacksEvidenceDoesNotVerdict) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_data_member_count(5);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->resolved_upto, 2);
+}
+
+TEST_F(CraftPreResolutionTest, QuorumLacksEvidenceAtFiveMembers) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_data_member_count(5);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {}}, QuorumSlotResponse{.slots = {}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_EQ(r->resolved_upto, 5);
+}
+
+// A malformed reply is discarded before counting, so it is never "lacks" evidence.
+TEST_F(CraftPreResolutionTest, MalformedReplyNeverCountsAsLacksEvidence) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_data_member_count(5);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {
+        QuorumSlotResponse{.slots = {JournalSlot{.lsn = 99, .is_empty = true}}}, // malformed: never requested
+        QuorumSlotResponse{.slots = {}},
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty()); // leader + 1 valid = 2 < 3
+    EXPECT_EQ(r->resolved_upto, 2);
+}
+
+// A hole in the middle caps resolved_upto, and verdicts above it are not returned (they would be ahead of the
+// proposed watermark).
+TEST_F(CraftPreResolutionTest, UnresolvedSlotCapsWatermarkAndDropsLaterVerdicts) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_data_member_count(5);
+    dev_->seed_lsns(2, {});
+    fetcher_.response = {
+        QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}},
+        QuorumSlotResponse{.slots = {JournalSlot{.lsn = 5, .is_empty = true}}},
+    }; // 3: data; 4: held by nobody; 5: committed tombstone; 6: held by nobody
+
+    auto r = do_pre_resolve(/*upto=*/6, /*may_verdict=*/false); // 4 and 6 cannot be verdicted
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 3);
+    EXPECT_TRUE(r->empty_slots.empty()); // 5's tombstone is above the watermark
+    EXPECT_TRUE(journal_->has_slot(3));
 }
 
 } // namespace

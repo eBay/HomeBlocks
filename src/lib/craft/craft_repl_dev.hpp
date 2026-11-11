@@ -94,6 +94,18 @@ struct QuorumSlotResponse {
     std::vector< JournalSlot > slots;
 };
 
+// Result of a leader pre-resolution round (docs/craft/resync.md §4.2).
+//   empty_slots   -- slots <= resolved_upto to carry as Empty verdicts in the SyncRSCommitLSN proposal: freshly
+//                    minted (login rounds only, on quorum-lacks evidence) or inherited from a member's
+//                    committed tombstone.
+//   resolved_upto -- the highest dLSN the leader may propose: every slot <= it is now held by this leader or
+//                    in empty_slots. One below the first slot that could not be resolved (no holder, and not
+//                    allowed or not enough evidence to verdict it Empty, or a failed local write).
+struct PreResolution {
+    std::vector< int64_t > empty_slots;
+    int64_t resolved_upto{-1};
+};
+
 // ─── journal backend abstraction ─────────────────────────────────────────────
 //
 // Injected into CraftReplDev so unit tests can supply a mock without touching
@@ -162,10 +174,11 @@ public:
     // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                   uint32_t timeout_ms) = 0;
-    // Broadcasts fetch_data(lsns) to every responding replica-set member; a non-responding member is
-    // simply absent from the result. Deliberately no replica-set-size/majority-count method: the
-    // contract is "trust whichever subset of members responded" -- there is no replica-set
-    // membership concept anywhere in this backend yet (S8/S9/S10 territory).
+    // Broadcasts fetch_data(lsns) to every OTHER responding replica-set data member (never the caller
+    // itself, never an arbiter); a non-responding member is simply absent from the result. Responses are
+    // evidence, not a vote: pre_resolve_slots counts them against CraftReplDev's data-member count
+    // (set_data_member_count) and never verdicts Empty on fewer than a quorum of members known to lack a
+    // slot.
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
@@ -369,6 +382,10 @@ public:
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
+    // Number of DATA members in this partition's replica set, this replica included (arbiters excluded).
+    // Pre-resolution needs it to tell a quorum of "lacks" evidence from a minority. 0 (unset) means unknown:
+    // pre-resolution then never mints a fresh Empty verdict.
+    void set_data_member_count(uint32_t n) { data_member_count_.store(n, std::memory_order_relaxed); }
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
@@ -501,26 +518,22 @@ private:
         CraftReplDev* owner_;
     };
 
-    // LEADER-only (S5 / SDSTOR-22907). Resolves every slot <= upto not yet confirmed present or Empty by
-    // THIS leader: a known gap in missing_lsns_, or a slot beyond this leader's own last_append_lsn that
-    // upto reaches past (never even opened as a gap -- e.g. a client Resolve naming a dLSN this leader
-    // never itself received, or a login rs_commit_lsn that is the QUORUM's max, not this replica's own).
-    // For each: fetch from the quorum; any responding member reporting is_empty=true wins that slot; a
-    // slot no responding member reports data or Empty for is quorum-lacks-evidence, minted fresh as Empty;
-    // a slot some responding member has real data for is written into this leader's own journal so it can
-    // also correctly serve fetch_data() to others.
-    //
-    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited). A slot whose local
-    // journal write fails after a successful quorum fetch is left out of both the return value and
-    // missing_lsns_/empty_lsns_ (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's own
-    // catch-up). The caller (append()/request_resolution(), SDSTOR-22908) must treat "still missing" as
-    // "not yet safe to propose past this slot", independent of whether the overall async_result succeeded.
+    // LEADER-only (S5 / SDSTOR-22907; docs/craft/resync.md §4.2). Resolves every slot <= upto not yet
+    // confirmed present or Empty by THIS leader: a known gap in missing_lsns_, or a slot beyond this
+    // leader's own last_append_lsn that upto reaches past. For each candidate, from the responses of the
+    // OTHER data members:
+    //   - a member holds data/zero for it    -> written into this leader's journal (it completed late);
+    //   - a member reports a committed Empty -> inherited into empty_slots (Empty beats data);
+    //   - nobody holds it                    -> verdicted Empty ONLY if may_verdict and a quorum of the
+    //     data members (this leader included, non-responders and malformed replies never counted) is known
+    //     to lack it. may_verdict is true only for the login round, which runs under the login fence, so no
+    //     ack path for the slot can still be open (I2). Otherwise the slot stays unresolved.
+    // resolved_upto stops one below the first unresolved candidate; callers must not propose past it.
     //
     // Fails closed (no partial resolution) if peer_fetcher_ is unset or the broadcast itself fails
-    // outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a replica's own
-    // best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an inability to
-    // consult the quorum at all must surface as an error, never be silently swallowed.
-    async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
+    // outright -- this method gates a RAFT proposal, so an inability to consult the quorum must surface as
+    // an error, never be silently swallowed.
+    async_result< PreResolution > pre_resolve_slots(int64_t upto, bool may_verdict);
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
     // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
@@ -642,7 +655,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
+    CraftPeerFetcher* peer_fetcher_{nullptr};      // null until S9 wires CraftConnector
+    std::atomic< uint32_t > data_member_count_{0}; // see set_data_member_count()
     uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 
