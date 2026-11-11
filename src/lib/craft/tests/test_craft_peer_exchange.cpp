@@ -57,6 +57,7 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
+    int reads{0};                          // read_slot calls
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
                                                              lba_count_t /* len */) override {
@@ -69,6 +70,7 @@ public:
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
+        ++reads;
         if (fail_on_read && *fail_on_read == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return co_await mock_read_slot(*this, lsn);
@@ -128,6 +130,101 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────
+
+// ── fetch_range: ranged, size-bounded callee (docs/craft/resync.md §4.3, §4.7) ─────────────────────────
+
+namespace {
+auto do_fetch_range(CraftReplDev& d, std::vector< LsnRange > ranges, uint64_t max_bytes) {
+    return homeblocks::detail::sync_get(d.fetch_range(std::move(ranges), max_bytes));
+}
+std::vector< int64_t > lsns_of(FetchRangeResult const& r) {
+    std::vector< int64_t > v;
+    for (auto const& s : r.slots)
+        v.push_back(s.lsn);
+    return v;
+}
+} // namespace
+
+TEST_F(CraftPeerExchangeTest, FetchRangeServesEverythingWithinBudget) {
+    for (int64_t l : {2, 3, 5})
+        add_slot(l, 0, /*len=*/4);
+    dev_->seed_lsns(5, {4});
+
+    auto r = do_fetch_range(*dev_, {{2, 5}}, /*max_bytes=*/1024);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(lsns_of(*r), (std::vector< int64_t >{2, 3, 5})); // 4 is missing here: omitted
+    EXPECT_EQ(r->next, -1);
+    EXPECT_EQ(r->reclaimed_below, -1);
+}
+
+TEST_F(CraftPeerExchangeTest, FetchRangeStopsAtBudgetWithContinuation) {
+    for (int64_t l = 0; l <= 4; ++l)
+        add_slot(l, 0, /*len=*/4);
+    dev_->seed_lsns(4, {});
+
+    auto r = do_fetch_range(*dev_, {{0, 4}}, /*max_bytes=*/8);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(lsns_of(*r), (std::vector< int64_t >{0, 1}));
+    EXPECT_EQ(r->next, 2);
+    // Reads stop at the budget: slots 0 and 1 fill it exactly, so slot 2 is never read -- a batched read loaded every
+    // slot of the batch first (review on #200).
+    EXPECT_EQ(journal_->reads, 2);
+}
+
+// A slot larger than the whole budget is still returned (alone), so a fetch always makes progress.
+TEST_F(CraftPeerExchangeTest, FetchRangeAlwaysReturnsAtLeastOneSlot) {
+    add_slot(0, 0, /*len=*/100);
+    add_slot(1, 0, /*len=*/4);
+    dev_->seed_lsns(1, {});
+
+    auto r = do_fetch_range(*dev_, {{0, 1}}, /*max_bytes=*/10);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(lsns_of(*r), (std::vector< int64_t >{0}));
+    EXPECT_EQ(r->next, 1);
+}
+
+// Empty and zero-write slots cost no payload, so they never exhaust the budget.
+TEST_F(CraftPeerExchangeTest, FetchRangeEmptyAndZeroSlotsAreFree) {
+    add_slot(0, 0, /*len=*/8, /*all_zeros=*/true);
+    dev_->seed_lsns(2, {});
+    dev_->seed_empty({1});
+    add_slot(2, 0, /*len=*/4);
+
+    auto r = do_fetch_range(*dev_, {{0, 2}}, /*max_bytes=*/4);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(lsns_of(*r), (std::vector< int64_t >{0, 1, 2}));
+    EXPECT_TRUE(r->slots[1].is_empty);
+}
+
+// When the budget runs out at the end of one range, the continuation is the start of the next range.
+TEST_F(CraftPeerExchangeTest, FetchRangeContinuesIntoNextRange) {
+    for (int64_t l : {1, 2, 7, 8})
+        add_slot(l, 0, /*len=*/4);
+    dev_->seed_lsns(8, {});
+
+    auto r = do_fetch_range(*dev_, {{1, 2}, {7, 8}}, /*max_bytes=*/8);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(lsns_of(*r), (std::vector< int64_t >{1, 2}));
+    EXPECT_EQ(r->next, 7);
+}
+
+// A huge sparse range is served in pieces: at most k_fetch_range_max_scan dLSNs are examined per call.
+TEST_F(CraftPeerExchangeTest, FetchRangeCapsTheScan) {
+    dev_->seed_lsns(-1, {});
+    auto r = do_fetch_range(*dev_, {{0, CraftReplDev::k_fetch_range_max_scan + 10}}, /*max_bytes=*/1024);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->slots.empty());
+    EXPECT_EQ(r->next, CraftReplDev::k_fetch_range_max_scan);
+}
+
+TEST_F(CraftPeerExchangeTest, FetchRangeReadErrorPropagates) {
+    add_slot(0, 0, /*len=*/4);
+    dev_->seed_lsns(0, {});
+    journal_->fail_on_read = 0;
+
+    auto r = do_fetch_range(*dev_, {{0, 0}}, /*max_bytes=*/1024);
+    EXPECT_FALSE(r.has_value());
+}
 
 // Requesting zero LSNs returns an empty result vector, not an error.
 TEST_F(CraftPeerExchangeTest, FetchDataEmptyRequest) {

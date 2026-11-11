@@ -46,6 +46,7 @@
 // directly (same pattern as test_craft_truncate.cpp).
 
 #include <gtest/gtest.h>
+#include <deque>
 #include <map>
 #include <optional>
 #include <sisl/logging/logging.h>
@@ -163,6 +164,23 @@ public:
         co_return response;
     }
 
+    // fetch_range: a scripted response queue when non-empty; otherwise the default (delegates to fetch_data).
+    // Every request's ranges are recorded.
+    std::deque< result< FetchRangeResult > > range_script;
+    std::vector< std::vector< LsnRange > > range_requests;
+    TestGate* range_gate{nullptr}; // when set, fetch_range suspends until the gate opens
+    async_result< FetchRangeResult > fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes,
+                                                 uint32_t timeout_ms) override {
+        range_requests.push_back(ranges);
+        if (range_gate) co_await range_gate->wait();
+        if (!range_script.empty()) {
+            auto r = std::move(range_script.front());
+            range_script.pop_front();
+            co_return r;
+        }
+        co_return co_await CraftPeerFetcher::fetch_range(std::move(ranges), max_bytes, timeout_ms);
+    }
+
     // Not exercised by this file -- pre_resolve_slots's quorum broadcast is covered by
     // test_craft_pre_resolution.cpp's own mock.
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
@@ -244,6 +262,10 @@ protected:
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+    }
+
+    auto install(JournalSlot slot, uint64_t term) {
+        return homeblocks::detail::sync_get(dev_->install_fetched_slot(slot, term));
     }
 
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
@@ -1185,6 +1207,262 @@ TEST_F(CraftRaftEntriesTest, ClientWriteRejectedWhileCatchUpInstallsSameSlot) {
     gate.open();
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// ── catch-up retry, backoff and ranged fetch (PR E1, docs/craft/resync.md §4.3) ──────────────────────
+
+namespace {
+result< FetchRangeResult > range_error() { return std::unexpected(std::make_error_condition(std::errc::io_error)); }
+JournalSlot zero_slot(int64_t lsn) {
+    return JournalSlot{.lsn = lsn, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = 1};
+}
+} // namespace
+
+// A failed pass is retried after a backoff delay, and the retry fills the slot.
+TEST_F(CraftRaftEntriesTest, CatchUpRetriesAfterAFailedFetch) {
+    std::vector< std::chrono::milliseconds > delays;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds d) -> async_status {
+        delays.push_back(d);
+        co_return ok();
+    });
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {range_error(), FetchRangeResult{.slots = {zero_slot(3)}}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+
+    EXPECT_EQ(delays, (std::vector< std::chrono::milliseconds >{CraftReplDev::catch_up_min_backoff}));
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+}
+
+// With no progress the backoff doubles up to the cap, and after catch_up_max_failed_passes the runner stops; the
+// next SyncRSCommitLSN restarts it.
+TEST_F(CraftRaftEntriesTest, CatchUpBacksOffThenStopsAndRestartsOnNextSync) {
+    std::vector< std::chrono::milliseconds > delays;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds d) -> async_status {
+        delays.push_back(d);
+        co_return ok();
+    });
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.should_fail = true; // default fetch_range delegates to the failing fetch_data
+    dev_->seed_lsns(/*last_append=*/2, {});
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+
+    ASSERT_EQ(delays.size(), static_cast< size_t >(CraftReplDev::catch_up_max_failed_passes - 1));
+    EXPECT_EQ(delays.front(), CraftReplDev::catch_up_min_backoff);
+    EXPECT_EQ(delays[1], CraftReplDev::catch_up_min_backoff * 2);
+    EXPECT_EQ(delays.back(), CraftReplDev::catch_up_max_backoff); // capped
+    auto const passes = fetcher_.range_requests.size();
+    EXPECT_EQ(passes, static_cast< size_t >(CraftReplDev::catch_up_max_failed_passes));
+
+    fetcher_.should_fail = false;
+    fetcher_.response = {zero_slot(3)};
+    commit_entry(*dev_, 2, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    EXPECT_GT(fetcher_.range_requests.size(), passes); // restarted
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+}
+
+// Without a delay function (light tests, unwired production) a pass that makes no progress ends the runner: no
+// retry, as before E1.
+TEST_F(CraftRaftEntriesTest, CatchUpDoesNotRetryWithoutDelayFn) {
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.should_fail = true;
+    dev_->seed_lsns(/*last_append=*/2, {});
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+
+    EXPECT_EQ(fetcher_.range_requests.size(), 1u);
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// The responder's continuation (`next`) is followed until the request is covered.
+TEST_F(CraftRaftEntriesTest, CatchUpFollowsTheContinuation) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3)}, .next = 4},
+                             FetchRangeResult{.slots = {zero_slot(4), zero_slot(5)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{3, 5}}));
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{4, 5}}));
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
+// Missing slots are sent as ranges, and each request is bounded by catch_up_max_slots.
+TEST_F(CraftRaftEntriesTest, CatchUpChunksRequestsByMaxSlots) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_catch_up_chunk(/*max_bytes=*/1 << 20, /*max_slots=*/2);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3), zero_slot(4)}},
+                             FetchRangeResult{.slots = {zero_slot(5), zero_slot(6)}},
+                             FetchRangeResult{.slots = {zero_slot(7)}}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(7, 0, {}));
+
+    ASSERT_GE(fetcher_.range_requests.size(), 3u);
+    EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{3, 4}}));
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{5, 6}}));
+    EXPECT_EQ(fetcher_.range_requests[2], (std::vector< LsnRange >{{7, 7}}));
+    EXPECT_EQ(dev_->commit_lsn(), 7);
+}
+
+// Non-contiguous missing slots become separate ranges in one request.
+TEST_F(CraftRaftEntriesTest, CatchUpSendsMissingSlotsAsRanges) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/8, {2, 3, 6});
+    fetcher_.response = {zero_slot(2), zero_slot(3), zero_slot(6)};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(8, 0, {}));
+
+    ASSERT_GE(fetcher_.range_requests.size(), 1u);
+    EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{2, 3}, {6, 6}}));
+    EXPECT_FALSE(dev_->is_missing(6));
+}
+
+// A response with a slot outside the request, or at/after its own `next`, is rejected whole.
+TEST_F(CraftRaftEntriesTest, CatchUpRejectsResponsePastItsContinuation) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3), zero_slot(5)}, .next = 4}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// A responder that reports no progress (empty response, continuation at the start) does not loop forever.
+TEST_F(CraftRaftEntriesTest, CatchUpAbandonsABatchThatMakesNoProgress) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {}, .next = 3}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+
+    EXPECT_EQ(fetcher_.range_requests.size(), 1u);
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// A responder past retention reports reclaimed_below; the slots stay missing (baseline recovery, not retry).
+TEST_F(CraftRaftEntriesTest, CatchUpReportsReclaimedResponder) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {}, .next = -1, .reclaimed_below = 10}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// ── review on #200 ──
+
+// A slot an in-flight client write still owns is not resolved: install reports it as no progress.
+TEST_F(CraftRaftEntriesTest, CatchUpSlotOwnedByAClientWriteIsNotProgress) {
+    dev_->seed_term(1);
+    TestGate gate;
+    journal_->write_gates[3] = &gate;
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.write(craft::client_hdr{.term = 1, .commit_lsn = -1, .all_committed_lsn = -1}, 3, 0, k_page_size,
+                             sisl::sg_list{});
+        co_return ok();
+    }(*dev_, w));
+    ASSERT_FALSE(w.has_value());
+    ASSERT_TRUE(dev_->is_missing(3));
+
+    auto r = install(zero_slot(3), 1);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(*r);
+
+    journal_->write_gates.clear();
+    gate.open();
+    ASSERT_TRUE(w.has_value());
+    EXPECT_TRUE(w->has_value());
+    r = install(zero_slot(3), 1); // filled by the write now: resolved
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(*r);
+}
+
+// A Sync that raises the target while a pass is failing is not lost when that pass gives up.
+TEST_F(CraftRaftEntriesTest, CatchUpKeepsATargetRaisedDuringAFailedPass) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    TestGate gate;
+    fetcher_.range_gate = &gate;
+    fetcher_.range_script = {range_error(), range_error()};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 1u); // held in the first fetch
+    commit_entry(*dev_, 2, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(6, 0, {}));
+    EXPECT_EQ(fetcher_.range_requests.size(), 1u); // the running runner owns the raised target
+
+    fetcher_.range_gate = nullptr;
+    gate.open();
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{3, 6}}));
+}
+
+// Slots a responder reports as reclaimed are left for baseline recovery: no retry and no backoff for them, while
+// the recoverable part of the range continues.
+TEST_F(CraftRaftEntriesTest, CatchUpLeavesReclaimedSlotsForBaseline) {
+    dev_->set_peer_fetcher(&fetcher_);
+    int delays = 0;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds) -> async_status {
+        ++delays;
+        co_return ok();
+    });
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {}, .next = -1, .reclaimed_below = 5},
+                             FetchRangeResult{.slots = {zero_slot(5), zero_slot(6)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(6, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{5, 6}}));
+    EXPECT_EQ(delays, 0);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_TRUE(dev_->is_missing(4));
+    EXPECT_FALSE(dev_->is_missing(5));
+    EXPECT_FALSE(dev_->is_missing(6));
+}
+
+// A response that fails validation changes nothing -- not even the retention floor it reports: the slots stay in
+// the next pass's request.
+TEST_F(CraftRaftEntriesTest, CatchUpIgnoresTheRetentionFloorOfARejectedResponse) {
+    dev_->set_peer_fetcher(&fetcher_);
+    int delays = 0;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds) -> async_status {
+        ++delays;
+        co_return ok();
+    });
+    dev_->seed_lsns(/*last_append=*/2, {});
+    // Slot 5 lies past `next` = 4: invalid, so its reclaimed_below must not be recorded.
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3), zero_slot(5)}, .next = 4, .reclaimed_below = 10},
+                             FetchRangeResult{.slots = {zero_slot(3), zero_slot(4), zero_slot(5)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{3, 5}}));
+    EXPECT_EQ(delays, 1); // an ordinary failed pass, retried after backoff
+    EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// A zero slot limit is clamped to one, so catch-up still makes progress instead of building empty batches forever.
+TEST_F(CraftRaftEntriesTest, CatchUpClampsAZeroSlotLimit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_catch_up_chunk(/*max_bytes=*/0, /*max_slots=*/0);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3)}, .next = -1},
+                             FetchRangeResult{.slots = {zero_slot(4)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(4, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{3, 3}}));
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{4, 4}}));
+    EXPECT_EQ(dev_->missing_count(), 0u);
 }
 
 } // namespace
