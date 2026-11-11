@@ -400,15 +400,13 @@ status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
         }
     }
 
-    auto const ordinal = info.ordinal;
     auto vol =
         volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
                                   dynamic_chunk_allocation(), orphan_idx ? std::move(orphan_idx->first) : nullptr);
+    // A failed create keeps its ordinal reserved: an index table it adopted still owns chunks under that ordinal, and a
+    // volume given the ordinal again would reuse them. An ordinal lost to a rare failure costs nothing.
+    if (!vol) { return std::unexpected(volume_error::INTERNAL_ERROR); }
     auto lg = std::scoped_lock(vol_lock_);
-    if (!vol) {
-        ordinal_reserver_->unreserve(ordinal);
-        return std::unexpected(volume_error::INTERNAL_ERROR);
-    }
     vol_map_.emplace(vol->id(), vol);
     return ok();
 }
