@@ -27,7 +27,9 @@ the natural assumption:
   client, not the `craft_replica` interface, not the codec.
 
 A volume created in CRAFT mode (see [Creating a CRAFT volume](#creating-a-craft-volume)) is backed by a
-`CraftReplDev`; on any other volume these functions return `std::errc::not_supported`.
+`CraftReplDev`; on any other volume these functions return `std::errc::not_supported`. While HomeBlocks is restricted
+or shutting down, or the volume is being destroyed, they return `std::errc::operation_not_supported`, and on an offline
+volume `volume_error::OFFLINE`. A volume is destroyed only once no CRAFT op is in flight on it.
 
 All methods are async/coroutine-style (`async_result<T>` / `async_status`) matching the existing
 HomeBlocks convention.

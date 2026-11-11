@@ -257,6 +257,10 @@ sisl::async::task< void > volume::destroy() {
     LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
     destroy_started_ = true;
 
+    // The CRAFT device goes before the index and journal it works on: no CRAFT op runs anymore (each one counts itself
+    // in flight on the volume, and the destroy starts only when none is), and its watchdog stops with it.
+    craft_dev_.reset();
+
     // 1. destroy the repl dev. A CRAFT volume's RAFT group is destroyed through RAFT, by whoever removes the partition;
     // every member's teardown follows it, so this one leaves the group alone.
     if (rd_ && !is_craft()) {

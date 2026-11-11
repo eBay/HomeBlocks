@@ -24,57 +24,87 @@
 // thing taken from craft_client is <craft/types.hpp>, the vocabulary the wire is defined in.
 //
 // A volume with no CRAFT backend (a plain HomeStore volume, or a CRAFT volume not yet wired) returns
-// std::errc::not_supported.
+// std::errc::not_supported. A system restricted or shutting down, or a volume being destroyed, refuses the op with
+// std::errc::operation_not_supported, and an offline volume with volume_error::OFFLINE.
+
+#include <optional>
 
 #include <homeblks/home_blocks.hpp>
 
 #include "craft/craft_repl_dev.hpp" // CraftReplDev: the concrete backend
+#include "homeblks_impl.hpp"        // the system-level guards
 #include "volume/volume.hpp"        // volume::craft_dev()
 
 namespace homeblocks {
 
 namespace {
-CraftReplDev* craft_dev_of(volume_handle const& v) { return v ? v->craft_dev() : nullptr; }
 auto no_craft_backend() { return std::unexpected(std::make_error_condition(std::errc::not_supported)); }
+
+// Why `vol` can't serve a CRAFT op now, if it can't. Called with the op counted in flight on the volume (vol_io_guard):
+// its destroy starts only once the volume is DESTROYING and no op is in flight, so it either waits for this op or is
+// seen here, and the CraftReplDev outlives the op.
+std::optional< std::error_condition > craft_unavailable(volume_handle const& vol, char const* op) {
+    auto const hb = HomeBlocksImpl::instance();
+    if (hb->is_restricted() || hb->is_shutting_down()) {
+        LOGE("Can't serve CRAFT {}: the system is restricted or shutting down.", op);
+        return std::make_error_condition(std::errc::operation_not_supported);
+    }
+    if (vol->is_offline()) {
+        LOGE("Can't serve CRAFT {}: volume {} is offline.", op, vol->id_str());
+        return std::error_condition{volume_error::OFFLINE};
+    }
+    if (vol->is_destroying()) {
+        LOGE("Can't serve CRAFT {}: volume {} is being destroyed.", op, vol->id_str());
+        return std::make_error_condition(std::errc::operation_not_supported);
+    }
+    if (!vol->craft_dev()) { return std::make_error_condition(std::errc::not_supported); }
+    return std::nullopt;
+}
 } // namespace
 
 async_result< craft::LoginResult > login(volume_handle const& vol, uint64_t client_token) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->login(client_token);
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "login")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->login(client_token);
 }
 
 async_status logout(volume_handle const& vol, craft::client_hdr hdr) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->logout(hdr);
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "logout")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->logout(hdr);
 }
 
 async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::client_hdr hdr, int64_t dlsn,
                                             uint64_t addr, uint64_t len, sisl::sg_list data) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->write(hdr, dlsn, addr, len, std::move(data));
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "write")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->write(hdr, dlsn, addr, len, std::move(data));
 }
 
 async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr, int64_t read_lsn,
                                               uint64_t addr, uint64_t len, sisl::sg_list dest) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->read(hdr, read_lsn, addr, len, std::move(dest));
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "read")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->read(hdr, read_lsn, addr, len, std::move(dest));
 }
 
 async_result< craft::lsn_pair > keep_alive(volume_handle const& vol, craft::client_hdr hdr) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->keep_alive(hdr);
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "keep_alive")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->keep_alive(hdr);
 }
 
 async_result< craft::resolution_result > request_resolution(volume_handle const& vol, craft::client_hdr hdr,
                                                             int64_t upto) {
-    auto* d = craft_dev_of(vol);
-    if (!d) co_return no_craft_backend();
-    co_return co_await d->request_resolution(hdr, upto);
+    if (!vol) co_return no_craft_backend();
+    vol_io_guard const guard{vol};
+    if (auto const err = craft_unavailable(vol, "request_resolution")) co_return std::unexpected(*err);
+    co_return co_await vol->craft_dev()->request_resolution(hdr, upto);
 }
 
 } // namespace homeblocks

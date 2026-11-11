@@ -214,11 +214,18 @@ TEST_F(CraftVolumeTest, RestartReattachesJournal) {
 TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     auto info = craft_vol_info("craft_vol_group_destroy");
     auto const id = info.id;
-    ASSERT_TRUE(create(std::move(info)));
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     ASSERT_TRUE(wait_for_group_gone(id));
+
+    // The replica's CRAFT device went with it: a CRAFT op through a handle kept from before is refused.
+    EXPECT_EQ((*vol)->craft_dev(), nullptr);
+    auto login = homeblocks::detail::sync_get(homeblocks::login(*vol, 1 /* client_token */));
+    ASSERT_FALSE(login);
+    EXPECT_EQ(login.error(), std::errc::operation_not_supported);
 }
 
 // Same, but the node restarts right after the destroy committed: whether the reaper ran first (on_destroy) or HomeStore
