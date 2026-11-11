@@ -1429,6 +1429,42 @@ TEST_F(CraftRaftEntriesTest, CatchUpLeavesReclaimedSlotsForBaseline) {
     EXPECT_FALSE(dev_->is_missing(6));
 }
 
+// A response that fails validation changes nothing -- not even the retention floor it reports: the slots stay in
+// the next pass's request.
+TEST_F(CraftRaftEntriesTest, CatchUpIgnoresTheRetentionFloorOfARejectedResponse) {
+    dev_->set_peer_fetcher(&fetcher_);
+    int delays = 0;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds) -> async_status {
+        ++delays;
+        co_return ok();
+    });
+    dev_->seed_lsns(/*last_append=*/2, {});
+    // Slot 5 lies past `next` = 4: invalid, so its reclaimed_below must not be recorded.
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3), zero_slot(5)}, .next = 4, .reclaimed_below = 10},
+                             FetchRangeResult{.slots = {zero_slot(3), zero_slot(4), zero_slot(5)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{3, 5}}));
+    EXPECT_EQ(delays, 1); // an ordinary failed pass, retried after backoff
+    EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// A zero slot limit is clamped to one, so catch-up still makes progress instead of building empty batches forever.
+TEST_F(CraftRaftEntriesTest, CatchUpClampsAZeroSlotLimit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_catch_up_chunk(/*max_bytes=*/0, /*max_slots=*/0);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {zero_slot(3)}, .next = -1},
+                             FetchRangeResult{.slots = {zero_slot(4)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(4, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{3, 3}}));
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{4, 4}}));
+    EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
 } // namespace
 } // namespace homeblocks
 

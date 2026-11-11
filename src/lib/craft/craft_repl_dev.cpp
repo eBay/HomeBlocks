@@ -2154,18 +2154,19 @@ async_result< size_t > CraftReplDev::catch_up_pass(std::vector< LsnRange > range
                 LOGE("catch-up: fetch_range failed: {}", r.error().message());
                 co_return resolved;
             }
-            if (r->reclaimed_below >= 0) {
-                // Past retention on the responder: baseline recovery (§4.9) is the remedy, not a retry. Those slots
-                // stay missing but are left out of later passes; the rest of the request continues.
-                LOGW("catch-up: responder reclaimed below {} -- baseline recovery needed", r->reclaimed_below);
-                std::lock_guard lk{state_mu_};
-                catch_up_reclaimed_below_ = std::max(catch_up_reclaimed_below_, r->reclaimed_below);
-            }
             if (auto bad = validate_range_response(batch, r->next, r->slots); bad) {
                 LOGE("catch-up: fetch_range response lsn={} outside the request, out of order, or past `next` -- "
                      "rejecting the response",
                      *bad);
-                co_return resolved;
+                co_return resolved; // a rejected response changes nothing, its retention floor included
+            }
+            if (r->reclaimed_below >= 0) {
+                // Past retention on the responder: baseline recovery (§4.9) is the remedy, not a retry. Those slots
+                // stay missing but are left out of later passes; the rest of the request continues. Recorded only
+                // for a response that passed validation (review on #200).
+                LOGW("catch-up: responder reclaimed below {} -- baseline recovery needed", r->reclaimed_below);
+                std::lock_guard lk{state_mu_};
+                catch_up_reclaimed_below_ = std::max(catch_up_reclaimed_below_, r->reclaimed_below);
             }
             for (auto& slot : r->slots) {
                 auto ok_r = co_await install_fetched_slot(slot, term);

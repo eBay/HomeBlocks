@@ -21,6 +21,7 @@
 #include <homestore/replication/repl_dev.hpp>
 #include <iomgr/timer.hpp> // iomgr::timer_token -- RAII recurring timer used by the watchdog
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -422,9 +423,11 @@ public:
     using retry_delay_fn_t = std::function< async_status(std::chrono::milliseconds) >;
     void set_retry_delay_fn(retry_delay_fn_t fn) { retry_delay_ = std::move(fn); }
     static retry_delay_fn_t iomgr_retry_delay(); // an iomgr one-shot timer as an awaitable delay
+    // Both limits are clamped to at least 1: a zero slot limit would build empty batches forever (review on #200),
+    // and a zero byte budget is meaningless (a response always carries at least one slot).
     void set_catch_up_chunk(uint64_t max_bytes, size_t max_slots) {
-        catch_up_max_bytes_ = max_bytes;
-        catch_up_max_slots_ = max_slots;
+        catch_up_max_bytes_ = std::max< uint64_t >(max_bytes, 1);
+        catch_up_max_slots_ = std::max< size_t >(max_slots, 1);
     }
     static constexpr std::chrono::milliseconds catch_up_min_backoff{100};
     static constexpr std::chrono::milliseconds catch_up_max_backoff{5000};
