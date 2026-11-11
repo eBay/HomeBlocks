@@ -243,7 +243,9 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     if (me() == 0) {
         auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
         ASSERT_TRUE(vol) << vol.error().message();
-        g_barrier->publish(group(id)->get_last_commit_lsn()); // covers CreateVolume, applied here
+        // At least CreateVolume's LSN, appended before it committed. Not the commit LSN: the create returns from the
+        // apply, before HomeStore advances that.
+        g_barrier->publish(group(id)->get_last_append_lsn());
     }
     ASSERT_TRUE(wait_until([&id] { return group(id) != nullptr; }));
     if (me() != 1) {
@@ -251,8 +253,8 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     }
     ASSERT_TRUE(sync());
 
-    // Member 1 has applied CreateVolume, and failed to, once it committed as far as member 0: HomeStore advances the
-    // commit LSN after the apply.
+    // Member 1 has applied CreateVolume, and failed to, once it committed up to that LSN: HomeStore advances the commit
+    // LSN after the apply.
     if (me() == 1) {
         auto const created_at = g_barrier->published();
         ASSERT_TRUE(wait_until([&id, created_at] {
