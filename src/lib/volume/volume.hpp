@@ -47,6 +47,14 @@ using VolIdxTablePtr = shared< VolumeIndexTable >;
 using ReplDevPtr = shared< homestore::repl_dev >;
 using index_cfg_t = homestore::BtreeConfig;
 
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
+// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+inline bool is_going_away(homestore::repl_dev const& group) {
+    auto const stage = group.get_stage();
+    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
+        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
+}
+
 using read_blks_list_t = std::vector< std::pair< lba_t, homestore::multi_blk_id > >;
 struct vol_read_ctx {
     const io_req* req;

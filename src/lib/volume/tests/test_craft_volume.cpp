@@ -218,6 +218,11 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     ASSERT_TRUE(vol);
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+    // From the destroy on, not only once the reaper removes the replica, its CRAFT ops are refused.
+    auto early = homeblocks::detail::sync_get(homeblocks::login(*vol, 1 /* client_token */));
+    ASSERT_FALSE(early);
+    EXPECT_EQ(early.error(), std::errc::operation_not_supported);
+
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     ASSERT_TRUE(wait_for_group_gone(id));
 

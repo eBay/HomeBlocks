@@ -170,14 +170,6 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
     co_return vol_ptr;
 }
 
-// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
-// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
-static bool is_going_away(homestore::repl_dev const& group) {
-    auto const stage = group.get_stage();
-    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
-        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
-}
-
 // CRAFT create on the member that receives it: forms the partition's RAFT group with every member, then replicates the
 // volume itself through the group's first entry, CreateVolume. Returns once that entry committed and this member
 // created its replica; the other members create theirs as they apply it.
@@ -636,8 +628,8 @@ std::vector< volume_id_t > HomeBlocksImpl::volume_ids() const {
 // Shared guard. Returns the volume's block size on success, or the rejecting volume_error.
 static result< uint32_t > io_precheck(volume_handle const& vol, uint64_t addr, uint64_t len, const char* op) {
     auto hb = HomeBlocksImpl::instance();
-    if (hb->is_restricted()) {
-        LOGE("Can't serve {}, system is in restricted mode.", op);
+    if (!hb || hb->is_restricted()) { // the instance is gone once a shutdown finished
+        LOGE("Can't serve {}, system is in restricted mode or shut down.", op);
         return std::unexpected(std::errc::operation_not_supported);
     }
     if (vol->is_craft()) {

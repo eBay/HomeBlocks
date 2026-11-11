@@ -44,9 +44,10 @@ auto no_craft_backend() { return std::unexpected(std::make_error_condition(std::
 // its destroy starts only once the volume is DESTROYING and no op is in flight, so it either waits for this op or is
 // seen here, and the CraftReplDev outlives the op.
 std::optional< std::error_condition > craft_unavailable(volume_handle const& vol, char const* op) {
+    // The instance is gone once a shutdown finished, while a caller may still hold the handle.
     auto const hb = HomeBlocksImpl::instance();
-    if (hb->is_restricted() || hb->is_shutting_down()) {
-        LOGE("Can't serve CRAFT {}: the system is restricted or shutting down.", op);
+    if (!hb || hb->is_restricted() || hb->is_shutting_down()) {
+        LOGE("Can't serve CRAFT {}: the system is restricted or shut down.", op);
         return std::make_error_condition(std::errc::operation_not_supported);
     }
     if (vol->is_offline()) {
@@ -55,6 +56,12 @@ std::optional< std::error_condition > craft_unavailable(volume_handle const& vol
     }
     if (vol->is_destroying()) {
         LOGE("Can't serve CRAFT {}: volume {} is being destroyed.", op, vol->id_str());
+        return std::make_error_condition(std::errc::operation_not_supported);
+    }
+    // Its group's destroy is under way: the replica goes at the reaper's next pass (a minute later in production), and
+    // whatever it acknowledged until then would go with it.
+    if (auto const& rd = vol->rd(); !rd || is_going_away(*rd)) {
+        LOGE("Can't serve CRAFT {}: the RAFT group of volume {} is being destroyed.", op, vol->id_str());
         return std::make_error_condition(std::errc::operation_not_supported);
     }
     if (!vol->craft_dev()) { return std::make_error_condition(std::errc::not_supported); }
