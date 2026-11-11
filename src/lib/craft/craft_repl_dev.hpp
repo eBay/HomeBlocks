@@ -55,29 +55,29 @@ class VolumeIndexTable;
 
 // Per-partition CRAFT state. Authoritative in memory; recovered from the journal + superblock on restart.
 struct CraftPartitionState {
-    int64_t commit_lsn{-1};        // contiguous committed prefix (== Synced)
-    int64_t last_append_lsn{-1};   // highest appended dLSN (may be uncommitted)
-    uint64_t client_token{0};      // token from the last successful InternalLogin
-    uint64_t term{0};              // current SESSION term: the only term whose IO is admitted. Changes only when an
-                                   // InternalLogin is applied (docs/craft/resync.md §4.6).
-    uint64_t fence_term{0};        // highest term of a login poll answered (PR C raises it). While fence_term > term
-                                   // the replica is fenced: it admits neither the old session nor the new one.
-    uint64_t aborted_upto{0};      // every login term <= this was aborted (LoginAborted); its InternalLogin is a no-op
+    int64_t commit_lsn{-1};      // contiguous committed prefix (== Synced)
+    int64_t last_append_lsn{-1}; // highest appended dLSN (may be uncommitted)
+    uint64_t client_token{0};    // token from the last successful InternalLogin
+    uint64_t term{0};            // current SESSION term: the only term whose IO is admitted. Changes only when an
+                                 // InternalLogin is applied (docs/craft/resync.md §4.6).
+    uint64_t fence_term{0};      // highest term of a login poll answered (PR C raises it). While fence_term > term
+                                 // the replica is fenced: it admits neither the old session nor the new one.
+    uint64_t aborted_upto{0};    // every login term <= this was aborted (LoginAborted); its InternalLogin is a no-op
     int64_t last_applied_raft_idx{-1}; // highest RAFT log index applied -- replayed/duplicate entries at or below
                                        // it are skipped. In-memory until S8 persists CraftPartitionState.
-    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
-                                   // floors journal reclaim (S8: truncate below min(this, checkpointed apply
-                                   // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
-                                   // TODO(S8): this is client-controlled wire input with only a narrow
-                                   // malformed-negative check applied where it's captured (write()/read()/
-                                   // keep_alive()) -- there is NO per-call bound possible there: a lagging
-                                   // replica legitimately sees this arrive ahead of its own last_append_lsn/
-                                   // commit_lsn (that gap is the signal it needs to catch up via S6 peer
-                                   // exchange), so clamping against local state would break that. Before using
-                                   // this as a reclaim floor, S8 must validate it against real journal/
-                                   // checkpoint state (e.g. never reclaim past what's actually durable/
-                                   // replicated here), since a buggy/malicious client could otherwise poison
-                                   // it with an absurdly large value with no local signal to catch it.
+    int64_t all_committed_lsn{-1};     // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
+                                       // floors journal reclaim (S8: truncate below min(this, checkpointed apply
+                                       // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
+                                       // TODO(S8): this is client-controlled wire input with only a narrow
+                                       // malformed-negative check applied where it's captured (write()/read()/
+                                       // keep_alive()) -- there is NO per-call bound possible there: a lagging
+                                       // replica legitimately sees this arrive ahead of its own last_append_lsn/
+                                       // commit_lsn (that gap is the signal it needs to catch up via S6 peer
+                                       // exchange), so clamping against local state would break that. Before using
+                                       // this as a reclaim floor, S8 must validate it against real journal/
+                                       // checkpoint state (e.g. never reclaim past what's actually durable/
+                                       // replicated here), since a buggy/malicious client could otherwise poison
+                                       // it with an absurdly large value with no local signal to catch it.
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
