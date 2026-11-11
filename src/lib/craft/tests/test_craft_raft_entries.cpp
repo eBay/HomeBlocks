@@ -137,6 +137,43 @@ public:
     }
 
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
+
+    bool fail_tail{false};
+    async_result< int64_t > tail_lsn() override {
+        if (fail_tail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        co_return slots.empty() ? -1 : slots.rbegin()->first;
+    }
+};
+
+// ── durable state store mock (S8) ─────────────────────────────────────────────
+//
+// Keeps the last persisted image and round-trips it through the real codec on load(), so restart tests also
+// exercise encode/decode. fail_on_call fails one specific persist() call (1-based); fail_persist fails all.
+class MockCraftStateStore : public CraftStateStore {
+public:
+    std::optional< CraftDurableState > saved;
+    int persist_calls{0};
+    bool fail_persist{false};
+    int fail_on_call{0};
+    bool fail_load{false};
+    TestGate* gate{nullptr}; // when set, persist suspends until the gate opens
+
+    result< std::optional< CraftDurableState > > load() override {
+        if (fail_load) return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (!saved) return std::optional< CraftDurableState >{};
+        auto bytes = encode_durable_state(*saved);
+        auto d = decode_durable_state(bytes.data(), bytes.size());
+        if (!d) return std::unexpected(std::make_error_condition(std::errc::illegal_byte_sequence));
+        return d;
+    }
+    async_status persist(CraftDurableState const& s) override {
+        int const call = ++persist_calls;
+        if (gate) co_await gate->wait();
+        if (fail_persist || call == fail_on_call)
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        saved = s;
+        co_return ok();
+    }
 };
 
 // ── peer fetcher mock ─────────────────────────────────────────────────────────
@@ -196,15 +233,16 @@ struct MockCraftCheckpointTrigger {
     int call_count{0};
     bool last_force{false};
     bool fail_next{false};
+    bool flushed{true}; // false: the request coalesced with a flush already running
 
-    async_status operator()(bool force) {
+    async_result< bool > operator()(bool force) {
         ++call_count;
         last_force = force;
         if (fail_next) {
             fail_next = false;
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         }
-        co_return ok();
+        co_return flushed;
     }
 };
 
@@ -273,6 +311,44 @@ protected:
             dev_->apply_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(empty_slots)));
     }
 
+public:
+    // S8 helpers: the private applies and persist_state() are reachable only through this (friended) fixture.
+    async_status abort_async(uint64_t upto) { return dev_->apply_login_aborted(upto); }
+    MockCraftStateStore* wire_store(CraftReplDev& dev) {
+        auto s = std::make_unique< MockCraftStateStore >();
+        auto* raw = s.get();
+        dev.set_state_store(std::move(s));
+        return raw;
+    }
+    auto apply_login(uint64_t token, uint64_t term, std::optional< int64_t > rs) {
+        return homeblocks::detail::sync_get(dev_->apply_internal_login(token, term, rs));
+    }
+    auto apply_abort(uint64_t upto) { return homeblocks::detail::sync_get(dev_->apply_login_aborted(upto)); }
+    async_status persist(CraftReplDev& dev) { return dev.persist_state(); }
+
+    // Simulates a restart: a fresh device over a copy of this journal and of the persisted image, recovered
+    // through the production restart path. The fetcher, when given, is wired before recovery runs.
+    struct Restarted {
+        std::shared_ptr< CraftReplDev > dev;
+        MockCraftJournalBackend* journal;
+        MockCraftStateStore* store;
+    };
+    Restarted restart(std::optional< CraftDurableState > image, std::map< int64_t, JournalSlot > slots,
+                      MockCraftPeerFetcher* fetcher = nullptr, bool fail_tail = false, bool fail_load = false) {
+        auto j = std::make_unique< MockCraftJournalBackend >();
+        auto* jraw = j.get();
+        j->slots = std::move(slots);
+        j->fail_tail = fail_tail;
+        auto dev = CraftReplDev::create(volume_id_t{}, std::move(j), k_page_size, nullptr);
+        auto* store = wire_store(*dev);
+        store->saved = std::move(image);
+        store->fail_load = fail_load;
+        if (fetcher) dev->set_peer_fetcher(fetcher);
+        dev->trigger_on_restart(); // every mock completes inline, so recovery has finished on return
+        return Restarted{dev, jraw, store};
+    }
+
+protected:
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftPeerFetcher fetcher_;
     MockCraftCheckpointTrigger trigger_;
@@ -1463,6 +1539,463 @@ TEST_F(CraftRaftEntriesTest, CatchUpClampsAZeroSlotLimit) {
     EXPECT_EQ(fetcher_.range_requests[0], (std::vector< LsnRange >{{3, 3}}));
     EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{4, 4}}));
     EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// ══ S8: durable partition state and restart recovery (SDSTOR-22745) ══════════
+
+JournalSlot page_slot(int64_t lsn) {
+    return JournalSlot{.lsn = lsn,
+                       .all_zeros = true,
+                       .lba_off_bytes = static_cast< lba_t >(lsn) * k_page_size,
+                       .len_bytes = k_page_size};
+}
+
+std::map< int64_t, JournalSlot > zero_slots(std::initializer_list< int64_t > lsns) {
+    std::map< int64_t, JournalSlot > m;
+    for (int64_t l : lsns)
+        m[l] = page_slot(l);
+    return m;
+}
+
+CraftDurableState sample_state() {
+    CraftDurableState s;
+    s.term = 3;
+    s.fence_term = 4;
+    s.client_token = 77;
+    s.aborted_upto = 2;
+    s.last_applied_raft_idx = 9;
+    s.durable_commit_lsn = 1;
+    s.sync_watermark = 6;
+    s.catch_up_target = 6;
+    s.empty_lsns = {4};
+    return s;
+}
+
+// ── codec ──
+
+TEST(CraftDurableStateCodec, RoundTrips) {
+    auto s = sample_state();
+    s.empty_lsns = {2, 4, 9};
+    auto bytes = encode_durable_state(s);
+    auto d = decode_durable_state(bytes.data(), bytes.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, s);
+
+    CraftDurableState fresh;
+    bytes = encode_durable_state(fresh);
+    d = decode_durable_state(bytes.data(), bytes.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, fresh);
+}
+
+TEST(CraftDurableStateCodec, RejectsMalformedImages) {
+    auto s = sample_state();
+    s.empty_lsns = {4, 9};
+    auto good = encode_durable_state(s);
+
+    EXPECT_FALSE(decode_durable_state(nullptr, 0).has_value());
+    EXPECT_FALSE(decode_durable_state(good.data(), 10).has_value());              // shorter than the header
+    EXPECT_FALSE(decode_durable_state(good.data(), good.size() - 1).has_value()); // empties cut short
+    auto longer = good;
+    longer.push_back(0);
+    EXPECT_FALSE(decode_durable_state(longer.data(), longer.size()).has_value()); // trailing bytes
+
+    auto bad_magic = good;
+    bad_magic[0] ^= 0xff;
+    EXPECT_FALSE(decode_durable_state(bad_magic.data(), bad_magic.size()).has_value());
+    auto bad_version = good;
+    bad_version[8] ^= 0xff;
+    EXPECT_FALSE(decode_durable_state(bad_version.data(), bad_version.size()).has_value());
+
+    // Verdicts must be strictly ascending and above durable_commit_lsn (1).
+    size_t const first_empty = good.size() - 2 * sizeof(int64_t);
+    auto unsorted = good;
+    int64_t const nine = 9, four = 4, one = 1;
+    std::memcpy(unsorted.data() + first_empty, &nine, sizeof(nine));
+    std::memcpy(unsorted.data() + first_empty + sizeof(int64_t), &four, sizeof(four));
+    EXPECT_FALSE(decode_durable_state(unsorted.data(), unsorted.size()).has_value());
+    auto at_frontier = good;
+    std::memcpy(at_frontier.data() + first_empty, &one, sizeof(one));
+    EXPECT_FALSE(decode_durable_state(at_frontier.data(), at_frontier.size()).has_value());
+}
+
+// ── write-ahead persistence ──
+
+// Without a store nothing is persisted and every apply behaves as before S8.
+TEST_F(CraftRaftEntriesTest, NoStorePersistIsANoOp) {
+    auto r = homeblocks::detail::sync_get(persist(*dev_));
+    EXPECT_TRUE(r.has_value());
+    ASSERT_TRUE(apply_login(42, 5, std::nullopt).has_value());
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// InternalLogin persists the fence, then the admitted term and token, and only then admits the session.
+TEST_F(CraftRaftEntriesTest, InternalLoginPersistsFenceAndTermBeforeAdmitting) {
+    auto* store = wire_store(*dev_);
+    ASSERT_TRUE(apply_login(42, 5, std::nullopt).has_value());
+
+    EXPECT_EQ(dev_->term(), 5u);
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->fence_term, 5u);
+    EXPECT_EQ(store->saved->term, 5u);
+    EXPECT_EQ(store->saved->client_token, 42u);
+    EXPECT_EQ(store->persist_calls, 2); // fence, then admission
+}
+
+// If the fence cannot be made durable the login fails before truncating: the stale tail stays and the new
+// session is not admitted (the in-memory fence keeps rejecting the old session meanwhile).
+TEST_F(CraftRaftEntriesTest, InternalLoginFencePersistFailureStopsBeforeTruncation) {
+    auto* store = wire_store(*dev_);
+    store->fail_on_call = 1;
+    dev_->seed_lsns(/*last_append=*/8, {});
+
+    auto r = apply_login(42, 5, /*rs=*/6);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_FALSE(journal_->truncated_to.has_value());
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->fence_term(), 5u);
+}
+
+// If the admission cannot be made durable the session is not admitted, even though truncation already ran.
+TEST_F(CraftRaftEntriesTest, InternalLoginTermPersistFailureDoesNotAdmit) {
+    auto* store = wire_store(*dev_);
+    store->fail_on_call = 2;
+    dev_->seed_lsns(/*last_append=*/8, {});
+
+    auto r = apply_login(42, 5, /*rs=*/6);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(journal_->truncated_to, 6);
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->fence_term(), 5u);
+}
+
+// The fence is lowered only once the abort is durable: while the persist is in flight the replica stays fenced.
+TEST_F(CraftRaftEntriesTest, LoginAbortedPersistsBeforeLoweringFence) {
+    auto* store = wire_store(*dev_);
+    ASSERT_TRUE(apply_login(42, 3, std::nullopt).has_value()); // session 3, durable
+    dev_->seed_fence_term(5); // a login poll for term 5 was answered (PR C raises this in production)
+    TestGate gate;
+    store->gate = &gate;
+    homeblocks::detail::detach(abort_async(5));
+    EXPECT_EQ(dev_->fence_term(), 5u); // persisting: still fenced
+    EXPECT_EQ(dev_->durable_state().fence_term, 3u);
+
+    store->gate = nullptr;
+    gate.open();
+    EXPECT_EQ(dev_->fence_term(), 3u);
+    EXPECT_EQ(store->saved->fence_term, 3u);
+    EXPECT_EQ(store->saved->aborted_upto, 5u);
+}
+
+// A LoginAborted whose image cannot be persisted keeps the fence: the replica stays safe (rejecting IO).
+TEST_F(CraftRaftEntriesTest, LoginAbortedPersistFailureKeepsFence) {
+    auto* store = wire_store(*dev_);
+    dev_->seed_term(3);
+    dev_->seed_fence_term(5);
+    store->fail_persist = true;
+
+    EXPECT_FALSE(apply_abort(5).has_value());
+    EXPECT_EQ(dev_->fence_term(), 5u);
+    EXPECT_EQ(dev_->aborted_upto(), 5u); // raising aborted_upto only makes later logins no-ops: applied at once
+
+    store->fail_persist = false;
+    ASSERT_TRUE(apply_abort(5).has_value());
+    EXPECT_EQ(dev_->fence_term(), 3u);
+    EXPECT_EQ(store->saved->aborted_upto, 5u);
+}
+
+// The Sync verdicts, watermark and catch-up target are durable before any verdicted block is freed.
+TEST_F(CraftRaftEntriesTest, SyncPersistsVerdictsBeforeFreeing) {
+    auto* store = wire_store(*dev_);
+    journal_->slots = zero_slots({0, 1, 2, 3});
+    journal_->slots[3].all_zeros = false; // real data under slot 3: a verdict must free it
+    dev_->seed_lsns(/*last_append=*/3, {});
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    EXPECT_EQ(journal_->free_slot_calls, 1);
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->empty_lsns, (std::set< int64_t >{3}));
+    EXPECT_EQ(store->saved->sync_watermark, 5);
+    EXPECT_EQ(store->saved->catch_up_target, 5);
+}
+
+// If the verdicts cannot be made durable, nothing is freed: a restart replaying this entry would otherwise free
+// the same blocks twice. Leaking them is the safe side.
+TEST_F(CraftRaftEntriesTest, SyncVerdictPersistFailureLeaksInsteadOfFreeing) {
+    auto* store = wire_store(*dev_);
+    store->fail_persist = true;
+    journal_->slots = zero_slots({0, 1, 2, 3});
+    journal_->slots[3].all_zeros = false;
+    dev_->seed_lsns(/*last_append=*/3, {});
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    EXPECT_EQ(journal_->free_slot_calls, 0);
+    EXPECT_TRUE(dev_->is_empty_slot(3)); // the verdict itself still holds in memory
+}
+
+// Every applied RAFT entry advances the persisted last-applied index.
+TEST_F(CraftRaftEntriesTest, ApplyQueuePersistsLastAppliedRaftIdx) {
+    auto* store = wire_store(*dev_);
+    commit_entry(*dev_, 7, CraftEntryType::LoginAborted, make_login_aborted_key(1));
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 7);
+    EXPECT_EQ(store->saved->aborted_upto, 1u);
+
+    store->fail_persist = true; // a failed persist only means the entry may be re-applied after a restart
+    commit_entry(*dev_, 8, CraftEntryType::LoginAborted, make_login_aborted_key(2));
+    EXPECT_EQ(dev_->last_applied_raft_idx(), 8);
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 7);
+}
+
+// Concurrent persist_state() calls share one writer; each returns once an image covering it is durable.
+TEST_F(CraftRaftEntriesTest, ConcurrentPersistsAreSerializedAndCoalesced) {
+    auto* store = wire_store(*dev_);
+    TestGate gate;
+    store->gate = &gate;
+    std::optional< status > first, second, third;
+    auto run = [](CraftRaftEntriesTest* t, CraftReplDev& dev, std::optional< status >& out) -> async_status {
+        // A captureless lambda: its coroutine frame owns the parameters, so detaching it is safe.
+        out = co_await t->persist(dev);
+        co_return ok();
+    };
+    homeblocks::detail::detach(run(this, *dev_, first));  // writer starts, held at the gate
+    homeblocks::detail::detach(run(this, *dev_, second)); // queued behind it
+    homeblocks::detail::detach(run(this, *dev_, third));  // coalesced with `second`
+    EXPECT_FALSE(first.has_value());
+    EXPECT_EQ(store->persist_calls, 1);
+
+    store->gate = nullptr;
+    gate.open();
+    ASSERT_TRUE(first && second && third);
+    EXPECT_TRUE(first->has_value() && second->has_value() && third->has_value());
+    EXPECT_EQ(store->persist_calls, 2); // one round for `first`, one for `second` and `third` together
+}
+
+// A failed round fails exactly the callers it covered.
+TEST_F(CraftRaftEntriesTest, PersistFailureIsReportedToItsCallers) {
+    auto* store = wire_store(*dev_);
+    store->fail_persist = true;
+    EXPECT_FALSE(homeblocks::detail::sync_get(persist(*dev_)).has_value());
+    store->fail_persist = false;
+    EXPECT_TRUE(homeblocks::detail::sync_get(persist(*dev_)).has_value());
+}
+
+// ── durable commit frontier ──
+
+// A checkpoint that actually flushed makes commit_lsn the durable frontier and drops verdicts at or below it.
+TEST_F(CraftRaftEntriesTest, FlushedCheckpointRecordsDurableCommit) {
+    auto* store = wire_store(*dev_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(/*last_append=*/10, {});
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    EXPECT_EQ(trigger_.call_count, 1);
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->durable_commit_lsn, 10);
+    EXPECT_TRUE(store->saved->empty_lsns.empty());
+}
+
+// A checkpoint request that coalesced into a flush already running proves nothing about the slots applied
+// since that flush started: the durable frontier must not move.
+TEST_F(CraftRaftEntriesTest, CoalescedCheckpointDoesNotRecordDurableCommit) {
+    auto* store = wire_store(*dev_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(5);
+    trigger_.flushed = false;
+    dev_->seed_lsns(/*last_append=*/10, {});
+
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    EXPECT_EQ(trigger_.call_count, 1);
+    EXPECT_EQ(dev_->durable_state().durable_commit_lsn, -1);
+    EXPECT_EQ(store->saved->durable_commit_lsn, -1);
+}
+
+// A frontier at or below the recorded one is ignored, and a persist failure is only logged.
+TEST_F(CraftRaftEntriesTest, DurableCommitNeverRegressesAndSurvivesPersistFailure) {
+    auto* store = wire_store(*dev_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(/*last_append=*/20, {});
+    ASSERT_TRUE(do_apply(10, 0).has_value());
+    EXPECT_EQ(store->saved->durable_commit_lsn, 10);
+
+    store->fail_persist = true;
+    ASSERT_TRUE(do_apply(20, 0).has_value());
+    EXPECT_EQ(dev_->durable_state().durable_commit_lsn, 20); // recorded; written again by the next persist
+    EXPECT_EQ(store->saved->durable_commit_lsn, 10);
+}
+
+// ── restart recovery ──
+
+// A device that never persisted anything restarts empty and healthy.
+TEST_F(CraftRaftEntriesTest, RestartWithNoImageStartsFresh) {
+    auto r = restart(std::nullopt, zero_slots({0, 1}));
+    EXPECT_FALSE(r.dev->is_recovery_faulted());
+    EXPECT_FALSE(r.dev->is_recovering());
+    EXPECT_EQ(r.dev->commit_lsn(), -1);
+    EXPECT_EQ(r.dev->last_append_lsn(), -1);
+}
+
+// The control fields come back from the image; commit_lsn restarts at the durable frontier; last_append_lsn is
+// the larger of the journal tail and the Sync watermark; every slot above the frontier the journal does not hold
+// (and is not verdicted Empty) is missing.
+TEST_F(CraftRaftEntriesTest, RestartRestoresControlStateAndJournalRange) {
+    auto r = restart(sample_state(), zero_slots({0, 1, 2, 3, 7}));
+    ASSERT_FALSE(r.dev->is_recovery_faulted());
+    EXPECT_FALSE(r.dev->is_recovering());
+
+    EXPECT_EQ(r.dev->term(), 3u);
+    EXPECT_EQ(r.dev->fence_term(), 4u);
+    EXPECT_EQ(r.dev->client_token(), 77u);
+    EXPECT_EQ(r.dev->aborted_upto(), 2u);
+    EXPECT_EQ(r.dev->last_applied_raft_idx(), 9);
+    // commit_lsn restarted at the durable frontier (1); the resumed catch-up (no peer wired) then advanced it over
+    // the slots already present (2, 3) and the Empty one (4), stopping at the first missing slot.
+    EXPECT_EQ(r.dev->commit_lsn(), 4);
+    EXPECT_EQ(r.dev->last_append_lsn(), 7);
+    EXPECT_TRUE(r.dev->is_empty_slot(4));
+    EXPECT_EQ(r.dev->missing_count(), 2u);
+    EXPECT_TRUE(r.dev->is_missing(5));
+    EXPECT_TRUE(r.dev->is_missing(6));
+    EXPECT_EQ(r.dev->overlay_lsn_for(7), 7); // slots above the frontier are readable again
+    EXPECT_EQ(r.dev->durable_state(), sample_state());
+}
+
+// The Sync watermark can be above the journal tail (the slots up to it were never received here).
+TEST_F(CraftRaftEntriesTest, RestartRaisesLastAppendToSyncWatermark) {
+    auto r = restart(sample_state(), zero_slots({0, 1, 2}));
+    EXPECT_EQ(r.dev->last_append_lsn(), 6);
+    EXPECT_TRUE(r.dev->is_missing(3));
+    EXPECT_TRUE(r.dev->is_missing(6));
+    EXPECT_FALSE(r.dev->is_missing(4)); // Empty
+}
+
+// RAFT entries at or below the persisted last-applied index are not applied again after a restart.
+TEST_F(CraftRaftEntriesTest, RestartSkipsAlreadyAppliedRaftEntries) {
+    auto r = restart(sample_state(), zero_slots({0, 1}));
+    commit_entry(*r.dev, 9, CraftEntryType::LoginAborted, make_login_aborted_key(100));
+    EXPECT_EQ(r.dev->aborted_upto(), 2u);
+    commit_entry(*r.dev, 10, CraftEntryType::LoginAborted, make_login_aborted_key(100));
+    EXPECT_EQ(r.dev->aborted_upto(), 100u);
+}
+
+// Even when the last-applied index did not reach disk, a re-applied InternalLogin whose term is already durable
+// is a no-op: it must not truncate the new session's writes.
+TEST_F(CraftRaftEntriesTest, RestartReappliedInternalLoginIsANoOp) {
+    auto img = sample_state();
+    img.last_applied_raft_idx = 0;
+    auto r = restart(img, zero_slots({0, 1, 2, 3, 7}));
+    commit_entry(*r.dev, 5, CraftEntryType::InternalLogin, make_internal_login_v2_key(77, 3, /*rs=*/2));
+    EXPECT_FALSE(r.journal->truncated_to.has_value());
+    EXPECT_EQ(r.dev->last_append_lsn(), 7);
+}
+
+// A catch-up the restart interrupted resumes toward the persisted target.
+TEST_F(CraftRaftEntriesTest, RestartResumesCatchUp) {
+    fetcher_.range_script = {FetchRangeResult{.slots = {page_slot(5), page_slot(6)}, .next = -1}};
+    auto r = restart(sample_state(), zero_slots({0, 1, 2, 3}), &fetcher_);
+    ASSERT_FALSE(fetcher_.range_requests.empty());
+    EXPECT_EQ(fetcher_.range_requests.front(), (std::vector< LsnRange >{{5, 6}}));
+    EXPECT_EQ(r.dev->missing_count(), 0u);
+    EXPECT_EQ(r.dev->commit_lsn(), 6);
+}
+
+// No catch-up is started when the persisted target is already covered.
+TEST_F(CraftRaftEntriesTest, RestartDoesNotResumeFinishedCatchUp) {
+    auto img = sample_state();
+    img.catch_up_target = 1;
+    restart(img, zero_slots({0, 1, 2, 3, 7}), &fetcher_);
+    EXPECT_TRUE(fetcher_.range_requests.empty());
+}
+
+// An image that cannot be read, or a journal whose tail cannot be read, faults the partition: restarting it
+// empty would forget fences and verdicts.
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnUnreadableImage) {
+    auto r = restart(sample_state(), zero_slots({0}), nullptr, /*fail_tail=*/false, /*fail_load=*/true);
+    EXPECT_TRUE(r.dev->is_recovery_faulted());
+}
+
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnUnreadableJournalTail) {
+    auto r = restart(sample_state(), zero_slots({0}), nullptr, /*fail_tail=*/true);
+    EXPECT_TRUE(r.dev->is_recovery_faulted());
+}
+
+// A backend that cannot report its tail (the interface default) cannot be recovered either.
+TEST_F(CraftRaftEntriesTest, RestartFaultsWhenBackendHasNoTail) {
+    struct NoTailJournal : MockCraftJournalBackend {
+        async_result< int64_t > tail_lsn() override { return CraftJournalBackend::tail_lsn(); }
+    };
+    auto dev = CraftReplDev::create(volume_id_t{}, std::make_unique< NoTailJournal >(), k_page_size, nullptr);
+    auto* store = wire_store(*dev);
+    store->saved = sample_state();
+    dev->trigger_on_restart();
+    EXPECT_TRUE(dev->is_recovery_faulted());
+}
+
+// A read error other than "not there" still faults the rebuild.
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnJournalReadError) {
+    struct BadReadJournal : MockCraftJournalBackend {
+        async_result< JournalSlot > read_slot(int64_t) override {
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+    };
+    auto j = std::make_unique< BadReadJournal >();
+    j->slots = zero_slots({0, 1, 2, 3});
+    auto dev = CraftReplDev::create(volume_id_t{}, std::move(j), k_page_size, nullptr);
+    wire_store(*dev)->saved = sample_state();
+    dev->trigger_on_restart();
+    EXPECT_TRUE(dev->is_recovery_faulted());
+}
+
+// Re-applying a slot journalled before the restart must not free the block it replaces in the index: the index
+// may already hold a NEWER slot's block there (a checkpoint ran past the recorded durable frontier). Slots above
+// the replay window free superseded blocks as usual.
+TEST_F(CraftRaftEntriesTest, RestartReplayDoesNotFreeReplacedBlocks) {
+    auto img = sample_state();
+    img.empty_lsns.clear();
+    img.sync_watermark = -1;
+    img.catch_up_target = -1;
+    auto r = restart(img, zero_slots({0, 1, 2, 3}));
+    ASSERT_EQ(r.dev->last_append_lsn(), 3);
+    r.journal->slots[4] = page_slot(4);
+    r.dev->seed_lsns(/*last_append=*/4, {});
+
+    int deletes = 0;
+    auto delete_fn = [&deletes](lba_t, lba_t, std::vector< homestore::blk_id >& freed) -> status {
+        ++deletes;
+        freed.push_back(homestore::blk_id{7, 1, 0});
+        return ok();
+    };
+    auto write_fn = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+    auto c = homeblocks::detail::sync_get(r.dev->commit_with(4, write_fn, delete_fn));
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(*c, 4);
+    EXPECT_EQ(deletes, 3);                    // slots 2, 3 (replayed) and 4
+    EXPECT_EQ(r.journal->free_data_calls, 1); // only slot 4's replaced block is freed
+}
+
+// End to end: state persisted by one device restores another.
+TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterRestart) {
+    auto* store = wire_store(*dev_);
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(2);
+    journal_->slots = zero_slots({0, 1, 2});
+    dev_->seed_lsns(/*last_append=*/2, {});
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(2, 0, {}));
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/2));
+    commit_entry(*dev_, 3, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(4, 0, {4}));
+    ASSERT_TRUE(store->saved.has_value());
+
+    auto r = restart(store->saved, journal_->slots);
+    ASSERT_FALSE(r.dev->is_recovery_faulted());
+    EXPECT_EQ(r.dev->term(), 5u);
+    EXPECT_EQ(r.dev->client_token(), 42u);
+    EXPECT_EQ(r.dev->last_applied_raft_idx(), 3);
+    EXPECT_EQ(r.dev->commit_lsn(), 2);
+    EXPECT_EQ(r.dev->last_append_lsn(), 4);
+    EXPECT_TRUE(r.dev->is_missing(3));
+    EXPECT_TRUE(r.dev->is_empty_slot(4));
 }
 
 } // namespace

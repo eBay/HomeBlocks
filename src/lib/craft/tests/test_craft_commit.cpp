@@ -500,9 +500,9 @@ TEST_F(CraftCommitTest, WriteFnErrorAbortsCommit) {
 
 struct MockCraftCheckpointTrigger {
     int call_count{0};
-    async_status operator()(bool) {
+    async_result< bool > operator()(bool) {
         ++call_count;
-        co_return ok();
+        co_return true;
     }
 };
 

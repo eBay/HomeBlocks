@@ -372,6 +372,9 @@ public:
         co_return ok();
     }
 
+    // The log store's tail: the highest seq_num written and not rolled back.
+    async_result< int64_t > tail_lsn() override { co_return static_cast< int64_t >(logstore_->tail_lsn()); }
+
 private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
@@ -385,13 +388,13 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 
 // Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
-    return [](bool force) -> async_status {
-        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
+    return [](bool force) -> async_result< bool > {
+        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return true;
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
         // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
         // (this trigger's only current caller, fire_checkpoint_trigger, coalesces with any in-flight
         // flush on purpose). Only a force=true false return is a real failure worth surfacing.
-        if (!force) co_return ok();
+        if (!force) co_return false;
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     };
 }
@@ -825,8 +828,25 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
     auto self = shared_from_this();
     detail::detach([self, commit_lsn_snapshot]() -> async_status {
-        if (auto cp = co_await self->checkpoint_trigger_(false); !cp)
+        auto cp = co_await self->checkpoint_trigger_(false);
+        if (!cp) {
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
+            co_return ok();
+        }
+        // Coalesced into a flush that was already running: that flush may predate some of the slots applied up
+        // to commit_lsn_snapshot, so it proves nothing about them. The next trigger will.
+        if (!*cp) co_return ok();
+        // S8: every slot <= commit_lsn_snapshot was applied to the index before this checkpoint started, so a
+        // restart may resume commit from here and the journal below it is no longer needed for local recovery.
+        {
+            std::lock_guard lk{self->state_mu_};
+            if (commit_lsn_snapshot <= self->durable_.durable_commit_lsn) co_return ok();
+            self->durable_.durable_commit_lsn = commit_lsn_snapshot;
+            auto& empties = self->durable_.empty_lsns;
+            empties.erase(empties.begin(), empties.upper_bound(commit_lsn_snapshot));
+        }
+        if (auto r = co_await self->persist_state(); !r)
+            LOGE("persisting durable commit_lsn={} failed: {}", commit_lsn_snapshot, r.error().message());
         co_return ok();
     }());
 }
@@ -841,13 +861,14 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 
 async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t write_fn,
                                                   delete_index_fn_t delete_fn) {
-    int64_t commit_lsn, last_append_lsn;
+    int64_t commit_lsn, last_append_lsn, replay_upto;
     {
         std::lock_guard lk{state_mu_};
         if (commit_running_) co_return state_.commit_lsn; // another run is already advancing
         commit_running_ = true;
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
+        replay_upto = replay_upto_;
     }
     // Tracks the highest lsn successfully applied so far, updated per-iteration below WITHOUT
     // state_mu_. Written to the shared state_.commit_lsn exactly once, in
@@ -885,6 +906,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             is_empty = empty_lsns_.contains(lsn);
         }
         if (is_missing) break; // stall at the first hole -- not an error
+        // A slot journalled before the last restart may be re-applied over an index that already holds a newer
+        // slot's block for the same LBA: never free what the re-apply replaces (see replay_upto_).
+        bool const replaying = lsn <= replay_upto;
 
         // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals
         // retiring_lsn -- shared by the data-apply path below and the is_empty path further down (a
@@ -921,6 +945,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                 if (auto r = delete_fn(start_lba, end_lba, freed); !r) co_return std::unexpected(r.error());
                 // Reclaim inline, same as write()'s own free_data call sites -- free errors are
                 // logged but non-fatal (the block is merely leaked, not corrupted).
+                if (replaying) freed.clear();
                 for (auto const& blk : freed) {
                     if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{blk}); !fr)
                         LOGE("free_data failed reclaiming blk={} lsn={}: {}", blk.to_string(), lsn,
@@ -956,7 +981,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                 // idempotent commit before commit_lsn was durably persisted): the index already holds
                 // this exact blkid, so freeing it here would free a block the index still references.
                 for (auto const& [_, info] : blocks_info) {
-                    if (!info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
+                    if (replaying || !info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
                     if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{info.old_blkid}); !fr)
                         LOGE("free_data failed reclaiming blk={} lsn={}: {}", info.old_blkid.to_string(), lsn,
                              fr.error().message());
@@ -1618,7 +1643,18 @@ async_status CraftReplDev::rebuild_overlay() {
         if (is_missing || is_empty) continue;
 
         auto slot_r = co_await journal_->read_slot(lsn);
-        if (!slot_r) co_return std::unexpected(slot_r.error());
+        if (!slot_r) {
+            // Never journalled here (or rolled back): after a restart the range above the durable commit frontier
+            // is rebuilt from the journal, so a slot that is not in it is simply missing -- catch-up fills it.
+            // Any other read error is a real fault.
+            auto const e = slot_r.error();
+            if (e == std::errc::result_out_of_range || e == std::errc::no_such_file_or_directory) {
+                std::lock_guard lk{state_mu_};
+                missing_lsns_.insert(lsn);
+                continue;
+            }
+            co_return std::unexpected(e);
+        }
         auto& slot = *slot_r;
 
         lba_t const start_lba = static_cast< lba_t >(slot.lba_off_bytes) / lba_size_;
@@ -1699,10 +1735,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
             return;
         }
         uint64_t const upto = reinterpret_cast< const LoginAbortedPayload* >(key.cbytes())->abort_upto;
-        owner_->enqueue_apply(lsn, [dev = owner_, upto]() -> async_status {
-            dev->apply_login_aborted(upto);
-            co_return ok();
-        });
+        owner_->enqueue_apply(lsn, [dev = owner_, upto]() -> async_status { return dev->apply_login_aborted(upto); });
         break;
     }
     default:
@@ -1757,8 +1790,17 @@ async_status CraftReplDev::drain_apply_queue() {
         if (auto r = co_await next.fn(); !r) {
             LOGE("drain_apply_queue: apply of raft lsn={} failed: {}", next.raft_lsn, r.error().message());
         }
-        std::lock_guard lk{state_mu_};
-        state_.last_applied_raft_idx = std::max(state_.last_applied_raft_idx, next.raft_lsn);
+        {
+            std::lock_guard lk{state_mu_};
+            state_.last_applied_raft_idx = std::max(state_.last_applied_raft_idx, next.raft_lsn);
+            durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, next.raft_lsn);
+        }
+        // After the entry's own durable effects (each apply persists what it must, ahead of the change), so a
+        // restart re-applies an entry rather than skip one that never reached disk. A failure here only means the
+        // entry may be re-applied after a restart; every apply is replay-safe.
+        if (auto r = co_await persist_state(); !r)
+            LOGE("drain_apply_queue: persisting last applied raft lsn={} failed: {}", next.raft_lsn,
+                 r.error().message());
     }
 }
 
@@ -1776,11 +1818,9 @@ async_status CraftReplDev::drain_apply_queue() {
 // correctness for that case currently rests entirely on HomeStore's calling convention (observed today:
 // fired at most once per instance per restart cycle), not on anything this class enforces itself.
 //
-// Currently a no-op in practice: CraftPartitionState itself (state_) has no superblock-recovery path
-// yet, so commit_lsn/last_append_lsn are still at their default -1/-1 when this fires, making
-// rebuild_overlay()'s walk range empty and run_recovery() clear recovering_ almost immediately. This
-// gate is still the correct wiring for once real superblock recovery populates state_ before this
-// fires.
+// With a state store wired (S8), run_recovery() first restores state_ from the durable image and the journal,
+// then rebuilds the overlay over (commit_lsn, last_append_lsn]. Without one, state_ stays at its defaults and the
+// walk is empty, as before S8.
 void CraftReplDev::CraftRaftListener::on_restart() {
     owner_->recovering_.store(true, std::memory_order_release);
     detail::detach(owner_->run_recovery());
@@ -1798,7 +1838,11 @@ void CraftReplDev::CraftRaftListener::on_restart() {
 // data is not. There is deliberately no self-healing path out of this state here -- an operator
 // decision (or a future re-sync-from-peer mechanism) is required.
 async_status CraftReplDev::run_recovery() {
-    auto r = co_await rebuild_overlay();
+    // S8: state_ comes back from the durable image and the journal first; rebuild_overlay then walks the range
+    // that restore set up (and marks slots the journal does not hold as missing). A failure of either step faults
+    // the partition the same way: an image that cannot be loaded must never restart as an empty partition.
+    auto r = co_await restore_state();
+    if (r) r = co_await rebuild_overlay();
     if (!r) {
         LOGE("rebuild_overlay failed during restart recovery: {} -- partition permanently faulted, will "
              "not accept client I/O (see recovery_faulted_'s doc comment)",
@@ -1807,7 +1851,181 @@ async_status CraftReplDev::run_recovery() {
         co_return r;
     }
     recovering_.store(false, std::memory_order_release);
+    // Resume a catch-up the restart interrupted. The runner itself re-derives what is still missing.
+    int64_t resume_to = -1;
+    {
+        std::lock_guard lk{state_mu_};
+        if (durable_.catch_up_target > state_.commit_lsn) resume_to = durable_.catch_up_target;
+    }
+    if (resume_to >= 0) request_catch_up(resume_to);
     co_return r;
+}
+
+// ─── durable state (S8 / SDSTOR-22745) ───────────────────────────────────────
+
+namespace {
+constexpr uint64_t k_durable_magic = 0x31425354'46415243ull; // "CRAFTSB1" little-endian
+constexpr uint32_t k_durable_version = 1;
+#pragma pack(push, 1)
+struct DurableHeader {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t n_empty;
+    uint64_t term;
+    uint64_t fence_term;
+    uint64_t client_token;
+    uint64_t aborted_upto;
+    int64_t last_applied_raft_idx;
+    int64_t durable_commit_lsn;
+    int64_t sync_watermark;
+    int64_t catch_up_target;
+};
+#pragma pack(pop)
+} // namespace
+
+std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
+    DurableHeader h{k_durable_magic,
+                    k_durable_version,
+                    static_cast< uint32_t >(s.empty_lsns.size()),
+                    s.term,
+                    s.fence_term,
+                    s.client_token,
+                    s.aborted_upto,
+                    s.last_applied_raft_idx,
+                    s.durable_commit_lsn,
+                    s.sync_watermark,
+                    s.catch_up_target};
+    std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t));
+    std::memcpy(out.data(), &h, sizeof(h));
+    size_t off = sizeof(h);
+    for (int64_t lsn : s.empty_lsns) {
+        std::memcpy(out.data() + off, &lsn, sizeof(lsn));
+        off += sizeof(lsn);
+    }
+    return out;
+}
+
+std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len) {
+    if (buf == nullptr || len < sizeof(DurableHeader)) return std::nullopt;
+    DurableHeader h;
+    std::memcpy(&h, buf, sizeof(h));
+    if (h.magic != k_durable_magic || h.version != k_durable_version) return std::nullopt;
+    if (len != sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t)) return std::nullopt;
+    CraftDurableState s{h.term,
+                        h.fence_term,
+                        h.client_token,
+                        h.aborted_upto,
+                        h.last_applied_raft_idx,
+                        h.durable_commit_lsn,
+                        h.sync_watermark,
+                        h.catch_up_target,
+                        {}};
+    int64_t prev = s.durable_commit_lsn;
+    for (uint32_t i = 0; i < h.n_empty; ++i) {
+        int64_t lsn;
+        std::memcpy(&lsn, buf + sizeof(h) + i * sizeof(int64_t), sizeof(lsn));
+        if (lsn <= prev) return std::nullopt; // must be strictly ascending and above the durable frontier
+        s.empty_lsns.insert(s.empty_lsns.end(), lsn);
+        prev = lsn;
+    }
+    return s;
+}
+
+async_status CraftReplDev::persist_state() {
+    if (!state_store_) co_return ok();
+    auto self = shared_from_this();
+    uint64_t gen;
+    bool start = false;
+    {
+        std::lock_guard lk{state_mu_};
+        gen = ++persist_req_gen_;
+        if (!persist_running_) {
+            persist_running_ = true;
+            start = true;
+        }
+    }
+    if (start) detail::detach(run_persist());
+    auto done = [this, gen] {
+        std::lock_guard lk{state_mu_};
+        return persist_done_gen_ >= gen;
+    };
+    // notify_all wakes every waiter whenever ANY image lands; loop until one covering this ticket has.
+    while (!done())
+        co_await persist_wait_.wait_until(done);
+    std::lock_guard lk{state_mu_};
+    if (persist_ok_gen_ >= gen) co_return ok();
+    co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+}
+
+// The single writer behind persist_state(). Each round persists the newest image, which covers every ticket
+// issued before it was taken; rounds repeat while new tickets arrive.
+async_status CraftReplDev::run_persist() {
+    auto self = shared_from_this();
+    for (;;) {
+        CraftDurableState image;
+        uint64_t gen;
+        {
+            std::lock_guard lk{state_mu_};
+            if (persist_done_gen_ >= persist_req_gen_) {
+                persist_running_ = false;
+                co_return ok();
+            }
+            image = durable_;
+            gen = persist_req_gen_;
+        }
+        auto r = co_await state_store_->persist(image);
+        {
+            std::lock_guard lk{state_mu_};
+            persist_done_gen_ = gen;
+            if (r) {
+                persist_ok_gen_ = gen;
+            } else {
+                LOGE("persisting durable partition state failed: {}", r.error().message());
+            }
+        }
+        persist_wait_.notify_all(); // never under state_mu_: woken waiters re-take it in their predicate
+    }
+}
+
+async_status CraftReplDev::restore_state() {
+    if (!state_store_) co_return ok();
+    auto loaded = state_store_->load();
+    if (!loaded) {
+        LOGE("restore_state: durable partition state unreadable: {}", loaded.error().message());
+        co_return std::unexpected(loaded.error());
+    }
+    if (!*loaded) co_return ok(); // never persisted: a fresh partition
+    CraftDurableState const& d = **loaded;
+
+    auto tail = co_await journal_->tail_lsn();
+    if (!tail) {
+        LOGE("restore_state: journal tail unavailable: {}", tail.error().message());
+        co_return std::unexpected(tail.error());
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        durable_ = d;
+        state_.term = d.term;
+        state_.fence_term = d.fence_term;
+        state_.client_token = d.client_token;
+        state_.aborted_upto = d.aborted_upto;
+        state_.last_applied_raft_idx = d.last_applied_raft_idx;
+        state_.commit_lsn = d.durable_commit_lsn;
+        state_.last_append_lsn = std::max({*tail, d.sync_watermark, d.durable_commit_lsn});
+        empty_lsns_ = std::unordered_set< int64_t >(d.empty_lsns.begin(), d.empty_lsns.end());
+        missing_lsns_.clear(); // rebuild_overlay marks every slot above commit_lsn the journal does not hold
+        replay_upto_ = std::max(*tail, d.durable_commit_lsn);
+        last_checkpoint_lsn_ = d.durable_commit_lsn;
+    }
+    {
+        std::lock_guard lk{apply_mu_};
+        last_enqueued_raft_idx_ = std::max(last_enqueued_raft_idx_, d.last_applied_raft_idx);
+    }
+    LOGI("restore_state: term={} fence_term={} commit_lsn={} journal tail={} sync_watermark={} empties={} "
+         "last_applied_raft_idx={}",
+         d.term, d.fence_term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(),
+         d.last_applied_raft_idx);
+    co_return ok();
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
@@ -2014,6 +2232,21 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
             if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
         }
         state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
+
+        // S8 write-ahead: the verdicts (above the durable commit frontier), the watermark and the catch-up target
+        // must be durable BEFORE any block is freed below. Otherwise a restart re-applies this entry with no
+        // memory of the verdicts and frees the same blocks a second time.
+        for (int64_t lsn : empty_slots)
+            if (lsn > durable_.durable_commit_lsn) durable_.empty_lsns.insert(lsn);
+        durable_.sync_watermark = std::max(durable_.sync_watermark, rs_commit_lsn);
+        durable_.catch_up_target = std::max(durable_.catch_up_target, rs_commit_lsn);
+    }
+
+    if (auto r = co_await persist_state(); !r) {
+        // Leak rather than risk a double free on replay: the blocks stay allocated under their (verdicted) slots.
+        LOGE("apply_sync_rs_commit_lsn: persisting verdicts failed: {} -- not freeing {} verdicted slot(s)",
+             r.error().message(), to_free.size());
+        to_free.clear();
     }
 
     if (!to_free.empty()) {
@@ -2027,7 +2260,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
     // Advance over everything already present, then hand the missing slots to catch-up. The catch-up runner runs
     // detached so a slow or unreachable peer never stalls the ordered apply queue (later entries).
-    advance_commit_after_sync(rs_commit_lsn);
+    co_await advance_commit_after_sync(rs_commit_lsn);
     request_catch_up(rs_commit_lsn);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
@@ -2087,12 +2320,12 @@ async_status CraftReplDev::run_catch_up() {
             }
         }
         if (ranges.empty() || peer_fetcher_ == nullptr) {
-            advance_commit_after_sync(target);
+            co_await advance_commit_after_sync(target);
             co_return ok();
         }
 
         auto resolved = co_await catch_up_pass(std::move(ranges), term);
-        advance_commit_after_sync(target);
+        co_await advance_commit_after_sync(target);
         if (resolved && *resolved > 0) {
             failed_passes = 0;
             backoff = catch_up_min_backoff;
@@ -2274,12 +2507,24 @@ async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint6
     co_return true;
 }
 
-void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
+async_status CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
     // commit_lsn (CRAFT-Design) is the LOCAL CONTIGUOUS prefix, distinct from rs_commit_lsn (the
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
     // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
     //
+    // With an index wired, the advance goes through commit(), which applies each slot to the index as it passes
+    // it (same rule: skip Empty, stop at Missing). Moving commit_lsn without that left the slots unapplied:
+    // commit() never revisits a slot below commit_lsn, and read() serves overlay entries only ABOVE commit_lsn,
+    // so a read of such an LBA returned the older index value (H9 in docs/craft/resync.md). It also made
+    // commit_lsn useless as a durable frontier for restart (S8). A commit() already running is left to finish;
+    // the next write/keep_alive/Sync carries the advance further, as for every other commit() caller.
+    if (indx_tbl_) {
+        if (auto r = co_await commit(rs_commit_lsn); !r)
+            LOGE("advance_commit_after_sync: commit({}) failed: {}", rs_commit_lsn, r.error().message());
+        co_return ok();
+    }
+    // No index (the write-path-only unit tests): nothing to apply, advance the frontier alone.
     int64_t commit_lsn_snapshot;
     bool should_checkpoint;
     {
@@ -2298,6 +2543,7 @@ void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
         should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
     if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
+    co_return ok();
 }
 
 // ─── InternalLogin apply (S5 / SDSTOR-22887; docs/craft/resync.md §4.6) ──────
@@ -2325,6 +2571,7 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
         // Local fence: from here on no new write of the old session is admitted, including on a replica that
         // missed the login poll (and so was never fenced by it). Lifted below by admitting the new term.
         state_.fence_term = std::max(state_.fence_term, term);
+        durable_.fence_term = std::max(durable_.fence_term, term);
         if (rs_commit_lsn && state_.last_append_lsn > *rs_commit_lsn) {
             if (state_.commit_lsn > *rs_commit_lsn) {
                 // Cannot happen if the leader computed rs_commit_lsn as max(quorum.last_append): commit only
@@ -2335,6 +2582,13 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
                 do_truncate = true;
             }
         }
+    }
+    // The fence must survive a restart before the stale tail is touched: a replica that restarted unfenced
+    // would admit the old session's writes again (the in-memory fence above already rejects them now).
+    if (auto r = co_await persist_state(); !r) {
+        LOGE("apply_internal_login: persisting fence term={} failed: {} -- new session NOT admitted", term,
+             r.error().message());
+        co_return r;
     }
     if (do_truncate) {
         // Writes admitted before the fence may still be journalling a slot above the watermark; one finishing
@@ -2357,6 +2611,19 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
             co_return r;
         }
     }
+    // Admission is made durable before it takes effect: once a new-term write is acked, a restart must not
+    // re-apply this InternalLogin (its truncation would destroy that write). With the term on disk the replay
+    // guard above turns the re-apply into a no-op.
+    {
+        std::lock_guard lk{state_mu_};
+        durable_.term = std::max(durable_.term, term);
+        durable_.client_token = client_token;
+    }
+    if (auto r = co_await persist_state(); !r) {
+        LOGE("apply_internal_login: persisting session term={} failed: {} -- new session NOT admitted", term,
+             r.error().message());
+        co_return r;
+    }
     {
         std::lock_guard lk{state_mu_};
         state_.client_token = client_token;
@@ -2372,11 +2639,31 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
 // Lifts a fence left by a login that never committed its InternalLogin, so the current owner's session is
 // admitted again. A fence above abort_upto belongs to a newer login and is left alone. aborted_upto makes the
 // abort final: a late InternalLogin for an aborted term is ignored by apply_internal_login.
-void CraftReplDev::apply_login_aborted(uint64_t abort_upto) {
+//
+// S8: aborted_upto is raised in memory at once (it only makes later InternalLogins no-ops: more restrictive). The
+// fence is lowered only after the image is durable; if persisting fails the replica stays fenced (safe; the next
+// login or LoginAborted repairs it).
+async_status CraftReplDev::apply_login_aborted(uint64_t abort_upto) {
+    auto self = shared_from_this();
+    bool lower_fence;
+    {
+        std::lock_guard lk{state_mu_};
+        state_.aborted_upto = std::max(state_.aborted_upto, abort_upto);
+        durable_.aborted_upto = std::max(durable_.aborted_upto, abort_upto);
+        lower_fence = state_.fence_term > state_.term && state_.fence_term <= abort_upto;
+        if (durable_.fence_term > durable_.term && durable_.fence_term <= abort_upto)
+            durable_.fence_term = durable_.term;
+    }
+    if (auto r = co_await persist_state(); !r) {
+        LOGE("apply_login_aborted: persisting abort_upto={} failed: {} -- fence kept", abort_upto, r.error().message());
+        co_return r;
+    }
     std::lock_guard lk{state_mu_};
-    state_.aborted_upto = std::max(state_.aborted_upto, abort_upto);
-    if (state_.fence_term > state_.term && state_.fence_term <= abort_upto) { state_.fence_term = state_.term; }
+    // Re-check: a login poll or InternalLogin applied while persisting may have raised the fence above abort_upto.
+    if (lower_fence && state_.fence_term > state_.term && state_.fence_term <= abort_upto)
+        state_.fence_term = state_.term;
     LOGD("apply_login_aborted abort_upto={} fence_term={} term={}", abort_upto, state_.fence_term, state_.term);
+    co_return ok();
 }
 
 } // namespace homeblocks

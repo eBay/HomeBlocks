@@ -127,6 +127,28 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     EXPECT_EQ(logstore->tail_lsn(), 2);
 }
 
+// S8 restart recovery reads the journal tail through the backend: it must follow writes and rollbacks.
+TEST_F(CraftHomeStoreBackendTest, TailLsnFollowsWritesAndRollback) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    for (int64_t lsn = 0; lsn <= 3; ++lsn) {
+        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
+                                                                  std::vector< homestore::csum_t >{}));
+        ASSERT_TRUE(r.has_value());
+    }
+    auto t = homeblocks::detail::sync_get(backend->tail_lsn());
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, 3);
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->truncate_to(1)).has_value());
+    t = homeblocks::detail::sync_get(backend->tail_lsn());
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, 1);
+}
+
 // read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
 TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     auto logstore = make_logstore();
@@ -401,6 +423,7 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
 
     auto r = homeblocks::detail::sync_get(trigger(/* force = */ true));
     ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(*r); // a forced flush always runs, so it covers everything applied before the call
 }
 
 // cp_mgr()'s in-flight-flush gate (m_in_flush_phase) is a synchronous check-and-set at entry: the
@@ -413,7 +436,7 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFail
     auto trigger = make_homestore_checkpoint_trigger_fn();
 
     constexpr int k_concurrent = 20;
-    std::vector< homestore::async_status > futs; // async_status is itself a sisl::async::task<result<...>>
+    std::vector< homestore::async_result< bool > > futs;
     futs.reserve(k_concurrent);
     for (int i = 0; i < k_concurrent; ++i) {
         futs.push_back(trigger(/* force = */ false));

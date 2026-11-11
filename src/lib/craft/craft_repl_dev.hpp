@@ -67,7 +67,7 @@ struct CraftPartitionState {
                                  // the replica is fenced: it admits neither the old session nor the new one.
     uint64_t aborted_upto{0};    // every login term <= this was aborted (LoginAborted); its InternalLogin is a no-op
     int64_t last_applied_raft_idx{-1}; // highest RAFT log index applied -- replayed/duplicate entries at or below
-                                       // it are skipped. In-memory until S8 persists CraftPartitionState.
+                                       // it are skipped. Persisted (CraftDurableState) after each apply.
     int64_t all_committed_lsn{-1};     // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
                                        // floors journal reclaim (S8: truncate below min(this, checkpointed apply
                                        // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
@@ -152,6 +152,12 @@ public:
     // blkid's byte length). Used by CraftReplDev::read() to fetch the bytes an index/overlay entry
     // only stores a block reference for. Mockable so read()'s tests stay light (no real HomeStore).
     virtual async_status read_data(homestore::multi_blk_id blkid, sisl::sg_list& dest) = 0;
+    // Highest lsn ever written and not rolled back (-1 for an empty journal). Restart recovery (S8) walks the
+    // slots between the durable commit frontier and this tail. Not every backend can answer: the default
+    // reports not_supported, which a recovery that needs it treats as a fault.
+    virtual async_result< int64_t > tail_lsn() {
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    }
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -205,13 +211,61 @@ public:
 // (homestore::cp_mgr().trigger_cp_flush()). Injected into CraftReplDev so unit tests can exercise
 // the trigger without touching HomeStore. Production code passes make_homestore_checkpoint_trigger_fn()'s result.
 // Default (empty) leaves the trigger stubbed -- same posture as CraftPeerFetcher.
-using checkpoint_trigger_fn_t = std::function< async_status(bool force) >;
+//
+// The result is true only when a checkpoint that started after the call has completed, i.e. everything applied to
+// the index before the call is now durable. false means the request coalesced with a flush already in progress
+// (force=false), which may not include the index state at the call. S8 records a durable commit frontier only on
+// true (docs/craft/resync.md §4.11).
+using checkpoint_trigger_fn_t = std::function< async_result< bool >(bool force) >;
 
 // Factory that wraps homestore::cp_mgr() (there is exactly one CPManager per HomeStore instance,
 // unlike make_homestore_journal_backend which is per-volume). Each CraftReplDev stores its own copy
 // of the returned callable by value (set_checkpoint_trigger) -- callers don't need to keep the
 // factory's result alive themselves. Tests inject a plain callable directly.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn();
+
+// ─── Durable partition state (S8 / SDSTOR-22745) ─────────────────────────────
+//
+// The part of a partition's state that neither the journal nor the RAFT log gives back after a restart. Written
+// AHEAD of the in-memory change it protects: CraftReplDev::durable_ is updated and persisted first, state_ second,
+// so a crash between the two restarts at least as restrictive as before -- it never admits a term whose login was
+// not made durable, and never forgets a fence it already answered under.
+//
+// Not here, and why:
+//   - last_append_lsn and the missing set come back from the journal itself: its tail, and a walk of the slots
+//     above durable_commit_lsn. last_append_lsn is raised to at least sync_watermark.
+//   - commit_lsn restarts at durable_commit_lsn, the frontier a completed checkpoint covers. Slots above it are
+//     re-applied to the index (CraftReplDev::replay_upto_ explains why that is safe).
+struct CraftDurableState {
+    uint64_t term{0};
+    uint64_t fence_term{0};
+    uint64_t client_token{0};
+    uint64_t aborted_upto{0};
+    int64_t last_applied_raft_idx{-1}; // RAFT entries at or below are not re-applied after a restart
+    int64_t durable_commit_lsn{-1};    // commit frontier covered by a completed checkpoint
+    int64_t sync_watermark{-1};        // highest SyncRSCommitLSN rs applied; last_append_lsn >= this
+    int64_t catch_up_target{-1};       // catch-up resumes toward this after a restart
+    std::set< int64_t > empty_lsns;    // Empty verdicts above durable_commit_lsn (below it they no longer matter)
+
+    bool operator==(CraftDurableState const&) const = default;
+};
+
+// On-disk image of CraftDurableState: a fixed header, then the Empty verdicts as int64s. decode returns nullopt
+// for anything malformed (bad magic or version, wrong length, verdicts not strictly ascending or at or below
+// durable_commit_lsn). A superblock that fails to decode must fault the partition, never restart it empty.
+std::vector< uint8_t > encode_durable_state(CraftDurableState const& s);
+std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len);
+
+// Persistence seam for CraftDurableState, one per partition. Production keeps the encoded image in a HomeStore
+// superblock (wired together with the CRAFT volume); tests inject an in-memory store. persist() returns only once
+// the image is durable. CraftReplDev never issues two persist() calls at once.
+class CraftStateStore {
+public:
+    // The last persisted state; nullopt if nothing was ever persisted; an error if what is there is unusable.
+    virtual homestore::result< std::optional< CraftDurableState > > load() = 0;
+    virtual async_status persist(CraftDurableState const& s) = 0;
+    virtual ~CraftStateStore() = default;
+};
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
@@ -442,6 +496,16 @@ public:
     // inject a mock.
     void set_checkpoint_trigger(checkpoint_trigger_fn_t fn) { checkpoint_trigger_ = std::move(fn); }
 
+    // Wires the durable partition state (S8). Must be called before the device serves anything or recovers:
+    // without a store nothing is persisted and a restart recovers nothing (the pre-S8 behaviour, still what the
+    // light unit tests use).
+    void set_state_store(unique< CraftStateStore > store) { state_store_ = std::move(store); }
+    // The image last handed to the store (or being handed to it). Test observability.
+    CraftDurableState durable_state() const {
+        std::lock_guard lk{state_mu_};
+        return durable_;
+    }
+
     // Overrides the commit_lsn delta between checkpoint triggers (default matches
     // sync_rs_commit_lsn_interval's own default of 128, tying checkpoint cadence to the periodic
     // SyncRSCommitLSN cadence). Production sets this from HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval)
@@ -617,13 +681,25 @@ private:
     async_result< bool > install_fetched_slot(JournalSlot& slot, uint64_t term);
     // commit_lsn advance shared by both parts: skips Empty, stops at the first Missing slot <= rs_commit_lsn,
     // and fires the periodic checkpoint trigger.
-    void advance_commit_after_sync(int64_t rs_commit_lsn);
+    async_status advance_commit_after_sync(int64_t rs_commit_lsn);
     // InternalLogin: replay-guarded; raises a local fence (so a replica that missed the login poll stops
     // admitting the old session too), waits for already-admitted writes above rs_commit_lsn to finish, truncates
     // above rs_commit_lsn (v2 entries only; v1 carries none), then admits the new session term.
     async_status apply_internal_login(uint64_t client_token, uint64_t term, std::optional< int64_t > rs_commit_lsn);
     // LoginAborted: lift every fence at or below abort_upto; later InternalLogins for those terms are no-ops.
-    void apply_login_aborted(uint64_t abort_upto);
+    async_status apply_login_aborted(uint64_t abort_upto);
+
+    // ── durable state (S8) ──
+    // Makes the current durable_ image durable. Callers update durable_ under state_mu_ first, then await this,
+    // then apply the change to state_ (write-ahead). Concurrent callers are coalesced onto one writer: each call
+    // returns once an image taken AFTER its own durable_ update has been persisted, and fails if that image's
+    // write failed. A no-op without a state store.
+    async_status persist_state();
+    async_status run_persist();
+    // Restart recovery, step 1 (before rebuild_overlay): load the durable image and rebuild state_ from it and the
+    // journal -- commit_lsn = durable_commit_lsn, last_append_lsn = max(journal tail, sync_watermark), the missing
+    // set from a walk of the journal above commit_lsn, Empty verdicts and control fields from the image.
+    async_status restore_state();
     // Shared admission check for write/read/keep_alive. Must be called with state_mu_ held.
     bool admits_term_locked(uint64_t term) const { return term == state_.term && state_.term >= state_.fence_term; }
 
@@ -824,12 +900,26 @@ private:
     checkpoint_trigger_fn_t checkpoint_trigger_{}; // empty until production wiring; unit tests inject a mock
     int64_t checkpoint_lsn_interval_{128};         // commit_lsn delta between checkpoint triggers; see
                                                    // set_checkpoint_lsn_interval()
-    int64_t last_checkpoint_lsn_{-1}; // commit_lsn as of the last triggered checkpoint (guarded by state_mu_)
-                                      // FIXME(S8/SDSTOR-22745): defaults to -1 in lockstep with state_.commit_lsn
-                                      // When S8 wires recovering commit_lsn from the journal/superblock on restart,
-                                      // seed this to the recovered commit_lsn too (not -1), or the first post-
-                                      // restart apply_sync_rs_commit_lsn will unconditionally fire a checkpoint
-                                      // regardless of how recently one actually happened before the crash.
+    int64_t last_checkpoint_lsn_{-1}; // commit_lsn as of the last triggered checkpoint (guarded by state_mu_).
+                                      // restore_state() seeds it to the recovered commit_lsn.
+
+    // ── durable state (S8) ──
+    unique< CraftStateStore > state_store_; // null: nothing persisted, nothing recovered
+    CraftDurableState durable_;             // write-ahead image (guarded by state_mu_); see persist_state()
+    // persist_state() bookkeeping (guarded by state_mu_): every caller takes a ticket (persist_req_gen_); one writer
+    // (persist_running_) persists the latest image and records the highest ticket it covered (persist_done_gen_)
+    // and the highest one that was written successfully (persist_ok_gen_).
+    uint64_t persist_req_gen_{0};
+    uint64_t persist_done_gen_{0};
+    uint64_t persist_ok_gen_{0};
+    bool persist_running_{false};
+    detail::wait_list persist_wait_; // notified (never under state_mu_) whenever persist_done_gen_ moves
+    // Slots at or below this were journalled before the last restart and may already be in the durable index (a
+    // checkpoint can run between our triggers, so the index can be ahead of durable_commit_lsn). Re-applying such
+    // a slot must not free the block it replaces: that block may belong to a NEWER slot the index already holds,
+    // which the replay re-applies right after. Leaking those blocks is bounded by the replay window; freeing
+    // them would corrupt. Guarded by state_mu_; -1 = no replay window.
+    int64_t replay_upto_{-1};
 };
 
 } // namespace homeblocks
