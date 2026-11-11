@@ -645,7 +645,7 @@ tooling, not for HomeBlocks.
 | Membership change | `replace_member` / `remove_member` callbacks (`CRD.hpp:470`) | No-ops (S10 not started) |
 | Tests | `src/lib/craft/tests/` (`test_craft_raft_entries.cpp`, `test_craft_pre_resolution.cpp`, `test_craft_peer_exchange.cpp`, `test_craft_truncate.cpp`, `test_craft_watchdog.cpp`, …) | One gtest executable per file, `MockCraftJournalBackend` + stub fetchers; run by `conan create` |
 
-### 3.2 Defects to fix (H1–H8)
+### 3.2 Defects to fix (H1–H9)
 
 | # | Severity | Defect | Consequence | Fixed in |
 |---|---|---|---|---|
@@ -654,9 +654,10 @@ tooling, not for HomeBlocks.
 | **H3** | **High** | `pre_resolve_slots` declares Empty when every member that happened to respond lacks the slot, with no quorum check, and is not restricted to login. | I1 unmet. Safe by accident at N=3 (both non-leader members hold any acked write the leader lacks); at N=5 a write acked by three silent members is voided when the two responders lack it. Mid-session verdicts also race in-flight acks. | PR B ([#197](https://github.com/eBay/HomeBlocks/pull/197)) |
 | **H4** | Medium | Sync catch-up fetches once, with no retry, inline in the apply (raising `last_append_lsn` to `N` is fine: the new range is marked missing in the same step). | A follower that fails one fetch stays stuck until the next Sync, and a slow peer stalls apply. | PR A (catch-up off the apply path), PR E (retry) |
 | **H5** | **High** | No quiesce: `get_rs_commit_lsn` ignores `is_login`; there is a single `term` field. | I8 unmet: an old client can be acked after the login poll and then truncated. Needs the fence/session split (§4.6). | PR A (state), PR C |
-| **H6** | Medium | No persisted partition state and no last-applied RAFT index; the token overwrite is unguarded on replay. | After a restart, replayed entries can change the session; persistence arrives with S8. | PR A (guards), S8 |
+| **H6** | Medium | No persisted partition state and no last-applied RAFT index; the token overwrite is unguarded on replay. | After a restart, replayed entries can change the session; persistence arrives with S8. | PR A (guards), S8a |
 | **H7** | Medium | `fetch_data` is unbounded and has no term or partition fence; the peer channel is not wired. | Large catch-ups cannot complete; a deposed leader's request is indistinguishable. | PR E (with S9) |
 | **H8** | Low | The watchdog calls the stub `append()`; the periodic trigger is dead code. | No healing during a session. | S7/S9 owner (`append`), PR E |
+| **H9** | **High** | `advance_commit_after_sync` (Sync apply and catch-up) moves `commit_lsn` over present slots without applying them to the index. `commit()` never revisits a slot below `commit_lsn`, and `read()` serves overlay entries only above it. | A read of an LBA last written by such a slot returns the older index value. `commit_lsn` is also useless as a durable restart frontier. | S8a |
 
 ### 3.3 Design-to-code map
 
@@ -1101,9 +1102,24 @@ would not propose the same watermark again, so catch-up would stay stuck. The ca
 (fill-only installs, tombstones are no-ops). A leader that restarts mid-round loses nothing, because a round has no effect
 until its entry commits.
 
-> **Caveat: `CraftReplDev` does not persist its partition state yet** (no superblock recovery, H6). Until S8 adds
-> it, the replay guards of PR A (`term ≤ session_term`, `term ≤ aborted_upto`) are what keep replayed entries
-> harmless. This design only requires the state above and the RAFT log to be durable *together*.
+**Persistence (S8a).** `CraftDurableState` is written through a `CraftStateStore` (a HomeStore superblock in
+production) **ahead of** the in-memory change it protects:
+
+| Change | Persisted first | Why first |
+|---|---|---|
+| `InternalLogin` raises the fence | `fence_term` | A replica that restarts unfenced would admit the old session again. |
+| `InternalLogin` admits the term | `term`, `client_token` | Once a new-term write is acked, a re-applied login must be a no-op, not truncate it. |
+| `LoginAborted` lowers the fence | `aborted_upto`, lowered `fence_term` | The fence is lowered only once the abort is durable. |
+| `SyncRSCommitLSN` frees verdicted blocks | Empty verdicts, `sync_watermark`, `catch_up_target` | A re-applied Sync with no memory of its verdicts would free the same blocks twice. |
+| Apply queue finishes an entry | `last_applied_raft_idx` | Entries at or below it are not re-applied. |
+| A checkpoint that actually flushed | `durable_commit_lsn` | Restart resumes `commit` there; verdicts at or below it are dropped. |
+
+On restart `commit_lsn = durable_commit_lsn`, `last_append_lsn = max(journal tail, sync_watermark)`, and every slot
+above `commit_lsn` the journal does not hold (and is not Empty) is missing; catch-up resumes toward
+`catch_up_target`. Slots up to the journal tail are re-applied to the index without freeing the blocks they replace,
+because a checkpoint may already have put a newer slot's block there. That leaks a bounded number of blocks and never
+corrupts. A store or journal tail that cannot be read faults the partition instead of restarting it empty. The login poll's fence
+(PR C) must also be persisted before the poll is answered; that is a one-line follow-up once PR C and S8a are both in.
 
 **Observability.** Add to `replica_stats` and the REST endpoint: `sync_target`,
 `catchup_inflight_bytes`, `catchup_last_error`, `rounds_{proposed,partial,aborted}`, `journal_floor`, and
@@ -1232,7 +1248,10 @@ coverage** for `src/lib/craft/` and for every function a PR adds or changes (the
 | **D. Login + `append()`** | HomeBlocks | **S7/S9 owner** | Login per §4.6 (term from replicated state, pre-sync, fenced poll, final round, Sync + `InternalLogin` v2, `LoginAborted` on failure; new-leader abort); `append()` as a fill-only round to `F_seen`. This doc is the contract | H8 (`append`) |
 | **E. Catch-up and fetch v2** | HomeBlocks + craft_client | this work, with S9 | Async catch-up with retry and backoff; chunked range fetch (`max_bytes`, continuation, `reclaimed_below`); term and partition fence on peer requests; periodic trigger; `peer.hpp` codec v2 + version bump | H4, H7, H8 |
 | **F. UBD side** | craft_client | this work | Stop calling `request_resolution` on a failed write; drop the connection on any send failure (D17); data digests on by default for peer traffic | D3, D4, D11, D17 |
-| Later | HomeBlocks | tbd | S8 reclaim floor + superblock persistence; snapshot (b′); lease / `InternalLogout` / stand-in; membership promotion gate | — |
+| **E1. Catch-up retry + range fetch** ([#200](https://github.com/eBay/HomeBlocks/pull/200)) | HomeBlocks | this work | Retry with backoff; range-based, byte-bounded `fetch_range` with continuation and `reclaimed_below` (callee side) | H4, H7 (callee) |
+| **S8a. Durable state + restart** | HomeBlocks | this work | `CraftStateStore` / `CraftDurableState` written ahead of each control change (§4.11); restart restores it and rebuilds the range from the journal; replay-safe re-apply; checkpoint trigger reports whether it flushed; Sync/catch-up advance goes through `commit()` | H6, H9 |
+| **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn, snapshot pins)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
+| Later | HomeBlocks | tbd | CRAFT volume wiring (superblock store, multi-member group); snapshot (b′); lease / `InternalLogout` / stand-in; membership promotion gate | — |
 
 PR A should land after the S7/S9 owner agrees the entry formats (`InternalLogin` v2, `LoginAborted`), because
 their login code proposes them.
@@ -1240,7 +1259,7 @@ their login code proposes them.
 ## 9. Gaps and risks
 
 This section lists what is still wrong, missing, or risky **in this design**. The code defects found in today's
-implementation are H1–H8 in §3.2 (HomeBlocks) and D1–D17 in Appendix A (reference server). Each gap gives its impact and how it should be handled. "Design" means this
+implementation are H1–H9 in §3.2 (HomeBlocks) and D1–D17 in Appendix A (reference server). Each gap gives its impact and how it should be handled. "Design" means this
 document should close it before implementation, "Defer" means it is accepted for now, and "Decide" means it needs an
 owner's call (§10).
 
@@ -1366,7 +1385,7 @@ are deferred (§6), and the policy for non-convergence is open question 10.
 | **G17** | **Shutdown and cancellation** of resync tasks, in-flight rounds, and snapshots are not specified, nor is deleting a partition mid-resync. | Hangs or use-after-free at teardown (the current code already uses detached threads and coroutines). | **Design.** Cancellation tokens per partition. Rounds have no effect until their entry commits, so cancelling one is always safe. |
 | **G18** | **Rolling upgrade and versioning.** Three wire changes (`client_hdr` v2, `resolve` v2, peer v2) and new RAFT-entry fields (`LoginAborted`, the metadata snapshot, …). `from_json` uses `j.at()`, so an entry missing a field **throws** and is dropped. | Mixed-version clusters either fail to decode or silently ignore safety fields. | **Design.** Version every RAFT entry, default absent fields on decode, negotiate the wire version at LOGIN/HELO, and define the upgrade order (servers first). |
 | **G19** | **Observability has no alerts or SLOs.** | Lag, stalls and divergence are invisible in operation. | **Design.** Alerts on: member lag (dLSN and bytes), time since last `commit_lsn` advance, unresolved-want age, re-freeze count, journal budget, digest mismatch (G3). |
-| **G20** | **`CraftReplDev` state is not persisted** (H6). | Fences, terms and the snapshot cursor are lost on restart until S8. | **Design** with S8 (superblock). Until then PR A's replay guards apply. |
+| **G20** | **`CraftReplDev` state is not persisted** (H6). | Fences, terms and the snapshot cursor are lost on restart until S8. | **Fixed** by S8a (§4.11), except the production superblock store and the login poll's fence (follow-ups). |
 | **G21** | **One partition per process** (D13). | The peer wire is ready (it carries `partition_id`), but the server is not. | **Decide** (open question 5). |
 
 ### 9.5 Small specification holes
