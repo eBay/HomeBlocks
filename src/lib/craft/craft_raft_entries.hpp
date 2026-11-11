@@ -38,12 +38,13 @@
 //     All subsequent IO with a mismatched term is rejected STALE_TERM.
 //
 //   CreateVolume — the partition's first entry: proposed by the member that formed
-//     the RAFT group; every member creates its local volume when it commits.
+//     the RAFT group, and again by its leader for a create that did not finish there;
+//     every member creates its local volume when it first commits.
 //     Applied by the volume layer (the partition has no CraftReplDev before it).
 //
 // Wire layout:
 //   header blob → CraftEntryHeader  (discriminant only)
-//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload | CreateVolumePayload
+//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload | CreateVolumeHeader
 //
 // For SyncRSCommitLSN the key blob is variable-length: the fixed
 // SyncRSCommitLSNPayload struct is followed immediately by
@@ -81,9 +82,12 @@ struct InternalLoginPayload {
 
 // ─── key blob: CreateVolume ───────────────────────────────────────────────────
 
-// Fixed prefix. Immediately followed by num_members × member uuid, then name_len name bytes. No ordinal: that is
-// local to each node. The uuid is raw bytes: a packed field can't bind to uuid's copy operations.
-struct CreateVolumePayload {
+// The key blob's fixed-size part, its header: num_members × member uuid follow it, then name_len name bytes. No
+// ordinal: that is local to each node. The uuid is raw bytes: a packed field can't bind to uuid's copy operations.
+// `version` comes first: an entry written in another layout is rejected rather than misread.
+struct CreateVolumeHeader {
+    static constexpr uint8_t VERSION{1};
+    uint8_t version;
     uint8_t id[sizeof(boost::uuids::uuid)];
     uint64_t size_bytes;
     uint32_t page_size;
@@ -145,13 +149,14 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 }
 
 inline size_t create_volume_key_size(size_t num_members, size_t name_len) {
-    return sizeof(CreateVolumePayload) + num_members * sizeof(boost::uuids::uuid) + name_len;
+    return sizeof(CreateVolumeHeader) + num_members * sizeof(boost::uuids::uuid) + name_len;
 }
 
 // Writes e into buf. Caller must size buf via create_volume_key_size(e.members.size(), e.name.size()) first, and keep
 // both counts within uint16_t.
 inline void serialize_create_volume(uint8_t* buf, CreateVolumeEntry const& e) {
-    auto* p = reinterpret_cast< CreateVolumePayload* >(buf);
+    auto* p = reinterpret_cast< CreateVolumeHeader* >(buf);
+    p->version = CreateVolumeHeader::VERSION;
     std::memcpy(p->id, &e.id, sizeof(p->id));
     p->size_bytes = e.size_bytes;
     p->page_size = e.page_size;
@@ -165,11 +170,12 @@ inline void serialize_create_volume(uint8_t* buf, CreateVolumeEntry const& e) {
     if (!e.name.empty()) { std::memcpy(tail, e.name.data(), e.name.size()); }
 }
 
-// `key` is persisted RAFT log data replayed on apply: validated against its declared counts before anything is
-// trusted, like parse_empty_slots. Returns std::nullopt if the entry doesn't parse.
+// `key` is persisted RAFT log data replayed on apply: validated against its version and declared counts before anything
+// is trusted, like parse_empty_slots. Returns std::nullopt if the entry doesn't parse.
 inline std::optional< CreateVolumeEntry > parse_create_volume(sisl::blob const& key) {
-    if (key.size() < sizeof(CreateVolumePayload)) { return std::nullopt; }
-    const auto* p = reinterpret_cast< const CreateVolumePayload* >(key.cbytes());
+    if (key.size() < sizeof(CreateVolumeHeader)) { return std::nullopt; }
+    const auto* p = reinterpret_cast< const CreateVolumeHeader* >(key.cbytes());
+    if (p->version != CreateVolumeHeader::VERSION) { return std::nullopt; }
     if (key.size() != create_volume_key_size(p->num_members, p->name_len)) { return std::nullopt; }
 
     CreateVolumeEntry e;

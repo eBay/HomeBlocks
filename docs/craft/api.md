@@ -255,8 +255,8 @@ from the result means not-present-here.
 
 `SyncRSCommitLSN { rs_commit_lsn, client_token, empty_slots[] }` and
 `InternalLogin { client_token, term }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
-(unchanged by the client-surface reshaping above). `CreateVolume { id, size, page_size, members[], name }`
-is a partition's first entry, applied by the volume layer (below).
+(unchanged by the client-surface reshaping above). `CreateVolume { version, id, size, page_size, members[], name }`
+is a partition's first entry, applied by the volume layer (below); an entry of another `version` is rejected.
 
 ---
 

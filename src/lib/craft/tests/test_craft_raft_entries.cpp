@@ -816,8 +816,17 @@ TEST(CreateVolumeCodecTest, RejectsKeyWhoseSizeDisagreesWithItsCounts) {
     auto padded = buf;
     padded.push_back(0);
     EXPECT_FALSE(parse_create_volume(as_blob(padded)));
-    auto prefix_only = std::vector< uint8_t >(buf.begin(), buf.begin() + sizeof(CreateVolumePayload) - 1);
+    auto prefix_only = std::vector< uint8_t >(buf.begin(), buf.begin() + sizeof(CreateVolumeHeader) - 1);
     EXPECT_FALSE(parse_create_volume(as_blob(prefix_only)));
+}
+
+TEST(CreateVolumeCodecTest, RejectsAnotherVersion) {
+    auto buf = serialize(make_create_volume_entry());
+    ASSERT_EQ(reinterpret_cast< CreateVolumeHeader const* >(buf.data())->version, CreateVolumeHeader::VERSION);
+    for (int const version : {0, CreateVolumeHeader::VERSION + 1}) {
+        reinterpret_cast< CreateVolumeHeader* >(buf.data())->version = static_cast< uint8_t >(version);
+        EXPECT_FALSE(parse_create_volume(as_blob(buf))) << "version " << version;
+    }
 }
 
 } // namespace
