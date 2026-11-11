@@ -165,6 +165,12 @@ bool volume::init(bool is_recovery) {
 }
 
 bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_init_error")) {
+        LOGI("vol={}: flip craft_create_volume_init_error set, local create fails", id_str());
+        return false;
+    }
+#endif
     auto rd = homestore::hs()->repl_service().get_repl_dev(id());
     if (!rd) {
         LOGE("No RAFT group for CRAFT volume: {}, uuid: {}, error: {}", vol_info_->name, id_str(), rd.error());
@@ -184,12 +190,21 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
     auto& logstores = homestore::logstore_service();
     auto const logdev_id = logstores.create_new_logdev(craft_journal_flush_mode);
     auto journal = (logdev_id != 0) ? logstores.create_new_log_store(logdev_id, false /* append_mode */) : nullptr;
-    if (!journal || !init_index_table(orphan_idx != nullptr, std::move(orphan_idx))) {
+    // Read before the table moves into the call: the order the arguments are evaluated in is unspecified.
+    bool const taken_over = orphan_idx != nullptr;
+    if (!journal || !init_index_table(taken_over, std::move(orphan_idx))) {
         LOGE("Failed to create the journal or index of volume: {}, uuid: {}", vol_info_->name, id_str());
         if (logdev_id != 0) { logstores.destroy_log_dev(logdev_id); }
         volume_chunk_selector_->release_chunks(ordinal());
         return false;
     }
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_crash_after_index")) {
+        // Stands for a crash between the index table and the superblock: nothing is cleaned up, the test restarts.
+        LOGI("vol={}: flip craft_create_volume_crash_after_index set, stopping before the superblock", id_str());
+        return false;
+    }
+#endif
 
     sb_.create(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
     sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal, pdev_id,

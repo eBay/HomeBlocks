@@ -19,6 +19,7 @@
 // is destroyed. test_craft_volume_multi covers a group with several members.
 
 #include <filesystem>
+#include <set>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 #include <sisl/flip/flip_client.hpp>
@@ -264,6 +265,65 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
         ASSERT_TRUE(wait_for_group_gone(id)) << flip;
         ASSERT_TRUE(create(clone(info))) << flip;
     }
+}
+
+// A create that crashed between its index table and its superblock leaves the table behind. The table keeps its
+// ordinal across restarts, so no other volume gets its chunks, and the volume's next create takes it over, also after
+// one that failed with it.
+TEST_F(CraftVolumeTest, LeftoverIndexTableIsTakenOver) {
+    auto const info = craft_vol_info("craft_vol_leftover_index");
+    auto const id = info.id;
+    auto const table_ordinals = [] {
+        std::set< uint32_t > ords;
+        for (uint32_t o = 0; o < MAX_NUM_VOLUMES; ++o) {
+            if (homestore::hs()->index_service().get_index_table(o)) { ords.insert(o); }
+        }
+        return ords;
+    };
+    auto const before = table_ordinals();
+
+    g_helper->set_flip_point("craft_create_volume_crash_after_index", 1);
+    ASSERT_FALSE(create(clone(info)));
+    g_helper->remove_flip("craft_create_volume_crash_after_index");
+    g_helper->restart();
+
+    // The table came back without its volume.
+    std::vector< uint32_t > leftover;
+    for (auto const o : table_ordinals()) {
+        if (!before.contains(o)) { leftover.push_back(o); }
+    }
+    ASSERT_EQ(leftover.size(), 1u);
+    auto const ordinal = leftover.front();
+    ASSERT_FALSE(hb()->get_volume(id));
+
+    // No other volume is given its ordinal.
+    volume_id_t other_id;
+    {
+        auto other = create(craft_vol_info("craft_vol_leftover_other"));
+        ASSERT_TRUE(other) << other.error().message();
+        EXPECT_NE((*other)->ordinal(), ordinal);
+        other_id = (*other)->id();
+    }
+
+    // A create of the volume that fails after taking the table over leaves it to the next one.
+    ASSERT_TRUE(wait_for_group_gone(id));
+    g_helper->set_flip_point("craft_create_volume_init_error", 1);
+    ASSERT_FALSE(create(clone(info)));
+    g_helper->remove_flip("craft_create_volume_init_error");
+    ASSERT_TRUE(wait_for_group_gone(id));
+    {
+        auto vol = create(clone(info));
+        ASSERT_TRUE(vol) << vol.error().message();
+        EXPECT_EQ((*vol)->ordinal(), ordinal);
+        EXPECT_EQ((*vol)->indx_table()->index_table()->ordinal(), ordinal);
+    }
+
+    g_helper->restart();
+    auto vol = hb()->get_volume(id);
+    ASSERT_TRUE(vol);
+    EXPECT_EQ((*vol)->ordinal(), ordinal);
+    EXPECT_NE((*vol)->craft_dev(), nullptr);
+    EXPECT_TRUE(hb()->get_volume(other_id));
 }
 #endif
 

@@ -58,7 +58,8 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
                      "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
         vol_map_.emplace(std::make_pair(id, vol_ptr));
-        ordinal_reserver_->reserve(vol_ptr->ordinal());
+        // Its index table, recovered before it, already holds the ordinal; one destroyed before the crash doesn't.
+        if (!ordinal_reserver_->is_reserved(vol_ptr->ordinal())) { ordinal_reserver_->reserve(vol_ptr->ordinal()); }
     }
 
     if (vol_ptr->is_destroying()) {
@@ -91,6 +92,9 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
         bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, sb->max_size_bytes, chunk_ids);
         RELEASE_ASSERT(success, "Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
                        boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
+        // The table holds its ordinal from here on, whether or not a volume comes to take it: a volume given the
+        // ordinal anew would get the table's chunks.
+        ordinal_reserver_->reserve(sb->ordinal);
         uint64_t const ordinal = sb->ordinal;
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
         idx_tbl_map_.emplace(pid_str, std::pair{tbl, ordinal});
@@ -370,7 +374,7 @@ status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
 #endif
 
     // A create that crashed between its index table and its superblock left the table behind (recovered without a
-    // volume). Reuse it, under the ordinal its chunks were recovered with: a second table for the same volume would
+    // volume). Take it over, with the ordinal it holds since its recovery: a second table for the same volume would
     // compete with it at the next recovery.
     std::optional< std::pair< shared< VolumeIndexTable >, uint64_t > > orphan_idx;
     {
@@ -381,18 +385,13 @@ status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
         }
     }
 
-    {
+    if (orphan_idx) {
+        DEBUG_ASSERT(ordinal_reserver_->is_reserved(orphan_idx->second),
+                     "vol={}: leftover index table's ordinal {} free", id_str, orphan_idx->second);
+        info.ordinal = orphan_idx->second;
+    } else {
         auto lg = std::scoped_lock(vol_lock_);
-        if (orphan_idx) {
-            if (ordinal_reserver_->is_reserved(orphan_idx->second)) {
-                LOGE("vol={}: ordinal {} of its leftover index table is taken", id_str, orphan_idx->second);
-                return std::unexpected(volume_error::INTERNAL_ERROR);
-            }
-            info.ordinal = orphan_idx->second;
-            ordinal_reserver_->reserve(info.ordinal);
-        } else {
-            info.ordinal = ordinal_reserver_->reserve();
-        }
+        info.ordinal = ordinal_reserver_->reserve();
         if (info.ordinal >= MAX_NUM_VOLUMES) {
             ordinal_reserver_->unreserve(info.ordinal);
             LOGE("vol={}: no free volume ordinal", id_str);
@@ -400,12 +399,20 @@ status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
         }
     }
 
-    auto vol =
-        volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
-                                  dynamic_chunk_allocation(), orphan_idx ? std::move(orphan_idx->first) : nullptr);
-    // A failed create keeps its ordinal reserved: an index table it adopted still owns chunks under that ordinal, and a
-    // volume given the ordinal again would reuse them. An ordinal lost to a rare failure costs nothing.
-    if (!vol) { return std::unexpected(volume_error::INTERNAL_ERROR); }
+    auto const ordinal = info.ordinal;
+    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                         dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr);
+    if (!vol) {
+        if (orphan_idx) {
+            // The table stays behind, holding its ordinal, for the next create of this volume to take over.
+            auto lg = std::scoped_lock(index_lock_);
+            idx_tbl_map_.emplace(id_str, std::move(*orphan_idx));
+        } else {
+            // Nothing is left under the ordinal: a failed create releases its chunks and journal.
+            ordinal_reserver_->unreserve(ordinal);
+        }
+        return std::unexpected(volume_error::INTERNAL_ERROR);
+    }
     auto lg = std::scoped_lock(vol_lock_);
     vol_map_.emplace(vol->id(), vol);
     return ok();
