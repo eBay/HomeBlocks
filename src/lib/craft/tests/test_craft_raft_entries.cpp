@@ -168,9 +168,11 @@ public:
     // Every request's ranges are recorded.
     std::deque< result< FetchRangeResult > > range_script;
     std::vector< std::vector< LsnRange > > range_requests;
+    TestGate* range_gate{nullptr}; // when set, fetch_range suspends until the gate opens
     async_result< FetchRangeResult > fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes,
                                                  uint32_t timeout_ms) override {
         range_requests.push_back(ranges);
+        if (range_gate) co_await range_gate->wait();
         if (!range_script.empty()) {
             auto r = std::move(range_script.front());
             range_script.pop_front();
@@ -260,6 +262,10 @@ protected:
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+    }
+
+    auto install(JournalSlot slot, uint64_t term) {
+        return homeblocks::detail::sync_get(dev_->install_fetched_slot(slot, term));
     }
 
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
@@ -1350,6 +1356,77 @@ TEST_F(CraftRaftEntriesTest, CatchUpReportsReclaimedResponder) {
     commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
 
     EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// ── review on #200 ──
+
+// A slot an in-flight client write still owns is not resolved: install reports it as no progress.
+TEST_F(CraftRaftEntriesTest, CatchUpSlotOwnedByAClientWriteIsNotProgress) {
+    dev_->seed_term(1);
+    TestGate gate;
+    journal_->write_gates[3] = &gate;
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.write(craft::client_hdr{.term = 1, .commit_lsn = -1, .all_committed_lsn = -1}, 3, 0, k_page_size,
+                             sisl::sg_list{});
+        co_return ok();
+    }(*dev_, w));
+    ASSERT_FALSE(w.has_value());
+    ASSERT_TRUE(dev_->is_missing(3));
+
+    auto r = install(zero_slot(3), 1);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(*r);
+
+    journal_->write_gates.clear();
+    gate.open();
+    ASSERT_TRUE(w.has_value());
+    EXPECT_TRUE(w->has_value());
+    r = install(zero_slot(3), 1); // filled by the write now: resolved
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(*r);
+}
+
+// A Sync that raises the target while a pass is failing is not lost when that pass gives up.
+TEST_F(CraftRaftEntriesTest, CatchUpKeepsATargetRaisedDuringAFailedPass) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    TestGate gate;
+    fetcher_.range_gate = &gate;
+    fetcher_.range_script = {range_error(), range_error()};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 1u); // held in the first fetch
+    commit_entry(*dev_, 2, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(6, 0, {}));
+    EXPECT_EQ(fetcher_.range_requests.size(), 1u); // the running runner owns the raised target
+
+    fetcher_.range_gate = nullptr;
+    gate.open();
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{3, 6}}));
+}
+
+// Slots a responder reports as reclaimed are left for baseline recovery: no retry and no backoff for them, while
+// the recoverable part of the range continues.
+TEST_F(CraftRaftEntriesTest, CatchUpLeavesReclaimedSlotsForBaseline) {
+    dev_->set_peer_fetcher(&fetcher_);
+    int delays = 0;
+    dev_->set_retry_delay_fn([&delays](std::chrono::milliseconds) -> async_status {
+        ++delays;
+        co_return ok();
+    });
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.range_script = {FetchRangeResult{.slots = {}, .next = -1, .reclaimed_below = 5},
+                             FetchRangeResult{.slots = {zero_slot(5), zero_slot(6)}, .next = -1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(6, 0, {}));
+    ASSERT_EQ(fetcher_.range_requests.size(), 2u);
+    EXPECT_EQ(fetcher_.range_requests[1], (std::vector< LsnRange >{{5, 6}}));
+    EXPECT_EQ(delays, 0);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_TRUE(dev_->is_missing(4));
+    EXPECT_FALSE(dev_->is_missing(5));
+    EXPECT_FALSE(dev_->is_missing(6));
 }
 
 } // namespace

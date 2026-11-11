@@ -727,6 +727,9 @@ private:
     // Catch-up runner state (guarded by state_mu_). See request_catch_up().
     int64_t catch_up_target_{-1};
     bool catch_up_running_{false};
+    // Slots below this were reported reclaimed by a responder during the current run: they need a baseline (snapshot)
+    // and are left out of later passes. Reset when a new runner starts.
+    int64_t catch_up_reclaimed_below_{-1};
     // Notified whenever an in-flight write() finishes; apply_internal_login waits on it before truncating.
     detail::wait_list write_drain_;
 

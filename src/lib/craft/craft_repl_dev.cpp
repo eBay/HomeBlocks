@@ -1510,42 +1510,38 @@ async_result< FetchRangeResult > CraftReplDev::fetch_range(std::vector< LsnRange
     int64_t scanned = 0;
     for (size_t ri = 0; ri < ranges.size(); ++ri) {
         auto [lo, hi] = ranges[ri];
-        for (int64_t start = lo; start <= hi;) {
+        for (int64_t lsn = lo; lsn <= hi; ++lsn) {
             if (scanned >= k_fetch_range_max_scan) {
-                out.next = start;
+                out.next = lsn;
                 co_return out;
             }
-            // Classify and read in batches through fetch_data (same Empty / present / absent rules).
-            int64_t const end = std::min(hi, start + std::min< int64_t >(255, k_fetch_range_max_scan - scanned - 1));
-            std::vector< int64_t > lsns;
-            for (int64_t l = start; l <= end; ++l)
-                lsns.push_back(l);
-            scanned += end - start + 1;
-            auto r = co_await fetch_data(std::move(lsns));
+            ++scanned;
+            // One slot at a time through fetch_data (same Empty / present / absent rules): the budget is checked after
+            // every slot, so at most one payload past it is read. A batched read loaded up to 256 payloads and then
+            // dropped the surplus (review on #200).
+            auto r = co_await fetch_data({lsn});
             if (!r) co_return std::unexpected(r.error());
-            for (auto& slot : *r) {
-                // Always return at least one slot; past that, stop before exceeding max_bytes.
-                uint64_t const sz = (slot.is_empty || slot.all_zeros) ? 0 : slot.len_bytes;
-                if (!out.slots.empty() && bytes + sz > max_bytes) {
-                    out.next = slot.lsn;
+            if (r->empty()) continue; // absent here
+            auto& slot = r->front();
+            // Always return at least one slot; past that, stop before exceeding max_bytes.
+            uint64_t const sz = (slot.is_empty || slot.all_zeros) ? 0 : slot.len_bytes;
+            if (!out.slots.empty() && bytes + sz > max_bytes) {
+                out.next = lsn;
+                co_return out;
+            }
+            bytes += sz;
+            out.slots.push_back(std::move(slot));
+            if (bytes >= max_bytes) {
+                // Budget reached: everything after this slot is the continuation.
+                if (lsn < hi) {
+                    out.next = lsn + 1;
                     co_return out;
                 }
-                bytes += sz;
-                int64_t const lsn = slot.lsn;
-                out.slots.push_back(std::move(slot));
-                if (bytes >= max_bytes) {
-                    // Budget reached: everything after this slot is the continuation.
-                    if (lsn < hi) {
-                        out.next = lsn + 1;
-                        co_return out;
-                    }
-                    if (ri + 1 < ranges.size()) {
-                        out.next = ranges[ri + 1].first;
-                        co_return out;
-                    }
+                if (ri + 1 < ranges.size()) {
+                    out.next = ranges[ri + 1].first;
+                    co_return out;
                 }
             }
-            start = end + 1;
         }
     }
     co_return out; // next = -1: everything requested was covered
@@ -2045,6 +2041,7 @@ void CraftReplDev::request_catch_up(int64_t rs_commit_lsn) {
         if (!catch_up_running_) {
             catch_up_running_ = true;
             start = true;
+            catch_up_reclaimed_below_ = -1; // a new runner may reach a different responder: ask again
         }
     }
     if (start) detail::detach(run_catch_up());
@@ -2057,22 +2054,32 @@ async_status CraftReplDev::run_catch_up() {
     for (;;) {
         int64_t target;
         uint64_t term;
+        int64_t reclaimed_before;
         std::vector< LsnRange > ranges; // missing slots <= target, as inclusive ranges
         {
             std::lock_guard lk{state_mu_};
+            reclaimed_before = catch_up_reclaimed_below_;
             target = catch_up_target_;
             term = state_.term;
             for (int64_t lsn : missing_lsns_) {
                 if (lsn > target) break; // missing_lsns_ is ordered
+                // Past the responder's retention: these need a baseline (snapshot, §4.9), not another fetch.
+                if (lsn < catch_up_reclaimed_below_) continue;
                 if (!ranges.empty() && ranges.back().second + 1 == lsn) {
                     ranges.back().second = lsn;
                 } else {
                     ranges.emplace_back(lsn, lsn);
                 }
             }
+            if (ranges.empty() && catch_up_reclaimed_below_ > 0) {
+                LOGW("catch-up: slots below {} are past the responder's retention -- left missing for baseline "
+                     "recovery",
+                     catch_up_reclaimed_below_);
+            }
             if (ranges.empty()) {
-                // Everything up to the target is resolved. Exit under the lock, so a Sync raising the target right
-                // now either is seen here (non-empty ranges next time) or starts a new runner after this one.
+                // Everything up to the target is resolved (or needs a baseline). Exit under the lock, so a Sync raising
+                // the target right now either is seen here (non-empty ranges next time) or starts a new runner after
+                // this one.
                 catch_up_running_ = false;
             } else if (peer_fetcher_ == nullptr) {
                 LOGW("catch-up: missing slot(s) <= {} but no peer_fetcher_ wired -- leaving as missing", target);
@@ -2091,11 +2098,24 @@ async_status CraftReplDev::run_catch_up() {
             backoff = catch_up_min_backoff;
             continue; // progress: go again straight away for whatever is left
         }
+        {
+            // The pass learned that part of the range is past retention: not a failure, and nothing to wait for --
+            // rebuild the ranges without it straight away.
+            std::lock_guard lk{state_mu_};
+            if (catch_up_reclaimed_below_ > reclaimed_before) continue;
+        }
         // No progress (fetch failed, nobody returned the slots, or local installs failed).
         if (!retry_delay_ || ++failed_passes >= catch_up_max_failed_passes) {
+            std::lock_guard lk{state_mu_};
+            // A SyncRSCommitLSN that raised the target during this pass saw a running runner and started none: keep
+            // going for it, with a fresh retry budget, rather than drop it until the next Sync (review on #200).
+            if (catch_up_target_ > target) {
+                failed_passes = 0;
+                backoff = catch_up_min_backoff;
+                continue;
+            }
             LOGW("catch-up: no progress toward {} after {} pass(es) -- stopping until the next SyncRSCommitLSN", target,
                  failed_passes + (retry_delay_ ? 0 : 1));
-            std::lock_guard lk{state_mu_};
             catch_up_running_ = false;
             co_return ok();
         }
@@ -2135,8 +2155,11 @@ async_result< size_t > CraftReplDev::catch_up_pass(std::vector< LsnRange > range
                 co_return resolved;
             }
             if (r->reclaimed_below >= 0) {
-                // Past retention on the responder: baseline recovery (§4.9) is the remedy, not a retry.
+                // Past retention on the responder: baseline recovery (§4.9) is the remedy, not a retry. Those slots
+                // stay missing but are left out of later passes; the rest of the request continues.
                 LOGW("catch-up: responder reclaimed below {} -- baseline recovery needed", r->reclaimed_below);
+                std::lock_guard lk{state_mu_};
+                catch_up_reclaimed_below_ = std::max(catch_up_reclaimed_below_, r->reclaimed_below);
             }
             if (auto bad = validate_range_response(batch, r->next, r->slots); bad) {
                 LOGE("catch-up: fetch_range response lsn={} outside the request, out of order, or past `next` -- "
@@ -2166,7 +2189,8 @@ async_result< size_t > CraftReplDev::catch_up_pass(std::vector< LsnRange > range
 }
 
 // Installs one slot returned by a catch-up fetch. Returns true if the slot is resolved afterwards (installed,
-// Empty, or already resolved by someone else), false if it is still missing (a local alloc/write failure).
+// Empty, or already resolved by someone else), false if it is still missing (a local alloc/write failure, or a
+// client write still owns it).
 async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint64_t term) {
     auto self = shared_from_this();
     {
@@ -2176,9 +2200,10 @@ async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint6
         // while catch-up installs it, a client gap-fill for the same dLSN is rejected (and vice
         // versa), so the two can never journal independently allocated blocks for one slot.
         std::lock_guard lk{state_mu_};
-        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn) ||
-            in_flight_write_dlsns_.contains(slot.lsn))
-            co_return true;
+        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn)) co_return true;
+        // Owned by an in-flight client write: not resolved yet. Reporting it as progress would let a peer that keeps
+        // returning this slot drive the runner around without backoff (review on #200).
+        if (in_flight_write_dlsns_.contains(slot.lsn)) co_return false;
         in_flight_write_dlsns_.insert(slot.lsn);
     }
     struct ClaimGuard {

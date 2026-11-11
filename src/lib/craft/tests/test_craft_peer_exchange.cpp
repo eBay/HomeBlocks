@@ -57,6 +57,7 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
+    int reads{0};                          // read_slot calls
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
                                                              lba_count_t /* len */) override {
@@ -69,6 +70,7 @@ public:
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
+        ++reads;
         if (fail_on_read && *fail_on_read == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return co_await mock_read_slot(*this, lsn);
@@ -164,6 +166,9 @@ TEST_F(CraftPeerExchangeTest, FetchRangeStopsAtBudgetWithContinuation) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(lsns_of(*r), (std::vector< int64_t >{0, 1}));
     EXPECT_EQ(r->next, 2);
+    // Reads stop at the budget: slots 0 and 1 fill it exactly, so slot 2 is never read -- a batched read loaded every
+    // slot of the batch first (review on #200).
+    EXPECT_EQ(journal_->reads, 2);
 }
 
 // A slot larger than the whole budget is still returned (alone), so a fetch always makes progress.
