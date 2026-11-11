@@ -54,8 +54,9 @@ Client sends to the RAFT leader. A follower does **not** fail the call: it repli
 response carrying `term == 0` and `leader_hint` set to the current leader's id, and the client retries
 login there (the design's `ENOTLEADER` redirect, carried as a sentinel rather than as the
 `craft_error::NOT_LEADER` error the other RPCs return; see `login` in [api.md](api.md)). Leader runs the
-full login orchestration (GetRSCommitLSN → optional FetchData → SyncRSCommitLSN RAFT → InternalLogin
-RAFT) and responds once both RAFT entries commit. `volume_id` names the volume to establish the session
+full login orchestration (GetRSCommitLSN → pre-resolution (FetchData / `Empty` verdicts) →
+SyncRSCommitLSN RAFT → InternalLogin RAFT) and responds once both entries have applied on the leader.
+`volume_id` names the volume to establish the session
 on (the design's `login(client_token, vol_id)`): a multi-volume server routes by it, and it is the same
 id every follow-on connection presents in HELO (see the wire doc in `craft_client`). `dLSN` is the
 starting per-partition LSN. `lba_size` is the volume block size in bytes — the client aligns every
@@ -191,8 +192,10 @@ carries the reconfig promotion gate.
 The request's `term` is the current session term T. A login poll fences writes whose term is ≤ T: the
 request's term, not the peer's own, which may lag behind an `InternalLogin` it hasn't applied yet. The
 response's `term` is the peer's own session term; a responder already past T makes the leader abort the
-login with `STALE_TERM`. The leader counts itself locally rather than sending its own LSNs, and identifies
-each responder by the connection it sent the request on, so the response carries no peer id.
+login with `STALE_TERM`. The leader counts itself locally rather than polling itself, but it quiesces its own
+prior-session writes the same way before reading its own LSNs: otherwise an old write acked by the leader and
+a member the poll missed could land above the watermark, and `InternalLogin` would truncate it. The leader
+identifies each responder by the connection it sent the request on, so the response carries no peer id.
 
 HomeBlocks handler: `CraftReplDev::get_rs_commit_lsn()` / `get_lsns()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
@@ -244,12 +247,13 @@ watermark and verdicts.
 ### 10. InternalLogin (RAFT proposal, from leader during login)
 
 ```
-RAFT entry payload: { client_token: uint64, term: uint64 }
+RAFT entry payload: { client_token: uint64, term: uint64, rs_commit_lsn: int64 }
 ```
 
-Proposed after `SyncRSCommitLSN` commits. On apply each replica stores `client_token` and `term`,
-rejecting any subsequent IO from a different term. Proposed immediately after the `SyncRSCommitLSN`
-entry during the login sequence.
+Proposed immediately after the login's `SyncRSCommitLSN` commits. On apply each replica first truncates
+its journal to `rs_commit_lsn` if its `last_append_lsn` is above it, then stores `client_token` and
+`term`, rejecting any subsequent IO from a different term. Until a replica has applied the entry, it
+rejects IO and HELO at the new term, so no new-session write can land before its truncation.
 
 ---
 
