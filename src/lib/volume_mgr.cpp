@@ -400,7 +400,16 @@ void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
         return;
     }
 
-    auto const st = create_craft_volume_local(std::move(*entry));
+    // Counted like a create, so a shutdown either waits for this apply or is seen by it: a replica made while HomeStore
+    // shuts down would itself never be shut down.
+    inc_ref();
+    status st = std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    if (is_shutting_down()) {
+        LOGW("vol={} lsn={}: HomeBlocks is shutting down, no replica created here", id_str, lsn);
+    } else {
+        st = create_craft_volume_local(std::move(*entry));
+    }
+    dec_ref();
     if (!st) { LOGE("vol={} lsn={}: failed to create the volume locally: {}", id_str, lsn, st.error().message()); }
     create_volume_ctx::complete(ctx, st);
 }
