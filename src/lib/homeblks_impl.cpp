@@ -219,8 +219,7 @@ public:
 
     // Only the RAFT (CRAFT) service looks peers up; init_homestore() checks the hook is set in that mode.
     std::pair< std::string, uint16_t > lookup_peer(homestore::replica_id_t uuid) const override {
-        auto const& lookup = hb_->config().lookup_peer;
-        return lookup ? lookup(uuid) : std::pair< std::string, uint16_t >{};
+        return hb_->config().lookup_peer(uuid);
     }
 
     homestore::replica_id_t get_my_repl_id() const override { return hb_->our_uuid(); }

@@ -102,7 +102,7 @@ struct CreateVolumeEntry {
     uint64_t size_bytes{0};
     uint32_t page_size{0};
     std::vector< boost::uuids::uuid > members;
-    std::string name;
+    std::string name; // volume_info::name: the caller's name for the volume, opaque to HomeBlocks
 };
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

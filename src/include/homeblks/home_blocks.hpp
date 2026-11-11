@@ -89,12 +89,15 @@ struct volume_info {
     volume_id_t id;
     uint64_t size_bytes{0};
     uint64_t page_size{0}; // logical block size for this volume (a per-volume runtime setting)
+    // The caller's name for the volume, opaque to HomeBlocks and kept in its superblock. A CRAFT create retry must
+    // repeat it; a CRAFT volume's is at most 99 bytes, without NUL.
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
     replication_mode repl_mode{replication_mode::DISABLED};
-    // CRAFT: the partition's replica set (each member's svc id, see home_blocks_config::on_svc_id). create_volume
-    // forms the RAFT group from it; this node must be a member. Only used at creation: the RAFT group persists and
-    // owns membership from then on.
+    // CRAFT: the partition's replica set, each member given by its svc id (see home_blocks_config::on_svc_id); this
+    // node must be one of them. Read only by create_volume, which forms the RAFT group from it and replicates it in the
+    // CreateVolume entry. It isn't kept in the superblock, so a volume loaded at a restart has none: from the create
+    // on, the membership is the RAFT group's, which a reconfiguration may change.
     std::vector< peer_id_t > members{};
 
     volume_info() = default;
@@ -117,9 +120,13 @@ struct volume_info {
     }
     auto operator==(volume_info const& rhs) const { return id == rhs.id; }
     std::string to_string() const {
-        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={} members={}",
-                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode),
-                           members.size());
+        std::string member_ids;
+        for (auto const& m : members) {
+            member_ids += (member_ids.empty() ? "" : ",") + boost::uuids::to_string(m);
+        }
+        return fmt::format(
+            "volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={} members=[{}]",
+            boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode), member_ids);
     }
 };
 
