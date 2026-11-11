@@ -63,9 +63,17 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool,
+    // Accepts writes (the login-fence tests drive write()); fetch_data tests seed `slots` directly.
+    homeblocks::detail::wait_list* write_waiters{nullptr}; // when set, write_slot waits until write_released
+    bool write_released{true};
+    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id, bool all_zeros,
                             std::vector< homestore::csum_t > const&) override {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+        if (write_waiters) {
+            while (!write_released)
+                co_await write_waiters->wait_until([this] { return write_released; });
+        }
+        slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
+        co_return ok();
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
@@ -75,7 +83,11 @@ public:
     }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
-    async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
+    int free_data_calls{0};
+    async_status free_data(homestore::multi_blk_id) override {
+        ++free_data_calls;
+        co_return ok();
+    }
 
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
@@ -125,6 +137,133 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->commit_lsn, 25);
     EXPECT_EQ(r->last_append_lsn, 50);
+}
+
+// ── login fence (docs/craft/resync.md §4.6, I8) ─────────────────────────────────
+
+namespace {
+auto zero_write(CraftReplDev& dev, uint64_t term, int64_t dlsn) {
+    return homeblocks::detail::sync_get(
+        dev.write(craft::client_hdr{.term = term, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn, /*addr=*/0,
+                  /*len=*/k_page_size, sisl::sg_list{}));
+}
+} // namespace
+
+// A login poll raises the fence before reporting; from then on the old session's writes are rejected.
+TEST_F(CraftPeerExchangeTest, LoginPollRaisesFenceAndRejectsOldSession) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(zero_write(*dev_, 3, 0).has_value());
+
+    auto r = homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/4, /*is_login=*/true));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->last_append_lsn, 0); // the write acked before the poll is covered
+    EXPECT_EQ(dev_->fence_term(), 4u);
+
+    auto w = zero_write(*dev_, 3, 1);
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// Non-login polls (watchdog/periodic) never fence.
+TEST_F(CraftPeerExchangeTest, NonLoginPollDoesNotFence) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, false)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 3, 0).has_value());
+}
+
+// The fence is monotonic: a delayed or duplicated poll from an older login cannot lower it.
+TEST_F(CraftPeerExchangeTest, LoginFenceIsMonotonic) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(6, true)).has_value());
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 6u);
+}
+
+// A poll for a term not newer than the current session is stale and does not fence.
+TEST_F(CraftPeerExchangeTest, StaleLoginPollDoesNotFence) {
+    dev_->seed_term(5);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 5, 0).has_value());
+}
+
+// While fenced, the new session is not admitted either (only its InternalLogin admits it).
+TEST_F(CraftPeerExchangeTest, FencedReplicaRejectsNewSessionUntilLogin) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+
+    auto w = zero_write(*dev_, 4, 0);
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// A login poll does not report until writes admitted before the fence have finished (review on #198): otherwise
+// the leader could count their slots as lacking while they are still being journalled.
+TEST_F(CraftPeerExchangeTest, LoginPollWaitsForInFlightWritesBeforeReporting) {
+    homeblocks::detail::wait_list waiters;
+    journal_->write_waiters = &waiters;
+    journal_->write_released = false;
+    dev_->seed_term(3);
+
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, 0, 0, k_page_size,
+                             sisl::sg_list{});
+        co_return ok();
+    }(*dev_, w));
+    ASSERT_FALSE(w.has_value()); // admitted, suspended in write_slot
+
+    std::optional< result< craft::lsn_pair > > poll;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.get_rs_commit_lsn(4, true);
+        co_return ok();
+    }(*dev_, poll));
+    EXPECT_EQ(dev_->fence_term(), 4u);
+    EXPECT_FALSE(poll.has_value()); // waiting for the in-flight write
+
+    journal_->write_released = true;
+    waiters.notify_all();
+    ASSERT_TRUE(w.has_value());
+    EXPECT_FALSE(w->has_value()); // fenced while in flight: never acked
+    ASSERT_TRUE(poll.has_value());
+    ASSERT_TRUE(poll->has_value());
+    EXPECT_EQ((*poll)->last_append_lsn, 0);
+    EXPECT_TRUE(journal_->slots.count(0) > 0); // the write finished journalling before the report
+
+    // ...and the slot is reported as held, so the leader's final round does not count it as lacking, and an Empty
+    // verdict would free its blocks (review on #199).
+    EXPECT_FALSE(dev_->is_missing(0));
+    auto f = do_fetch_data({0});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_EQ(f->size(), 1u);
+    EXPECT_EQ((*f)[0].lsn, 0);
+    EXPECT_FALSE((*f)[0].is_empty);
+}
+
+// A login poll that arrives after its login was already aborted must not fence again: the InternalLogin that would
+// lift the fence is a no-op for an aborted term, so the old session would stay rejected for good (review on #199).
+TEST_F(CraftPeerExchangeTest, LoginPollAfterItsAbortDoesNotFence) {
+    dev_->seed_term(3);
+    std::vector< uint8_t > hdr(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(hdr.data())->type = CraftEntryType::LoginAborted;
+    std::vector< uint8_t > key(sizeof(LoginAbortedPayload));
+    reinterpret_cast< LoginAbortedPayload* >(key.data())->abort_upto = 4;
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, sisl::blob{hdr.data(), static_cast< uint32_t >(hdr.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    ASSERT_EQ(dev_->aborted_upto(), 4u);
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 3, 0).has_value()); // the old session is still admitted
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+    EXPECT_EQ(dev_->fence_term(), 5u); // a newer login still fences
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────
@@ -256,6 +395,56 @@ TEST_F(CraftPeerExchangeTest, FetchDataReadErrorPropagates) {
 
     auto r = do_fetch_data({1, 2, 3});
     EXPECT_FALSE(r.has_value()); // error propagated; partial result discarded
+}
+
+// A replica that MISSED the login poll is never fenced, so an old-session write at or below the login watermark keeps
+// going. If the login's Sync verdicts that slot Empty and its InternalLogin admits the new term (it drains only writes
+// above the watermark) before the write finishes, the write is void: it must fail, stay out of the overlay, keep its
+// slot Empty, and give back its blocks (review on #199).
+TEST_F(CraftPeerExchangeTest, OldWriteVoidedWhileInFlightOnAnUnfencedReplicaIsDiscarded) {
+    auto commit = [this](int64_t raft_lsn, CraftEntryType type, std::vector< uint8_t > key) {
+        std::vector< uint8_t > hdr(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(hdr.data())->type = type;
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->test_listener().on_commit(raft_lsn, sisl::blob{hdr.data(), static_cast< uint32_t >(hdr.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    };
+    homeblocks::detail::wait_list waiters;
+    journal_->write_waiters = &waiters;
+    journal_->write_released = false;
+    dev_->seed_term(3);
+
+    std::vector< uint8_t > buf(k_page_size, 0xAB);
+    sisl::sg_list sg;
+    sg.size = buf.size();
+    sg.iovs.push_back(iovec{buf.data(), buf.size()});
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach(
+        [](CraftReplDev& d, sisl::sg_list sg, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+            o = co_await d.write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, 0, 0,
+                                 k_page_size, std::move(sg));
+            co_return ok();
+        }(*dev_, sg, w));
+    ASSERT_FALSE(w.has_value()); // admitted (no poll reached this replica), suspended in write_slot
+
+    // The login commits: Sync rs=0 verdicting slot 0 Empty, then InternalLogin term 4 with rs=0 (nothing above it).
+    std::vector< uint8_t > sync(sync_rs_commit_lsn_key_size(1));
+    serialize_sync_rs_commit_lsn(sync.data(), 0, 0, {0});
+    commit(1, CraftEntryType::SyncRSCommitLSN, std::move(sync));
+    std::vector< uint8_t > login(sizeof(InternalLoginPayloadV2));
+    *reinterpret_cast< InternalLoginPayloadV2* >(login.data()) = {.client_token = 9, .term = 4, .rs_commit_lsn = 0};
+    commit(2, CraftEntryType::InternalLogin, std::move(login));
+    ASSERT_EQ(dev_->term(), 4u);
+    ASSERT_TRUE(dev_->is_empty_slot(0));
+
+    journal_->write_released = true;
+    waiters.notify_all();
+    ASSERT_TRUE(w.has_value());
+    ASSERT_FALSE(w->has_value());
+    EXPECT_EQ(w->error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1) << "voided data must not be readable";
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    EXPECT_EQ(journal_->free_data_calls, 1) << "its blocks are given back";
 }
 
 } // namespace

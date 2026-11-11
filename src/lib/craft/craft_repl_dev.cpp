@@ -408,16 +408,38 @@ CraftReplDev::~CraftReplDev() {
 }
 
 // ─── get_rs_commit_lsn ────────────────────────────────────────────
-// Snapshot the in-memory partition state under state_mu_ for consistency with
-// write() which updates state_ under the same lock.
+// Snapshot the in-memory partition state under state_mu_ for consistency with write(), which updates
+// state_ under the same lock. On a login poll the fence is raised in the SAME critical section, before the
+// snapshot: every write acked before this point is covered by the reported last_append_lsn, and no write of
+// the old session can be acked after it (write()'s pre- and post-flight checks both use admits_term_locked).
 
-async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
-    craft::lsn_pair pair{};
+async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t term, bool is_login) {
+    auto self = shared_from_this();
     {
         std::lock_guard lk{state_mu_};
-        pair = {state_.commit_lsn, state_.last_append_lsn};
+        // A poll for a term already aborted (LoginAborted applied first: a delayed poll) must not fence again --
+        // the InternalLogin that would lift it is a no-op for an aborted term, so the fence would never lift.
+        if (is_login && term > state_.term && term > state_.fence_term && term > state_.aborted_upto) {
+            LOGI("get_rs_commit_lsn: login fence raised fence_term {} -> {} (session term={})", state_.fence_term, term,
+                 state_.term);
+            state_.fence_term = term;
+        }
+        if (!is_login || state_.fence_term <= state_.term) {
+            co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn}; // not fenced: report as-is
+        }
     }
-    co_return pair;
+    // Fenced: writes admitted before the fence have already advanced last_append_lsn and marked their slot
+    // missing, but are still journalling. They can no longer be acked (post-flight and post-commit checks fail),
+    // yet reporting now would let the leader's final round count those slots as lacking and verdict them Empty
+    // while the write is still installing them. Wait for them to finish, then report.
+    auto drained = [this] {
+        std::lock_guard lk{state_mu_};
+        return in_flight_write_dlsns_.empty();
+    };
+    while (!drained())
+        co_await write_drain_.wait_until(drained);
+    std::lock_guard lk{state_mu_};
+    co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
 
 // ─── truncate (S4) ────────────────────────────────────────────────────────────
@@ -731,6 +753,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // In both orderings free_data is either unnecessary or wrong. blkid is intentionally not freed.
     // CraftJournalEntry.term lets recovery skip the stale entry; the next login truncates it durably.
     bool stale_post_flight = false;
+    bool voided = false; // the slot was verdicted Empty while this write was journalling
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
@@ -738,17 +761,38 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
         } else {
-            missing_lsns_.erase(dlsn);
             snapshot = {state_.commit_lsn, state_.last_append_lsn};
+        }
+        if (stale_post_flight && empty_lsns_.contains(dlsn)) {
+            // A replica that missed the login poll was never fenced, so this old-session write at or below the login
+            // watermark ran on while the login's SyncRSCommitLSN verdicted its slot Empty (the verdict found the slot
+            // missing, so freed nothing) and its InternalLogin admitted the new term (it drains only writes ABOVE
+            // the watermark). The slot is void: never publish it (the overlay would serve voided data while an earlier
+            // gap keeps commit_lsn below it) and give back its blocks (review on #199).
+            voided = true;
+        } else {
+            // Otherwise the slot is journalled here either way, so publish it as held: a login's final round must see
+            // it (fetch_data reports it, an Empty verdict frees its blocks), and the login's truncation removes it if
+            // it lies above rs_commit_lsn. That truncation cannot have run yet: it waits for this write (in-flight
+            // guard, released only when this call returns).
+            missing_lsns_.erase(dlsn);
         }
     }
 
-    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
+    if (voided) {
+        if (blkid_allocated) {
+            if (auto fr = co_await journal_->free_data(blkid); !fr)
+                LOGE("free_data failed for voided write dlsn={}: {}", dlsn, fr.error().message());
+        }
+        co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+    }
 
     // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
-    // it to the index.
+    // it to the index. Done for a discarded write too, for the same reason it is published as held above.
     populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_), all_zeros,
                      blkid, csums);
+
+    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
 
     // Best-effort piggyback: advance commit_lsn toward the client's own view of it. Every outcome --
     // a stall at a gap, or even a genuine commit() fault -- is ignored here; the write itself already
