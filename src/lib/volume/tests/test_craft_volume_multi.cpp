@@ -239,8 +239,8 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     }
     ASSERT_TRUE(sync());
 
+    // Member 1 may apply CreateVolume only now: its flip stays set until it is done here, so that apply fails too.
     if (me() == 1) {
-        g_helper->remove_flip("craft_create_volume_apply_error");
         ASSERT_FALSE(hb()->get_volume(id));
         auto retry = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
         ASSERT_FALSE(retry);
@@ -250,6 +250,7 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
 
     EXPECT_NE(group(id), nullptr);
     if (me() != 1) { EXPECT_TRUE(hb()->get_volume(id)); }
+    if (me() == 1) { g_helper->remove_flip("craft_create_volume_apply_error"); }
     ASSERT_TRUE(sync());
 }
 #endif
