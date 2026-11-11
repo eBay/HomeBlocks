@@ -606,7 +606,7 @@ them.
 | **I3** | **Held data is never applied before its verdict.** A replica must not advance `commit_lsn` over a slot whose committed verdict it has not yet applied. | Otherwise an Empty slot's sub-quorum copy lands in the index, and no un-apply path exists. See §4.5: the client's piggybacked commit can outrun the RAFT apply. |
 | **I4** | **A fetch never overwrites, and Empty beats data.** `install` fills only a hole. A verdict tombstone overwrites held data. | Convergence on the merge key without per-entry version checks. |
 | **I5** | **Truncation is login-only**, performed when `InternalLogin` is applied. | The new session reuses slot numbers above `rs_commit_lsn`, so stale-session and new-session data must never share a slot. |
-| **I6** | **A sync target never exceeds what the next login can reach.** Any committed `SyncRSCommitLSN(N)` implies the leader's `last_append_lsn ≥ N`, so a later login's `rs_commit_lsn ≥ N`. | Keeps truncation (I5) from cutting below a committed watermark. |
+| **I6** | **A login never truncates below a committed watermark.** Login takes `rs_commit_lsn = max(max(quorum.last_append), N_committed)`, where `N_committed` is the highest `SyncRSCommitLSN` watermark in the RAFT log the leader has applied (RAFT leader completeness guarantees a new leader has it). Applying a Sync also raises every member's `last_append_lsn` to `N` (the covered range is marked missing), so polls normally report it anyway. | A leader can commit `Sync(100)` and fail before the others fetch the data; without the lower bound a poll quorum could pick `rs = 99` and truncate below a committed watermark. |
 | **I7** | **Fetch stays within retention.** A responder answers `reclaimed` for slots below its journal floor, and the requester escalates to baseline resync. | The bounded journal must not silently drop a fill. |
 | **I8** | **The login fence holds until a committed outcome.** A replica fenced by a login poll keeps rejecting the old session until it applies `InternalLogin` or `LoginAborted` for that login. No timeout lifts it, and neither does a restart. | Login truncation drops everything above `rs_commit_lsn`. A write acked to the old client after its fence lifted, but before truncation, would be lost (§9.1 C1). |
 
@@ -715,10 +715,14 @@ round(target, may_verdict):                  # target = F_seen (fill-only) or rs
   for d in (lo, target]:                      # walked as intervals, not slot by slot
       if d already verdicted (leader journal tombstone)        -> resolved
       elif some responder holds d (data or zero)               -> durable; if leader lacks d, queue fetch(d, holder)
-      elif may_verdict and count(responders lacking d) >= quorum -> new_empty += d    # login only, under the fence
+      elif may_verdict and count(responders lacking d) >= quorum -> new_empty += d    # login only, under the fence;
+                                                        # a responder counts as lacking d only if d > its journal_floor
+                                                        # (a reclaimed gap may be an acked write: not evidence)
       else                                                     -> N = d - 1; break
   fetch queued slots (chunked, §4.7); install on leader (never overwrite)
   a failed fetch: N = min(N, d - 1)
+  new_empty = [d for d in new_empty if d <= N]   # filter AFTER every failure has lowered N
+  if any d <= N lacks a holder only because responders reclaimed it: request baseline recovery (§4.9)
   if N > last_proposed or new_empty nonempty:
       propose SyncRSCommitLSN{N, token, term, empty_slots = new_empty}       # empty_slots always <= N
   return N
@@ -827,9 +831,11 @@ Both terms are **persisted**. A restart must not lift a fence, because a restart
 
 **Phases.**
 
-0. **Assign the term from replicated state** (D16). `new_term = session_term + 1`, using the last *applied*
-   `InternalLogin` term (or the highest `fence_term` seen in the pre-sync poll, if larger). Never a per-process
-   counter. A stale leader cannot finish: its proposals fail once it is no longer the RAFT leader.
+0. **Assign the term from replicated state** (D16). `new_term = max(session_term, fence_term, aborted_upto) + 1`,
+   over the leader's own applied state and the values reported by the pre-sync poll. Never a per-process counter.
+   After `LoginAborted(8)` the fence returns to the old session term 7, so `session_term + 1` would pick 8 again,
+   whose `InternalLogin` is ignored forever; the term must be strictly above every aborted term. `aborted_upto` is
+   therefore persisted, reported in probes, and carried by control snapshots (§4.9). A stale leader cannot finish: its proposals fail once it is no longer the RAFT leader.
 
 1. **Pre-sync, no fence (d).** The leader polls every member with `is_login = false`, which fences nothing, and
    gets `pre = max(quorum.last_append)`. It fills its own gap up to `pre` from holders, but issues **no
@@ -840,9 +846,12 @@ Both terms are **persisted**. A restart must not lift a fence, because a restart
    happens **before** anyone is fenced, so it no longer stretches the fenced window.
 
 2. **Fenced poll.** The leader fences itself first (D5), then polls every member with `is_login = true,
-   term = new_term`. A replica sets `fence_term = max(fence_term, new_term)`, persists it, and only then reports
-   `{commit_lsn, last_append_lsn}`. A poll with `term ≤ fence_term` leaves the fence unchanged (D6).
-   `rs_commit_lsn = max(quorum.last_append)`.
+   term = new_term`. A replica sets `fence_term = max(fence_term, new_term)`, persists it, **waits for every write it
+   admitted before the fence to finish** (they can no longer be acked, but they have already advanced
+   `last_append_lsn` and marked their slot missing), and only then reports `{commit_lsn, last_append_lsn}` and
+   answers fetches. Otherwise the final round could count an in-flight slot as lacking and verdict it Empty while
+   the write is still journalling it. A poll with `term ≤ fence_term` leaves the fence unchanged (D6).
+   `rs_commit_lsn = max(max(quorum.last_append), N_committed)`, the last committed Sync watermark (I6).
 
 3. **Final round.** Run the round of §4.2 with `target = rs_commit_lsn` and `F_seen := target`. The fence has
    closed every ack path ≤ `rs`, so quorum-lacks evidence may verdict any slot. After phase 1 the leader is
@@ -923,8 +932,10 @@ below its own monotonic `commit_lsn`, so a stale min is merely conservative.
 - `probe_slots` and `fetch_data` report `journal_floor`. A request for slots below it gets `reclaimed_below`,
   and the requester escalates to baseline (I7).
 - **A silent member freezes the floor** (its `commit_lsn` is stale in the min). That is bounded by a retention
-  cap: once the journal exceeds `R` slots or bytes above the floor, the floor advances anyway and the silent member
-  is consigned to baseline resync. That is the wiki's "relegated to the snapshot path". The cap is a **local**
+  cap: once the journal exceeds `R` slots or bytes above the floor, the cap **relaxes only `all_committed_lsn`** (the
+  silent member's stale vote) and the silent member is consigned to baseline resync. The other two bounds are
+  hard: never reclaim above the checkpointed `commit_lsn` (local durability) or into an active `snapshot_pin`. If
+  those still block, apply backpressure or end the snapshot session explicitly. That is the wiki's "relegated to the snapshot path". The cap is a **local**
   decision, so it cannot tell *silent* from *slow*: a live member that is merely slow can be pushed to baseline
   too. Set `R` well above the expected catch-up lag. Open question 7 asks whether the leader should own the
   decision instead.
@@ -963,7 +974,12 @@ listener's snapshot callbacks carry **one small object**:
 
 - *Outstanding tombstones* are the Empty verdicts (all from logins) at dLSNs above the group's reclaim floor. A
   member that holds a late copy of such a slot must still learn it is void. They are rare, so the list is short.
-- On install the member adopts this state exactly as if it had applied the compacted entries. Then normal data
+- On install the member adopts this state, and **reconciles its journal for the logins it skipped**: every held
+  slot above its own `commit_lsn` whose term is older than the snapshot's `session_term` is dropped before any IO
+  is admitted. The compacted `InternalLogin` entries would have truncated those slots. Dropping an unapplied slot
+  is always safe: if it was durable, catch-up fetches it again. Without this, a returning replica keeps old-session
+  slot 101 across a login at 100 and reproduces H1.
+- It then behaves exactly as if it had applied the compacted entries. Then normal data
   catch-up starts toward `N`, and it falls into the CRAFT snapshot below if its fetches say `reclaimed_below`.
 - Because the snapshot holds no data, RAFT log compaction no longer depends on the data floor (§4.8).
 
@@ -983,12 +999,16 @@ The leader is used only if it is the only eligible member.
 |---|---|---|
 | `snap_begin` | `partition_id`, `receiver_id`, optional `resume{session_id, cursor}` | `session_id`, `startLSN`, `lease_ms`; or `restart_required` (the resumed session is gone) or `busy` (the source is at its session limit) |
 | `snap_chunk` | `session_id`, `cursor`, `max_bytes` | `range [a, b)`, extent list (data or hole), data bytes, CRC32C over the chunk, `next_cursor`, `done` |
+| `snap_keepalive` | `session_id` | ok; renews the lease (also renewed by tail `fetch_data` carrying `session_id`) |
 | `snap_end` | `session_id` | ok; the source releases its checkpoint and journal pin |
 
 **Requirements.**
 
 1. **Frozen at exactly `startLSN`.** On `snap_begin` the source pins a checkpoint and sets `startLSN` to its
-   `commit_lsn` at that checkpoint. The B-tree is walked from the pinned checkpoint, never the live tree.
+   `commit_lsn` at that checkpoint. `snap_begin` carries the receiver's current `commit_lsn`, and the source refuses
+   (`behind`) unless `startLSN ≥` it. The receiver then retries later or picks another source. A snapshot must
+   never lower a commit point the receiver has already advertised, because the client may have cleared Missing
+   entries on the strength of it. The B-tree is walked from the pinned checkpoint, never the live tree.
 2. **Chunks carry data, not B-tree nodes.** A B-tree entry points to a `blkid` on the source's own disk, which
    means nothing on the receiver. The source walks the frozen tree in LBA order and emits `{lba range → data
    extents | hole}`, reading blocks through their `blkid`. The receiver allocates its own blocks and inserts its
@@ -1014,7 +1034,9 @@ The leader is used only if it is the only eligible member.
      at the end (resuming across different sources is a later optimization, §9.5).
    - **Leader change:** no effect. The transfer does not involve the leader.
 8. **Tail from the same source.** After the last chunk the receiver fetches `startLSN + 1 …` **from the source**,
-   which is guaranteed to hold it because of its pin. Once caught up to the source's pin it sends `snap_end`, and
+   which is guaranteed to hold it because of its pin. Tail fetches carry the `session_id`, and each one renews the
+   lease just like `snap_chunk`. An idle gap sends `snap_keepalive{session_id}`, so a long tail transfer never loses
+   its pin. Once caught up to the source's pin it sends `snap_end`, and
    normal §4.3 catch-up from any member continues toward the current Sync target. Completion: `commit_lsn =
    startLSN` when the last chunk is installed; journal slots ≤ `startLSN` are dropped; `last_append_lsn =
    max(startLSN, last_append_lsn)`. A returning member **keeps** the journal slots it holds above `startLSN`,
@@ -1196,7 +1218,7 @@ coverage** for `src/lib/craft/` and for every function a PR adds or changes (the
 
 | PR | Repo | Owner | Scope | Fixes |
 |---|---|---|---|---|
-| **A. RAFT-entry correctness** ([#196](https://github.com/eBay/HomeBlocks/pull/196)) | HomeBlocks | this work | Ordered apply queue in `on_commit` (no detach); Sync apply split into an ordered local part (verdicts, `commit_lsn`) and one serialized catch-up runner that re-checks each slot against new verdicts; InternalLogin apply raises a local fence and drains in-flight writes before truncating; stop raising `last_append_lsn` unconditionally; `InternalLoginPayload` v2 with `rs_commit_lsn` (v1 still decodes); `apply_internal_login` truncates above `rs` and sets the session term, with a replay guard; `session_term` / `fence_term` / `aborted_upto` / `last_applied_raft_idx` state; `LoginAborted` entry + apply; IO admission `hdr.term == session_term ≥ fence_term` | H1, H2, H4 (state), H5 (state), H6 (guards) |
+| **A. RAFT-entry correctness** ([#196](https://github.com/eBay/HomeBlocks/pull/196)) | HomeBlocks | this work | Ordered apply queue in `on_commit` (no detach); Sync apply split into an ordered local part (verdicts, `commit_lsn`) and one serialized catch-up runner that re-checks each slot against new verdicts; InternalLogin apply raises a local fence and drains in-flight writes before truncating; keep raising `last_append_lsn` to `N` on Sync apply (I6); `InternalLoginPayload` v2 with `rs_commit_lsn` (v1 still decodes); `apply_internal_login` truncates above `rs` and sets the session term, with a replay guard; `session_term` / `fence_term` / `aborted_upto` / `last_applied_raft_idx` state; `LoginAborted` entry + apply; IO admission `hdr.term == session_term ≥ fence_term` | H1, H2, H4 (state), H5 (state), H6 (guards) |
 | **B. Pre-resolution safety** ([#197](https://github.com/eBay/HomeBlocks/pull/197)) | HomeBlocks | this work | `pre_resolve_slots(upto, may_verdict)`: count responders including the leader, Empty only at login with quorum-lacks evidence; a peer tombstone means "already resolved"; return the partial watermark | H3 |
 | **C. Quiesce** | HomeBlocks | this work | `get_rs_commit_lsn(term, is_login)` raises `fence_term` monotonically before reporting; reply carries both terms | H5 |
 | **D. Login + `append()`** | HomeBlocks | **S7/S9 owner** | Login per §4.6 (term from replicated state, pre-sync, fenced poll, final round, Sync + `InternalLogin` v2, `LoginAborted` on failure; new-leader abort); `append()` as a fill-only round to `F_seen`. This doc is the contract | H8 (`append`) |
