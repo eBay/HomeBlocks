@@ -292,8 +292,9 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
 }
 
 // A create whose local apply failed and whose rollback never ran (the receiver crashed first) leaves its group without
-// a replica here. A retry neither proposes into that group nor destroys it, also after a restart: once the group is
-// destroyed, the volume can be created again.
+// a replica here. A retry neither proposes into that group nor destroys it, also when the group shows up only after
+// the retry's own check (as a peer's join may install one), and after a restart: once the group is destroyed, the
+// volume can be created again.
 TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
     auto const info = craft_vol_info("craft_vol_unfinished");
     auto const id = info.id;
@@ -308,9 +309,20 @@ TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
         ASSERT_FALSE(retry);
         EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
         EXPECT_FALSE(hb()->get_volume(id));
-        EXPECT_NE(group(id), nullptr);
+        auto const rd = group(id);
+        ASSERT_NE(rd, nullptr);
+        EXPECT_FALSE(is_going_away(*rd));
     };
     expect_left_alone();
+
+    // create_repl_dev hands the retry this group, which this node leads. Proposed into, its CreateVolume would fail
+    // here, and the rollback would destroy the group.
+    g_helper->set_flip_point("craft_create_volume_skip_group_check", 1);
+    g_helper->set_flip_point("craft_create_volume_apply_error", 1);
+    expect_left_alone();
+    g_helper->remove_flip("craft_create_volume_skip_group_check");
+    g_helper->remove_flip("craft_create_volume_apply_error");
+
     g_helper->restart();
     expect_left_alone();
 

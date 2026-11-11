@@ -204,6 +204,7 @@ public:
             // HomeStore loads a recovered group's repl dev before asking for its listener, and creates a new group's
             // (on create or join) only after.
             bool const recovered = homestore::hs()->repl_service().get_repl_dev(group_id).has_value();
+            if (!recovered) { HomeBlocksImpl::on_craft_group_made(group_id); }
             return std::make_shared< CraftGroupListener >(hb_, group_id, recovered);
         }
         return std::make_shared< HBListener >(hb_);

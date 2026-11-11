@@ -274,18 +274,32 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     // definition and members of what it committed aren't known here, nor destroys it, since other members may hold
     // replicas: its destroy, or the partition's cleanup, comes first. (create_repl_dev would also hand a group being
     // destroyed back as if formed.)
-    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old) {
+    bool check = true;
+#ifdef _PRERELEASE
+    // Stands for a group that a peer's join installs right after this check.
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_skip_group_check")) { check = false; }
+#endif
+    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); check && old) {
         LOGE("vol={}: a RAFT group of this volume is already here ({}): not one this create forms", id_str,
              is_going_away(**old) ? "being destroyed" : "without a replica here");
         return std::unexpected(std::errc::operation_in_progress);
     }
 
-    // 1. Form the group: this node creates it, wins its first election, then adds every other member.
+    // 1. Form the group: this node creates it, wins its first election, then adds every other member. A peer's join can
+    // still install a group of this volume first: create_repl_dev then hands that one back, or fails waiting to lead
+    // it. Only a group this call made is proposed into or rolled back.
     std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
+    craft_group_forming forming{.id = id};
+    forming_ = &forming;
     auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
+    forming_ = nullptr;
+    if (!forming.made && (rd || homestore::hs()->repl_service().get_repl_dev(id))) {
+        LOGE("vol={}: a RAFT group of this volume was installed meanwhile: not one this create forms", id_str);
+        return std::unexpected(std::errc::operation_in_progress);
+    }
     if (!rd) {
         LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
-        remove_craft_group(id);
+        if (forming.made) { remove_craft_group(id); }
         return std::unexpected(rd.error());
     }
     auto const& group = *rd;

@@ -161,6 +161,10 @@ public:
     // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
     // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
     void on_craft_group_destroyed(volume_id_t const& id);
+    // CRAFT: HomeStore asks for a new RAFT group's listener on the thread that instantiated the group.
+    static void on_craft_group_made(volume_id_t const& id) {
+        if (forming_ && forming_->id == id) { forming_->made = true; }
+    }
 
     void start_reaper_thread();
 
@@ -206,6 +210,13 @@ private:
     status validate_craft_volume(volume_info const& info) const;
     result< volume_handle > form_craft_volume(volume_info info);
     void remove_craft_group(volume_id_t const& id);
+    // The group this thread's create_repl_dev forms, and whether that call made it rather than was handed one a peer's
+    // join installed: nuraft_mesg instantiates a group once, on the thread whose create or join won.
+    struct craft_group_forming {
+        volume_id_t id;
+        bool made{false};
+    };
+    static inline thread_local craft_group_forming* forming_{nullptr};
 
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
