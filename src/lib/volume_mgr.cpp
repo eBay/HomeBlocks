@@ -188,6 +188,9 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
     auto const group = homestore::hs()->repl_service().get_repl_dev(id);
     {
         auto lg = std::scoped_lock(vol_lock_);
+        // A create of this volume still in flight here decides it, even once its replica exists: it may yet time out
+        // and roll the group back.
+        if (creating_vols_.contains(id)) { co_return std::unexpected(std::errc::operation_in_progress); }
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             // A replica whose group is gone or going is removed with it: e.g. a failed create whose CreateVolume still
             // committed before its rollback's destroy. Not a volume to hand back, whatever its parameters.
@@ -205,7 +208,7 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
                  existing.to_string());
             co_return std::unexpected(std::errc::invalid_argument);
         }
-        if (!creating_vols_.insert(id).second) { co_return std::unexpected(std::errc::operation_in_progress); }
+        creating_vols_.insert(id);
     }
 
     // Group formation blocks this thread until the election and every member's join are done, and HomeStore drives
