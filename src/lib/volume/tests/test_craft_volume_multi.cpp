@@ -298,6 +298,11 @@ int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&parsed_argc, argv);
     SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_craft_volume_multi_setup, config);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
+    // Each member runs on files of its own: a device list would be shared, and wiped, by all of them.
+    if (SISL_OPTIONS.count("device_list")) {
+        LOGERROR("test_craft_volume_multi gives every member its own files: --device_list is not supported");
+        return 1;
+    }
     if (SISL_OPTIONS.count("config_path")) {
         std::filesystem::create_directories(SISL_OPTIONS["config_path"].as< std::string >());
     }
