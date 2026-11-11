@@ -711,18 +711,23 @@ round(target, may_verdict):                  # target = F_seen (fill-only) or rs
   P    = parallel probe(partition, raft_term, (lo, target]) to every member incl. self, deadline T_probe
   if |responders| < quorum: abort (retry with backoff)
 
-  new_empty = []; N = target
+  new_empty = []; N = target; stop_reclaimed = false
   for d in (lo, target]:                      # walked as intervals, not slot by slot
       if d already verdicted (leader journal tombstone)        -> resolved
       elif some responder holds d (data or zero)               -> durable; if leader lacks d, queue fetch(d, holder)
       elif may_verdict and count(responders lacking d) >= quorum -> new_empty += d    # login only, under the fence;
                                                         # a responder counts as lacking d only if d > its journal_floor
                                                         # (a reclaimed gap may be an acked write: not evidence)
-      else                                                     -> N = d - 1; break
+      else                                                     -> N = d - 1
+                                                                  stop_reclaimed = (no responder holds d and some
+                                                                    responder reports d <= its journal_floor)
+                                                                  break
   fetch queued slots (chunked, §4.7); install on leader (never overwrite)
   a failed fetch: N = min(N, d - 1)
   new_empty = [d for d in new_empty if d <= N]   # filter AFTER every failure has lowered N
-  if any d <= N lacks a holder only because responders reclaimed it: request baseline recovery (§4.9)
+  if stop_reclaimed: request baseline recovery (§4.9) for the members that lack slot N + 1, the hole that stopped
+                    the round (checked against the ORIGINAL target range, not the resolved prefix, so repeated
+                    rounds cannot stall on the same reclaimed hole)
   if N > last_proposed or new_empty nonempty:
       propose SyncRSCommitLSN{N, token, term, empty_slots = new_empty}       # empty_slots always <= N
   return N
@@ -1088,9 +1093,12 @@ already are at the interface; `sync_get` is used only at today's call sites).
 **Persistence and restart.** The partition state persists `{commit_lsn, last_append_lsn, session term, fence
 term, token, last_applied_raft_idx}` after every mutation (D12 covers install and
 tombstone). Persisting `last_applied_raft_idx` is what makes replay safe (D15): `echo_state_machine` returns it
-from `last_commit_index()`, so nuraft resumes after it instead of re-applying from index 0. The resync target is
-**not** persisted: the first post-restart trigger re-raises it, and the catch-up loop is idempotent (fill-only
-installs, tombstones are no-ops). A leader that restarts mid-round loses nothing, because a round has no effect
+from `last_commit_index()`, so nuraft resumes after it instead of re-applying from index 0. The **catch-up target**
+(`sync_target`, the highest applied Sync watermark) is persisted with `last_applied_raft_idx`, and catch-up restarts
+from it during recovery. Otherwise a follower that applied `Sync(100)` and restarted before fetching the data would
+lose the target, could not replay the entry (its applied index is past it), and with no new writes the leader
+would not propose the same watermark again, so catch-up would stay stuck. The catch-up loop is idempotent
+(fill-only installs, tombstones are no-ops). A leader that restarts mid-round loses nothing, because a round has no effect
 until its entry commits.
 
 > **Caveat: `CraftReplDev` does not persist its partition state yet** (no superblock recovery, H6). Until S8 adds
