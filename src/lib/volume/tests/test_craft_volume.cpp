@@ -152,8 +152,16 @@ TEST_F(CraftVolumeTest, CreateRejectsInvalidRequests) {
     not_craft.repl_mode = replication_mode::DISABLED;
     expect_rejected(std::move(not_craft));
 
-    // Longer than the superblock keeps: it would come back truncated after a restart.
+    // A CRAFT page is a HomeStore data block.
+    for (uint64_t const page_size : {0ul, 512ul, 8192ul}) {
+        auto wrong_page = craft_vol_info("wrong_page");
+        wrong_page.page_size = page_size;
+        expect_rejected(std::move(wrong_page));
+    }
+
+    // Longer than the superblock keeps, or with a NUL: it would come back cut short after a restart.
     expect_rejected(craft_vol_info(std::string(volume::MAX_NAME_LEN + 1, 'n')));
+    expect_rejected(craft_vol_info(std::string("nul\0name", 8)));
 }
 
 TEST_F(CraftVolumeTest, LegacyOpsRejected) {

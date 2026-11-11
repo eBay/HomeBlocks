@@ -232,10 +232,15 @@ status HomeBlocksImpl::validate_craft_volume(volume_info const& info) const {
              boost::uuids::to_string(our_uuid()), info.members.size());
         return std::unexpected(std::errc::invalid_argument);
     }
-    // The whole name must fit the superblock: a retry, also after a restart, is matched against the stored one.
-    if (info.page_size == 0 || info.page_size > std::numeric_limits< uint32_t >::max() ||
-        info.name.size() > volume::MAX_NAME_LEN) {
-        LOGE("vol={}: invalid page size {} or name length {} (at most {})", id_str, info.page_size, info.name.size(),
+    // CraftReplDev writes and checksums one page per HomeStore data block, whose size is the node's.
+    if (info.page_size != DATA_BLK_SIZE) {
+        LOGE("vol={}: page size {} is not this node's data block size {}", id_str, info.page_size, DATA_BLK_SIZE);
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    // The whole name must come back from the superblock, which keeps it as a C string: a retry, also after a restart,
+    // is matched against the stored one.
+    if (info.name.size() > volume::MAX_NAME_LEN || info.name.find('\0') != std::string::npos) {
+        LOGE("vol={}: invalid name of {} bytes (at most {}, without NUL)", id_str, info.name.size(),
              volume::MAX_NAME_LEN);
         return std::unexpected(std::errc::invalid_argument);
     }
