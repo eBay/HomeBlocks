@@ -25,7 +25,11 @@
 // homestore keeps an equivalent (internal, unexported) src/lib/common/coro_helpers.hpp; we keep our own minimal
 // copy rather than depend on its internals.
 
+#include <coroutine>
 #include <exception>
+#include <functional>
+#include <mutex>
+#include <vector>
 #include <tuple>
 #include <utility>
 
@@ -66,5 +70,40 @@ inline void detach(sisl::async::task< T > task) {
     stdexec::start_detached(
         stdexec::write_env(std::move(wrapper), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
 }
+
+// A list of coroutines waiting for a condition, resumed by notify_all(). wait_until(pred) suspends only if
+// pred() is false, and the check-then-park is atomic with respect to notify_all() (both take mu_), so a
+// notification can never be missed. Waiters resume inline on the notifying thread on EVERY notify_all(),
+// whether or not pred() now holds, so callers must loop: `while (!pred()) co_await wl.wait_until(pred);`.
+// pred() may take other locks; lock order is wait_list::mu_ first.
+class wait_list {
+public:
+    struct awaiter {
+        wait_list& wl;
+        std::function< bool() > pred;
+        bool await_ready() { return pred(); }
+        bool await_suspend(std::coroutine_handle<> h) {
+            std::lock_guard lk{wl.mu_};
+            if (pred()) return false;
+            wl.waiters_.push_back(h);
+            return true;
+        }
+        void await_resume() noexcept {}
+    };
+    awaiter wait_until(std::function< bool() > pred) { return awaiter{*this, std::move(pred)}; }
+    void notify_all() {
+        std::vector< std::coroutine_handle<> > to_resume;
+        {
+            std::lock_guard lk{mu_};
+            to_resume.swap(waiters_);
+        }
+        for (auto h : to_resume)
+            h.resume();
+    }
+
+private:
+    std::mutex mu_;
+    std::vector< std::coroutine_handle<> > waiters_;
+};
 
 } // namespace homeblocks::detail

@@ -32,12 +32,19 @@
 //     Proposed by the leader; applied by every replica.
 //
 //   InternalLogin — establishes a new client session (token + term). Proposed
-//     by the leader as step 4 of the login sequence; applied by every replica.
-//     All subsequent IO with a mismatched term is rejected STALE_TERM.
+//     by the leader as the last step of the login sequence; applied by every
+//     replica, in RAFT log order after the login's SyncRSCommitLSN. v2 also
+//     carries rs_commit_lsn: apply truncates the stale-session tail above it
+//     before admitting the new term (docs/craft/resync.md §4.6). All subsequent
+//     IO with a mismatched term is rejected STALE_TERM.
+//
+//   LoginAborted — ends a login that fenced the replicas but never committed its
+//     InternalLogin (leader crash, failed login). Apply lifts every fence at or
+//     below abort_upto and makes any later InternalLogin for those terms a no-op.
 //
 // Wire layout:
 //   header blob → CraftEntryHeader  (discriminant only)
-//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload
+//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload(V2) | LoginAbortedPayload
 //
 // For SyncRSCommitLSN the key blob is variable-length: the fixed
 // SyncRSCommitLSNPayload struct is followed immediately by
@@ -48,7 +55,7 @@
 
 namespace homeblocks {
 
-ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin);
+ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, LoginAborted);
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
@@ -68,9 +75,24 @@ struct SyncRSCommitLSNPayload {
 
 // ─── key blob: InternalLogin ──────────────────────────────────────────────────
 
+// v1 (no rs_commit_lsn): still accepted on apply, but performs no truncation.
 struct InternalLoginPayload {
     uint64_t client_token;
     uint64_t term;
+};
+
+// v2: the login watermark rides the entry, so every replica -- including one that missed the login and
+// replays it later -- truncates above it on apply. Distinguished from v1 by key size.
+struct InternalLoginPayloadV2 {
+    uint64_t client_token;
+    uint64_t term;
+    int64_t rs_commit_lsn;
+};
+
+// ─── key blob: LoginAborted ───────────────────────────────────────────────────
+
+struct LoginAbortedPayload {
+    uint64_t abort_upto; // every login term <= this is aborted
 };
 #pragma pack(pop)
 

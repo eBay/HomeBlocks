@@ -16,12 +16,15 @@
 
 #include "../hb_internal.hpp"
 #include "craft_raft_entries.hpp"
+#include "../coro_helpers.hpp"          // detail::wait_list
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
 #include <iomgr/timer.hpp> // iomgr::timer_token -- RAII recurring timer used by the watchdog
 
 #include <atomic>
 #include <chrono>
+#include <deque>
+#include <optional>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -54,23 +57,29 @@ class VolumeIndexTable;
 
 // Per-partition CRAFT state. Authoritative in memory; recovered from the journal + superblock on restart.
 struct CraftPartitionState {
-    int64_t commit_lsn{-1};        // contiguous committed prefix (== Synced)
-    int64_t last_append_lsn{-1};   // highest appended dLSN (may be uncommitted)
-    uint64_t client_token{0};      // token from the last successful InternalLogin
-    uint64_t term{0};              // current session term
-    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
-                                   // floors journal reclaim (S8: truncate below min(this, checkpointed apply
-                                   // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
-                                   // TODO(S8): this is client-controlled wire input with only a narrow
-                                   // malformed-negative check applied where it's captured (write()/read()/
-                                   // keep_alive()) -- there is NO per-call bound possible there: a lagging
-                                   // replica legitimately sees this arrive ahead of its own last_append_lsn/
-                                   // commit_lsn (that gap is the signal it needs to catch up via S6 peer
-                                   // exchange), so clamping against local state would break that. Before using
-                                   // this as a reclaim floor, S8 must validate it against real journal/
-                                   // checkpoint state (e.g. never reclaim past what's actually durable/
-                                   // replicated here), since a buggy/malicious client could otherwise poison
-                                   // it with an absurdly large value with no local signal to catch it.
+    int64_t commit_lsn{-1};      // contiguous committed prefix (== Synced)
+    int64_t last_append_lsn{-1}; // highest appended dLSN (may be uncommitted)
+    uint64_t client_token{0};    // token from the last successful InternalLogin
+    uint64_t term{0};            // current SESSION term: the only term whose IO is admitted. Changes only when an
+                                 // InternalLogin is applied (docs/craft/resync.md §4.6).
+    uint64_t fence_term{0};      // highest term of a login poll answered (PR C raises it). While fence_term > term
+                                 // the replica is fenced: it admits neither the old session nor the new one.
+    uint64_t aborted_upto{0};    // every login term <= this was aborted (LoginAborted); its InternalLogin is a no-op
+    int64_t last_applied_raft_idx{-1}; // highest RAFT log index applied -- replayed/duplicate entries at or below
+                                       // it are skipped. In-memory until S8 persists CraftPartitionState.
+    int64_t all_committed_lsn{-1};     // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
+                                       // floors journal reclaim (S8: truncate below min(this, checkpointed apply
+                                       // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
+                                       // TODO(S8): this is client-controlled wire input with only a narrow
+                                       // malformed-negative check applied where it's captured (write()/read()/
+                                       // keep_alive()) -- there is NO per-call bound possible there: a lagging
+                                       // replica legitimately sees this arrive ahead of its own last_append_lsn/
+                                       // commit_lsn (that gap is the signal it needs to catch up via S6 peer
+                                       // exchange), so clamping against local state would break that. Before using
+                                       // this as a reclaim floor, S8 must validate it against real journal/
+                                       // checkpoint state (e.g. never reclaim past what's actually durable/
+                                       // replicated here), since a buggy/malicious client could otherwise poison
+                                       // it with an absurdly large value with no local signal to catch it.
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
@@ -358,6 +367,18 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.term;
     }
+    uint64_t fence_term() const {
+        std::lock_guard lk{state_mu_};
+        return state_.fence_term;
+    }
+    uint64_t aborted_upto() const {
+        std::lock_guard lk{state_mu_};
+        return state_.aborted_upto;
+    }
+    int64_t last_applied_raft_idx() const {
+        std::lock_guard lk{state_mu_};
+        return state_.last_applied_raft_idx;
+    }
     // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim
     // (S8's job, not read anywhere yet in this class); exposed so S8's eventual reclaim logic has
     // something to read.
@@ -396,6 +417,10 @@ public:
     void seed_empty(std::initializer_list< int64_t > empty);
     // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
     void seed_term(uint64_t term);
+    // Sets the login fence directly (PR C's get_rs_commit_lsn(is_login) is what raises it in production).
+    void seed_fence_term(uint64_t fence_term);
+    // Awaited by write() right after its piggyback commit() (test-only), to hold a write at that point.
+    std::function< async_status() > test_post_commit_hook_;
     // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
     // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
     homestore::repl_dev_listener& test_listener() { return raft_listener_; }
@@ -522,12 +547,39 @@ private:
     // consult the quorum at all must surface as an error, never be silently swallowed.
     async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
 
-    // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
-    // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
-    // fetch + journal writes.
+    // ── RAFT entry apply (docs/craft/resync.md §4.3) ──
+    // on_commit (a synchronous HomeStore callback) never applies directly: it enqueues the entry, and ONE
+    // drainer coroutine applies queued entries strictly in RAFT log order, finishing each entry's full local
+    // effect (including its co_awaits) before starting the next. That ordering is what lets InternalLogin's
+    // truncation rely on every earlier SyncRSCommitLSN's verdicts already being installed. The slow part of a
+    // SyncRSCommitLSN -- fetching missing slots from peers -- is NOT done on the queue: it is detached as a
+    // separate catch-up (catch_up_to) so a slow or unreachable peer can never stall later entries.
+    using apply_fn_t = std::function< async_status() >;
+    void enqueue_apply(int64_t raft_lsn, apply_fn_t fn);
+    async_status drain_apply_queue();
+
+    // Ordered part of SyncRSCommitLSN: validate, install Empty verdicts (freeing held data), mark the newly
+    // covered range missing, advance commit_lsn over what is already present, then kick off catch_up_to.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
-    void apply_internal_login(uint64_t client_token, uint64_t term);
+    // Unordered part: raise the catch-up target to rs_commit_lsn and make sure ONE catch-up runner is active.
+    // The runner fetches slots <= target that are still missing, installs them (fill-only) and advances
+    // commit_lsn, looping while the target rises. A single runner means two fetches never race to install the
+    // same slot; per-slot re-checks against empty_lsns_ (before allocating and after writing) mean a verdict
+    // applied mid-fetch always wins and its blocks are reclaimed.
+    void request_catch_up(int64_t rs_commit_lsn);
+    async_status run_catch_up();
+    // commit_lsn advance shared by both parts: skips Empty, stops at the first Missing slot <= rs_commit_lsn,
+    // and fires the periodic checkpoint trigger.
+    void advance_commit_after_sync(int64_t rs_commit_lsn);
+    // InternalLogin: replay-guarded; raises a local fence (so a replica that missed the login poll stops
+    // admitting the old session too), waits for already-admitted writes above rs_commit_lsn to finish, truncates
+    // above rs_commit_lsn (v2 entries only; v1 carries none), then admits the new session term.
+    async_status apply_internal_login(uint64_t client_token, uint64_t term, std::optional< int64_t > rs_commit_lsn);
+    // LoginAborted: lift every fence at or below abort_upto; later InternalLogins for those terms are no-ops.
+    void apply_login_aborted(uint64_t abort_upto);
+    // Shared admission check for write/read/keep_alive. Must be called with state_mu_ held.
+    bool admits_term_locked(uint64_t term) const { return term == state_.term && state_.term >= state_.fence_term; }
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
@@ -617,6 +669,23 @@ private:
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
                                   // in_flight_write_dlsns_, and last_checkpoint_lsn_
+
+    // Ordered RAFT apply queue (see enqueue_apply). apply_mu_ is never held across a co_await and never
+    // nested with state_mu_.
+    struct PendingApply {
+        int64_t raft_lsn;
+        apply_fn_t fn;
+    };
+    std::mutex apply_mu_;
+    std::deque< PendingApply > apply_queue_;
+    bool apply_running_{false};
+    int64_t last_enqueued_raft_idx_{-1}; // guarded by apply_mu_; drops duplicate/replayed deliveries early
+
+    // Catch-up runner state (guarded by state_mu_). See request_catch_up().
+    int64_t catch_up_target_{-1};
+    bool catch_up_running_{false};
+    // Notified whenever an in-flight write() finishes; apply_internal_login waits on it before truncating.
+    detail::wait_list write_drain_;
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
