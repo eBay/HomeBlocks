@@ -670,8 +670,11 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         CraftReplDev* self;
         int64_t dlsn;
         ~InFlightDlsnGuard() {
-            std::lock_guard lk{self->state_mu_};
-            self->in_flight_write_dlsns_.erase(dlsn);
+            {
+                std::lock_guard lk{self->state_mu_};
+                self->in_flight_write_dlsns_.erase(dlsn);
+            }
+            self->write_drain_.notify_all(); // apply_internal_login may be waiting to truncate
         }
     } in_flight_guard{this, dlsn};
 
@@ -1572,7 +1575,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // Fixed-size payload in one of two versions, told apart by exact key size. v1 carries no
         // rs_commit_lsn (-1: no truncation); v2 does.
         uint64_t token, term;
-        int64_t rs = -1;
+        std::optional< int64_t > rs; // v1 carries no watermark: no truncation
         if (key.size() == sizeof(InternalLoginPayloadV2)) {
             const auto* p = reinterpret_cast< const InternalLoginPayloadV2* >(key.cbytes());
             token = p->client_token;
@@ -1889,7 +1892,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     }
 
     std::unordered_set< int64_t > to_free;
-    uint64_t term;
     {
         std::lock_guard lk{state_mu_};
         // client_token is NOT gated against state_.client_token here. Per the login sequence (CRAFT-Design),
@@ -1900,7 +1902,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         // (MemCraftReplica::cold_apply_sync) discards the parameter outright for the same reason.
         // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
         // checks (see apply_internal_login's header comment), not from an equality check here.
-        term = state_.term;
 
         for (int64_t lsn : empty_slots) {
             bool const was_missing = missing_lsns_.erase(lsn) > 0;
@@ -1925,91 +1926,139 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
-    // Advance over everything already present, then hand the missing slots to catch-up. catch_up_to runs
+    // Advance over everything already present, then hand the missing slots to catch-up. The catch-up runner runs
     // detached so a slow or unreachable peer never stalls the ordered apply queue (later entries).
     advance_commit_after_sync(rs_commit_lsn);
-    detail::detach(catch_up_to(rs_commit_lsn, term));
+    request_catch_up(rs_commit_lsn);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
 }
 
-async_status CraftReplDev::catch_up_to(int64_t rs_commit_lsn, uint64_t term) {
-    auto self = shared_from_this();
-    std::vector< int64_t > to_fetch;
+void CraftReplDev::request_catch_up(int64_t rs_commit_lsn) {
+    bool start = false;
     {
         std::lock_guard lk{state_mu_};
-        for (int64_t lsn : missing_lsns_) {
-            if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
-            to_fetch.push_back(lsn);
+        catch_up_target_ = std::max(catch_up_target_, rs_commit_lsn);
+        if (!catch_up_running_) {
+            catch_up_running_ = true;
+            start = true;
         }
     }
-    if (to_fetch.empty()) co_return ok();
+    if (start) detail::detach(run_catch_up());
+}
 
-    if (!to_fetch.empty()) {
-        if (peer_fetcher_ == nullptr) {
-            LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
-                 to_fetch.size());
-        } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_); !fetched) {
-            LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
-                 fetched.error().message(), to_fetch.size());
-        } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
-            // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
-            // repeated) -- any deviation means the response itself can't be trusted, so none of it is
-            // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
-            // fine from a peer that has already proven unreliable.
-            LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
-                 "entire batch, leaving {} lsn(s) as missing",
-                 *bad_lsn, to_fetch.size());
-        } else {
-            for (auto& slot : *fetched) {
-                if (slot.is_empty) {
-                    std::lock_guard lk{state_mu_};
-                    empty_lsns_.insert(slot.lsn);
-                    missing_lsns_.erase(slot.lsn);
-                    continue;
-                }
-                // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
-                // journalling the block reference. all_zeros slots carry no data and skip alloc.
-                homestore::multi_blk_id blkid{};
-                bool blkid_allocated = false;
-                if (!slot.all_zeros) {
-                    auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
-                    if (!alloc_res) {
-                        LOGE("apply_sync_rs_commit_lsn: alloc_write_data failed lsn={}: {} -- leaving as missing",
-                             slot.lsn, alloc_res.error().message());
-                        continue;
-                    }
-                    blkid = *alloc_res;
-                    blkid_allocated = true;
-                }
-
-                // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
-                // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
-                // default instance. That's an implicit, undocumented dependency on HomeStore's current
-                // behavior -- see SDSTOR-25613.
-                auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
-                                                         slot.all_zeros, slot.csums);
-                if (!res) {
-                    LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
-                         res.error().message());
-                    if (blkid_allocated) {
-                        detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
-                            if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                                LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
-                                     lsn, fr.error().message());
-                            co_return ok();
-                        }());
-                    }
-                    continue;
-                }
-                std::lock_guard lk{state_mu_};
-                missing_lsns_.erase(slot.lsn);
+async_status CraftReplDev::run_catch_up() {
+    auto self = shared_from_this();
+    int64_t done_target = -2;
+    for (;;) {
+        int64_t rs_commit_lsn;
+        uint64_t term;
+        std::vector< int64_t > to_fetch;
+        {
+            std::lock_guard lk{state_mu_};
+            rs_commit_lsn = catch_up_target_;
+            if (rs_commit_lsn == done_target) {
+                // Nothing new since the last pass; a later Sync restarts the runner. (Retry with backoff for
+                // slots still missing is follow-up work, docs/craft/resync.md PR E.)
+                catch_up_running_ = false;
+                co_return ok();
+            }
+            term = state_.term;
+            for (int64_t lsn : missing_lsns_) {
+                if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
+                to_fetch.push_back(lsn);
             }
         }
-    }
+        done_target = rs_commit_lsn;
+        if (to_fetch.empty()) {
+            advance_commit_after_sync(rs_commit_lsn);
+            continue;
+        }
 
-    advance_commit_after_sync(rs_commit_lsn);
-    co_return ok();
+        if (!to_fetch.empty()) {
+            if (peer_fetcher_ == nullptr) {
+                LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
+                     to_fetch.size());
+            } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_); !fetched) {
+                LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
+                     fetched.error().message(), to_fetch.size());
+            } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
+                // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
+                // repeated) -- any deviation means the response itself can't be trusted, so none of it is
+                // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
+                // fine from a peer that has already proven unreliable.
+                LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
+                     "entire batch, leaving {} lsn(s) as missing",
+                     *bad_lsn, to_fetch.size());
+            } else {
+                for (auto& slot : *fetched) {
+                    {
+                        // Skip a slot that was filled (write gap-fill) or verdicted Empty since the request was
+                        // built: installing it now would duplicate data or resurrect a voided slot.
+                        std::lock_guard lk{state_mu_};
+                        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn)) continue;
+                    }
+                    if (slot.is_empty) {
+                        std::lock_guard lk{state_mu_};
+                        empty_lsns_.insert(slot.lsn);
+                        missing_lsns_.erase(slot.lsn);
+                        continue;
+                    }
+                    // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
+                    // journalling the block reference. all_zeros slots carry no data and skip alloc.
+                    homestore::multi_blk_id blkid{};
+                    bool blkid_allocated = false;
+                    if (!slot.all_zeros) {
+                        auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
+                        if (!alloc_res) {
+                            LOGE("apply_sync_rs_commit_lsn: alloc_write_data failed lsn={}: {} -- leaving as missing",
+                                 slot.lsn, alloc_res.error().message());
+                            continue;
+                        }
+                        blkid = *alloc_res;
+                        blkid_allocated = true;
+                    }
+
+                    // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+                    // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+                    // default instance. That's an implicit, undocumented dependency on HomeStore's current
+                    // behavior -- see SDSTOR-25613.
+                    auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
+                                                             slot.all_zeros, slot.csums);
+                    if (!res) {
+                        LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
+                             res.error().message());
+                        if (blkid_allocated) {
+                            detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+                                if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                                    LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: "
+                                         "{}",
+                                         lsn, fr.error().message());
+                                co_return ok();
+                            }());
+                        }
+                        continue;
+                    }
+                    bool voided_meanwhile;
+                    {
+                        std::lock_guard lk{state_mu_};
+                        // A SyncRSCommitLSN applied while this slot was being written verdicted it Empty. It saw the
+                        // slot as still missing, so it did not reclaim; reclaim the blocks just written here.
+                        voided_meanwhile = empty_lsns_.contains(slot.lsn);
+                        if (!voided_meanwhile) missing_lsns_.erase(slot.lsn);
+                    }
+                    if (voided_meanwhile) {
+                        LOGW("catch-up: lsn={} verdicted Empty during install -- reclaiming", slot.lsn);
+                        if (auto fr = co_await journal_->free_slot(slot.lsn); !fr)
+                            LOGE("catch-up: free_slot failed lsn={}: {} -- blocks may leak", slot.lsn,
+                                 fr.error().message());
+                    }
+                }
+            }
+        }
+
+        advance_commit_after_sync(rs_commit_lsn);
+    }
 }
 
 void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
@@ -2049,7 +2098,8 @@ void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
 //      slot with the old session's.
 //   3. Admit the new session: term and client_token. Only now can a new-term write be accepted, i.e.
 //      strictly after the truncation. Setting term >= fence_term also lifts the login fence.
-async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term, int64_t rs_commit_lsn) {
+async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term,
+                                                std::optional< int64_t > rs_commit_lsn) {
     auto self = shared_from_this();
     bool do_truncate = false;
     {
@@ -2059,22 +2109,33 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
                  state_.term, state_.aborted_upto);
             co_return ok();
         }
-        if (rs_commit_lsn >= 0 && state_.last_append_lsn > rs_commit_lsn) {
-            if (state_.commit_lsn > rs_commit_lsn) {
+        // Local fence: from here on no new write of the old session is admitted, including on a replica that
+        // missed the login poll (and so was never fenced by it). Lifted below by admitting the new term.
+        state_.fence_term = std::max(state_.fence_term, term);
+        if (rs_commit_lsn && state_.last_append_lsn > *rs_commit_lsn) {
+            if (state_.commit_lsn > *rs_commit_lsn) {
                 // Cannot happen if the leader computed rs_commit_lsn as max(quorum.last_append): commit only
                 // advances over quorum-acked slots. Refuse to truncate committed data rather than corrupt it.
                 LOGE("apply_internal_login: commit_lsn={} above rs_commit_lsn={} -- skipping truncation",
-                     state_.commit_lsn, rs_commit_lsn);
+                     state_.commit_lsn, *rs_commit_lsn);
             } else {
                 do_truncate = true;
             }
         }
     }
     if (do_truncate) {
-        if (auto r = co_await truncate(rs_commit_lsn); !r) {
+        // Writes admitted before the fence may still be journalling a slot above the watermark; one finishing
+        // after the rollback would recreate the stale tail. Wait for them (they cannot be acked: their
+        // post-flight term check now fails).
+        int64_t const rs = *rs_commit_lsn;
+        co_await write_drain_.wait_until([this, rs] {
+            std::lock_guard lk{state_mu_};
+            return in_flight_write_dlsns_.upper_bound(rs) == in_flight_write_dlsns_.end();
+        });
+        if (auto r = co_await truncate(rs); !r) {
             // The session is NOT admitted: admitting it over an untruncated stale tail could mix the two
             // sessions' data in one slot. The replica keeps rejecting the new term until it is repaired.
-            LOGE("apply_internal_login: truncate({}) failed: {} -- new session term={} NOT admitted", rs_commit_lsn,
+            LOGE("apply_internal_login: truncate({}) failed: {} -- new session term={} NOT admitted", rs,
                  r.error().message(), term);
             co_return r;
         }
@@ -2083,7 +2144,8 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
         std::lock_guard lk{state_mu_};
         state_.client_token = client_token;
         state_.term = term;
-        LOGD("apply_internal_login client_token={} term={} rs_commit_lsn={}", client_token, term, rs_commit_lsn);
+        LOGD("apply_internal_login client_token={} term={} rs_commit_lsn={}", client_token, term,
+             rs_commit_lsn.value_or(-1));
     }
     co_return ok();
 }

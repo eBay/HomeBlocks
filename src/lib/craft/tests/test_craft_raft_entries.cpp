@@ -65,6 +65,20 @@ namespace {
 
 static constexpr uint32_t k_page_size = 4096;
 
+// A test-controlled suspension point: an awaited gate stays suspended until open() is called (then the
+// suspended coroutine resumes inline on the test thread). Lets a test hold an apply or a fetch mid-flight.
+struct TestGate {
+    bool is_open{false};
+    homeblocks::detail::wait_list waiters;
+    auto wait() {
+        return waiters.wait_until([this] { return is_open; });
+    }
+    void open() {
+        is_open = true;
+        waiters.notify_all();
+    }
+};
+
 // ── journal mock ──────────────────────────────────────────────────────────────
 //
 // Backed by a std::map so tests can inspect exactly which LSNs got persisted during catch-up.
@@ -77,6 +91,7 @@ public:
     int free_data_calls{0};
     std::optional< int64_t > truncated_to; // last truncate_to() argument, if any
     bool fail_truncate{false};
+    TestGate* write_gate{nullptr}; // when set, write_slot suspends until the gate opens
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -85,6 +100,7 @@ public:
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
+        if (write_gate) co_await write_gate->wait();
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] =
@@ -105,7 +121,13 @@ public:
         co_return ok();
     }
 
-    async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
+    TestGate* free_gate{nullptr}; // when set, free_slot suspends until the gate opens
+    int free_slot_calls{0};
+    async_status free_slot(int64_t lsn) override {
+        ++free_slot_calls;
+        if (free_gate) co_await free_gate->wait();
+        co_return co_await mock_free_slot(*this, lsn);
+    }
 
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
@@ -129,10 +151,12 @@ public:
         co_return craft::lsn_pair{};
     }
 
+    TestGate* gate{nullptr}; // when set, fetch_data suspends until the gate opens
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                           uint32_t timeout_ms) override {
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
+        if (gate) co_await gate->wait();
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
@@ -976,6 +1000,106 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsLoginAbortedWrongSize) {
 
     EXPECT_EQ(dev_->fence_term(), 4u); // untouched
     EXPECT_EQ(dev_->aborted_upto(), 0u);
+}
+
+// ── Copilot review follow-ups (PR #196) ───────────────────────────────────────────────────────────
+
+// A v2 watermark of -1 is legitimate (the quorum had appended nothing): a replica holding an old-session tail
+// must still truncate all of it. Only v1 entries skip truncation.
+TEST_F(CraftRaftEntriesTest, InternalLoginV2TruncatesToMinusOne) {
+    dev_->seed_lsns(/*last_append=*/4, {});
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/-1));
+
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, -1);
+    EXPECT_EQ(dev_->last_append_lsn(), -1);
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// Ordering under suspension: while a SyncRSCommitLSN apply is suspended (reclaiming a slot it verdicts Empty),
+// the following InternalLogin must not truncate or admit. With per-entry detached applies it would.
+TEST_F(CraftRaftEntriesTest, LoginWaitsForSuspendedEarlierSyncApply) {
+    TestGate gate;
+    journal_->free_gate = &gate;
+    dev_->seed_lsns(/*last_append=*/10, {});
+    journal_->slots[8] = JournalSlot{.lsn = 8, .lba_off_bytes = 0, .len_bytes = 1}; // held -> reclaimed on Empty
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(8, 0, {8}));
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/8));
+
+    EXPECT_EQ(journal_->free_slot_calls, 1);
+    EXPECT_FALSE(journal_->truncated_to.has_value()); // login has not run yet
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->last_applied_raft_idx(), -1);
+
+    gate.open(); // the Sync apply finishes, then the queue runs the login
+
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 8);
+    EXPECT_EQ(dev_->term(), 5u);
+    EXPECT_EQ(dev_->last_applied_raft_idx(), 2);
+}
+
+// Catch-up runs off the apply queue: a peer fetch held pending does not block the next entry.
+TEST_F(CraftRaftEntriesTest, PendingCatchUpDoesNotBlockLogin) {
+    TestGate gate;
+    fetcher_.gate = &gate;
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(5, 0, {}));
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/5));
+
+    EXPECT_EQ(dev_->term(), 5u); // login applied while the fetch for 3..5 is still pending
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5}));
+    gate.open();
+}
+
+// A slot verdicted Empty while its catch-up fetch is in flight is not installed (Empty wins).
+TEST_F(CraftRaftEntriesTest, CatchUpSkipsSlotVerdictedEmptyMidFetch) {
+    TestGate gate;
+    fetcher_.gate = &gate;
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(/*last_append=*/2, {});
+    fetcher_.response = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = 1}};
+
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {}));
+    commit_entry(*dev_, 2, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(3, 0, {3})); // voids 3
+    gate.open();
+
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_FALSE(journal_->has_slot(3)); // the stale response was not installed
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+}
+
+// A replica that missed the login poll is fenced by the InternalLogin apply itself: while the login waits for an
+// already-admitted write above the watermark, a new old-session write is rejected.
+TEST_F(CraftRaftEntriesTest, LoginFencesAndWaitsForInFlightWriteAboveWatermark) {
+    TestGate gate;
+    journal_->write_gate = &gate;
+    dev_->seed_term(3);
+    dev_->seed_lsns(/*last_append=*/5, {});
+
+    // An old-session write to slot 7 is admitted and suspends inside write_slot.
+    auto in_flight = dev_->write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, 7, 0,
+                                 k_page_size, sisl::sg_list{});
+    homeblocks::detail::detach([](auto t) -> async_status {
+        (void)co_await std::move(t);
+        co_return ok();
+    }(std::move(in_flight)));
+
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 4, /*rs=*/5));
+    EXPECT_EQ(dev_->fence_term(), 4u);
+    EXPECT_FALSE(journal_->truncated_to.has_value()); // waiting for the in-flight write
+    journal_->write_gate = nullptr;
+    auto r = write_at(*dev_, 3, 6); // a new old-session write is fenced
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+
+    gate.open(); // the in-flight write finishes (unacked), then truncation and admission proceed
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 5);
+    EXPECT_EQ(dev_->term(), 4u);
 }
 
 } // namespace

@@ -16,6 +16,7 @@
 
 #include "../hb_internal.hpp"
 #include "craft_raft_entries.hpp"
+#include "../coro_helpers.hpp"          // detail::wait_list
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
 #include <iomgr/timer.hpp> // iomgr::timer_token -- RAII recurring timer used by the watchdog
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <optional>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -558,16 +560,20 @@ private:
     // covered range missing, advance commit_lsn over what is already present, then kick off catch_up_to.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
-    // Unordered part: fetch slots <= rs_commit_lsn that are still missing, install them (fill-only), and
-    // advance commit_lsn. Safe to overlap later entries: it never writes above rs_commit_lsn, and any later
-    // InternalLogin truncates only above its own (higher or equal) rs_commit_lsn.
-    async_status catch_up_to(int64_t rs_commit_lsn, uint64_t term);
+    // Unordered part: raise the catch-up target to rs_commit_lsn and make sure ONE catch-up runner is active.
+    // The runner fetches slots <= target that are still missing, installs them (fill-only) and advances
+    // commit_lsn, looping while the target rises. A single runner means two fetches never race to install the
+    // same slot; per-slot re-checks against empty_lsns_ (before allocating and after writing) mean a verdict
+    // applied mid-fetch always wins and its blocks are reclaimed.
+    void request_catch_up(int64_t rs_commit_lsn);
+    async_status run_catch_up();
     // commit_lsn advance shared by both parts: skips Empty, stops at the first Missing slot <= rs_commit_lsn,
     // and fires the periodic checkpoint trigger.
     void advance_commit_after_sync(int64_t rs_commit_lsn);
-    // InternalLogin: replay-guarded; truncates above rs_commit_lsn (v2 entries; -1 for v1 = no truncation),
-    // then admits the new session term -- truncation strictly before admission.
-    async_status apply_internal_login(uint64_t client_token, uint64_t term, int64_t rs_commit_lsn);
+    // InternalLogin: replay-guarded; raises a local fence (so a replica that missed the login poll stops
+    // admitting the old session too), waits for already-admitted writes above rs_commit_lsn to finish, truncates
+    // above rs_commit_lsn (v2 entries only; v1 carries none), then admits the new session term.
+    async_status apply_internal_login(uint64_t client_token, uint64_t term, std::optional< int64_t > rs_commit_lsn);
     // LoginAborted: lift every fence at or below abort_upto; later InternalLogins for those terms are no-ops.
     void apply_login_aborted(uint64_t abort_upto);
     // Shared admission check for write/read/keep_alive. Must be called with state_mu_ held.
@@ -672,6 +678,12 @@ private:
     std::deque< PendingApply > apply_queue_;
     bool apply_running_{false};
     int64_t last_enqueued_raft_idx_{-1}; // guarded by apply_mu_; drops duplicate/replayed deliveries early
+
+    // Catch-up runner state (guarded by state_mu_). See request_catch_up().
+    int64_t catch_up_target_{-1};
+    bool catch_up_running_{false};
+    // Notified whenever an in-flight write() finishes; apply_internal_login waits on it before truncating.
+    detail::wait_list write_drain_;
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
