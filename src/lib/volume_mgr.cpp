@@ -268,37 +268,27 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     auto const id = info.id;
     auto const id_str = boost::uuids::to_string(id);
 
-    shared< homestore::repl_dev > group;
+    // A group of this volume is already here, without a replica of it here: an earlier one still being destroyed (e.g.
+    // by a failed create's rollback), or one an earlier create formed that didn't finish on this member (this node
+    // crashed before its rollback, or its local create failed). This create neither proposes into it, since the
+    // definition and members of what it committed aren't known here, nor destroys it, since other members may hold
+    // replicas: its destroy, or the partition's cleanup, comes first. (create_repl_dev would also hand a group being
+    // destroyed back as if formed.)
     if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old) {
-        // An earlier group of this volume is still being destroyed, e.g. by a failed create's rollback: wait for it to
-        // go. create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again
-        // restarts its reap (or, if that destroy is refused, revives it).
-        if (is_going_away(**old)) {
-            LOGE("vol={}: an earlier RAFT group of this volume is still being destroyed", id_str);
-            return std::unexpected(std::errc::operation_in_progress);
-        }
-        // A group an earlier create formed, which didn't finish here: this node crashed before its rollback, or its
-        // local create failed. Its leader proposes CreateVolume again, which every member applies once; another member
-        // leaves it to the leader. Never destroyed by this create: the other members may hold replicas.
-        if (!(*old)->is_leader()) {
-            LOGE("vol={}: its RAFT group exists without a replica here, and another member leads it", id_str);
-            return std::unexpected(std::errc::operation_in_progress);
-        }
-        group = *old;
+        LOGE("vol={}: a RAFT group of this volume is already here ({}): not one this create forms", id_str,
+             is_going_away(**old) ? "being destroyed" : "without a replica here");
+        return std::unexpected(std::errc::operation_in_progress);
     }
-    bool const formed_here = !group;
 
-    if (formed_here) {
-        // 1. Form the group: this node creates it, wins its first election, then adds every other member.
-        std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
-        auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
-        if (!rd) {
-            LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
-            remove_craft_group(id);
-            return std::unexpected(rd.error());
-        }
-        group = *rd;
+    // 1. Form the group: this node creates it, wins its first election, then adds every other member.
+    std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
+    auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
+    if (!rd) {
+        LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
+        remove_craft_group(id);
+        return std::unexpected(rd.error());
     }
+    auto const& group = *rd;
 
     // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before
     // in this process (a create retried after its group was destroyed), that layer still holds the old group's leader
@@ -331,16 +321,15 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     if (applied.wait_until(deadline) == std::future_status::ready) { st = applied.get(); }
     if (!st) {
         LOGE("vol={}: CreateVolume did not commit and apply here: {}", id_str, st.error().message());
-        bool rollback = formed_here;
+        bool rollback = true;
 #ifdef _PRERELEASE
         // Stands for a receiver that crashed before its rollback: the group outlives the create.
-        if (rollback && iomgr_flip::instance()->test_flip("craft_create_volume_no_rollback")) { rollback = false; }
+        if (iomgr_flip::instance()->test_flip("craft_create_volume_no_rollback")) { rollback = false; }
 #endif
         if (rollback) { remove_craft_group(id); }
         return std::unexpected(st.error());
     }
-    LOGI("vol={}: created, in a RAFT group {} with {} members", id_str, formed_here ? "it formed" : "that existed",
-         info.members.size());
+    LOGI("vol={}: created, RAFT group formed with {} members", id_str, info.members.size());
     return get_volume(id);
 }
 

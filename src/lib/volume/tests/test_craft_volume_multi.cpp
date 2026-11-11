@@ -223,7 +223,7 @@ TEST_F(CraftVolumeMultiTest, FailedCreateLeavesNoReplica) {
 }
 
 // A follower's own apply fails, so the group lives on without a replica there. A create sent to that follower leaves
-// the group to its leader: it neither forms nor destroys it, and the other members keep their replicas.
+// the group alone: it neither proposes into nor destroys it, and the other members keep their replicas.
 TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(3);

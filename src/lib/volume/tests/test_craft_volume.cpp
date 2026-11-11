@@ -288,18 +288,29 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
 }
 
 // A create whose local apply failed and whose rollback never ran (the receiver crashed first) leaves its group without
-// a replica here. A retry proposes CreateVolume again in the group it leads, and never destroys the group.
-TEST_F(CraftVolumeTest, RetryReproposesInAGroupItLeads) {
-    auto const info = craft_vol_info("craft_vol_repropose");
+// a replica here. A retry neither proposes into that group nor destroys it, also after a restart: once the group is
+// destroyed, the volume can be created again.
+TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
+    auto const info = craft_vol_info("craft_vol_unfinished");
     auto const id = info.id;
     g_helper->set_flip_point("craft_create_volume_apply_error", 1);
     g_helper->set_flip_point("craft_create_volume_no_rollback", 1);
     ASSERT_FALSE(create(clone(info)));
     g_helper->remove_flip("craft_create_volume_apply_error");
     g_helper->remove_flip("craft_create_volume_no_rollback");
-    g_helper->restart();
 
-    ASSERT_FALSE(hb()->get_volume(id));
+    auto const expect_left_alone = [this, &info, &id] {
+        auto retry = create(clone(info));
+        ASSERT_FALSE(retry);
+        EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
+        EXPECT_FALSE(hb()->get_volume(id));
+        EXPECT_NE(group(id), nullptr);
+    };
+    expect_left_alone();
+    g_helper->restart();
+    expect_left_alone();
+
+    // Destroyed through its leader: this node, once its one-member group has elected it again after the restart.
     auto const leads = [&id] {
         auto const rd = group(id);
         return rd != nullptr && rd->is_leader();
@@ -309,11 +320,11 @@ TEST_F(CraftVolumeTest, RetryReproposesInAGroupItLeads) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     ASSERT_TRUE(leads());
-
+    ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+    ASSERT_TRUE(wait_for_group_gone(id));
     auto vol = create(clone(info));
     ASSERT_TRUE(vol) << vol.error().message();
     EXPECT_NE((*vol)->craft_dev(), nullptr);
-    EXPECT_NE(group(id), nullptr);
 }
 
 // A create that crashed between its index table and its superblock leaves the table behind. The table keeps its

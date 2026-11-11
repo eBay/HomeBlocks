@@ -38,8 +38,7 @@
 //     All subsequent IO with a mismatched term is rejected STALE_TERM.
 //
 //   CreateVolume — the partition's first entry: proposed by the member that formed
-//     the RAFT group, and again by its leader for a create that did not finish there;
-//     every member creates its local volume when it first commits.
+//     the RAFT group; every member creates its local volume when it commits.
 //     Applied by the volume layer (the partition has no CraftReplDev before it).
 //
 // Wire layout:

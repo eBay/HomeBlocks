@@ -303,9 +303,9 @@ with `invalid_argument`. Retrying a create that succeeded (same id, size, page s
 other create with that id fails with `invalid_argument`. A concurrent create of the same volume fails with
 `operation_in_progress`, and so does one made while an earlier RAFT group of the volume is still being destroyed:
 HomeStore reaps a destroyed group, and the replicas follow it, `repl_dev_cleanup_interval_sec` (a minute by default)
-after its destroy commits. A group that outlived an earlier create with no replica on this member (the member crashed
-before the rollback, or its own create failed) is never destroyed by a later create: its leader proposes `CreateVolume`
-again, which every member applies once, and any other member fails the create with `operation_in_progress`.
+after its destroy commits. A create never proposes into, or destroys, a group of the volume that it didn't form: one
+that outlived an earlier create without a replica on this member (the member crashed before the rollback, or its own
+create failed) fails the create with `operation_in_progress` until the group is destroyed.
 
 A restart reopens each replica's journal and reattaches its `CraftReplDev` (the partition's CRAFT state itself
 is not recovered yet). A replica whose group is gone is removed. The legacy `async_read` / `async_write` /
