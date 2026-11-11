@@ -275,6 +275,35 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
     }
 }
 
+// A create whose local apply failed and whose rollback never ran (the receiver crashed first) leaves its group without
+// a replica here. A retry proposes CreateVolume again in the group it leads, and never destroys the group.
+TEST_F(CraftVolumeTest, RetryReproposesInAGroupItLeads) {
+    auto const info = craft_vol_info("craft_vol_repropose");
+    auto const id = info.id;
+    g_helper->set_flip_point("craft_create_volume_apply_error", 1);
+    g_helper->set_flip_point("craft_create_volume_no_rollback", 1);
+    ASSERT_FALSE(create(clone(info)));
+    g_helper->remove_flip("craft_create_volume_apply_error");
+    g_helper->remove_flip("craft_create_volume_no_rollback");
+    g_helper->restart();
+
+    ASSERT_FALSE(hb()->get_volume(id));
+    auto const leads = [&id] {
+        auto const rd = group(id);
+        return rd != nullptr && rd->is_leader();
+    };
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!leads() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    ASSERT_TRUE(leads());
+
+    auto vol = create(clone(info));
+    ASSERT_TRUE(vol) << vol.error().message();
+    EXPECT_NE((*vol)->craft_dev(), nullptr);
+    EXPECT_NE(group(id), nullptr);
+}
+
 // A create that crashed between its index table and its superblock leaves the table behind. The table keeps its
 // ordinal across restarts, so no other volume gets its chunks, and the volume's next create takes it over, also after
 // one that failed with it.

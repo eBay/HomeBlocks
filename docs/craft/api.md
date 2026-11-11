@@ -293,13 +293,16 @@ auto vol = co_await hb->create_volume(std::move(info));
 3. `create_volume` returns once the entry committed and the receiver created its replica; the other members
    create theirs as they apply it. `get_volume` returns each member's replica on that member.
 
-A failure, or no commit within `craft_create_volume_timeout_ms` (default 30s), destroys the group again: a
-member that already created its replica removes it when the group is destroyed. The page size must be 4096, the
-node's data block size, and the name at most 99 bytes without NUL; otherwise the create fails with
-`invalid_argument`. Retrying a create that succeeded (same id, size, page size and name) returns the volume; any other
-create with that id fails with `invalid_argument`. A concurrent create of the same volume fails with `operation_in_progress`, and so
-does one made while an earlier RAFT group of the volume is still being destroyed: HomeStore reaps a destroyed group,
-and the replicas follow it, `repl_dev_cleanup_interval_sec` (a minute by default) after its destroy commits.
+If a create that formed the group fails, or nothing commits within `craft_create_volume_timeout_ms` (default 30s), it
+destroys the group again: a member that already created its replica removes it when the group is destroyed. The page
+size must be 4096, the node's data block size, and the name at most 99 bytes without NUL; otherwise the create fails
+with `invalid_argument`. Retrying a create that succeeded (same id, size, page size and name) returns the volume; any
+other create with that id fails with `invalid_argument`. A concurrent create of the same volume fails with
+`operation_in_progress`, and so does one made while an earlier RAFT group of the volume is still being destroyed:
+HomeStore reaps a destroyed group, and the replicas follow it, `repl_dev_cleanup_interval_sec` (a minute by default)
+after its destroy commits. A group that outlived an earlier create with no replica on this member (the member crashed
+before the rollback, or its own create failed) is never destroyed by a later create: its leader proposes `CreateVolume`
+again, which every member applies once, and any other member fails the create with `operation_in_progress`.
 
 A restart reopens each replica's journal and reattaches its `CraftReplDev` (the partition's CRAFT state itself
 is not recovered yet). A replica whose group is gone is removed. The legacy `async_read` / `async_write` /

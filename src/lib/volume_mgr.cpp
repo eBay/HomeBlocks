@@ -273,21 +273,36 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     auto const id = info.id;
     auto const id_str = boost::uuids::to_string(id);
 
-    // An earlier group of this volume is still being destroyed, e.g. by a failed create's rollback: wait for it to go.
-    // create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again restarts its
-    // reap (or, if that destroy is refused, revives it).
-    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old && is_going_away(**old)) {
-        LOGE("vol={}: an earlier RAFT group of this volume is still being destroyed", id_str);
-        return std::unexpected(std::errc::operation_in_progress);
+    shared< homestore::repl_dev > group;
+    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); old) {
+        // An earlier group of this volume is still being destroyed, e.g. by a failed create's rollback: wait for it to
+        // go. create_repl_dev would hand it back as if formed, proposing into it fails, and destroying it again
+        // restarts its reap (or, if that destroy is refused, revives it).
+        if (is_going_away(**old)) {
+            LOGE("vol={}: an earlier RAFT group of this volume is still being destroyed", id_str);
+            return std::unexpected(std::errc::operation_in_progress);
+        }
+        // A group an earlier create formed, which didn't finish here: this node crashed before its rollback, or its
+        // local create failed. Its leader proposes CreateVolume again, which every member applies once; another member
+        // leaves it to the leader. Never destroyed by this create: the other members may hold replicas.
+        if (!(*old)->is_leader()) {
+            LOGE("vol={}: its RAFT group exists without a replica here, and another member leads it", id_str);
+            return std::unexpected(std::errc::operation_in_progress);
+        }
+        group = *old;
     }
+    bool const formed_here = !group;
 
-    // 1. Form the group: this node creates it, wins its first election, then adds every other member.
-    std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
-    auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
-    if (!rd) {
-        LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
-        remove_craft_group(id);
-        return std::unexpected(rd.error());
+    if (formed_here) {
+        // 1. Form the group: this node creates it, wins its first election, then adds every other member.
+        std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
+        auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
+        if (!rd) {
+            LOGE("vol={}: failed to form its RAFT group: {}", id_str, rd.error().message());
+            remove_craft_group(id);
+            return std::unexpected(rd.error());
+        }
+        group = *rd;
     }
 
     // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before
@@ -296,14 +311,14 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     // share one deadline.
     auto const deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
-    while (!(*rd)->is_leader() && std::chrono::steady_clock::now() < deadline) {
+    while (!group->is_leader() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
     // 2. Replicate the volume itself: every member creates its replica when this entry commits.
     auto ctx = make_create_volume_ctx(info);
     auto applied = ctx->done_.get_future();
-    bool propose = (*rd)->is_leader();
+    bool propose = group->is_leader();
     if (!propose) {
         LOGE("vol={}: not the leader of its RAFT group in time, CreateVolume not proposed", id_str);
         ctx->complete(std::unexpected(std::errc::timed_out));
@@ -315,16 +330,22 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
         propose = false;
     }
 #endif
-    if (propose) { (*rd)->async_alloc_write(ctx->hdr_buf_, ctx->key_buf_, sisl::sg_list{}, ctx); }
+    if (propose) { group->async_alloc_write(ctx->hdr_buf_, ctx->key_buf_, sisl::sg_list{}, ctx); }
 
     status st = std::unexpected(std::make_error_condition(std::errc::timed_out));
     if (applied.wait_until(deadline) == std::future_status::ready) { st = applied.get(); }
     if (!st) {
         LOGE("vol={}: CreateVolume did not commit and apply here: {}", id_str, st.error().message());
-        remove_craft_group(id);
+        bool rollback = formed_here;
+#ifdef _PRERELEASE
+        // Stands for a receiver that crashed before its rollback: the group outlives the create.
+        if (rollback && iomgr_flip::instance()->test_flip("craft_create_volume_no_rollback")) { rollback = false; }
+#endif
+        if (rollback) { remove_craft_group(id); }
         return std::unexpected(st.error());
     }
-    LOGI("vol={}: created, RAFT group formed with {} members", id_str, info.members.size());
+    LOGI("vol={}: created, in a RAFT group {} with {} members", id_str, formed_here ? "it formed" : "that existed",
+         info.members.size());
     return get_volume(id);
 }
 

@@ -210,6 +210,37 @@ TEST_F(CraftVolumeMultiTest, FailedCreateLeavesNoReplica) {
     ASSERT_TRUE(wait_until([&id] { return !hb()->get_volume(id) && group(id) == nullptr; }));
     ASSERT_TRUE(sync());
 }
+
+// A follower's own apply fails, so the group lives on without a replica there. A create sent to that follower leaves
+// the group to its leader: it neither forms nor destroys it, and the other members keep their replicas.
+TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(3);
+    if (me() == 1) { g_helper->set_flip_point("craft_create_volume_apply_error", 1); }
+    ASSERT_TRUE(sync());
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] { return group(id) != nullptr; }));
+    if (me() != 1) {
+        ASSERT_TRUE(wait_until([&id] { return hb()->get_volume(id).has_value(); }));
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        g_helper->remove_flip("craft_create_volume_apply_error");
+        ASSERT_FALSE(hb()->get_volume(id));
+        auto retry = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
+        ASSERT_FALSE(retry);
+        EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
+    }
+    ASSERT_TRUE(sync());
+
+    EXPECT_NE(group(id), nullptr);
+    if (me() != 1) { EXPECT_TRUE(hb()->get_volume(id)); }
+    ASSERT_TRUE(sync());
+}
 #endif
 
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
