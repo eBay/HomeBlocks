@@ -117,8 +117,20 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 // cause crash;
 //
 async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info) {
+    // Counted before anything else and released on every exit: a shutdown either waits for this create or is seen by
+    // it below, before it touches HomeStore.
+    struct CreateRef {
+        HomeBlocksImpl& hb;
+        ~CreateRef() { hb.dec_ref(); }
+    };
+    inc_ref();
+    CreateRef const ref{*this};
     if (is_restricted()) {
         LOGE("Can't serve volume create, System is in restricted mode.");
+        co_return std::unexpected(std::errc::operation_not_supported);
+    }
+    if (is_shutting_down()) {
+        LOGE("Can't serve volume create, system is shutting down.");
         co_return std::unexpected(std::errc::operation_not_supported);
     }
     if (is_craft()) { co_return co_await create_craft_volume(std::move(vol_info)); }
@@ -127,7 +139,6 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
         co_return std::unexpected(std::errc::not_supported);
     }
 
-    inc_ref();
     auto id = vol_info.id;
 
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
@@ -142,7 +153,6 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
 
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
-            dec_ref();
             co_return std::unexpected(std::errc::invalid_argument);
         }
     }
@@ -154,11 +164,9 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
         LOGW("create_volume with input id: {} ordinal: {} ", boost::uuids::to_string(id), vol_ptr->info()->ordinal);
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
-        dec_ref();
         co_return std::unexpected(volume_error::INTERNAL_ERROR);
     }
 
-    dec_ref();
     co_return vol_ptr;
 }
 
@@ -200,7 +208,6 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
         if (!creating_vols_.insert(id).second) { co_return std::unexpected(std::errc::operation_in_progress); }
     }
 
-    inc_ref();
     // Group formation blocks this thread until the election and every member's join are done, and HomeStore drives
     // it with sync_get: it must never run on a reactor. A thread of its own is safe whatever thread the caller is on.
     auto done = std::make_shared< sisl::async::value_awaitable< result< volume_handle > > >();
@@ -213,7 +220,6 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
         auto lg = std::scoped_lock(vol_lock_);
         creating_vols_.erase(id);
     }
-    dec_ref();
     co_return ret;
 }
 
@@ -286,9 +292,10 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
 
     // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before
     // in this process (a create retried after its group was destroyed), that layer still holds the old group's leader
-    // flag, so it may not have waited: wait for the leadership itself before proposing.
-    auto const timeout = std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
-    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    // flag, so it may not have waited: wait for the leadership itself before proposing. The leadership and the commit
+    // share one deadline.
+    auto const deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
     while (!(*rd)->is_leader() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -296,9 +303,13 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     // 2. Replicate the volume itself: every member creates its replica when this entry commits.
     auto ctx = make_create_volume_ctx(info);
     auto applied = ctx->done_.get_future();
-    bool propose = true;
+    bool propose = (*rd)->is_leader();
+    if (!propose) {
+        LOGE("vol={}: not the leader of its RAFT group in time, CreateVolume not proposed", id_str);
+        ctx->complete(std::unexpected(std::errc::timed_out));
+    }
 #ifdef _PRERELEASE
-    if (iomgr_flip::instance()->test_flip("craft_create_volume_propose_error")) {
+    if (propose && iomgr_flip::instance()->test_flip("craft_create_volume_propose_error")) {
         LOGI("vol={}: flip craft_create_volume_propose_error set, CreateVolume not proposed", id_str);
         ctx->complete(std::unexpected(std::errc::io_error));
         propose = false;
@@ -307,7 +318,7 @@ result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
     if (propose) { (*rd)->async_alloc_write(ctx->hdr_buf_, ctx->key_buf_, sisl::sg_list{}, ctx); }
 
     status st = std::unexpected(std::make_error_condition(std::errc::timed_out));
-    if (applied.wait_for(timeout) == std::future_status::ready) { st = applied.get(); }
+    if (applied.wait_until(deadline) == std::future_status::ready) { st = applied.get(); }
     if (!st) {
         LOGE("vol={}: CreateVolume did not commit and apply here: {}", id_str, st.error().message());
         remove_craft_group(id);
