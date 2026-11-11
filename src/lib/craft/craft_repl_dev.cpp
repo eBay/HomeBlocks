@@ -414,7 +414,7 @@ CraftReplDev::~CraftReplDev() {
 // the old session can be acked after it (write()'s pre- and post-flight checks both use admits_term_locked).
 
 async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t term, bool is_login) {
-    craft::lsn_pair pair{};
+    auto self = shared_from_this();
     {
         std::lock_guard lk{state_mu_};
         if (is_login && term > state_.term && term > state_.fence_term) {
@@ -422,9 +422,22 @@ async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t term, b
                  state_.term);
             state_.fence_term = term;
         }
-        pair = {state_.commit_lsn, state_.last_append_lsn};
+        if (!is_login || state_.fence_term <= state_.term) {
+            co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn}; // not fenced: report as-is
+        }
     }
-    co_return pair;
+    // Fenced: writes admitted before the fence have already advanced last_append_lsn and marked their slot
+    // missing, but are still journalling. They can no longer be acked (post-flight and post-commit checks fail),
+    // yet reporting now would let the leader's final round count those slots as lacking and verdict them Empty
+    // while the write is still installing them. Wait for them to finish, then report.
+    auto drained = [this] {
+        std::lock_guard lk{state_mu_};
+        return in_flight_write_dlsns_.empty();
+    };
+    while (!drained())
+        co_await write_drain_.wait_until(drained);
+    std::lock_guard lk{state_mu_};
+    co_return craft::lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
 
 // ─── truncate (S4) ────────────────────────────────────────────────────────────

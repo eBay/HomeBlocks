@@ -64,8 +64,14 @@ public:
     }
 
     // Accepts writes (the login-fence tests drive write()); fetch_data tests seed `slots` directly.
-    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id,
-                            bool all_zeros, std::vector< homestore::csum_t > const&) override {
+    homeblocks::detail::wait_list* write_waiters{nullptr}; // when set, write_slot waits until write_released
+    bool write_released{true};
+    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id, bool all_zeros,
+                            std::vector< homestore::csum_t > const&) override {
+        if (write_waiters) {
+            while (!write_released)
+                co_await write_waiters->wait_until([this] { return write_released; });
+        }
         slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
         co_return ok();
     }
@@ -190,6 +196,40 @@ TEST_F(CraftPeerExchangeTest, FencedReplicaRejectsNewSessionUntilLogin) {
     auto w = zero_write(*dev_, 4, 0);
     ASSERT_FALSE(w.has_value());
     EXPECT_EQ(w.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// A login poll does not report until writes admitted before the fence have finished (review on #198): otherwise
+// the leader could count their slots as lacking while they are still being journalled.
+TEST_F(CraftPeerExchangeTest, LoginPollWaitsForInFlightWritesBeforeReporting) {
+    homeblocks::detail::wait_list waiters;
+    journal_->write_waiters = &waiters;
+    journal_->write_released = false;
+    dev_->seed_term(3);
+
+    std::optional< result< craft::lsn_pair > > w;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, 0, 0, k_page_size,
+                             sisl::sg_list{});
+        co_return ok();
+    }(*dev_, w));
+    ASSERT_FALSE(w.has_value()); // admitted, suspended in write_slot
+
+    std::optional< result< craft::lsn_pair > > poll;
+    homeblocks::detail::detach([](CraftReplDev& d, std::optional< result< craft::lsn_pair > >& o) -> async_status {
+        o = co_await d.get_rs_commit_lsn(4, true);
+        co_return ok();
+    }(*dev_, poll));
+    EXPECT_EQ(dev_->fence_term(), 4u);
+    EXPECT_FALSE(poll.has_value()); // waiting for the in-flight write
+
+    journal_->write_released = true;
+    waiters.notify_all();
+    ASSERT_TRUE(w.has_value());
+    EXPECT_FALSE(w->has_value()); // fenced while in flight: never acked
+    ASSERT_TRUE(poll.has_value());
+    ASSERT_TRUE(poll->has_value());
+    EXPECT_EQ((*poll)->last_append_lsn, 0);
+    EXPECT_TRUE(journal_->slots.count(0) > 0); // the write finished journalling before the report
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────
