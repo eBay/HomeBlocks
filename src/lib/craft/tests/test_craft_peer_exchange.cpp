@@ -230,6 +230,36 @@ TEST_F(CraftPeerExchangeTest, LoginPollWaitsForInFlightWritesBeforeReporting) {
     ASSERT_TRUE(poll->has_value());
     EXPECT_EQ((*poll)->last_append_lsn, 0);
     EXPECT_TRUE(journal_->slots.count(0) > 0); // the write finished journalling before the report
+
+    // ...and the slot is reported as held, so the leader's final round does not count it as lacking, and an Empty
+    // verdict would free its blocks (review on #199).
+    EXPECT_FALSE(dev_->is_missing(0));
+    auto f = do_fetch_data({0});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_EQ(f->size(), 1u);
+    EXPECT_EQ((*f)[0].lsn, 0);
+    EXPECT_FALSE((*f)[0].is_empty);
+}
+
+// A login poll that arrives after its login was already aborted must not fence again: the InternalLogin that would
+// lift the fence is a no-op for an aborted term, so the old session would stay rejected for good (review on #199).
+TEST_F(CraftPeerExchangeTest, LoginPollAfterItsAbortDoesNotFence) {
+    dev_->seed_term(3);
+    std::vector< uint8_t > hdr(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(hdr.data())->type = CraftEntryType::LoginAborted;
+    std::vector< uint8_t > key(sizeof(LoginAbortedPayload));
+    reinterpret_cast< LoginAbortedPayload* >(key.data())->abort_upto = 4;
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, sisl::blob{hdr.data(), static_cast< uint32_t >(hdr.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    ASSERT_EQ(dev_->aborted_upto(), 4u);
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 3, 0).has_value()); // the old session is still admitted
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+    EXPECT_EQ(dev_->fence_term(), 5u); // a newer login still fences
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────

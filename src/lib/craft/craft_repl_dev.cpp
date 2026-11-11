@@ -417,7 +417,9 @@ async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t term, b
     auto self = shared_from_this();
     {
         std::lock_guard lk{state_mu_};
-        if (is_login && term > state_.term && term > state_.fence_term) {
+        // A poll for a term already aborted (LoginAborted applied first: a delayed poll) must not fence again --
+        // the InternalLogin that would lift it is a no-op for an aborted term, so the fence would never lift.
+        if (is_login && term > state_.term && term > state_.fence_term && term > state_.aborted_upto) {
             LOGI("get_rs_commit_lsn: login fence raised fence_term {} -> {} (session term={})", state_.fence_term, term,
                  state_.term);
             state_.fence_term = term;
@@ -758,17 +760,21 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
         } else {
-            missing_lsns_.erase(dlsn);
             snapshot = {state_.commit_lsn, state_.last_append_lsn};
         }
+        // The slot is journalled here either way, so publish it as held: a login's final round must see it
+        // (fetch_data reports it, an Empty verdict frees its blocks), and the login's truncation removes it if it
+        // lies above rs_commit_lsn. That truncation cannot have run yet: it waits for this write (in-flight guard,
+        // released only when this call returns).
+        missing_lsns_.erase(dlsn);
     }
 
-    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
-
     // Populate the journal-tail overlay: makes this entry locally readable ahead of commit() applying
-    // it to the index.
+    // it to the index. Done for a discarded write too, for the same reason it is published as held above.
     populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_), all_zeros,
                      blkid, csums);
+
+    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
 
     // Best-effort piggyback: advance commit_lsn toward the client's own view of it. Every outcome --
     // a stall at a gap, or even a genuine commit() fault -- is ignored here; the write itself already
