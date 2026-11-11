@@ -51,6 +51,23 @@ namespace {
 // repeated). Returns the first response LSN that violates it (unrequested or duplicated), or nullopt if
 // every entry matches exactly one requested LSN. Erasing from `pending` as we go catches duplicates for
 // free: a repeated lsn finds nothing left to erase the second time.
+// A fetch_range response must be strictly ascending, inside the requested ranges, and below `next` when `next` is
+// set (the responder covered everything before it). Returns the first offending dLSN, if any.
+std::optional< int64_t > validate_range_response(std::vector< LsnRange > const& requested, int64_t next,
+                                                 std::vector< JournalSlot > const& response) {
+    int64_t prev = std::numeric_limits< int64_t >::min();
+    size_t ri = 0;
+    for (auto const& slot : response) {
+        if (slot.lsn <= prev) return slot.lsn;
+        if (next >= 0 && slot.lsn >= next) return slot.lsn;
+        while (ri < requested.size() && requested[ri].second < slot.lsn)
+            ++ri;
+        if (ri == requested.size() || slot.lsn < requested[ri].first) return slot.lsn;
+        prev = slot.lsn;
+    }
+    return std::nullopt;
+}
+
 std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& requested,
                                                  std::vector< JournalSlot > const& response) {
     std::unordered_set< int64_t > pending{requested.begin(), requested.end()};
@@ -1457,6 +1474,83 @@ async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_toke
 //
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
 
+// ─── ranged, size-bounded fetch (docs/craft/resync.md §4.3, §4.7) ────────────
+
+async_result< FetchRangeResult > CraftPeerFetcher::fetch_range(std::vector< LsnRange > ranges, uint64_t /*max_bytes*/,
+                                                               uint32_t timeout_ms) {
+    std::vector< int64_t > lsns;
+    for (auto [lo, hi] : ranges)
+        for (int64_t l = lo; l <= hi; ++l)
+            lsns.push_back(l);
+    auto r = co_await fetch_data(lsns, timeout_ms);
+    if (!r) co_return std::unexpected(r.error());
+    std::sort(r->begin(), r->end(), [](JournalSlot const& a, JournalSlot const& b) { return a.lsn < b.lsn; });
+    co_return FetchRangeResult{.slots = std::move(*r), .next = -1, .reclaimed_below = -1};
+}
+
+CraftReplDev::retry_delay_fn_t CraftReplDev::iomgr_retry_delay() {
+    return [](std::chrono::milliseconds d) -> async_status {
+        struct delay_awaiter {
+            std::chrono::milliseconds d;
+            bool await_ready() const noexcept { return d.count() <= 0; }
+            void await_suspend(std::coroutine_handle<> h) const {
+                iomgr::schedule_oneshot(std::chrono::duration_cast< std::chrono::nanoseconds >(d),
+                                        iomgr::reactor_regex::least_busy_io, [h]() { h.resume(); });
+            }
+            void await_resume() const noexcept {}
+        };
+        co_await delay_awaiter{d};
+        co_return ok();
+    };
+}
+
+async_result< FetchRangeResult > CraftReplDev::fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes) {
+    FetchRangeResult out;
+    uint64_t bytes = 0;
+    int64_t scanned = 0;
+    for (size_t ri = 0; ri < ranges.size(); ++ri) {
+        auto [lo, hi] = ranges[ri];
+        for (int64_t start = lo; start <= hi;) {
+            if (scanned >= k_fetch_range_max_scan) {
+                out.next = start;
+                co_return out;
+            }
+            // Classify and read in batches through fetch_data (same Empty / present / absent rules).
+            int64_t const end = std::min(hi, start + std::min< int64_t >(255, k_fetch_range_max_scan - scanned - 1));
+            std::vector< int64_t > lsns;
+            for (int64_t l = start; l <= end; ++l)
+                lsns.push_back(l);
+            scanned += end - start + 1;
+            auto r = co_await fetch_data(std::move(lsns));
+            if (!r) co_return std::unexpected(r.error());
+            for (auto& slot : *r) {
+                // Always return at least one slot; past that, stop before exceeding max_bytes.
+                uint64_t const sz = (slot.is_empty || slot.all_zeros) ? 0 : slot.len_bytes;
+                if (!out.slots.empty() && bytes + sz > max_bytes) {
+                    out.next = slot.lsn;
+                    co_return out;
+                }
+                bytes += sz;
+                int64_t const lsn = slot.lsn;
+                out.slots.push_back(std::move(slot));
+                if (bytes >= max_bytes) {
+                    // Budget reached: everything after this slot is the continuation.
+                    if (lsn < hi) {
+                        out.next = lsn + 1;
+                        co_return out;
+                    }
+                    if (ri + 1 < ranges.size()) {
+                        out.next = ranges[ri + 1].first;
+                        co_return out;
+                    }
+                }
+            }
+            start = end + 1;
+        }
+    }
+    co_return out; // next = -1: everything requested was covered
+}
+
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
     enum class SlotKind { Empty, Present, Absent };
 
@@ -1958,133 +2052,200 @@ void CraftReplDev::request_catch_up(int64_t rs_commit_lsn) {
 
 async_status CraftReplDev::run_catch_up() {
     auto self = shared_from_this();
-    int64_t done_target = -2;
+    auto backoff = catch_up_min_backoff;
+    int failed_passes = 0;
     for (;;) {
-        int64_t rs_commit_lsn;
+        int64_t target;
         uint64_t term;
-        std::vector< int64_t > to_fetch;
+        std::vector< LsnRange > ranges; // missing slots <= target, as inclusive ranges
         {
             std::lock_guard lk{state_mu_};
-            rs_commit_lsn = catch_up_target_;
-            if (rs_commit_lsn == done_target) {
-                // Nothing new since the last pass; a later Sync restarts the runner. (Retry with backoff for
-                // slots still missing is follow-up work, docs/craft/resync.md PR E.)
-                catch_up_running_ = false;
-                co_return ok();
-            }
+            target = catch_up_target_;
             term = state_.term;
             for (int64_t lsn : missing_lsns_) {
-                if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
-                to_fetch.push_back(lsn);
-            }
-        }
-        done_target = rs_commit_lsn;
-        if (to_fetch.empty()) {
-            advance_commit_after_sync(rs_commit_lsn);
-            continue;
-        }
-
-        if (!to_fetch.empty()) {
-            if (peer_fetcher_ == nullptr) {
-                LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
-                     to_fetch.size());
-            } else if (auto fetched = co_await peer_fetcher_->fetch_data(to_fetch, peer_fetch_timeout_ms_); !fetched) {
-                LOGE("apply_sync_rs_commit_lsn: fetch_data failed: {} -- leaving {} lsn(s) as missing",
-                     fetched.error().message(), to_fetch.size());
-            } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
-                // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
-                // repeated) -- any deviation means the response itself can't be trusted, so none of it is
-                // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
-                // fine from a peer that has already proven unreliable.
-                LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
-                     "entire batch, leaving {} lsn(s) as missing",
-                     *bad_lsn, to_fetch.size());
-            } else {
-                for (auto& slot : *fetched) {
-                    {
-                        // Skip a slot that was filled (write gap-fill) or verdicted Empty since the request was
-                        // built: installing it now would duplicate data or resurrect a voided slot.
-                        // Also claim the slot in in_flight_write_dlsns_, the same per-dLSN ownership write() takes:
-                        // while catch-up installs it, a client gap-fill for the same dLSN is rejected (and vice
-                        // versa), so the two can never journal independently allocated blocks for one slot.
-                        std::lock_guard lk{state_mu_};
-                        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn) ||
-                            in_flight_write_dlsns_.contains(slot.lsn))
-                            continue;
-                        in_flight_write_dlsns_.insert(slot.lsn);
-                    }
-                    struct ClaimGuard {
-                        CraftReplDev* self;
-                        int64_t lsn;
-                        ~ClaimGuard() {
-                            {
-                                std::lock_guard lk{self->state_mu_};
-                                self->in_flight_write_dlsns_.erase(lsn);
-                            }
-                            self->write_drain_.notify_all();
-                        }
-                    } claim{this, slot.lsn};
-                    if (slot.is_empty) {
-                        std::lock_guard lk{state_mu_};
-                        empty_lsns_.insert(slot.lsn);
-                        missing_lsns_.erase(slot.lsn);
-                        continue;
-                    }
-                    // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
-                    // journalling the block reference. all_zeros slots carry no data and skip alloc.
-                    homestore::multi_blk_id blkid{};
-                    bool blkid_allocated = false;
-                    if (!slot.all_zeros) {
-                        auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
-                        if (!alloc_res) {
-                            LOGE("apply_sync_rs_commit_lsn: alloc_write_data failed lsn={}: {} -- leaving as missing",
-                                 slot.lsn, alloc_res.error().message());
-                            continue;
-                        }
-                        blkid = *alloc_res;
-                        blkid_allocated = true;
-                    }
-
-                    // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
-                    // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
-                    // default instance. That's an implicit, undocumented dependency on HomeStore's current
-                    // behavior -- see SDSTOR-25613.
-                    auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
-                                                             slot.all_zeros, slot.csums);
-                    if (!res) {
-                        LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
-                             res.error().message());
-                        if (blkid_allocated) {
-                            detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
-                                if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                                    LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: "
-                                         "{}",
-                                         lsn, fr.error().message());
-                                co_return ok();
-                            }());
-                        }
-                        continue;
-                    }
-                    bool voided_meanwhile;
-                    {
-                        std::lock_guard lk{state_mu_};
-                        // A SyncRSCommitLSN applied while this slot was being written verdicted it Empty. It saw the
-                        // slot as still missing, so it did not reclaim; reclaim the blocks just written here.
-                        voided_meanwhile = empty_lsns_.contains(slot.lsn);
-                        if (!voided_meanwhile) missing_lsns_.erase(slot.lsn);
-                    }
-                    if (voided_meanwhile) {
-                        LOGW("catch-up: lsn={} verdicted Empty during install -- reclaiming", slot.lsn);
-                        if (auto fr = co_await journal_->free_slot(slot.lsn); !fr)
-                            LOGE("catch-up: free_slot failed lsn={}: {} -- blocks may leak", slot.lsn,
-                                 fr.error().message());
-                    }
+                if (lsn > target) break; // missing_lsns_ is ordered
+                if (!ranges.empty() && ranges.back().second + 1 == lsn) {
+                    ranges.back().second = lsn;
+                } else {
+                    ranges.emplace_back(lsn, lsn);
                 }
             }
+            if (ranges.empty()) {
+                // Everything up to the target is resolved. Exit under the lock, so a Sync raising the target right
+                // now either is seen here (non-empty ranges next time) or starts a new runner after this one.
+                catch_up_running_ = false;
+            } else if (peer_fetcher_ == nullptr) {
+                LOGW("catch-up: missing slot(s) <= {} but no peer_fetcher_ wired -- leaving as missing", target);
+                catch_up_running_ = false;
+            }
+        }
+        if (ranges.empty() || peer_fetcher_ == nullptr) {
+            advance_commit_after_sync(target);
+            co_return ok();
         }
 
-        advance_commit_after_sync(rs_commit_lsn);
+        auto resolved = co_await catch_up_pass(std::move(ranges), term);
+        advance_commit_after_sync(target);
+        if (resolved && *resolved > 0) {
+            failed_passes = 0;
+            backoff = catch_up_min_backoff;
+            continue; // progress: go again straight away for whatever is left
+        }
+        // No progress (fetch failed, nobody returned the slots, or local installs failed).
+        if (!retry_delay_ || ++failed_passes >= catch_up_max_failed_passes) {
+            LOGW("catch-up: no progress toward {} after {} pass(es) -- stopping until the next SyncRSCommitLSN", target,
+                 failed_passes + (retry_delay_ ? 0 : 1));
+            std::lock_guard lk{state_mu_};
+            catch_up_running_ = false;
+            co_return ok();
+        }
+        LOGD("catch-up: no progress toward {}, retrying in {} ms", target, backoff.count());
+        co_await retry_delay_(backoff);
+        backoff = std::min(backoff * 2, catch_up_max_backoff);
     }
+}
+
+async_result< size_t > CraftReplDev::catch_up_pass(std::vector< LsnRange > ranges, uint64_t term) {
+    auto self = shared_from_this();
+    size_t resolved = 0;
+    // Bound each request by slot count too: a request is itself a message.
+    size_t i = 0;
+    while (i < ranges.size()) {
+        std::vector< LsnRange > batch;
+        size_t slots = 0;
+        while (i < ranges.size() && slots < catch_up_max_slots_) {
+            auto [lo, hi] = ranges[i];
+            size_t const room = catch_up_max_slots_ - slots;
+            if (static_cast< size_t >(hi - lo + 1) > room) {
+                int64_t const cut = lo + static_cast< int64_t >(room) - 1;
+                batch.emplace_back(lo, cut);
+                ranges[i].first = cut + 1;
+                slots += room;
+                break;
+            }
+            batch.emplace_back(lo, hi);
+            slots += static_cast< size_t >(hi - lo + 1);
+            ++i;
+        }
+        // Follow the responder's continuation until this batch is covered.
+        while (!batch.empty()) {
+            auto r = co_await peer_fetcher_->fetch_range(batch, catch_up_max_bytes_, peer_fetch_timeout_ms_);
+            if (!r) {
+                LOGE("catch-up: fetch_range failed: {}", r.error().message());
+                co_return resolved;
+            }
+            if (r->reclaimed_below >= 0) {
+                // Past retention on the responder: baseline recovery (§4.9) is the remedy, not a retry.
+                LOGW("catch-up: responder reclaimed below {} -- baseline recovery needed", r->reclaimed_below);
+            }
+            if (auto bad = validate_range_response(batch, r->next, r->slots); bad) {
+                LOGE("catch-up: fetch_range response lsn={} outside the request, out of order, or past `next` -- "
+                     "rejecting the response",
+                     *bad);
+                co_return resolved;
+            }
+            for (auto& slot : r->slots) {
+                auto ok_r = co_await install_fetched_slot(slot, term);
+                if (ok_r && *ok_r) ++resolved;
+            }
+            if (r->next < 0) break;
+            // Keep only the part of the batch at or after `next`.
+            std::vector< LsnRange > rest;
+            for (auto [lo, hi] : batch) {
+                if (hi < r->next) continue;
+                rest.emplace_back(std::max(lo, r->next), hi);
+            }
+            if (r->slots.empty() && r->next <= batch.front().first) {
+                LOGE("catch-up: fetch_range made no progress (next={}) -- abandoning this batch", r->next);
+                break;
+            }
+            batch = std::move(rest);
+        }
+    }
+    co_return resolved;
+}
+
+// Installs one slot returned by a catch-up fetch. Returns true if the slot is resolved afterwards (installed,
+// Empty, or already resolved by someone else), false if it is still missing (a local alloc/write failure).
+async_result< bool > CraftReplDev::install_fetched_slot(JournalSlot& slot, uint64_t term) {
+    auto self = shared_from_this();
+    {
+        // Skip a slot that was filled (write gap-fill) or verdicted Empty since the request was
+        // built: installing it now would duplicate data or resurrect a voided slot.
+        // Also claim the slot in in_flight_write_dlsns_, the same per-dLSN ownership write() takes:
+        // while catch-up installs it, a client gap-fill for the same dLSN is rejected (and vice
+        // versa), so the two can never journal independently allocated blocks for one slot.
+        std::lock_guard lk{state_mu_};
+        if (!missing_lsns_.contains(slot.lsn) || empty_lsns_.contains(slot.lsn) ||
+            in_flight_write_dlsns_.contains(slot.lsn))
+            co_return true;
+        in_flight_write_dlsns_.insert(slot.lsn);
+    }
+    struct ClaimGuard {
+        CraftReplDev* self;
+        int64_t lsn;
+        ~ClaimGuard() {
+            {
+                std::lock_guard lk{self->state_mu_};
+                self->in_flight_write_dlsns_.erase(lsn);
+            }
+            self->write_drain_.notify_all();
+        }
+    } claim{this, slot.lsn};
+    if (slot.is_empty) {
+        std::lock_guard lk{state_mu_};
+        empty_lsns_.insert(slot.lsn);
+        missing_lsns_.erase(slot.lsn);
+        co_return true;
+    }
+    // HS_DATA_LINKED, same as write(): allocate blocks and write the payload before
+    // journalling the block reference. all_zeros slots carry no data and skip alloc.
+    homestore::multi_blk_id blkid{};
+    bool blkid_allocated = false;
+    if (!slot.all_zeros) {
+        auto alloc_res = co_await journal_->alloc_write_data(slot.data, slot.len_bytes);
+        if (!alloc_res) {
+            LOGE("catch-up: alloc_write_data failed lsn={}: {} -- leaving as missing", slot.lsn,
+                 alloc_res.error().message());
+            co_return false;
+        }
+        blkid = *alloc_res;
+        blkid_allocated = true;
+    }
+
+    // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
+    // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
+    // default instance. That's an implicit, undocumented dependency on HomeStore's current
+    // behavior -- see SDSTOR-25613.
+    auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid, slot.all_zeros,
+                                             slot.csums);
+    if (!res) {
+        LOGE("catch-up: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn, res.error().message());
+        if (blkid_allocated) {
+            detail::detach([self, blkid, lsn = slot.lsn]() -> async_status {
+                if (auto fr = co_await self->journal_->free_data(blkid); !fr)
+                    LOGE("catch-up: free_data failed after write_slot failure lsn={}: "
+                         "{}",
+                         lsn, fr.error().message());
+                co_return ok();
+            }());
+        }
+        co_return false;
+    }
+    bool voided_meanwhile;
+    {
+        std::lock_guard lk{state_mu_};
+        // A SyncRSCommitLSN applied while this slot was being written verdicted it Empty. It saw the
+        // slot as still missing, so it did not reclaim; reclaim the blocks just written here.
+        voided_meanwhile = empty_lsns_.contains(slot.lsn);
+        if (!voided_meanwhile) missing_lsns_.erase(slot.lsn);
+    }
+    if (voided_meanwhile) {
+        LOGW("catch-up: lsn={} verdicted Empty during install -- reclaiming", slot.lsn);
+        if (auto fr = co_await journal_->free_slot(slot.lsn); !fr)
+            LOGE("catch-up: free_slot failed lsn={}: {} -- blocks may leak", slot.lsn, fr.error().message());
+    }
+    co_return true;
 }
 
 void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {

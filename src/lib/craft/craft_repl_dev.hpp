@@ -103,6 +103,19 @@ struct QuorumSlotResponse {
     std::vector< JournalSlot > slots;
 };
 
+// A ranged, size-bounded catch-up fetch (docs/craft/resync.md §4.3, §4.7). `ranges` are inclusive [lo, hi] dLSN
+// ranges, ascending and non-overlapping. The responder returns slots in ascending dLSN order (absent slots omitted,
+// as with fetch_data) and stops once the payload reaches max_bytes (always returning at least one slot if any is
+// held); `next` is the first dLSN it did not cover (-1 when every range was covered). `reclaimed_below` is the
+// responder's journal floor when part of the request lies below it (-1 otherwise): those slots can no longer be
+// served from the journal and need baseline recovery (§4.9).
+using LsnRange = std::pair< int64_t, int64_t >;
+struct FetchRangeResult {
+    std::vector< JournalSlot > slots;
+    int64_t next{-1};
+    int64_t reclaimed_below{-1};
+};
+
 // ─── journal backend abstraction ─────────────────────────────────────────────
 //
 // Injected into CraftReplDev so unit tests can supply a mock without touching
@@ -177,6 +190,11 @@ public:
     // membership concept anywhere in this backend yet (S8/S9/S10 territory).
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
+    // Ranged, size-bounded variant used by catch-up (see FetchRangeResult). The default expands the ranges and
+    // delegates to fetch_data, covering everything in one response (next = -1) -- correct, just unbounded -- so
+    // existing transports keep working; a real transport (S9) overrides it to bound the response on the wire.
+    virtual async_result< FetchRangeResult > fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes,
+                                                         uint32_t timeout_ms);
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -323,6 +341,11 @@ public:
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
     async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns);
+    // Callee side of CraftPeerFetcher::fetch_range: serves held slots in `ranges`, ascending, until the payload
+    // reaches max_bytes (at least one slot), and sets `next` to the first dLSN not covered. At most
+    // k_fetch_range_max_scan dLSNs are examined per call, so a huge sparse range is also served in pieces.
+    async_result< FetchRangeResult > fetch_range(std::vector< LsnRange > ranges, uint64_t max_bytes);
+    static constexpr int64_t k_fetch_range_max_scan = 65536;
 
     // Reconstructs the journal-tail overlay from the journal after a restart (a fresh instance's
     // overlay_ starts empty -- nothing else repopulates it). Walks (commit_lsn, last_append_lsn],
@@ -390,6 +413,22 @@ public:
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
+    // Catch-up retry (docs/craft/resync.md §4.3). A pass that makes no progress waits `delay` before retrying,
+    // starting at catch_up_min_backoff and doubling to catch_up_max_backoff; after catch_up_max_failed_passes
+    // consecutive passes without progress the runner exits (the next SyncRSCommitLSN restarts it), so an
+    // unreachable peer can never pin this device in memory forever. Without a delay function (the default, and
+    // the light unit tests) a pass that makes no progress simply ends the runner, as before. Production wiring
+    // passes iomgr_retry_delay().
+    using retry_delay_fn_t = std::function< async_status(std::chrono::milliseconds) >;
+    void set_retry_delay_fn(retry_delay_fn_t fn) { retry_delay_ = std::move(fn); }
+    static retry_delay_fn_t iomgr_retry_delay(); // an iomgr one-shot timer as an awaitable delay
+    void set_catch_up_chunk(uint64_t max_bytes, size_t max_slots) {
+        catch_up_max_bytes_ = max_bytes;
+        catch_up_max_slots_ = max_slots;
+    }
+    static constexpr std::chrono::milliseconds catch_up_min_backoff{100};
+    static constexpr std::chrono::milliseconds catch_up_max_backoff{5000};
+    static constexpr int catch_up_max_failed_passes = 10;
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
@@ -569,6 +608,10 @@ private:
     // applied mid-fetch always wins and its blocks are reclaimed.
     void request_catch_up(int64_t rs_commit_lsn);
     async_status run_catch_up();
+    // One catch-up pass over `ranges` (missing slots <= target, as ranges): fetch_range with continuation,
+    // install each slot (claim / re-check / reclaim, as before). Returns how many slots were resolved.
+    async_result< size_t > catch_up_pass(std::vector< LsnRange > ranges, uint64_t term);
+    async_result< bool > install_fetched_slot(JournalSlot& slot, uint64_t term);
     // commit_lsn advance shared by both parts: skips Empty, stops at the first Missing slot <= rs_commit_lsn,
     // and fires the periodic checkpoint trigger.
     void advance_commit_after_sync(int64_t rs_commit_lsn);
@@ -711,8 +754,12 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};
+    retry_delay_fn_t retry_delay_;                    // unset: no retry (see set_retry_delay_fn)
+    uint64_t catch_up_max_bytes_{8ull * 1024 * 1024}; // per fetch_range request
+    size_t catch_up_max_slots_{4096}; // per fetch_range request (bounds the request itself)     // deadline for
+                                      // fetch_data; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
