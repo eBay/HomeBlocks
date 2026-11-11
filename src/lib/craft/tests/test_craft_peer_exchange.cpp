@@ -63,9 +63,11 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool,
-                            std::vector< homestore::csum_t > const&) override {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // Accepts writes (the login-fence tests drive write()); fetch_data tests seed `slots` directly.
+    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id,
+                            bool all_zeros, std::vector< homestore::csum_t > const&) override {
+        slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
+        co_return ok();
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
@@ -125,6 +127,69 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->commit_lsn, 25);
     EXPECT_EQ(r->last_append_lsn, 50);
+}
+
+// ── login fence (docs/craft/resync.md §4.6, I8) ─────────────────────────────────
+
+namespace {
+auto zero_write(CraftReplDev& dev, uint64_t term, int64_t dlsn) {
+    return homeblocks::detail::sync_get(
+        dev.write(craft::client_hdr{.term = term, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn, /*addr=*/0,
+                  /*len=*/k_page_size, sisl::sg_list{}));
+}
+} // namespace
+
+// A login poll raises the fence before reporting; from then on the old session's writes are rejected.
+TEST_F(CraftPeerExchangeTest, LoginPollRaisesFenceAndRejectsOldSession) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(zero_write(*dev_, 3, 0).has_value());
+
+    auto r = homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/4, /*is_login=*/true));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->last_append_lsn, 0); // the write acked before the poll is covered
+    EXPECT_EQ(dev_->fence_term(), 4u);
+
+    auto w = zero_write(*dev_, 3, 1);
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// Non-login polls (watchdog/periodic) never fence.
+TEST_F(CraftPeerExchangeTest, NonLoginPollDoesNotFence) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, false)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 3, 0).has_value());
+}
+
+// The fence is monotonic: a delayed or duplicated poll from an older login cannot lower it.
+TEST_F(CraftPeerExchangeTest, LoginFenceIsMonotonic) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(6, true)).has_value());
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 6u);
+}
+
+// A poll for a term not newer than the current session is stale and does not fence.
+TEST_F(CraftPeerExchangeTest, StaleLoginPollDoesNotFence) {
+    dev_->seed_term(5);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(5, true)).has_value());
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+
+    EXPECT_EQ(dev_->fence_term(), 0u);
+    EXPECT_TRUE(zero_write(*dev_, 5, 0).has_value());
+}
+
+// While fenced, the new session is not admitted either (only its InternalLogin admits it).
+TEST_F(CraftPeerExchangeTest, FencedReplicaRejectsNewSessionUntilLogin) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(4, true)).has_value());
+
+    auto w = zero_write(*dev_, 4, 0);
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::STALE_TERM));
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────

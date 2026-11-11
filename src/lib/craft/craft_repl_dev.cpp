@@ -408,13 +408,20 @@ CraftReplDev::~CraftReplDev() {
 }
 
 // ─── get_rs_commit_lsn ────────────────────────────────────────────
-// Snapshot the in-memory partition state under state_mu_ for consistency with
-// write() which updates state_ under the same lock.
+// Snapshot the in-memory partition state under state_mu_ for consistency with write(), which updates
+// state_ under the same lock. On a login poll the fence is raised in the SAME critical section, before the
+// snapshot: every write acked before this point is covered by the reported last_append_lsn, and no write of
+// the old session can be acked after it (write()'s pre- and post-flight checks both use admits_term_locked).
 
-async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
+async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t term, bool is_login) {
     craft::lsn_pair pair{};
     {
         std::lock_guard lk{state_mu_};
+        if (is_login && term > state_.term && term > state_.fence_term) {
+            LOGI("get_rs_commit_lsn: login fence raised fence_term {} -> {} (session term={})", state_.fence_term, term,
+                 state_.term);
+            state_.fence_term = term;
+        }
         pair = {state_.commit_lsn, state_.last_append_lsn};
     }
     co_return pair;

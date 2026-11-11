@@ -300,10 +300,13 @@ public:
 
     // Callee side of the GetRSCommitLSN broadcast -- matches craft::craft_peer::get_rs_commit_lsn's
     // shape (craft_client's include/craft/peer.hpp) so a future wire-decoded request has somewhere
-    // to pass {term, is_login}. is_login=true is meant to quiesce prior-session writes before
-    // reporting last_append (the fencing barrier); watchdog/periodic polls pass is_login=false.
-    // Neither term-fencing nor quiesce is implemented yet -- both parameters are accepted but
-    // unused until S9 needs them (matches craft_client's own reference implementation today).
+    // to pass {term, is_login}. is_login=true is the login fence (docs/craft/resync.md §4.6, I8): before
+    // reporting its LSNs the replica raises fence_term to `term` (monotonic, and only for a term newer than
+    // the current session), so from that moment it acks no write of the old session -- an in-flight write
+    // that passed its pre-flight term check is discarded by write()'s post-flight recheck. The fence lifts
+    // only when an InternalLogin or LoginAborted for that login is applied; no timer releases it.
+    // Watchdog/periodic polls pass is_login=false and change nothing. Reporting session/fence terms in the
+    // reply needs the peer wire v2 (craft_client lsn_pair has no room for them).
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn;
@@ -417,7 +420,7 @@ public:
     void seed_empty(std::initializer_list< int64_t > empty);
     // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
     void seed_term(uint64_t term);
-    // Sets the login fence directly (PR C's get_rs_commit_lsn(is_login) is what raises it in production).
+    // Sets the login fence directly (get_rs_commit_lsn(term, is_login=true) is what raises it in production).
     void seed_fence_term(uint64_t fence_term);
     // Awaited by write() right after its piggyback commit() (test-only), to hold a write at that point.
     std::function< async_status() > test_post_commit_hook_;
