@@ -75,6 +75,7 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
     int free_data_calls{0};
+    std::function< void(int64_t) > on_write; // runs inside write_slot, to apply an Empty verdict mid-write
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -83,6 +84,7 @@ public:
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
+        if (on_write) on_write(lsn);
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] =
@@ -497,6 +499,26 @@ TEST_F(CraftRaftEntriesTest, CatchUpFilledSlotAboveHoleIsInOverlay) {
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_EQ(dev_->overlay_lsn_for(2), 5);
+}
+
+// Same race in catch-up: an Empty verdict applied during the fill's journal write leaves the fill void.
+TEST_F(CraftRaftEntriesTest, CatchUpFillVoidedByEmptyDuringWriteIsNotPublished) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {
+        JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
+        JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}};
+    // Each slot is voted Empty while its own write is in flight.
+    journal_->on_write = [this](int64_t lsn) {
+        if (lsn == 3) dev_->seed_empty({3});
+        if (lsn == 4) dev_->seed_empty({3, 4});
+    };
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // slot 3 was never published
+    EXPECT_EQ(journal_->free_data_calls, 1); // slot 4's blocks were freed
 }
 
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_data verbatim.

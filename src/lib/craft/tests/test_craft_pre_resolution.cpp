@@ -660,6 +660,29 @@ TEST_F(CraftPreResolutionTest, MissingCapLeavesGapOpeningFillUnresolved) {
     EXPECT_EQ(dev_->missing_count(), 1u); // just 2: no gap opened for 6..7
 }
 
+// An Empty verdict applied while a fill's journal write is in flight finds the slot still missing, so it neither
+// frees nor retires anything. The fill must see the verdict: no overlay entry, and its blocks freed.
+TEST_F(CraftPreResolutionTest, FillVoidedByEmptyDuringWriteIsNotPublished) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
+                  JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}}}};
+    // Each slot is voted Empty while its own write is in flight.
+    journal_->on_write = [this](int64_t lsn) {
+        if (lsn == 3) dev_->seed_empty({3});
+        if (lsn == 4) dev_->seed_empty({3, 4});
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // slot 3 was never published
+    EXPECT_EQ(journal_->free_data_calls, 1); // slot 4's blocks were freed
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
 // ── membership-aware quorum ───────────────────────────────────────────────────
 
 // N=5: self + 1 responder = 2 < quorum 3 -- not enough evidence to mint Empty.

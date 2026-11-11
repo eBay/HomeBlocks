@@ -2213,6 +2213,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             result.unresolved.push_back(slot->lsn);
             continue;
         }
+        bool voided = false;
         {
             // Term checked in the same critical section as the erase. If it changed during write_slot, the
             // entry stays journalled (blkid not freed -- the journal references it, same as write()'s
@@ -2222,14 +2223,25 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                 LOGW("pre_resolve_slots: term changed during write_slot -- abandoning at lsn={}", slot->lsn);
                 co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
             }
-            missing_lsns_.erase(slot->lsn);
-            // Record a slot filled above the frontier the way write() does (C2a).
-            for (int64_t gap = state_.last_append_lsn + 1; gap < slot->lsn; ++gap)
-                if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
-            state_.last_append_lsn = std::max(state_.last_append_lsn, slot->lsn);
-            // Readable like a write()'s slot until commit indexes it. Under state_mu_, so an Empty verdict either
-            // finds the slot missing or retires this entry.
-            populate_overlay_from_slot(slot->lsn, *slot, blkid);
+            // An Empty verdict applied during write_slot found the slot still missing, so it freed nothing and had
+            // no entry to retire: the fill is void, as in write()'s post-flight.
+            if (empty_lsns_.contains(slot->lsn)) {
+                voided = true;
+            } else {
+                missing_lsns_.erase(slot->lsn);
+                // Record a slot filled above the frontier the way write() does (C2a).
+                for (int64_t gap = state_.last_append_lsn + 1; gap < slot->lsn; ++gap)
+                    if (!empty_lsns_.contains(gap)) missing_lsns_.insert(gap);
+                state_.last_append_lsn = std::max(state_.last_append_lsn, slot->lsn);
+                // Readable like a write()'s slot until commit indexes it. A later Empty verdict finds the slot
+                // present and retires this entry.
+                populate_overlay_from_slot(slot->lsn, *slot, blkid);
+            }
+        }
+        // Freed while the claim is still held, so no other writer can journal the slot in between.
+        if (voided && blkid_allocated) {
+            if (auto fr = co_await journal_->free_data(blkid); !fr)
+                LOGE("pre_resolve_slots: free_data failed for voided fill lsn={}: {}", slot->lsn, fr.error().message());
         }
     }
     if (capped > 0)
@@ -2396,10 +2408,23 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                     }
                     continue;
                 }
-                std::lock_guard lk{state_mu_};
-                missing_lsns_.erase(slot.lsn);
-                // Readable until commit indexes it, same as pre_resolve_slots' fills.
-                populate_overlay_from_slot(slot.lsn, slot, blkid);
+                bool voided;
+                {
+                    std::lock_guard lk{state_mu_};
+                    // Same as pre_resolve_slots' fills: an Empty verdict applied during write_slot leaves this fill
+                    // void; otherwise it's readable until commit indexes it.
+                    voided = empty_lsns_.contains(slot.lsn);
+                    if (!voided) {
+                        missing_lsns_.erase(slot.lsn);
+                        populate_overlay_from_slot(slot.lsn, slot, blkid);
+                    }
+                }
+                // Freed while the claim is still held, as in pre_resolve_slots.
+                if (voided && blkid_allocated) {
+                    if (auto fr = co_await journal_->free_data(blkid); !fr)
+                        LOGE("apply_sync_rs_commit_lsn: free_data failed for voided fill lsn={}: {}", slot.lsn,
+                             fr.error().message());
+                }
             }
         }
     }
