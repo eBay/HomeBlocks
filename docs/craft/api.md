@@ -135,8 +135,8 @@ back as a hole); non-empty `data` is a **data write** of exactly `len` bytes (si
 buffer). Both take a `dLSN` and merge by highest-`dLSN`-per-LBA. Does **not** apply to the LBA index;
 `hdr.commit_lsn` rides along and advances the contiguous commit frontier best-effort, in `dLSN` order
 (this is CRAFT's commit — piggybacked on the writes the client is already broadcasting). Rejected with
-`craft_error::STALE_TERM` if `hdr.term` != the session term, or if the replica is quiesced for a login
-(a write already in flight when the quiesce begins still journals its slot, but is not acked), or
+`craft_error::STALE_TERM` if `hdr.term` != the session term, or if a login quiesce is fencing its term
+(≤ the poll's T; a write already in flight when the quiesce begins still journals its slot, but is not acked), or
 `std::errc::invalid_argument` on misalignment. ACK fires on journal-append completion and **returns the achieved
 `{commit_lsn, last_append_lsn}`** — every CRAFT IO response piggybacks the watermarks, so any
 round-trip refreshes the client's per-member model (its reclaim floor and Missing-map recovery) without
@@ -250,20 +250,22 @@ async_status truncate(int64_t lsn);
 Drop all journal entries with `dLSN > lsn` (stale prior-term tail; login truncation after
 `InternalLogin` commits).
 
-### `fetch_data` (peer resync)
+### `fetch_data` (peer)
 
 ```cpp
 async_result<std::vector<JournalSlot>> fetch_data(std::vector<int64_t> lsns);
 ```
 
-Server-to-server raw journal read during `SyncRSCommitLSN` apply. Each `JournalSlot` is one of: a data
+Server-to-server raw journal read: the leader's pre-resolution fetches unresolved slots from every member
+before it proposes a `SyncRSCommitLSN`, and a lagging replica fetches its missing slots while applying one.
+Each `JournalSlot` is one of: a data
 slot, a zero write (`all_zeros=true`, no data), or `Empty` (`is_empty=true`); a requested LSN absent
 from the result means not-present-here.
 
 ### RAFT state machine entries
 
 `SyncRSCommitLSN { rs_commit_lsn, client_token, empty_slots[] }` and
-`InternalLogin { client_token, term }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
+`InternalLogin { client_token, term, rs_commit_lsn }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
 (unchanged by the client-surface reshaping above).
 
 ---

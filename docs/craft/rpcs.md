@@ -1,6 +1,6 @@
 # CRAFT RPCs
 
-11 RPCs total. 6 client↔server (Login, Write, Read, KeepAlive, Resolve, Logout), 5 server↔server (3 via
+12 RPCs total. 7 client↔server (Login, HELO, Write, Read, KeepAlive, Resolve, Logout), 5 server↔server (3 via
 RAFT, 2 non-RAFT). RAFT internal RPCs (heartbeat, vote, membership) are not listed here.
 
 > **Commit is not a separate RPC.** The commit watermark rides on `client_hdr.commit_lsn`, piggybacked
@@ -21,14 +21,22 @@ RAFT, 2 non-RAFT). RAFT internal RPCs (heartbeat, vote, membership) are not list
 
 ## Common header
 
-Every client IO (Write, Read, KeepAlive) carries a `client_hdr`:
+On the wire, every client IO after login (Write, Read, KeepAlive, Resolve, Logout) starts with:
+
+```
+{ commit_lsn: int64, all_committed_lsn: int64 }
+```
+
+The session `term` isn't sent per IO: LOGIN or HELO binds it to the connection, and the replica fences each
+IO by that bound term (see RPC Transport). `CraftConnector` stamps the bound term into the C++ `client_hdr`,
+so `CraftReplDev` sees:
 
 ```
 client_hdr: { term: uint64, commit_lsn: int64, all_committed_lsn: int64 }
 ```
 
-- `term` — fences a stale writer (rejected `ETERM`); checked on **every** IO including KeepAlive, so a
-  deposed client cannot even reset the liveness watchdog.
+- `term` — the connection's bound session term; a mismatch is rejected with `STALE_TERM` on **every** IO,
+  including KeepAlive, so a deposed client cannot even reset the liveness watchdog.
 - `commit_lsn` — advance the contiguous commit frontier toward this, best-effort, in dLSN order
   (`-1` = don't advance). This is CRAFT's commit, piggybacked. It is also the client's **resolved
   prefix** (every slot ≤ it is quorum-acked or already `Empty`, so none is still in flight), which is
@@ -65,6 +73,21 @@ addr/len to it and presents the geometry to the filesystem. `capacity` is the vo
 (CRAFT-on-HomeBlocks wiki); every member must accept an IO of `max_tx` bytes.
 
 HomeBlocks handler: `CraftReplDev::login()`
+
+#### HELO (bind a follow-on connection)
+
+```
+Request:  { volume_id: uuid, client_token: uint64, term: uint64 }
+Response: { status }
+```
+
+Sent on every connection after the one that ran Login (another queue, or a connection to a follower) to
+bind it to the existing session; any replica answers. `OK` binds the connection to `term`; otherwise
+`WRONG_TOKEN`, `STALE_TERM` or `NOT_LEADER` (craft_client's wire doc). It's an attach, not a re-login: the
+replica already knows the session term from the replicated `InternalLogin`, and until it has applied that
+entry it rejects HELO at the new term.
+
+HomeBlocks handler: `CraftConnector` (S9)
 
 ---
 
@@ -184,8 +207,10 @@ Leader polls peers for their LSN state before a `SyncRSCommitLSN` proposal (logi
 `is_login=true` makes the peer **quiesce prior-session writes** before reporting `last_append` (the
 fencing barrier): they are rejected with `STALE_TERM`, and a write already in flight journals its slot
 but is not acked. Watchdog/periodic polls carry `is_login=false` and never quiesce. Only `last_append`
-feeds the watermark: login proposes `max(quorum.last_append)`, while a watchdog round caps that at the
-client's piggybacked `commit_lsn` because nothing is quiesced (see #9). The polled `commit_lsn` is a
+feeds the watermark. Login proposes the max `last_append` over the leader and every member that replied
+before the poll timeout (not just the first majority to reply), counting each member once, and fails with
+`NO_QUORUM` if those aren't a majority. A watchdog round caps that at the client's piggybacked
+`commit_lsn` because nothing is quiesced (see #9). The polled `commit_lsn` is a
 contiguity certificate that bounds the leader's hole-resolution window, seeds `all_committed_lsn`, and
 carries the reconfig promotion gate.
 
@@ -202,7 +227,7 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ---
 
-### 8. FetchData (Unicast, from behind replica to an ahead peer)
+### 8. FetchData (Broadcast from the leader during pre-resolution; unicast from a lagging replica)
 
 ```
 Request:  { lsns: [int64] }
@@ -250,9 +275,10 @@ watermark and verdicts.
 RAFT entry payload: { client_token: uint64, term: uint64, rs_commit_lsn: int64 }
 ```
 
-Proposed immediately after the login's `SyncRSCommitLSN` commits. On apply each replica first truncates
-its journal to `rs_commit_lsn` if its `last_append_lsn` is above it, then stores `client_token` and
-`term`, rejecting any subsequent IO from a different term. Until a replica has applied the entry, it
+Proposed immediately after the login's `SyncRSCommitLSN` commits. On apply each replica first fences
+prior-session writes and waits for any already in flight to finish (a replica the login poll missed was
+never quiesced), then truncates its journal to `rs_commit_lsn` if its `last_append_lsn` is above it, then
+stores `client_token` and `term`, rejecting any subsequent IO from a different term. Until a replica has applied the entry, it
 rejects IO and HELO at the new term, so no new-session write can land before its truncation.
 
 ---

@@ -139,7 +139,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 
 **InternalLogin:**
 - RAFT entry carries `{client_token, term}`; S7 adds `rs_commit_lsn`
-- On apply: `state.client_token = client_token`, `state.term = term`; S7 has the replica first truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5)
+- On apply: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5)
 - All subsequent IO with a different `term` is rejected
 - Proposed immediately after `SyncRSCommitLSN` commits during login
 
@@ -176,11 +176,11 @@ term across the replica set.
 
 **Acceptance criteria:**
 - Implements the leader-side login sequence:
-  1. Broadcast `GetRSCommitLSN(is_login=true)` to all peers; each **quiesces prior-session writes** before replying (fencing barrier): old-term writes get `STALE_TERM`, including one already in flight when the poll arrives (its slot stays journaled, but the write is not acked); collect `{commit_lsn, last_append_lsn}`; the leader quiesces its own prior-session writes the same way before recording its own
+  1. Broadcast `GetRSCommitLSN(T, is_login=true)` to all peers, with T the current session term; each **quiesces prior-session writes** before replying (fencing barrier): old-term writes get `STALE_TERM`, including one already in flight when the poll arrives (its slot stays journaled, but the write is not acked); collect each responder's `{term, commit_lsn, last_append_lsn}`, and abort with `STALE_TERM` if any responder's term is already past T; the leader quiesces its own prior-session writes the same way before recording its own
   2. Compute `rs_commit_lsn` = max `last_append_lsn` over the leader and every member that replied before the poll timeout (not just the first quorum to reply), counting each member once; if the leader plus responders are not a majority, fail with `NO_QUORUM` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
   3. Pre-resolve every unresolved slot ≤ `rs_commit_lsn`, including holes below the leader's own `last_append_lsn`: fetch each from any peer holding it, or record an `Empty` verdict when a quorum (leader included) lacks it. If any slot stays unresolved, the login fails before anything is proposed and the client retries
-  4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts; wait for commit
-  5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for commit. Each replica with `last_append > rs_commit_lsn` truncates to `rs_commit_lsn` when it applies the entry, before adopting the new term (no truncate RPC; a replica that missed the login truncates when it applies the entry later). Until a replica has applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its truncation
+  4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts; wait for it to apply on the leader, which brings the leader's `commit_lsn` to `rs_commit_lsn`
+  5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for it to apply on the leader. Each replica with `last_append > rs_commit_lsn` truncates to `rs_commit_lsn` when it applies the entry, before adopting the new term (no truncate RPC; a replica that missed the login truncates when it applies the entry later). Before truncating, the replica fences prior-session writes the way the login poll does and waits for any already in flight to finish, so none can journal a slot above `rs_commit_lsn` afterwards; the fence holds until it adopts the new term. Until a replica has applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its truncation
   6. Return `{members, dLSN=rs_commit_lsn, term=term+1}` plus the volume geometry `{lba_size, capacity, max_tx}`
 - **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner. The leader aborts the login once it passes a deadline shorter than the quiesce timeout
 - Returns `ENOTLEADER` if called on a follower
@@ -226,7 +226,7 @@ the RPC layer and storage layer have a clean boundary with no storage logic in t
   and every other connection sends `Helo {volume_id, client_token, term}` to bind to the session. The connector
   checks the term and token against `CraftReplDev`'s current session, binds the term to the connection, and stamps
   that term into `client_hdr.term` on every op from it; `CraftReplDev` checks it per op
-- Server-to-server handlers: `GetRSCommitLSN`, `FetchData`, `GetLSNs` (used during login and resync)
+- Server-to-server handlers: `GetRSCommitLSN`, `FetchData` (used during login and resync)
 - Each handler translates wire types ↔ `CraftReplDev` types with no storage logic
 - Leader redirect: if a `Login` arrives at a follower, reply with a successful response carrying `term == 0`
   and `leader_hint` set to the leader's id (a sentinel, not a `NOT_LEADER` error; see rpcs.md's Login)
