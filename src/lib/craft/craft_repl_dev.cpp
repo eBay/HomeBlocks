@@ -509,6 +509,11 @@ void CraftReplDev::seed_commit_lsn(int64_t commit) {
     state_.commit_lsn = commit;
 }
 
+void CraftReplDev::seed_fence_term(uint64_t fence_term) {
+    std::lock_guard lk{state_mu_};
+    state_.fence_term = fence_term;
+}
+
 void CraftReplDev::seed_term(uint64_t term) {
     std::lock_guard lk{state_mu_};
     state_.term = term;
@@ -589,7 +594,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // state_.term is guarded by state_mu_ like the rest of state_ -- read it under the same lock
         // used for the gap-marking below rather than unlocked, now that apply_internal_login (22887)
         // actually mutates it from the RAFT commit thread.
-        if (hdr.term != state_.term) {
+        if (!admits_term_locked(hdr.term)) {
             LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
@@ -726,7 +731,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term) {
+        if (!admits_term_locked(hdr.term)) {
             LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
             stale_post_flight = true;
         } else {
@@ -1046,7 +1051,7 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
     }
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term) {
+        if (!admits_term_locked(hdr.term)) {
             LOGW("read rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
@@ -1279,7 +1284,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
     }
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term) {
+        if (!admits_term_locked(hdr.term)) {
             LOGW("keep_alive rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
         }
@@ -1541,6 +1546,9 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
     }
     const auto* entry_hdr = reinterpret_cast< const CraftEntryHeader* >(header.cbytes());
 
+    // Every entry is parsed here (the blobs are only valid for the duration of this callback) and its apply
+    // is enqueued with the parsed values captured by value. The queue applies entries strictly in RAFT log
+    // order -- see enqueue_apply. A malformed entry is rejected here and never enqueued.
     switch (entry_hdr->type) {
     case CraftEntryType::SyncRSCommitLSN: {
         if (key.size() < sizeof(SyncRSCommitLSNPayload)) {
@@ -1553,45 +1561,102 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
             LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
             return;
         }
-        // apply_sync_rs_commit_lsn co_awaits peer fetch + journal writes; on_commit itself is a synchronous
-        // HomeStore callback, so fire-and-forget it.
-        //
-        // Lifetime: on_commit itself only touches the raw `owner_` pointer, which is safe since HomeStore
-        // never calls on_commit on a dead device. The DETACHED coroutine this dispatches into is a separate
-        // concern -- apply_sync_rs_commit_lsn opens with `auto self = shared_from_this()`, so the coroutine
-        // frame holds a strong reference across every co_await, keeping CraftReplDev alive even if every
-        // external owner (e.g. a volume-removal path) drops its shared_ptr mid-apply. Requires every
-        // CraftReplDev to be owned via shared_ptr
-        //
-        // FIXME: KNOWN GAP (not yet fixed): detaching here also breaks strict RAFT apply ordering.
-        // on_commit returns to HomeStore as soon as this coroutine hits its first co_await, so
-        // HomeStore can call on_commit for the NEXT committed entry -- a synchronous InternalLogin, or
-        // another detached SyncRSCommitLSN -- before this one's effects are fully applied.
-        // No individual field access races (state_mu_ still guards every access), but replicas can end up
-        // applying entries in different effective orders depending on async completion timing, which
-        // violates the determinism RAFT relies on for replicas to converge. See the commit_lsn advance at
-        // the tail of apply_sync_rs_commit_lsn and the client_token overwrite in apply_internal_login for
-        // the two mutation points this exposes. Real fix: one per-device serialized apply queue that both
-        // entry types funnel through, processing one entry's full effect (including all its co_awaits)
-        // before starting the next -- not independent detached tasks.
-        detail::detach(
-            owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token, std::move(*empty_slots)));
+        owner_->enqueue_apply(lsn,
+                              [dev = owner_, rs = payload->rs_commit_lsn, token = payload->client_token,
+                               empties = std::move(*empty_slots)]() -> async_status {
+                                  return dev->apply_sync_rs_commit_lsn(rs, token, empties);
+                              });
         break;
     }
     case CraftEntryType::InternalLogin: {
-        // Fixed-size payload, no variable trailing data (unlike SyncRSCommitLSN) -- exact-size check.
-        if (key.size() != sizeof(InternalLoginPayload)) {
+        // Fixed-size payload in one of two versions, told apart by exact key size. v1 carries no
+        // rs_commit_lsn (-1: no truncation); v2 does.
+        uint64_t token, term;
+        int64_t rs = -1;
+        if (key.size() == sizeof(InternalLoginPayloadV2)) {
+            const auto* p = reinterpret_cast< const InternalLoginPayloadV2* >(key.cbytes());
+            token = p->client_token;
+            term = p->term;
+            rs = p->rs_commit_lsn;
+        } else if (key.size() == sizeof(InternalLoginPayload)) {
+            const auto* p = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
+            token = p->client_token;
+            term = p->term;
+        } else {
             LOGE("on_commit lsn={} InternalLogin key wrong size ({} bytes)", lsn, key.size());
             return;
         }
-        const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
-        // Pure in-memory state transition (no co_await) -- called directly, not detached.
-        owner_->apply_internal_login(login_payload->client_token, login_payload->term);
+        owner_->enqueue_apply(lsn, [dev = owner_, token, term, rs]() -> async_status {
+            return dev->apply_internal_login(token, term, rs);
+        });
+        break;
+    }
+    case CraftEntryType::LoginAborted: {
+        if (key.size() != sizeof(LoginAbortedPayload)) {
+            LOGE("on_commit lsn={} LoginAborted key wrong size ({} bytes)", lsn, key.size());
+            return;
+        }
+        uint64_t const upto = reinterpret_cast< const LoginAbortedPayload* >(key.cbytes())->abort_upto;
+        owner_->enqueue_apply(lsn, [dev = owner_, upto]() -> async_status {
+            dev->apply_login_aborted(upto);
+            co_return ok();
+        });
         break;
     }
     default:
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
         break;
+    }
+}
+
+// ─── ordered apply queue (docs/craft/resync.md §4.3) ─────────────────────────
+//
+// Replaces the former detail::detach-per-entry dispatch, which let a later entry (an InternalLogin and its
+// truncation) apply before an earlier SyncRSCommitLSN had installed its verdicts. Exactly one drainer runs at a
+// time; it applies one entry's full local effect before starting the next. Entries at or below the last
+// enqueued RAFT index are duplicates/replays and are dropped.
+//
+// Lifetime: the drainer opens with shared_from_this(), so the device outlives every queued apply even if all
+// external owners drop it mid-drain (same requirement apply_sync_rs_commit_lsn already had).
+void CraftReplDev::enqueue_apply(int64_t raft_lsn, apply_fn_t fn) {
+    bool start_drainer = false;
+    {
+        std::lock_guard lk{apply_mu_};
+        if (raft_lsn <= last_enqueued_raft_idx_) {
+            LOGW("enqueue_apply: raft lsn={} already applied or queued (last={}) -- skipping replay", raft_lsn,
+                 last_enqueued_raft_idx_);
+            return;
+        }
+        last_enqueued_raft_idx_ = raft_lsn;
+        apply_queue_.push_back(PendingApply{raft_lsn, std::move(fn)});
+        if (!apply_running_) {
+            apply_running_ = true;
+            start_drainer = true;
+        }
+    }
+    if (start_drainer) detail::detach(drain_apply_queue());
+}
+
+async_status CraftReplDev::drain_apply_queue() {
+    auto self = shared_from_this();
+    for (;;) {
+        PendingApply next;
+        {
+            std::lock_guard lk{apply_mu_};
+            if (apply_queue_.empty()) {
+                apply_running_ = false;
+                co_return ok();
+            }
+            next = std::move(apply_queue_.front());
+            apply_queue_.pop_front();
+        }
+        // A failed apply is logged by the apply itself and does not stop the queue: a RAFT entry is
+        // committed, so later entries must still apply, in order.
+        if (auto r = co_await next.fn(); !r) {
+            LOGE("drain_apply_queue: apply of raft lsn={} failed: {}", next.raft_lsn, r.error().message());
+        }
+        std::lock_guard lk{state_mu_};
+        state_.last_applied_raft_idx = std::max(state_.last_applied_raft_idx, next.raft_lsn);
     }
 }
 
@@ -1810,8 +1875,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
-    // Lives in the coroutine frame across every co_await below -- see the lifetime comment at the
-    // on_commit call site (detail::detach) for why this is required.
+    // Lives in the coroutine frame across every co_await below -- see enqueue_apply's lifetime comment.
     auto self = shared_from_this();
 
     // Validated before any state is touched -- an out-of-range verdict means the entry itself cannot be
@@ -1825,7 +1889,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     }
 
     std::unordered_set< int64_t > to_free;
-    std::vector< int64_t > to_fetch;
     uint64_t term;
     {
         std::lock_guard lk{state_mu_};
@@ -1851,10 +1914,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
             if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
         }
         state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
-
-        for (int64_t lsn : missing_lsns_) {
-            if (lsn <= rs_commit_lsn) to_fetch.push_back(lsn);
-        }
     }
 
     if (!to_free.empty()) {
@@ -1865,6 +1924,26 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
             }
         }
     }
+
+    // Advance over everything already present, then hand the missing slots to catch-up. catch_up_to runs
+    // detached so a slow or unreachable peer never stalls the ordered apply queue (later entries).
+    advance_commit_after_sync(rs_commit_lsn);
+    detail::detach(catch_up_to(rs_commit_lsn, term));
+    LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
+    co_return ok();
+}
+
+async_status CraftReplDev::catch_up_to(int64_t rs_commit_lsn, uint64_t term) {
+    auto self = shared_from_this();
+    std::vector< int64_t > to_fetch;
+    {
+        std::lock_guard lk{state_mu_};
+        for (int64_t lsn : missing_lsns_) {
+            if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
+            to_fetch.push_back(lsn);
+        }
+    }
+    if (to_fetch.empty()) co_return ok();
 
     if (!to_fetch.empty()) {
         if (peer_fetcher_ == nullptr) {
@@ -1929,14 +2008,16 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         }
     }
 
+    advance_commit_after_sync(rs_commit_lsn);
+    co_return ok();
+}
+
+void CraftReplDev::advance_commit_after_sync(int64_t rs_commit_lsn) {
     // commit_lsn (CRAFT-Design) is the LOCAL CONTIGUOUS prefix, distinct from rs_commit_lsn (the
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
     // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
     //
-    // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
-    // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
-    // the time this advance actually runs, breaking strict RAFT apply ordering.
     int64_t commit_lsn_snapshot;
     bool should_checkpoint;
     {
@@ -1955,26 +2036,68 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
     }
     if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
-    LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
+}
+
+// ─── InternalLogin apply (S5 / SDSTOR-22887; docs/craft/resync.md §4.6) ──────
+//
+// Applied from the ordered apply queue, so every earlier entry -- in particular this login's own
+// SyncRSCommitLSN and its Empty verdicts -- is fully applied first. Three steps, in this order:
+//   1. Replay guard: a term at or below the current session term, or covered by a LoginAborted, is a
+//      duplicate/stale entry and changes nothing (no token overwrite either).
+//   2. Truncate the stale-session tail above rs_commit_lsn (v2 entries; rs_commit_lsn == -1 for v1 means no
+//      truncation). The new session reuses slot numbers above rs_commit_lsn, so its data must never share a
+//      slot with the old session's.
+//   3. Admit the new session: term and client_token. Only now can a new-term write be accepted, i.e.
+//      strictly after the truncation. Setting term >= fence_term also lifts the login fence.
+async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term, int64_t rs_commit_lsn) {
+    auto self = shared_from_this();
+    bool do_truncate = false;
+    {
+        std::lock_guard lk{state_mu_};
+        if (term <= state_.term || term <= state_.aborted_upto) {
+            LOGW("apply_internal_login: ignoring stale/aborted login term={} (session term={}, aborted_upto={})", term,
+                 state_.term, state_.aborted_upto);
+            co_return ok();
+        }
+        if (rs_commit_lsn >= 0 && state_.last_append_lsn > rs_commit_lsn) {
+            if (state_.commit_lsn > rs_commit_lsn) {
+                // Cannot happen if the leader computed rs_commit_lsn as max(quorum.last_append): commit only
+                // advances over quorum-acked slots. Refuse to truncate committed data rather than corrupt it.
+                LOGE("apply_internal_login: commit_lsn={} above rs_commit_lsn={} -- skipping truncation",
+                     state_.commit_lsn, rs_commit_lsn);
+            } else {
+                do_truncate = true;
+            }
+        }
+    }
+    if (do_truncate) {
+        if (auto r = co_await truncate(rs_commit_lsn); !r) {
+            // The session is NOT admitted: admitting it over an untruncated stale tail could mix the two
+            // sessions' data in one slot. The replica keeps rejecting the new term until it is repaired.
+            LOGE("apply_internal_login: truncate({}) failed: {} -- new session term={} NOT admitted", rs_commit_lsn,
+                 r.error().message(), term);
+            co_return r;
+        }
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        state_.client_token = client_token;
+        state_.term = term;
+        LOGD("apply_internal_login client_token={} term={} rs_commit_lsn={}", client_token, term, rs_commit_lsn);
+    }
     co_return ok();
 }
 
-// ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────
+// ─── LoginAborted apply (docs/craft/resync.md §4.6) ──────────────────────────
 //
-// Pure in-memory state transition -- no journal I/O, no peer fetch -- so this stays synchronous
-// (unlike apply_sync_rs_commit_lsn) and on_commit calls it directly rather than via detail::detach().
-// "Enforce single-writer exclusivity" needs no explicit rejection here: every other RPC's term-fence
-// check (STALE_TERM on mismatch) already does that. Overwriting state_.term is what invalidates any
-// existing session -- a caller still presenting the old term is fenced out on its very next call.
-
-void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
+// Lifts a fence left by a login that never committed its InternalLogin, so the current owner's session is
+// admitted again. A fence above abort_upto belongs to a newer login and is left alone. aborted_upto makes the
+// abort final: a late InternalLogin for an aborted term is ignored by apply_internal_login.
+void CraftReplDev::apply_login_aborted(uint64_t abort_upto) {
     std::lock_guard lk{state_mu_};
-    state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
-    // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
-    // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting
-    // log order blindly.
-    state_.term = std::max(state_.term, term);
-    LOGD("apply_internal_login client_token={} term={}", client_token, state_.term);
+    state_.aborted_upto = std::max(state_.aborted_upto, abort_upto);
+    if (state_.fence_term > state_.term && state_.fence_term <= abort_upto) { state_.fence_term = state_.term; }
+    LOGD("apply_login_aborted abort_upto={} fence_term={} term={}", abort_upto, state_.fence_term, state_.term);
 }
 
 } // namespace homeblocks

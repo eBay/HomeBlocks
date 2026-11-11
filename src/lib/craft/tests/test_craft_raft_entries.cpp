@@ -75,6 +75,8 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
     int free_data_calls{0};
+    std::optional< int64_t > truncated_to; // last truncate_to() argument, if any
+    bool fail_truncate{false};
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -92,7 +94,11 @@ public:
 
     async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
 
-    async_status truncate_to(int64_t) override { co_return ok(); }
+    async_status truncate_to(int64_t lsn) override {
+        if (fail_truncate) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        truncated_to = lsn;
+        co_return ok();
+    }
 
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
@@ -172,6 +178,21 @@ std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64
                                                    const std::vector< int64_t >& empty_slots) {
     std::vector< uint8_t > buf(sync_rs_commit_lsn_key_size(empty_slots.size()));
     serialize_sync_rs_commit_lsn(buf.data(), rs_commit_lsn, client_token, empty_slots);
+    return buf;
+}
+
+std::vector< uint8_t > make_internal_login_v2_key(uint64_t client_token, uint64_t term, int64_t rs_commit_lsn) {
+    std::vector< uint8_t > buf(sizeof(InternalLoginPayloadV2));
+    auto* p = reinterpret_cast< InternalLoginPayloadV2* >(buf.data());
+    p->client_token = client_token;
+    p->term = term;
+    p->rs_commit_lsn = rs_commit_lsn;
+    return buf;
+}
+
+std::vector< uint8_t > make_login_aborted_key(uint64_t abort_upto) {
+    std::vector< uint8_t > buf(sizeof(LoginAbortedPayload));
+    reinterpret_cast< LoginAbortedPayload* >(buf.data())->abort_upto = abort_upto;
     return buf;
 }
 
@@ -714,10 +735,10 @@ TEST_F(CraftRaftEntriesTest, InternalLoginTermNeverRegresses) {
     EXPECT_EQ(dev_->term(), 5u);
 }
 
-// client_token has no ordering semantics (it's an opaque id, unlike term) -- it's a plain overwrite even
-// when the accompanying term regresses and is guarded. Pins down the intentional asymmetry between the
-// two fields so it doesn't read as an oversight to a future reader.
-TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegresses) {
+// A stale InternalLogin (term at or below the current session) is a replayed or superseded entry and
+// changes nothing -- not even client_token. (Previously the token was overwritten regardless; that let a
+// replayed old login rebind the session to a deposed client.)
+TEST_F(CraftRaftEntriesTest, InternalLoginIgnoredEntirelyWhenTermRegresses) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
@@ -726,8 +747,8 @@ TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegr
     auto key2 = make_internal_login_key(/*client_token=*/99, /*term=*/3); // lower term, different token
     dev_->test_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
 
-    EXPECT_EQ(dev_->term(), 5u);          // guarded against regression
-    EXPECT_EQ(dev_->client_token(), 99u); // overwritten regardless
+    EXPECT_EQ(dev_->term(), 5u);         // guarded against regression
+    EXPECT_EQ(dev_->client_token(), 1u); // NOT overwritten: the whole entry is ignored
 }
 
 // Happy-path regression check for the write()-term-check-under-lock reorg: a matching term still
@@ -777,6 +798,184 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// ── InternalLogin v2, ordered apply, fence, LoginAborted (docs/craft/resync.md §4.3, §4.6) ──────────
+
+namespace {
+void commit_entry(CraftReplDev& dev, int64_t raft_lsn, CraftEntryType type, std::vector< uint8_t > key) {
+    auto header_buf = make_header(type);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev.test_listener().on_commit(raft_lsn, as_blob(header_buf), as_blob(key), {}, ctx);
+}
+
+auto write_at(CraftReplDev& dev, uint64_t term, int64_t dlsn) {
+    return homeblocks::detail::sync_get(
+        dev.write(craft::client_hdr{.term = term, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn, /*addr=*/0,
+                  /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+}
+} // namespace
+
+// v2 carries rs_commit_lsn: the stale-session tail above it is truncated before the new term is admitted.
+TEST_F(CraftRaftEntriesTest, InternalLoginV2TruncatesAboveRsCommitLsn) {
+    dev_->seed_lsns(/*last_append=*/10, {});
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/6));
+
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 6);
+    EXPECT_EQ(dev_->last_append_lsn(), 6);
+    EXPECT_EQ(dev_->term(), 5u);
+    EXPECT_EQ(dev_->client_token(), 42u);
+}
+
+TEST_F(CraftRaftEntriesTest, InternalLoginV2NoTruncateWhenNothingAboveRs) {
+    dev_->seed_lsns(/*last_append=*/6, {});
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/6));
+
+    EXPECT_FALSE(journal_->truncated_to.has_value());
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// v1 entries (no rs_commit_lsn) still decode and admit the session, but cannot truncate.
+TEST_F(CraftRaftEntriesTest, InternalLoginV1StillAppliesWithoutTruncation) {
+    dev_->seed_lsns(/*last_append=*/10, {});
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_key(42, 5));
+
+    EXPECT_FALSE(journal_->truncated_to.has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 10);
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// If truncation fails, the new session is NOT admitted: admitting it over an untruncated stale tail could
+// put two sessions' data in one slot.
+TEST_F(CraftRaftEntriesTest, InternalLoginTruncateFailureDoesNotAdmitSession) {
+    dev_->seed_lsns(/*last_append=*/10, {});
+    journal_->fail_truncate = true;
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/6));
+
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->client_token(), 0u);
+    auto r = write_at(*dev_, 5, 7);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// commit_lsn above rs_commit_lsn cannot happen with a correct leader; the apply refuses to truncate committed
+// data but still admits the session.
+TEST_F(CraftRaftEntriesTest, InternalLoginSkipsTruncationBelowCommitLsn) {
+    dev_->seed_lsns(/*last_append=*/10, {});
+    dev_->seed_commit_lsn(8);
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/6));
+
+    EXPECT_FALSE(journal_->truncated_to.has_value());
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// A RAFT entry delivered again at an already-applied index (restart replay, duplicate callback) is dropped.
+TEST_F(CraftRaftEntriesTest, ReplayedRaftIndexIsSkipped) {
+    commit_entry(*dev_, 7, CraftEntryType::InternalLogin, make_internal_login_v2_key(1, 2, -1));
+    commit_entry(*dev_, 7, CraftEntryType::InternalLogin, make_internal_login_v2_key(9, 9, -1)); // same index
+    commit_entry(*dev_, 6, CraftEntryType::InternalLogin, make_internal_login_v2_key(9, 9, -1)); // older index
+
+    EXPECT_EQ(dev_->term(), 2u);
+    EXPECT_EQ(dev_->client_token(), 1u);
+    EXPECT_EQ(dev_->last_applied_raft_idx(), 7);
+}
+
+// Entries apply in RAFT order: the login's SyncRSCommitLSN installs its Empty verdict before the following
+// InternalLogin truncates, so the verdict survives and the truncation point is the login watermark.
+TEST_F(CraftRaftEntriesTest, SyncVerdictsApplyBeforeFollowingLoginTruncates) {
+    dev_->seed_lsns(/*last_append=*/10, {});
+    commit_entry(*dev_, 1, CraftEntryType::SyncRSCommitLSN, make_sync_rs_commit_lsn_key(8, 0, {8}));
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, /*rs=*/8));
+
+    EXPECT_TRUE(dev_->is_empty_slot(8));
+    ASSERT_TRUE(journal_->truncated_to.has_value());
+    EXPECT_EQ(*journal_->truncated_to, 8);
+    EXPECT_EQ(dev_->last_append_lsn(), 8);
+    EXPECT_EQ(dev_->term(), 5u);
+    EXPECT_EQ(dev_->last_applied_raft_idx(), 2);
+}
+
+// A malformed entry is rejected at parse time and never enqueued, so a later valid entry still applies.
+TEST_F(CraftRaftEntriesTest, MalformedEntryDoesNotBlockLaterEntries) {
+    std::vector< uint8_t > bad(sizeof(InternalLoginPayload) + 3, 0);
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, bad);
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 5, -1));
+
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// While fenced (fence_term > session term) the replica admits neither the old session nor the new one.
+TEST_F(CraftRaftEntriesTest, FencedReplicaRejectsOldAndNewSessions) {
+    dev_->seed_term(3);
+    dev_->seed_fence_term(4);
+
+    auto old_w = write_at(*dev_, 3, 1);
+    ASSERT_FALSE(old_w.has_value());
+    EXPECT_EQ(old_w.error(), make_error_condition(volume_error::STALE_TERM));
+    auto new_w = write_at(*dev_, 4, 1);
+    ASSERT_FALSE(new_w.has_value());
+    EXPECT_EQ(new_w.error(), make_error_condition(volume_error::STALE_TERM));
+}
+
+// Applying the login's InternalLogin lifts the fence and admits the new session in one step.
+TEST_F(CraftRaftEntriesTest, InternalLoginLiftsFenceAndAdmitsNewSession) {
+    dev_->seed_term(3);
+    dev_->seed_fence_term(4);
+    commit_entry(*dev_, 1, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 4, -1));
+
+    EXPECT_EQ(dev_->term(), 4u);
+    EXPECT_TRUE(write_at(*dev_, 4, 1).has_value());
+    EXPECT_FALSE(write_at(*dev_, 3, 2).has_value());
+}
+
+// LoginAborted lifts a fence left by a login that never committed: the old session is admitted again.
+TEST_F(CraftRaftEntriesTest, LoginAbortedLiftsFenceAndReadmitsOldSession) {
+    dev_->seed_term(3);
+    dev_->seed_fence_term(4);
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(4));
+
+    EXPECT_EQ(dev_->fence_term(), 3u);
+    EXPECT_EQ(dev_->aborted_upto(), 4u);
+    EXPECT_TRUE(write_at(*dev_, 3, 1).has_value());
+}
+
+// A fence above abort_upto belongs to a newer login and is left alone.
+TEST_F(CraftRaftEntriesTest, LoginAbortedLeavesNewerFence) {
+    dev_->seed_term(3);
+    dev_->seed_fence_term(6);
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(4));
+
+    EXPECT_EQ(dev_->fence_term(), 6u);
+    EXPECT_FALSE(write_at(*dev_, 3, 1).has_value());
+}
+
+// An abort is final: a late InternalLogin for an aborted term is ignored.
+TEST_F(CraftRaftEntriesTest, InternalLoginForAbortedTermIsIgnored) {
+    dev_->seed_term(3);
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(4));
+    commit_entry(*dev_, 2, CraftEntryType::InternalLogin, make_internal_login_v2_key(42, 4, -1));
+
+    EXPECT_EQ(dev_->term(), 3u);
+    EXPECT_NE(dev_->client_token(), 42u);
+}
+
+TEST_F(CraftRaftEntriesTest, AbortedUptoNeverRegresses) {
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, make_login_aborted_key(9));
+    commit_entry(*dev_, 2, CraftEntryType::LoginAborted, make_login_aborted_key(4));
+
+    EXPECT_EQ(dev_->aborted_upto(), 9u);
+}
+
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsLoginAbortedWrongSize) {
+    std::vector< uint8_t > bad(sizeof(LoginAbortedPayload) + 1, 0);
+    dev_->seed_term(3);
+    dev_->seed_fence_term(4);
+    commit_entry(*dev_, 1, CraftEntryType::LoginAborted, bad);
+
+    EXPECT_EQ(dev_->fence_term(), 4u); // untouched
+    EXPECT_EQ(dev_->aborted_upto(), 0u);
 }
 
 } // namespace
