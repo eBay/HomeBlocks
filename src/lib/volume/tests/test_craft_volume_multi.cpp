@@ -16,7 +16,8 @@
 // CRAFT volume creation (SDSTOR-22894) across a multi-member RAFT group: one process per member. Replica 0 starts the
 // others (re-executing this binary with --replica_num) and receives every create; the processes share nothing but a
 // shared-memory barrier, and each one checks its own HomeBlocks. Every member must end up with the volume, keep it
-// across a restart of the whole group, and lose it again when a create fails after the followers applied it.
+// across a restart of the whole group, and lose it again when a create fails after the followers applied it; a member
+// left without a replica must not take the group down. Each test creates its own volume.
 
 #include <filesystem>
 #include <spawn.h>
@@ -178,10 +179,20 @@ TEST_F(CraftVolumeMultiTest, CreateReachesEveryMember) {
 
 TEST_F(CraftVolumeMultiTest, VolumeSurvivesRestartOfEveryMember) {
     ASSERT_TRUE(sync());
+    auto const id = test_volume_id(4);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_4")));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync()); // every member has its replica before any restarts
+
     g_helper->restart();
     ASSERT_TRUE(sync()); // every member is back before anyone checks
 
-    auto const id = test_volume_id(1);
     auto vol = hb()->get_volume(id);
     ASSERT_TRUE(vol);
     EXPECT_NE((*vol)->craft_dev(), nullptr);
