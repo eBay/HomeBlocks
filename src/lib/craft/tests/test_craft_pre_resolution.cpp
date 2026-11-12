@@ -103,8 +103,8 @@ public:
 // ── peer fetcher mock ─────────────────────────────────────────────────────────
 //
 // Records the LSN list fetch_from_quorum was last called with; returns a programmable response (one
-// QuorumSlotResponse per simulated responding member; an untagged reply is tagged test_member_id(i + 1)) or an
-// injected error. fetch_data isn't exercised
+// QuorumSlotResponse per simulated responding member; an untagged reply is tagged test_member_id(i + 1) unless
+// tag_untagged is false) or an injected error. fetch_data isn't exercised
 // by this file (see test_craft_raft_entries.cpp) -- CraftPeerFetcher bundles both because
 // pre_resolve_slots's quorum broadcast and apply_sync_rs_commit_lsn's single-peer catch-up are wired
 // through the same production channel (CraftConnector, S9).
@@ -116,6 +116,8 @@ public:
     int call_count{0};
     std::vector< QuorumSlotResponse > response;
     bool should_fail{false};
+    // false: pass replies with no member id through as-is, as a buggy transport would.
+    bool tag_untagged{true};
     std::function< void() > on_fetch; // runs inside the fetch, to change leader/term mid-await
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
@@ -135,7 +137,7 @@ public:
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         auto tagged = response; // an untagged reply is the i-th distinct member
         for (size_t i = 0; i < tagged.size(); ++i)
-            if (tagged[i].member.is_nil()) tagged[i].member = test_member_id(i + 1);
+            if (tag_untagged && tagged[i].member.is_nil()) tagged[i].member = test_member_id(i + 1);
         co_return tagged;
     }
 
@@ -872,6 +874,37 @@ TEST_F(CraftPreResolutionTest, LeaderOutsideVoterListMintsNoEmpty) {
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->empty_slots.empty());
     EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// N=3: a reply with no member id isn't a vote -- self alone < quorum 2.
+TEST_F(CraftPreResolutionTest, UntaggedReplyLackDoesNotCount) {
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.tag_untagged = false;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// An untagged reply's evidence is still used: its data fills slot 3 and its Empty for slot 4 is inherited.
+TEST_F(CraftPreResolutionTest, UntaggedReplyEvidenceIsStillUsed) {
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.tag_untagged = false;
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}, JournalSlot{.lsn = 4, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4}));
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
 }
 
 // ── slots with a write in flight (H1) ─────────────────────────────────────────

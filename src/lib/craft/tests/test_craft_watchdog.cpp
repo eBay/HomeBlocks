@@ -384,6 +384,20 @@ TEST_F(CraftWatchdogTest, LeaderOutsideVoterListNeverSyncs) {
     EXPECT_TRUE(proposer_.proposed.empty());
 }
 
+// N=3: a reply with no member id isn't a vote.
+TEST_F(CraftWatchdogTest, UntaggedReplyIsNotQuorum) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.polled_members = {craft::peer_id_t{}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
 // Destroys a CraftReplDev at an unpredictable point relative to its own watchdog timer's firing --
 // sometimes well before the first tick, sometimes squarely inside the window where on_watchdog_tick()
 // is either about to run, actively running, or has just returned. An EARLIER, one-shot-timer-that-
