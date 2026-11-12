@@ -322,6 +322,13 @@ int main(int argc, char* argv[]) {
         LOGERROR("test_craft_volume_multi gives every member its own files: --device_list is not supported");
         return 1;
     }
+    // The members run the tests in one order, meeting at each barrier: a shuffled run needs a seed they all share. An
+    // explicit --gtest_random_seed reaches every member with the other arguments.
+    if (GTEST_FLAG_GET(shuffle) && GTEST_FLAG_GET(random_seed) == 0) {
+        LOGERROR("test_craft_volume_multi runs the tests of every member in one order: --gtest_shuffle needs a "
+                 "--gtest_random_seed");
+        return 1;
+    }
     if (SISL_OPTIONS.count("config_path")) {
         std::filesystem::create_directories(SISL_OPTIONS["config_path"].as< std::string >());
     }
