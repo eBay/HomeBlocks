@@ -243,6 +243,12 @@ status HomeBlocksImpl::validate_craft_volume(volume_info const& info) const {
         LOGE("vol={}: page size {} is not this node's data block size {}", vol_str, info.page_size, DATA_BLK_SIZE);
         return std::unexpected(std::errc::invalid_argument);
     }
+    // CRAFT IO is whole pages within the volume: a partial last page could never be written or read.
+    if (info.size_bytes == 0 || info.size_bytes % info.page_size != 0) {
+        LOGE("vol={}: size {} is not a positive multiple of the page size {}", vol_str, info.size_bytes,
+             info.page_size);
+        return std::unexpected(std::errc::invalid_argument);
+    }
     // The whole name must come back from the superblock, which keeps it as a C string: a retry, also after a restart,
     // is matched against the stored one.
     if (info.name.size() > volume::MAX_NAME_LEN || info.name.find('\0') != std::string::npos) {

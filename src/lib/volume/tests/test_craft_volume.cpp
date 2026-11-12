@@ -154,6 +154,13 @@ TEST_F(CraftVolumeTest, CreateRejectsInvalidRequests) {
         expect_rejected(std::move(wrong_page));
     }
 
+    // Whole pages only, and at least one: a partial last page could never be written.
+    for (uint64_t const size : {0ul, 4096ul + 1, (1ul << 30) - 2048}) {
+        auto wrong_size = craft_vol_info("wrong_size");
+        wrong_size.size_bytes = size;
+        expect_rejected(std::move(wrong_size));
+    }
+
     // Longer than the superblock keeps, or with a NUL: it would come back cut short after a restart.
     expect_rejected(craft_vol_info(std::string(volume::MAX_NAME_LEN + 1, 'n')));
     expect_rejected(craft_vol_info(std::string("nul\0name", 8)));
