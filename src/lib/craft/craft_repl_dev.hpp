@@ -434,6 +434,10 @@ public:
     // after construction, same pattern as set_peer_fetch_timeout_ms.
     void set_checkpoint_lsn_interval(int64_t n) { checkpoint_lsn_interval_ = n; }
 
+    // Handles this partition's CRAFT RAFT entries. HomeStore does not hold it: the group's listener (created before
+    // this device exists) forwards to it.
+    homestore::repl_dev_listener& raft_listener() { return raft_listener_; }
+
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
@@ -447,9 +451,6 @@ public:
     void seed_term(uint64_t term);
     // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
     void seed_in_flight(int64_t lsn);
-    // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
-    // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
-    homestore::repl_dev_listener& test_listener() { return raft_listener_; }
 
     // Test seam for commit(): runs the same apply-one-slot algorithm, but the index write/delete
     // operations are injected rather than routed through indx_tbl_, so tests can exercise commit()'s

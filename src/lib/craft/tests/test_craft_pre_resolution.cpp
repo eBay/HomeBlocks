@@ -853,7 +853,7 @@ protected:
         fetcher_.response = {QuorumSlotResponse{}}; // one responder holding nothing
         proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
             cintrusive< homestore::repl_req_ctx > ctx{};
-            dev_->test_listener().on_commit(1, h, k, {}, ctx);
+            dev_->raft_listener().on_commit(1, h, k, {}, ctx);
         };
     }
 
@@ -929,7 +929,7 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     dev_->seed_lsns(5, {});
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
         cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->test_listener().on_commit(1, h, k, {}, ctx);
+        dev_->raft_listener().on_commit(1, h, k, {}, ctx);
         dev_->seed_term(2);
     };
 
@@ -1112,7 +1112,7 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
     serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {});
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+    dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     ASSERT_TRUE(dev_->is_missing(4)); // catch-up failed: the mock's fetch_data is unsupported
     ASSERT_TRUE(dev_->is_missing(5));
@@ -1139,7 +1139,7 @@ TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsRejectedAndFreed) {
     journal_->on_write = [&](int64_t lsn) {
         if (lsn != 0) return;
         cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     };
 
@@ -1331,7 +1331,7 @@ TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
     *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 9, .term = 2};
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+    dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     EXPECT_EQ(dev_->client_commit_lsn(), -1);
 }
@@ -1387,7 +1387,7 @@ TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
     *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 99, .term = 4};
     cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+    dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     dev_->seed_lsns(5, {});
 

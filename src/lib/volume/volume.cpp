@@ -16,10 +16,17 @@
 #include "volume.hpp"
 #include "lib/homeblks_impl.hpp"
 #include "coro_helpers.hpp"
+#include "home_blks_config.hpp"
+#include <homestore/logstore/log_store.hpp>
+#include <homestore/logstore_service.hpp>
 #include <homestore/replication_service.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homeblocks {
+
+// The CRAFT journal is write-through, like every CRAFT journal test: flushed inline on append, the timer as backstop.
+static constexpr auto craft_journal_flush_mode = static_cast< homestore::flush_mode_t >(
+    static_cast< uint32_t >(homestore::flush_mode_t::TIMER) | static_cast< uint32_t >(homestore::flush_mode_t::INLINE));
 
 uint64_t volume::get_index_size() {
     // Get approximate index size based on volume size. additional space for interior nodes.
@@ -66,8 +73,14 @@ volume::volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSele
                shared< VolumeChunkSelector > index_chunk_sel) :
         sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
     sb_.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // Older layouts are not supported (the chunk list moved with every added field): fail loudly, never misparse. Not
+    // fault containment either: a volume left unloaded would lose its journal, which HomeStore purges as unopened, and
+    // its chunks, which startup resets as unowned.
+    RELEASE_ASSERT(sb_->magic == VOL_SB_MAGIC && sb_->version == VOL_SB_VER,
+                   "unsupported volume superblock, magic: {:#x} version: {:#x}", sb_->magic, sb_->version);
     // generate volume info from sb;
     vol_info_ = std::make_shared< volume_info >(sb_->id, sb_->size, sb_->page_size, sb_->name, sb_->ordinal);
+    vol_info_->repl_mode = sb_->repl_mode;
     metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     m_state_ = sb_->state;
     LOGI("volume superblock loaded from disk, vol_info : {}", vol_info_->to_string());
@@ -153,18 +166,118 @@ bool volume::init(bool is_recovery) {
     return true;
 }
 
+bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_init_error")) {
+        LOGI("vol={}: flip craft_create_volume_init_error set, local create fails", id_str());
+        return false;
+    }
+#endif
+    // A table left by an earlier create of this volume was sized for that create's volume: a larger one outgrows it.
+    if (orphan_idx) {
+        if (auto const held = orphan_idx->index_table()->mutable_super_blk()->max_size_bytes; held < get_index_size()) {
+            LOGE("vol={}: its leftover index table holds {} bytes, a volume of {} bytes needs {}: not taken over",
+                 id_str(), held, vol_info_->size_bytes, get_index_size());
+            return false;
+        }
+    }
+    auto rd = homestore::hs()->repl_service().get_repl_dev(id());
+    if (!rd) {
+        LOGE("No RAFT group for CRAFT volume: {}, uuid: {}, error: {}", vol_info_->name, id_str(), rd.error());
+        return false;
+    }
+    rd_ = rd.value();
+
+    uint32_t pdev_id;
+    auto chunk_ids =
+        volume_chunk_selector_->allocate_init_chunks(ordinal(), vol_info_->size_bytes, pdev_id, dynamic_chunk_alloc);
+    if (chunk_ids.empty()) {
+        LOGE("Failed to allocate chunks for volume: {}, uuid: {}", vol_info_->name, id_str());
+        return false;
+    }
+
+    // The volume's own journal: a dedicated logdev keeps its flush and truncation independent of the RAFT log's.
+    auto& logstores = homestore::logstore_service();
+    auto const logdev_id = logstores.create_new_logdev(craft_journal_flush_mode);
+    auto journal = (logdev_id != 0) ? logstores.create_new_log_store(logdev_id, false /* append_mode */) : nullptr;
+    // Read before the table moves into the call: the order the arguments are evaluated in is unspecified.
+    bool const taken_over = orphan_idx != nullptr;
+    if (!journal || !init_index_table(taken_over, std::move(orphan_idx))) {
+        LOGE("Failed to create the journal or index of volume: {}, uuid: {}", vol_info_->name, id_str());
+        if (logdev_id != 0) { logstores.destroy_log_dev(logdev_id); }
+        volume_chunk_selector_->release_chunks(ordinal());
+        return false;
+    }
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_crash_after_index")) {
+        // Stands for a crash between the index table and the superblock: nothing is cleaned up, the test restarts.
+        LOGI("vol={}: flip craft_create_volume_crash_after_index set, stopping before the superblock", id_str());
+        return false;
+    }
+#endif
+
+    sb_.create(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
+    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal, pdev_id,
+              chunk_ids);
+    sb_->repl_mode = replication_mode::CRAFT;
+    sb_->journal_logdev_id = logdev_id;
+    sb_->journal_store_id = journal->get_store_id();
+    journal_open_ = true;
+    // First write of the superblock: from here on the volume exists, and a replayed CreateVolume finds it.
+    state_change(volume_state::ONLINE);
+
+    attach_craft_dev(std::move(journal));
+    LOGI("Created CRAFT volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {} journal: {}/{}",
+         vol_info_->name, id_str(), ordinal(), vol_info_->size_bytes, pdev_id, chunk_ids.size(), logdev_id,
+         sb_->journal_store_id);
+    return true;
+}
+
+// Reopens the volume's journal at load, ahead of the log store service start: HomeStore purges every logdev nobody
+// reopened. The store itself opens during the log replay, and the CraftReplDev is attached then.
+void volume::reopen_craft_journal() {
+    auto& logstores = homestore::logstore_service();
+    logstores.open_logdev(sb_->journal_logdev_id, craft_journal_flush_mode);
+    journal_open_ = true;
+    detail::detach([](sisl::async::task< shared< homestore::home_log_store > > open,
+                      volume_handle vol) -> sisl::async::task< void > {
+        vol->attach_craft_dev(co_await std::move(open));
+        LOGI("CRAFT volume: {} uuid: {} reattached to its journal", vol->vol_info_->name, vol->id_str());
+    }(logstores.open_log_store(sb_->journal_logdev_id, sb_->journal_store_id, false /* append_mode */, nullptr,
+                                         nullptr),
+                                         shared_from_this()));
+}
+
+void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
+    // The device keeps the index table it is given; without one it could neither apply commits nor serve reads.
+    RELEASE_ASSERT(indx_tbl_ != nullptr, "CRAFT volume: {} uuid: {} has no index table to attach its device to",
+                   vol_info_->name, id_str());
+    auto const lba_size = static_cast< uint32_t >(vol_info_->page_size);
+    auto dev = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
+                                    lba_size, indx_tbl_);
+    dev->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
+    dev->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
+    dev->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
+    craft_dev_ = std::move(dev); // published only once configured
+}
+
+// Runs once, by the removal that claimed it (try_start_destroy).
 sisl::async::task< void > volume::destroy() {
     LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
-    destroy_started_ = true;
 
-    // 1. destroy the repl dev;
-    if (rd_) {
+    // The CRAFT device goes before the index and journal it works on: no CRAFT op runs anymore (each one counts itself
+    // in flight on the volume, and the destroy starts only when none is), and its watchdog stops with it.
+    craft_dev_.reset();
+
+    // 1. destroy the repl dev. A CRAFT volume's RAFT group is destroyed through RAFT, by whoever removes the partition;
+    // every member's teardown follows it, so this one leaves the group alone.
+    if (rd_ && !is_craft()) {
         LOGI("Destroying repl dev for volume: {}", vol_info_->name);
         // remove_repl_dev is a coroutine (async_status); co_await it (rather than a blocking sync_get) so this
         // path can run on an iomgr reactor without parking it. Best-effort during destroy, result ignored.
         (void)co_await homestore::hs()->repl_service().remove_repl_dev(id());
-        rd_ = nullptr;
     }
+    rd_ = nullptr;
 
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("vol_destroy_crash_simulation")) {
@@ -182,6 +295,15 @@ sisl::async::task< void > volume::destroy() {
         co_await indx_tbl_->destroy();
         index_chunk_selector_->release_chunks(vol_info_->ordinal);
         indx_tbl_ = nullptr;
+    }
+
+    // The CRAFT journal, if this boot opened it. One left unopened (a destroy resumed after a crash) is purged by
+    // HomeStore when it starts.
+    if (journal_open_) {
+        LOGI("Destroying journal for volume: {}, uuid: {}", vol_info_->name, id_str());
+        homestore::logstore_service().remove_log_store(sb_->journal_logdev_id, sb_->journal_store_id);
+        homestore::logstore_service().destroy_log_dev(sb_->journal_logdev_id);
+        journal_open_ = false;
     }
 
 #ifdef _PRERELEASE
@@ -215,11 +337,13 @@ sisl::async::task< void > volume::destroy() {
 }
 
 void volume::update_vol_sb_cb(const std::vector< chunk_num_t >& chunk_ids) {
-    // Update the volume superblk with latest set of chunk id's.
-    uint32_t pdev_id = sb_->pdev_id;
+    // Update the volume superblk with latest set of chunk id's. resize() value-initializes the header, so carry every
+    // field (state, ...) over and rewrite only the chunk list.
+    auto const hdr = *sb_;
     sb_.resize(sizeof(vol_sb_t) + (chunk_ids.size() * sizeof(homestore::chunk_num_t)));
-    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal, pdev_id,
-              chunk_ids);
+    *sb_ = hdr;
+    sb_->init(vol_info_->page_size, vol_info_->size_bytes, vol_info_->id, vol_info_->name, vol_info_->ordinal,
+              hdr.pdev_id, chunk_ids);
     sb_.write();
 }
 

@@ -23,9 +23,13 @@
 #include <istream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
+#include <boost/uuid/name_generator_sha1.hpp>
+#include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/format.h>
@@ -60,7 +64,8 @@ using homestore::status;
 // =============================================== volumes ===============================================
 
 // Opaque volume handle. Produced by home_blocks::create_volume() / get_volume(); never constructed directly.
-// All I/O is via the free async_* functions below.
+// All I/O is via the free async_* functions below. A handle is valid until shutdown(): after init_homeblocks() again,
+// get_volume() returns the volume's new handle.
 class volume;
 using volume_handle = std::shared_ptr< volume >;
 
@@ -85,12 +90,19 @@ ENUM(volume_state, uint32_t,
 ENUM(replication_mode, uint8_t, DISABLED = 1, CRAFT);
 
 struct volume_info {
-    volume_id_t id;
+    volume_id_t id; // CRAFT: craft_volume_id(name)
     uint64_t size_bytes{0};
     uint64_t page_size{0}; // logical block size for this volume (a per-volume runtime setting)
+    // The caller's name for the volume, kept in its superblock. A CRAFT volume's is its partition ID, at most 99
+    // bytes, without NUL: its id derives from it.
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
     replication_mode repl_mode{replication_mode::DISABLED};
+    // CRAFT: the partition's replica set, each member given by its svc id (see home_blocks_config::on_svc_id); this
+    // node must be one of them. Read only by create_volume, which forms the RAFT group from it and replicates it in the
+    // CreateVolume entry. It isn't kept in the superblock, so a volume loaded at a restart has none: from the create
+    // on, the membership is the RAFT group's, which a reconfiguration may change.
+    std::vector< peer_id_t > members{};
 
     volume_info() = default;
     volume_info(const volume_info&) = delete;
@@ -100,7 +112,8 @@ struct volume_info {
             page_size(rhs.page_size),
             name(std::move(rhs.name)),
             ordinal(rhs.ordinal),
-            repl_mode(rhs.repl_mode) {}
+            repl_mode(rhs.repl_mode),
+            members(std::move(rhs.members)) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name) :
             id(id_in), size_bytes(size), page_size(psize), name(std::move(in_name)) {}
     volume_info(volume_id_t id_in, uint64_t size, uint64_t psize, std::string in_name, uint64_t ord) :
@@ -111,10 +124,24 @@ struct volume_info {
     }
     auto operator==(volume_info const& rhs) const { return id == rhs.id; }
     std::string to_string() const {
-        return fmt::format("volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={}",
-                           boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode));
+        std::string member_ids;
+        for (auto const& m : members) {
+            member_ids += (member_ids.empty() ? "" : ",") + boost::uuids::to_string(m);
+        }
+        return fmt::format(
+            "volume_info: id={} size_bytes={}, page_size={}, name={} ordinal={} repl_mode={} members=[{}]",
+            boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode), member_ids);
     }
 };
+
+// CRAFT: the id of the volume `name` names, a name-based uuid (RFC 4122 version 5). A CRAFT volume's name is its
+// partition ID (<volume_uuid>_<partition_index>), so every node derives the same id, its RAFT group's, from it. A CRAFT
+// create_volume takes no other id.
+inline volume_id_t craft_volume_id(std::string_view name) {
+    // HomeBlocks' namespace for CRAFT volume names. Never change it: the ids of existing volumes derive from it.
+    static auto const ns = boost::uuids::string_generator()("525b868e-3f29-5f58-bf10-14272f83ff7c");
+    return boost::uuids::name_generator_sha1{ns}(name.data(), name.size());
+}
 
 struct volume_stats {
     volume_id_t id;
@@ -173,9 +200,10 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 [[nodiscard]] async_status logout(volume_handle const& vol, craft::client_hdr hdr);
 
 // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length and must be
-// aligned to the volume's lba_size (from craft::LoginResult), else std::errc::invalid_argument. `data` is a
-// caller-owned (iomgr) buffer: pass empty `data` (size==0) for a WRITE_ZEROES/unmap over [addr, addr+len)
-// (metadata-only; no block allocation); pass non-empty `data` of exactly `len` bytes for a data write.
+// aligned to the volume's lba_size (from craft::LoginResult) and within the volume, else
+// std::errc::invalid_argument. `data` is a caller-owned (iomgr) buffer: pass empty `data` (size==0) for a
+// WRITE_ZEROES/unmap over [addr, addr+len) (metadata-only; no block allocation); pass non-empty `data` of
+// exactly `len` bytes for a data write.
 // The write kind is determined by data.empty() -- no separate flag. Not applied to the index directly;
 // `hdr.commit_lsn` rides along and advances the frontier best-effort in dLSN order (CRAFT's piggybacked
 // commit). STALE_TERM if hdr.term != session term.
@@ -194,7 +222,7 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // pre-read_lsn version is gone from the index by construction (apply is a blind overwrite past
 // commit_lsn) and is not reconstructible from anything this replica still holds. Returns
 // volume_error::HORIZON_STALE in that case rather than silently serving a too-new version.
-// std::errc::invalid_argument if addr/len are misaligned.
+// std::errc::invalid_argument if addr/len are misaligned or reach past the end of the volume.
 [[nodiscard]] async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr,
                                                             int64_t read_lsn, uint64_t addr, uint64_t len,
                                                             sisl::sg_list dest);
@@ -268,6 +296,14 @@ struct home_blocks_config {
     // result<peer_id_t> may carry an error (e.g. OM unreachable), which fails init_homeblocks. Empty -> a random
     // svc id is generated on first boot.
     std::function< async_result< peer_id_t >() > on_svc_id{};
+
+    // Replication backend of every volume. DISABLED: legacy single-node volumes. CRAFT: every volume is a CRAFT
+    // partition replicated by its own RAFT group, and repl_svc_port and lookup_peer are required.
+    replication_mode repl_mode{replication_mode::DISABLED};
+    uint16_t repl_svc_port{0}; // CRAFT: this node's RAFT port
+    // CRAFT: resolves a member's RAFT {host, port}. Called off-reactor whenever the RAFT layer (re)connects to that
+    // member, so it may block (e.g. an RPC to the OM). Return an empty host if the member is unknown.
+    std::function< std::pair< std::string, uint16_t >(peer_id_t const&) > lookup_peer{};
 };
 
 // Opaque handle to a running homeblocks instance. Obtained only from init_homeblocks().

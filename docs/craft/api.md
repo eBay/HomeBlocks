@@ -26,8 +26,11 @@ the natural assumption:
   defined in (`client_hdr`, `lsn_pair`, `read_result`, `io_extent`, `craft_error`, `LoginResult`). Not the
   client, not the `craft_replica` interface, not the codec.
 
-Until a `CraftReplDev` is wired to a volume, these functions have no backend and return
-`std::errc::not_supported`.
+A volume created in CRAFT mode (see [Creating a CRAFT volume](#creating-a-craft-volume)) is backed by a
+`CraftReplDev`; on any other volume these functions return `std::errc::not_supported`. While HomeBlocks is restricted,
+shutting down or shut down, or the volume or its RAFT group is being destroyed, they return
+`std::errc::operation_not_supported`, and on an offline volume `volume_error::OFFLINE`. A volume is destroyed only once
+no CRAFT op is in flight on it.
 
 All methods are async/coroutine-style (`async_result<T>` / `async_status`) matching the existing
 HomeBlocks convention.
@@ -266,7 +269,63 @@ from the result means not-present-here.
 
 `SyncRSCommitLSN { rs_commit_lsn, client_token, empty_slots[] }` and
 `InternalLogin { client_token, term, rs_commit_lsn }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
-(unchanged by the client-surface reshaping above).
+(unchanged by the client-surface reshaping above). `CreateVolume { version, id, size, page_size, members[], name }`
+is a partition's first entry, applied by the volume layer (below); an entry of another `version` is rejected.
+
+---
+
+## Creating a CRAFT volume
+
+An instance runs CRAFT volumes when it is brought up in CRAFT mode, which runs HomeStore's RAFT service (the
+replication mode is process-wide):
+
+```cpp
+home_blocks_config{
+    ...,
+    .repl_mode = replication_mode::CRAFT,
+    .repl_svc_port = consensus_port,             // this node's RAFT port
+    .lookup_peer = [](peer_id_t const& member) { // a member's RAFT {host, port}, e.g. from the OM
+        return std::pair< std::string, uint16_t >{host_of(member), port_of(member)};
+    },
+};
+```
+
+A member is identified by its svc id (`on_svc_id`). `lookup_peer` is called off-reactor whenever the RAFT
+layer (re)connects to a member, so it may block.
+
+`create_volume` is called on **one** member of the partition (the receiver), with the whole member set. The
+volume's name is the partition ID, `<volume_uuid>_<partition_index>`, and its id is `craft_volume_id(name)`, a
+name-based uuid (RFC 4122 version 5) that every node derives alike from the partition ID:
+
+```cpp
+volume_info info{craft_volume_id(partition_id), size_bytes, page_size, partition_id};
+info.repl_mode = replication_mode::CRAFT;
+info.members = {member_a, member_b, member_c}; // must include the receiver
+auto vol = co_await hb->create_volume(std::move(info));
+```
+
+1. The receiver forms the partition's RAFT group (group id = volume id): it creates the group, wins its first
+   election and adds every other member. The members persist the group's membership.
+2. It proposes `CreateVolume`, the group's first entry. Every member creates its replica (data chunks, its
+   own journal, index, `CraftReplDev`) when the entry commits.
+3. `create_volume` returns once the entry committed and the receiver created its replica; the other members
+   create theirs as they apply it. `get_volume` returns each member's replica on that member.
+
+If a create that formed the group fails, or nothing commits within `craft_create_volume_timeout_ms` (default 30s), it
+destroys the group again: a member that already created its replica removes it when the group is destroyed. The page
+size must be 4096, the node's data block size, the volume size a positive multiple of it, the name at most 99 bytes
+without NUL, and the id `craft_volume_id(name)`; otherwise the create fails with `invalid_argument`. Retrying a create
+that succeeded (same id, size, page size and name) returns the volume; any other create with that id fails with
+`invalid_argument`. A concurrent create of the same volume fails with `operation_in_progress`, and so does one made
+while an earlier RAFT group of the volume is still being destroyed: HomeStore reaps a destroyed group, and the replicas
+follow it, `repl_dev_cleanup_interval_sec` (a minute by default) after its destroy commits. A create never proposes
+into, or destroys, a group of the volume that it didn't form, and fails with `operation_in_progress` instead: one that a
+concurrent create on another member installs here, or one that outlived an earlier create without a replica on this
+member (the member crashed before the rollback, or its own create failed), which stays until it is destroyed.
+
+A restart reopens each replica's journal and reattaches its `CraftReplDev` (the partition's CRAFT state itself
+is not recovered yet). A replica whose group is gone is removed. The legacy `async_read` / `async_write` /
+`async_unmap` and `remove_volume` return `operation_not_supported` on a CRAFT volume.
 
 ---
 
@@ -283,6 +342,6 @@ The CRAFT free functions supersede the legacy byte block ops (now `[[deprecated]
 
 The commit watermark rides on these calls (`client_hdr::commit_lsn`); there is no separate `commit`
 call. Each handle is **one replica device**, never an aggregate / "whole volume" handle. A handle comes
-from `create_volume` (production, once a homestore `CraftReplDev` backend is wired to it). The in-memory
+from `create_volume` / `get_volume` on an instance in CRAFT mode. The in-memory
 reference model that used to back a handle in-process moved to the `craft_client` package
 (`craft::MemCraftReplica`), so there is no in-tree memory volume here anymore.

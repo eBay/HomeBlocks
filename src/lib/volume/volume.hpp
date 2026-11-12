@@ -21,7 +21,9 @@
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
 #include <homestore/replication/repl_dev.hpp>
+#include <homestore/logstore/log_store_internal.hpp>
 #include <iomgr/io_op.hpp>
+#include <future>
 #include <sisl/async/task.hpp>
 #include <sisl/async/value_awaitable.hpp>
 #include <sisl/async/when_all.hpp>
@@ -44,6 +46,14 @@ using VolIdxTablePtr = shared< VolumeIndexTable >;
 
 using ReplDevPtr = shared< homestore::repl_dev >;
 using index_cfg_t = homestore::BtreeConfig;
+
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
+// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+inline bool is_going_away(homestore::repl_dev const& group) {
+    auto const stage = group.get_stage();
+    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
+        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
+}
 
 using read_blks_list_t = std::vector< std::pair< lba_t, homestore::multi_blk_id > >;
 struct vol_read_ctx {
@@ -116,10 +126,11 @@ public:
 class volume : public std::enable_shared_from_this< volume > {
 public:
     inline static auto const VOL_META_NAME = std::string("Volume2"); // different from old releae;
+    static constexpr uint64_t MAX_NAME_LEN = 99; // the longest name the superblock keeps; it truncates longer ones
 private:
     static constexpr uint64_t VOL_SB_MAGIC = 0xc01fadeb; // different from old release;
-    static constexpr uint64_t VOL_SB_VER = 0x3;          // bump one from old release
-    static constexpr uint64_t VOL_NAME_SIZE = 100;
+    static constexpr uint64_t VOL_SB_VER = 0x4;          // 0x4: repl_mode and the CRAFT journal ids
+    static constexpr uint64_t VOL_NAME_SIZE = MAX_NAME_LEN + 1;
     static constexpr homestore::csum_t init_crc_16 = 0x8005;
 
     struct vol_sb_t {
@@ -134,6 +145,9 @@ private:
         uint64_t ordinal; // Id unique to local homeblk instance.
         uint32_t pdev_id; // All chunks for this volume allocated from this physical dev.
         uint32_t num_chunks;
+        replication_mode repl_mode{replication_mode::DISABLED};
+        homestore::logdev_id_t journal_logdev_id{0}; // CRAFT: the volume's own journal (logdev + log store)
+        homestore::logstore_id_t journal_store_id{0};
         // List of chunk ids allocated for this volume are stored after this.
 
         void init(uint32_t page_sz, uint64_t sz_bytes, volume_id_t vid, std::string const& name_str, uint64_t ord,
@@ -172,7 +186,7 @@ public:
     explicit volume(volume_info&& info, shared< VolumeChunkSelector > vol_chunk_sel,
                     shared< VolumeChunkSelector > index_chunk_sel) :
             sb_{VOL_META_NAME}, volume_chunk_selector_{vol_chunk_sel}, index_chunk_selector_{index_chunk_sel} {
-        vol_info_ = std::make_shared< volume_info >(info.id, info.size_bytes, info.page_size, info.name, info.ordinal);
+        vol_info_ = std::make_shared< volume_info >(std::move(info));
         metrics_ = std::make_unique< VolumeMetrics >(vol_info_->name);
     }
     explicit volume(sisl::byte_view const& buf, void* cookie, shared< VolumeChunkSelector > vol_chunk_sel,
@@ -205,6 +219,17 @@ public:
         return ret ? vol : nullptr;
     }
 
+    // CRAFT: creates this node's replica of a partition whose RAFT group (the volume's repl dev) already exists: data
+    // chunks, the volume's own journal, the index table and the superblock, then the CraftReplDev on top. Applied on
+    // CreateVolume commit. `orphan_idx` is the index table of a create that crashed before its superblock, reused
+    // instead of creating a second table for the same volume.
+    static volume_handle make_craft_volume(volume_info&& info, shared< VolumeChunkSelector > volume_chunk_sel,
+                                           shared< VolumeChunkSelector > index_chunk_sel, bool dynamic_chunk_alloc,
+                                           VolIdxTablePtr orphan_idx) {
+        auto vol = std::make_shared< volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
+        return vol->init_craft(dynamic_chunk_alloc, std::move(orphan_idx)) ? vol : nullptr;
+    }
+
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
     volume_id_t id() const { return vol_info_->id; };
     uint64_t ordinal() const { return vol_info_->ordinal; }
@@ -217,6 +242,11 @@ public:
     // engine object, NOT a craft::craft_replica: that interface is the CLIENT's view of a member and belongs on
     // the far side of the wire.
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
+    bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
+    // CRAFT recovery: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and attaches
+    // the CraftReplDev once HomeStore's log replay opens the journal's store. Call it after init_index_table: the
+    // device keeps the index table it is given.
+    void reopen_craft_journal();
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -253,9 +283,14 @@ public:
     //
     // if destroy_started_ is true, it means volume destroy has started and we should not call remove again;
     // if outstanding_reqs_ is not zero, it means there are still requests outstanding and we should not call remove;
-    // destroy_started_ will be set to true when volume destroy starts processing;
+    // destroy_started_ will be set to true when a removal claims the destroy (try_start_destroy);
     //
     bool can_remove() const { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
+
+    // Claims the volume's destroy once no request is in flight: true for exactly one caller, which then runs destroy().
+    // Two removals of one volume can run at once on different workers (e.g. a GC pass and the removal that marked it
+    // DESTROYING): with can_remove() checked apart from the claim, both would destroy it.
+    bool try_start_destroy() { return outstanding_reqs_.test_eq(0) && !destroy_started_.exchange(true); }
 
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
     void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }
@@ -270,6 +305,8 @@ private:
     // destroyed automatically; if success, the repl dev will be stored in the volume object;
     //
     bool init(bool is_recovery);
+    bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
+    void attach_craft_dev(shared< homestore::home_log_store > journal);
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 
@@ -293,6 +330,7 @@ private:
     std::atomic< volume_state > m_state_; // in-memory sb state, avoid taking lock in IO path;
     std::unique_ptr< VolumeMetrics > metrics_;
     shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
+    bool journal_open_{false};                  // CRAFT: this boot created or reopened the volume's journal
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and
@@ -351,6 +389,23 @@ struct repl_result_ctx : public vol_repl_ctx {
     }
 
     repl_result_ctx(uint32_t hdr_extn_size, uint32_t key_size = 0) : vol_repl_ctx{hdr_extn_size, key_size} {}
+};
+
+// The CRAFT CreateVolume proposal: owns the entry's header and key for the life of the request, and carries its
+// outcome (commit plus local apply, or a rollback / error) back to the proposing create_volume.
+struct create_volume_ctx : public homestore::repl_req_ctx {
+    sisl::io_blob_safe hdr_buf_;
+    sisl::io_blob_safe key_buf_;
+    std::promise< status > done_;
+    std::atomic_flag completed_{};
+
+    void complete(status s) {
+        if (!completed_.test_and_set()) { done_.set_value(std::move(s)); }
+    }
+    // Completes ctx if it is this node's CreateVolume proposal; a no-op for a follower's or a replayed request.
+    static void complete(cintrusive< homestore::repl_req_ctx > const& ctx, status s) {
+        if (auto* c = dynamic_cast< create_volume_ctx* >(ctx.get())) { c->complete(std::move(s)); }
+    }
 };
 
 } // namespace homeblocks
