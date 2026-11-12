@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <boost/uuid/uuid.hpp>
+#include <homeblks/home_blocks.hpp>
 #include <sisl/fds/buffer.hpp>
 
 // ─── CRAFT RAFT entry types ───────────────────────────────────────────────────
@@ -95,15 +96,6 @@ struct CreateVolumeHeader {
 };
 #pragma pack(pop)
 
-// Decoded CreateVolume entry.
-struct CreateVolumeEntry {
-    boost::uuids::uuid id;
-    uint64_t size_bytes{0};
-    uint32_t page_size{0};
-    std::vector< boost::uuids::uuid > members;
-    std::string name; // volume_info::name: the caller's name for the volume, opaque to HomeBlocks
-};
-
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 inline size_t sync_rs_commit_lsn_key_size(size_t num_empty) {
@@ -151,44 +143,46 @@ inline size_t create_volume_key_size(size_t num_members, size_t name_len) {
     return sizeof(CreateVolumeHeader) + num_members * sizeof(boost::uuids::uuid) + name_len;
 }
 
-// Writes e into buf. Caller must size buf via create_volume_key_size(e.members.size(), e.name.size()) first, and keep
-// both counts within uint16_t.
-inline void serialize_create_volume(uint8_t* buf, CreateVolumeEntry const& e) {
+// Writes the replicated part of v into buf: its id, size, page size, members and name. The rest is each node's own (the
+// ordinal) or implied (CRAFT). Caller must size buf via create_volume_key_size(v.members.size(), v.name.size()) first,
+// and keep both counts within uint16_t and the page size within uint32_t.
+inline void serialize_create_volume(uint8_t* buf, volume_info const& v) {
     auto* p = reinterpret_cast< CreateVolumeHeader* >(buf);
     p->version = CreateVolumeHeader::VERSION;
-    std::memcpy(p->id, &e.id, sizeof(p->id));
-    p->size_bytes = e.size_bytes;
-    p->page_size = e.page_size;
-    p->num_members = static_cast< uint16_t >(e.members.size());
-    p->name_len = static_cast< uint16_t >(e.name.size());
+    std::memcpy(p->id, &v.id, sizeof(p->id));
+    p->size_bytes = v.size_bytes;
+    p->page_size = static_cast< uint32_t >(v.page_size);
+    p->num_members = static_cast< uint16_t >(v.members.size());
+    p->name_len = static_cast< uint16_t >(v.name.size());
     auto* tail = reinterpret_cast< uint8_t* >(p + 1);
-    for (auto const& m : e.members) {
+    for (auto const& m : v.members) {
         std::memcpy(tail, &m, sizeof(m));
         tail += sizeof(m);
     }
-    if (!e.name.empty()) { std::memcpy(tail, e.name.data(), e.name.size()); }
+    if (!v.name.empty()) { std::memcpy(tail, v.name.data(), v.name.size()); }
 }
 
 // `key` is persisted RAFT log data replayed on apply: validated against its version and declared counts before anything
-// is trusted, like parse_empty_slots. Returns std::nullopt if the entry doesn't parse.
-inline std::optional< CreateVolumeEntry > parse_create_volume(sisl::blob const& key) {
+// is trusted, like parse_empty_slots. Returns the CRAFT volume it defines, without an ordinal (each node assigns its
+// own), or std::nullopt if the entry doesn't parse.
+inline std::optional< volume_info > parse_create_volume(sisl::blob const& key) {
     if (key.size() < sizeof(CreateVolumeHeader)) { return std::nullopt; }
     const auto* p = reinterpret_cast< const CreateVolumeHeader* >(key.cbytes());
     if (p->version != CreateVolumeHeader::VERSION) { return std::nullopt; }
     if (key.size() != create_volume_key_size(p->num_members, p->name_len)) { return std::nullopt; }
 
-    CreateVolumeEntry e;
-    std::memcpy(&e.id, p->id, sizeof(p->id));
-    e.size_bytes = p->size_bytes;
-    e.page_size = p->page_size;
+    volume_id_t id;
+    std::memcpy(&id, p->id, sizeof(p->id));
     const auto* tail = reinterpret_cast< const uint8_t* >(p + 1);
-    e.members.resize(p->num_members);
-    for (auto& m : e.members) {
+    std::vector< peer_id_t > members(p->num_members);
+    for (auto& m : members) {
         std::memcpy(&m, tail, sizeof(m));
         tail += sizeof(m);
     }
-    e.name.assign(reinterpret_cast< const char* >(tail), p->name_len);
-    return e;
+    volume_info v{id, p->size_bytes, p->page_size, std::string(reinterpret_cast< const char* >(tail), p->name_len)};
+    v.repl_mode = replication_mode::CRAFT;
+    v.members = std::move(members);
+    return v;
 }
 
 } // namespace homeblocks

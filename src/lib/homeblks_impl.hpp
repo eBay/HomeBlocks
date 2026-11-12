@@ -202,7 +202,8 @@ private:
 
     void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
 
-    status create_craft_volume_local(CreateVolumeEntry&& entry);
+    // CRAFT: creates this member's replica of a volume a committed CreateVolume entry defines.
+    status create_craft_volume_local(volume_info&& info);
 
     // CRAFT create_volume on the member that receives it. form_craft_volume blocks (group formation, then the wait
     // for CreateVolume), so it runs on a thread of its own, never on a reactor.

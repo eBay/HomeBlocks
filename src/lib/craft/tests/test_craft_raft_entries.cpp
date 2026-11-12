@@ -785,20 +785,22 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
 
 // ── CreateVolume codec (SDSTOR-22894) ─────────────────────────────────────────
 
-CreateVolumeEntry make_create_volume_entry() {
+volume_info make_craft_volume_info() {
     auto gen = boost::uuids::random_generator();
-    return CreateVolumeEntry{
-        .id = gen(), .size_bytes = 1 << 30, .page_size = 4096, .members = {gen(), gen(), gen()}, .name = "vol_7"};
+    volume_info v{gen(), 1 << 30, 4096, "vol_7", 3 /* ordinal: each node's own, not replicated */};
+    v.repl_mode = replication_mode::CRAFT;
+    v.members = {gen(), gen(), gen()};
+    return v;
 }
 
-std::vector< uint8_t > serialize(CreateVolumeEntry const& e) {
-    std::vector< uint8_t > buf(create_volume_key_size(e.members.size(), e.name.size()));
-    serialize_create_volume(buf.data(), e);
+std::vector< uint8_t > serialize(volume_info const& v) {
+    std::vector< uint8_t > buf(create_volume_key_size(v.members.size(), v.name.size()));
+    serialize_create_volume(buf.data(), v);
     return buf;
 }
 
 TEST(CreateVolumeCodecTest, RoundTrip) {
-    auto const in = make_create_volume_entry();
+    auto const in = make_craft_volume_info();
     auto buf = serialize(in);
     auto const out = parse_create_volume(as_blob(buf));
     ASSERT_TRUE(out);
@@ -807,10 +809,12 @@ TEST(CreateVolumeCodecTest, RoundTrip) {
     EXPECT_EQ(out->page_size, in.page_size);
     EXPECT_EQ(out->members, in.members);
     EXPECT_EQ(out->name, in.name);
+    EXPECT_EQ(out->repl_mode, replication_mode::CRAFT);
+    EXPECT_EQ(out->ordinal, 0u);
 }
 
 TEST(CreateVolumeCodecTest, RejectsKeyWhoseSizeDisagreesWithItsCounts) {
-    auto buf = serialize(make_create_volume_entry());
+    auto buf = serialize(make_craft_volume_info());
     auto truncated = std::vector< uint8_t >(buf.begin(), buf.end() - 1);
     EXPECT_FALSE(parse_create_volume(as_blob(truncated)));
     auto padded = buf;
@@ -821,7 +825,7 @@ TEST(CreateVolumeCodecTest, RejectsKeyWhoseSizeDisagreesWithItsCounts) {
 }
 
 TEST(CreateVolumeCodecTest, RejectsAnotherVersion) {
-    auto buf = serialize(make_create_volume_entry());
+    auto buf = serialize(make_craft_volume_info());
     ASSERT_EQ(reinterpret_cast< CreateVolumeHeader const* >(buf.data())->version, CreateVolumeHeader::VERSION);
     for (int const version : {0, CreateVolumeHeader::VERSION + 1}) {
         reinterpret_cast< CreateVolumeHeader* >(buf.data())->version = static_cast< uint8_t >(version);

@@ -250,17 +250,12 @@ status HomeBlocksImpl::validate_craft_volume(volume_info const& info) const {
 
 // The CreateVolume entry for `info`, in a ctx that collects its outcome.
 static intrusive< create_volume_ctx > make_create_volume_ctx(volume_info const& info) {
-    CreateVolumeEntry const entry{.id = info.id,
-                                  .size_bytes = info.size_bytes,
-                                  .page_size = static_cast< uint32_t >(info.page_size),
-                                  .members = info.members,
-                                  .name = info.name};
     auto ctx = intrusive< create_volume_ctx >{new create_volume_ctx()};
     ctx->hdr_buf_ = sisl::io_blob_safe{static_cast< uint32_t >(sizeof(CraftEntryHeader)), 0};
     reinterpret_cast< CraftEntryHeader* >(ctx->hdr_buf_.bytes())->type = CraftEntryType::CreateVolume;
     ctx->key_buf_ =
-        sisl::io_blob_safe{static_cast< uint32_t >(create_volume_key_size(entry.members.size(), entry.name.size())), 0};
-    serialize_create_volume(ctx->key_buf_.bytes(), entry);
+        sisl::io_blob_safe{static_cast< uint32_t >(create_volume_key_size(info.members.size(), info.name.size())), 0};
+    serialize_create_volume(ctx->key_buf_.bytes(), info);
     return ctx;
 }
 
@@ -412,10 +407,7 @@ void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
     create_volume_ctx::complete(ctx, st);
 }
 
-status HomeBlocksImpl::create_craft_volume_local(CreateVolumeEntry&& entry) {
-    volume_info info{entry.id, entry.size_bytes, entry.page_size, std::move(entry.name)};
-    info.repl_mode = replication_mode::CRAFT;
-    info.members = std::move(entry.members);
+status HomeBlocksImpl::create_craft_volume_local(volume_info&& info) {
     auto const id_str = boost::uuids::to_string(info.id);
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("craft_create_volume_apply_error")) {
