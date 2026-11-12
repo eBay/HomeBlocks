@@ -59,6 +59,56 @@ std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& r
     }
     return std::nullopt;
 }
+
+// Counts one round's quorum replies by sender: only voters other than this member count, each once. Fails closed if
+// the voter list is empty or excludes this member. Replies a correct transport never sends are logged under `round`.
+class VoterTally {
+public:
+    // drop: this member's own reply. use: evidence but not a vote (a learner's, an untagged one, or a repeat, which
+    // merges with the member's first reply since "absent" is only a snapshot). count: a distinct voter.
+    enum class Reply { drop, use, count };
+
+    VoterTally(char const* round, craft::peer_id_t self, std::vector< craft::peer_id_t > voters) :
+            round_{round}, self_{self}, voters_{std::move(voters)} {
+        if (!is_voter(self_))
+            LOGW("{}: this member ({}) isn't among the {} voter(s) -- failing closed", round_,
+                 boost::uuids::to_string(self_), voters_.size());
+    }
+
+    Reply add(craft::peer_id_t const& member) {
+        if (member == self_) {
+            LOGW("{}: dropping a reply from this member itself", round_);
+            return Reply::drop;
+        }
+        if (member.is_nil()) {
+            LOGW("{}: a reply carries no member id -- used as evidence, not counted", round_);
+            return Reply::use;
+        }
+        if (!seen_.insert(member).second) {
+            LOGW("{}: repeat reply from {} -- merged, not counted", round_, boost::uuids::to_string(member));
+            return Reply::use;
+        }
+        if (!is_voter(member)) return Reply::use; // a learner
+        ++counted_;
+        return Reply::count;
+    }
+
+    // This member plus the counted voters are a majority of the voters.
+    bool has_quorum() const { return is_voter(self_) && 1 + counted_ >= quorum_size(); }
+    size_t counted() const { return counted_; }
+    size_t quorum_size() const { return voters_.size() / 2 + 1; }
+
+private:
+    bool is_voter(craft::peer_id_t const& m) const {
+        return std::find(voters_.begin(), voters_.end(), m) != voters_.end();
+    }
+
+    char const* round_;
+    craft::peer_id_t self_;
+    std::vector< craft::peer_id_t > voters_;
+    std::set< craft::peer_id_t > seen_;
+    size_t counted_{0};
+};
 } // namespace
 
 // ─── HomeStore journal backend ────────────────────────────────────────────────
@@ -401,10 +451,19 @@ void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
 
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
-    explicit HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd) : rd_{std::move(rd)} {}
+    HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
+            rd_{std::move(rd)}, my_id_{replica_id} {}
 
     bool is_leader() const override { return rd_->is_leader(); }
-    uint32_t member_count() const override { return static_cast< uint32_t >(rd_->get_replication_quorum().size()); }
+    craft::peer_id_t my_id() const override { return my_id_; }
+    // get_replication_quorum() lists every config member, learners included; get_replication_status() (complete
+    // only on the leader) says which of them can vote.
+    std::vector< craft::peer_id_t > voters() const override {
+        auto ids = rd_->get_replication_quorum();
+        for (auto const& p : rd_->get_replication_status())
+            if (!p.can_vote) std::erase(ids, p.id_);
+        return ids;
+    }
 
     // TODO(S7): no deadline. Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs()
     // skips the proposer), so a leader without quorum waits out the outage holding append()'s gate. Add a
@@ -421,11 +480,13 @@ public:
 
 private:
     shared< homestore::repl_dev > rd_;
+    craft::peer_id_t my_id_;
 };
 } // namespace
 
-unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd) {
-    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd));
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd,
+                                                         craft::peer_id_t replica_id) {
+    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd), replica_id);
 }
 
 #ifdef _PRERELEASE
@@ -1543,7 +1604,8 @@ async_status CraftReplDev::watchdog_sync() {
         ~RoundGuard() { dev->watchdog_round_in_flight_.store(false, std::memory_order_release); }
     } round_guard{this};
 
-    if (peer_fetcher_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (peer_fetcher_ == nullptr || raft_proposer_ == nullptr)
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 
     uint64_t term, client_token;
     int64_t target;
@@ -1562,12 +1624,18 @@ async_status CraftReplDev::watchdog_sync() {
         LOGW("watchdog_sync: quorum poll failed: {}", polled.error().message());
         co_return std::unexpected(polled.error());
     }
-    if (1 + polled->size() < quorum_size()) {
-        LOGW("watchdog_sync: {} responder(s) + self < quorum {} -- not syncing", polled->size(), quorum_size());
+    // Only distinct voters other than this leader count toward quorum; every other reply still feeds the
+    // target (VoterTally).
+    VoterTally tally{"watchdog_sync", raft_proposer_->my_id(), raft_proposer_->voters()};
+    for (auto const& p : *polled) {
+        if (tally.add(p.member) == VoterTally::Reply::drop) continue;
+        target = std::max(target, p.lsns.last_append_lsn);
+    }
+    if (!tally.has_quorum()) {
+        LOGW("watchdog_sync: {} distinct voter(s) + self < quorum {} -- not syncing", tally.counted(),
+             tally.quorum_size());
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
-    for (auto const& p : *polled)
-        target = std::max(target, p.last_append_lsn);
 
     {
         std::lock_guard lk{state_mu_};
@@ -2081,9 +2149,12 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     data_by_lsn.reserve(candidates.size());
     std::unordered_set< int64_t > empty_by_quorum;
     empty_by_quorum.reserve(candidates.size());
-    int valid_member_count = 0;
-    for (auto& member : *responses) {
-        if (auto bad_lsn = validate_fetch_response(candidates, member.slots); bad_lsn) {
+    // Only distinct voters other than this leader count toward quorum-lacks evidence; a learner's reply or a
+    // member's repeat still contributes its slots (VoterTally).
+    VoterTally tally{"pre_resolve_slots", raft_proposer_->my_id(), raft_proposer_->voters()};
+    int valid_member_count = 0; // usable replies, counted or not
+    for (auto& reply : *responses) {
+        if (auto bad_lsn = validate_fetch_response(candidates, reply.slots); bad_lsn) {
             // Reject only this member's response, not the whole quorum fetch -- a broadcast should
             // tolerate one misbehaving member without losing legitimate evidence from the rest.
             LOGW("pre_resolve_slots: a quorum member's response named lsn={} not requested (or duplicated) -- "
@@ -2091,8 +2162,9 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                  *bad_lsn);
             continue;
         }
+        if (tally.add(reply.member) == VoterTally::Reply::drop) continue;
         ++valid_member_count;
-        for (auto& slot : member.slots) {
+        for (auto& slot : reply.slots) {
             if (slot.is_empty) {
                 empty_by_quorum.insert(slot.lsn);
                 data_by_lsn.erase(slot.lsn);
@@ -2103,19 +2175,18 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         }
     }
     if (valid_member_count == 0) {
-        // Every responding member's reply was malformed. Fail closed rather than
+        // No usable reply (every one malformed or this member's own). Fail closed rather than
         // falling through to mint an Empty verdict for every candidate with nothing behind it.
-        LOGE("pre_resolve_slots: all {} responding member(s) sent a malformed reply -- no trustworthy "
-             "evidence for {} candidate(s)",
+        LOGE("pre_resolve_slots: none of {} reply(ies) is usable -- no trustworthy evidence for {} candidate(s)",
              responses->size(), candidates.size());
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
     // Every candidate is a slot this leader lacks, so it counts itself among the members lacking it.
-    bool const quorum_lacks = 1 + static_cast< uint32_t >(valid_member_count) >= quorum_size();
+    bool const quorum_lacks = tally.has_quorum();
     if (!quorum_lacks)
-        LOGW("pre_resolve_slots: {} valid responder(s) + self < quorum {} of {} -- no fresh Empty verdicts",
-             valid_member_count, quorum_size(), raft_proposer_->member_count());
+        LOGW("pre_resolve_slots: {} distinct voter(s) + self < quorum {} -- no fresh Empty verdicts", tally.counted(),
+             tally.quorum_size());
 
     auto const term_changed = [this, term] {
         std::lock_guard lk{state_mu_};

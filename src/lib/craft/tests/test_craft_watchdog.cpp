@@ -89,6 +89,7 @@ public:
 class MockCraftQuorumPoller : public CraftPeerFetcher {
 public:
     std::vector< craft::lsn_pair > polled;
+    std::vector< craft::peer_id_t > polled_members; // sender of polled[i]; test_member_id(i + 1) when absent
     std::atomic< int > poll_calls{0};
     // When set, the first poll stays outstanding until the test completes poll_gate (a poll slower than
     // the tick interval). Later polls return immediately, so overlapping rounds show up in poll_calls.
@@ -100,11 +101,14 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
-        co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{}};
+        co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{.member = test_member_id(1)}};
     }
-    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+    async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         if (++poll_calls == 1 && hold_first_poll) co_await poll_gate;
-        co_return polled;
+        std::vector< QuorumLsnResponse > replies;
+        for (size_t i = 0; i < polled.size(); ++i)
+            replies.push_back({i < polled_members.size() ? polled_members[i] : test_member_id(i + 1), polled[i]});
+        co_return replies;
     }
 };
 
@@ -293,6 +297,98 @@ TEST_F(CraftWatchdogTest, StaleTickWithoutQuorumDoesNotPropose) {
     proposer_.members = 5;
     dev_->seed_lsns(5, {});
     fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// ── distinct voters (SDSTOR-26635) ────────────────────────────────────────────
+//
+// Each round is set up to propose 5 (complete local prefix, client commit 5), so a missing quorum is the only
+// reason it doesn't. Only voters other than this leader (test_member_id(0)) count, each once.
+
+// N=5: two replies from one member are one voter -- self + 1 < quorum 3.
+TEST_F(CraftWatchdogTest, RepliesFromOneMemberAreNotQuorum) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8},
+                       craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.polled_members = {test_member_id(1), test_member_id(1)};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// N=3: the leader's own reply doesn't count -- self alone < quorum 2.
+TEST_F(CraftWatchdogTest, OwnReplyIsNotQuorum) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.polled_members = {test_member_id(0)};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// N=3: a learner's reply isn't a vote.
+TEST_F(CraftWatchdogTest, LearnerReplyIsNotQuorum) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.polled_members = {test_member_id(7)}; // not among voters 0..2
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// An unknown voter list (members = 0) never syncs.
+TEST_F(CraftWatchdogTest, UnknownMembershipNeverSyncs) {
+    proposer_.members = 0;
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// A leader missing from its own voter list never syncs, even with voters 1 and 2 answering.
+TEST_F(CraftWatchdogTest, LeaderOutsideVoterListNeverSyncs) {
+    proposer_.self = test_member_id(9); // voters are 0..2
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8},
+                       craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// N=3: a reply with no member id isn't a vote.
+TEST_F(CraftWatchdogTest, UntaggedReplyIsNotQuorum) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.polled_members = {craft::peer_id_t{}};
     arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));

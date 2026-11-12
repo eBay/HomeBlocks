@@ -103,7 +103,8 @@ public:
 // ── peer fetcher mock ─────────────────────────────────────────────────────────
 //
 // Records the LSN list fetch_from_quorum was last called with; returns a programmable response (one
-// QuorumSlotResponse per simulated responding member) or an injected error. fetch_data isn't exercised
+// QuorumSlotResponse per simulated responding member; an untagged reply is tagged test_member_id(i + 1) unless
+// tag_untagged is false) or an injected error. fetch_data isn't exercised
 // by this file (see test_craft_raft_entries.cpp) -- CraftPeerFetcher bundles both because
 // pre_resolve_slots's quorum broadcast and apply_sync_rs_commit_lsn's single-peer catch-up are wired
 // through the same production channel (CraftConnector, S9).
@@ -115,6 +116,8 @@ public:
     int call_count{0};
     std::vector< QuorumSlotResponse > response;
     bool should_fail{false};
+    // false: pass replies with no member id through as-is, as a buggy transport would.
+    bool tag_untagged{true};
     std::function< void() > on_fetch; // runs inside the fetch, to change leader/term mid-await
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
@@ -132,10 +135,13 @@ public:
         last_timeout_ms = timeout_ms;
         if (on_fetch) on_fetch();
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        co_return response;
+        auto tagged = response; // an untagged reply is the i-th distinct member
+        for (size_t i = 0; i < tagged.size(); ++i)
+            if (tag_untagged && tagged[i].member.is_nil()) tagged[i].member = test_member_id(i + 1);
+        co_return tagged;
     }
 
-    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+    async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
@@ -752,6 +758,150 @@ TEST_F(CraftPreResolutionTest, DataFromSingleHolderWrittenBelowQuorum) {
 
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// ── distinct voters (SDSTOR-26635) ────────────────────────────────────────────
+//
+// Replies are tagged with their member: only voters other than this leader (test_member_id(0)) count toward
+// quorum, each once. A learner's reply or a member's repeat is still used as evidence, just not counted.
+
+// N=5: two replies from one member are one voter -- self + 1 < quorum 3.
+TEST_F(CraftPreResolutionTest, RepliesFromOneMemberCountOnce) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.member = test_member_id(1)},
+                         QuorumSlotResponse{.member = test_member_id(1)}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// A repeat's content merges with the member's first reply: self + members 1 and 2 make quorum 3 (slot 4, which no
+// reply holds, is voted Empty), but member 1's second reply holds slot 3, so it's filled rather than voted Empty.
+TEST_F(CraftPreResolutionTest, RepeatHoldingSlotKeepsItFromEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {
+        QuorumSlotResponse{.member = test_member_id(1)},
+        QuorumSlotResponse{.member = test_member_id(1),
+                           .slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}},
+        QuorumSlotResponse{.member = test_member_id(2)},
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4}));
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// N=3: the leader's own reply is dropped, leaving no usable reply -- fails closed like zero responders.
+TEST_F(CraftPreResolutionTest, OwnReplyIsDiscarded) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.member = test_member_id(0)}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_FALSE(journal_->has_slot(3));
+}
+
+// N=3: a learner lacking the slot isn't a vote -- self alone < quorum 2.
+TEST_F(CraftPreResolutionTest, LearnerLackDoesNotCount) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.member = test_member_id(7)}}; // not among voters 0..2
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// A learner's data is still real evidence: it fills the slot.
+TEST_F(CraftPreResolutionTest, LearnerDataStillFills) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.member = test_member_id(7),
+                                            .slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// An unknown voter list (members = 0) fails closed: no fresh Empty, however many reply.
+TEST_F(CraftPreResolutionTest, UnknownMembershipMintsNoEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 0;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}, QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// A leader missing from its own voter list fails closed too, even though voters 1 and 2 both lack the slot.
+TEST_F(CraftPreResolutionTest, LeaderOutsideVoterListMintsNoEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.self = test_member_id(9); // voters are 0..2
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}, QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// N=3: a reply with no member id isn't a vote -- self alone < quorum 2.
+TEST_F(CraftPreResolutionTest, UntaggedReplyLackDoesNotCount) {
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.tag_untagged = false;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// An untagged reply's evidence is still used: its data fills slot 3 and its Empty for slot 4 is inherited.
+TEST_F(CraftPreResolutionTest, UntaggedReplyEvidenceIsStillUsed) {
+    dev_->set_peer_fetcher(&fetcher_);
+    fetcher_.tag_untagged = false;
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}, JournalSlot{.lsn = 4, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{4}));
     EXPECT_TRUE(r->unresolved.empty());
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));

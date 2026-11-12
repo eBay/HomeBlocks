@@ -143,7 +143,7 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
-    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+    async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
