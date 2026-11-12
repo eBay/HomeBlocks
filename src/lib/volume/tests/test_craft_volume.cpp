@@ -385,7 +385,7 @@ TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
 
 // A create that crashed between its index table and its superblock leaves the table behind. The table keeps its
 // ordinal across restarts, so no other volume gets its chunks, and the volume's next create takes it over, also after
-// one that failed with it.
+// one that failed with it. A create too large for the table fails instead.
 TEST_F(CraftVolumeTest, LeftoverIndexTableIsTakenOver) {
     auto const info = craft_vol_info("craft_vol_leftover_index");
     auto const id = info.id;
@@ -420,6 +420,12 @@ TEST_F(CraftVolumeTest, LeftoverIndexTableIsTakenOver) {
         EXPECT_NE((*other)->ordinal(), ordinal);
         other_id = (*other)->id();
     }
+
+    // A larger create of the volume fails rather than take over a table sized for a smaller one, and leaves it.
+    ASSERT_TRUE(wait_for_group_gone(id));
+    auto larger = clone(info);
+    larger.size_bytes *= 2;
+    ASSERT_FALSE(create(std::move(larger)));
 
     // A create of the volume that fails after taking the table over leaves it to the next one.
     ASSERT_TRUE(wait_for_group_gone(id));

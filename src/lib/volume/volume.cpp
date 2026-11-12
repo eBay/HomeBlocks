@@ -173,6 +173,14 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
         return false;
     }
 #endif
+    // A table left by an earlier create of this volume was sized for that create's volume: a larger one outgrows it.
+    if (orphan_idx) {
+        if (auto const held = orphan_idx->index_table()->mutable_super_blk()->max_size_bytes; held < get_index_size()) {
+            LOGE("vol={}: its leftover index table holds {} bytes, a volume of {} bytes needs {}: not taken over",
+                 id_str(), held, vol_info_->size_bytes, get_index_size());
+            return false;
+        }
+    }
     auto rd = homestore::hs()->repl_service().get_repl_dev(id());
     if (!rd) {
         LOGE("No RAFT group for CRAFT volume: {}, uuid: {}, error: {}", vol_info_->name, id_str(), rd.error());
