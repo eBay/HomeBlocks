@@ -90,13 +90,17 @@ struct JournalSlot {
 
 // One replica-set member's fetch_data-shaped reply to a pre-resolution broadcast (S5 / SDSTOR-22907).
 // Reuses JournalSlot's existing four-way per-LSN contract (is_empty / present+data / present+zero /
-// omitted-not-held-here) as-is.
-//
-// TODO(S7): carries no peer id, nor do poll_quorum_lsns()'s replies, so a duplicate reply, self or a learner
-// counts toward quorum like a distinct voter. Tag replies with the member, drop duplicates and self, and fail
-// closed if member_count() < 1 (quorum_size() would be 1).
+// omitted-not-held-here) as-is. `member` is the responder, tagged by the transport (the wire carries no
+// id); only distinct voters other than this member count toward a quorum.
 struct QuorumSlotResponse {
-    std::vector< JournalSlot > slots;
+    craft::peer_id_t member{};
+    std::vector< JournalSlot > slots{};
+};
+
+// One member's reply to a GetRSCommitLSN broadcast (poll_quorum_lsns), tagged the same way.
+struct QuorumLsnResponse {
+    craft::peer_id_t member{};
+    craft::lsn_pair lsns{};
 };
 
 // ─── journal backend abstraction ─────────────────────────────────────────────
@@ -168,15 +172,17 @@ public:
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                   uint32_t timeout_ms) = 0;
     // Broadcasts fetch_data(lsns) to every OTHER responding replica-set member; a non-responding member
-    // is simply absent from the result. Whether the responders amount to a quorum is the caller's
-    // judgement, made against CraftRaftProposer::member_count() -- this interface only transports.
+    // is simply absent from the result. Each reply carries its member. Whether the responders amount to a
+    // quorum is the caller's judgement, made against CraftRaftProposer::voters() -- this interface only
+    // transports.
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
     // Broadcasts GetRSCommitLSN(term, is_login) to every OTHER replica-set member and returns each
-    // responder's {commit_lsn, last_append_lsn}; a non-responding member is absent from the result. Used
-    // by the watchdog trigger (is_login=false, never quiesces) and, once S7 lands, by login (is_login=true).
-    virtual async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t term, bool is_login,
-                                                                            uint32_t timeout_ms) = 0;
+    // responder's {commit_lsn, last_append_lsn}, tagged with its member; a non-responding member is absent
+    // from the result. Used by the watchdog trigger (is_login=false, never quiesces) and, once S7 lands, by
+    // login (is_login=true).
+    virtual async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t term, bool is_login,
+                                                                              uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
 
@@ -191,8 +197,11 @@ public:
 class CraftRaftProposer {
 public:
     virtual bool is_leader() const = 0;
-    // Voting replica-set size, including this member -- the denominator of every quorum decision here.
-    virtual uint32_t member_count() const = 0;
+    // This member's id.
+    virtual craft::peer_id_t my_id() const = 0;
+    // Voting members, this one included; learners excluded. The denominator of every quorum decision here.
+    // Only the leader's view is complete, and quorum decisions are leader-only.
+    virtual std::vector< craft::peer_id_t > voters() const = 0;
     // Proposes a key-only RAFT entry (no data payload). Completes once the entry has committed and been
     // dispatched to this member's CraftRaftListener::on_commit, or with an error if replication fails.
     virtual async_status propose(sisl::blob header, sisl::blob key) = 0;
@@ -201,7 +210,8 @@ public:
 
 // Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
-unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd);
+// my_id is this member's replica id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t my_id);
 
 #ifdef _PRERELEASE
 // Test seam for proposal completion: the same ctx make_homestore_raft_proposer() hands HomeStore, and its
@@ -585,8 +595,9 @@ private:
     // a slot some responding member has real data for is written into this leader's own journal so it can
     // also correctly serve fetch_data() to others.
     //
-    // A fresh Empty verdict needs quorum-lacks evidence: this leader plus enough valid responders to make
-    // quorum_size(). An Empty inherited from a responder's prior verdict needs no count.
+    // A fresh Empty verdict needs quorum-lacks evidence: this leader plus enough distinct other voters to make
+    // a majority of CraftRaftProposer::voters() (see VoterTally). An Empty inherited from a responder's prior
+    // verdict needs no count.
     //
     // Returns the slots <= upto now verdicted Empty (freshly minted or inherited), and the ones left
     // unresolved: too few responders to mint Empty, or a local journal write that failed after the
@@ -604,9 +615,6 @@ private:
     };
     // term: the session the round belongs to (STALE_TERM if state_.term differs, at entry or later).
     async_result< PreResolution > pre_resolve_slots(int64_t upto, uint64_t term);
-
-    // Majority of member_count(). Requires raft_proposer_.
-    uint32_t quorum_size() const { return raft_proposer_->member_count() / 2 + 1; }
 
     // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
     // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from

@@ -89,6 +89,7 @@ public:
 class MockCraftQuorumPoller : public CraftPeerFetcher {
 public:
     std::vector< craft::lsn_pair > polled;
+    std::vector< craft::peer_id_t > polled_members; // sender of polled[i]; test_member_id(i + 1) when absent
     std::atomic< int > poll_calls{0};
     // When set, the first poll stays outstanding until the test completes poll_gate (a poll slower than
     // the tick interval). Later polls return immediately, so overlapping rounds show up in poll_calls.
@@ -100,11 +101,14 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
-        co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{}};
+        co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{.member = test_member_id(1)}};
     }
-    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+    async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         if (++poll_calls == 1 && hold_first_poll) co_await poll_gate;
-        co_return polled;
+        std::vector< QuorumLsnResponse > replies;
+        for (size_t i = 0; i < polled.size(); ++i)
+            replies.push_back({i < polled_members.size() ? polled_members[i] : test_member_id(i + 1), polled[i]});
+        co_return replies;
     }
 };
 

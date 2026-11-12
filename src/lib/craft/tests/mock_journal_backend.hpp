@@ -35,8 +35,17 @@ async_result< JournalSlot > mock_read_slot(Mock& mock, int64_t lsn) {
     co_return it->second;
 }
 
-// Leader of a 3-member group by default. propose() records each entry and succeeds unless `fail` is set;
-// on_commit, if set, runs with the entry as RAFT would (typically the device's own listener on_commit).
+// Deterministic, non-nil member id: MockCraftRaftProposer is test_member_id(0), and the mock peer fetchers tag
+// their i-th reply test_member_id(i + 1).
+inline craft::peer_id_t test_member_id(uint32_t i) {
+    craft::peer_id_t id{};
+    id.begin()[15] = static_cast< uint8_t >(i + 1);
+    return id;
+}
+
+// Leader of a 3-voter group by default (this member is test_member_id(0)). propose() records each entry and
+// succeeds unless `fail` is set; on_commit, if set, runs with the entry as RAFT would (typically the device's own
+// listener on_commit).
 class MockCraftRaftProposer : public CraftRaftProposer {
 public:
     bool leader{true};
@@ -46,7 +55,14 @@ public:
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
 
     bool is_leader() const override { return leader; }
-    uint32_t member_count() const override { return members; }
+    craft::peer_id_t my_id() const override { return test_member_id(0); }
+    // Voters are test_member_id(0..members-1); members = 0 is an unknown membership. Any other id is a learner.
+    std::vector< craft::peer_id_t > voters() const override {
+        std::vector< craft::peer_id_t > ids;
+        for (uint32_t i = 0; i < members; ++i)
+            ids.push_back(test_member_id(i));
+        return ids;
+    }
 
     async_status propose(sisl::blob header, sisl::blob key) override {
         if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));

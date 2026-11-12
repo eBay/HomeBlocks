@@ -103,7 +103,8 @@ public:
 // ── peer fetcher mock ─────────────────────────────────────────────────────────
 //
 // Records the LSN list fetch_from_quorum was last called with; returns a programmable response (one
-// QuorumSlotResponse per simulated responding member) or an injected error. fetch_data isn't exercised
+// QuorumSlotResponse per simulated responding member; an untagged reply is tagged test_member_id(i + 1)) or an
+// injected error. fetch_data isn't exercised
 // by this file (see test_craft_raft_entries.cpp) -- CraftPeerFetcher bundles both because
 // pre_resolve_slots's quorum broadcast and apply_sync_rs_commit_lsn's single-peer catch-up are wired
 // through the same production channel (CraftConnector, S9).
@@ -132,10 +133,13 @@ public:
         last_timeout_ms = timeout_ms;
         if (on_fetch) on_fetch();
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        co_return response;
+        auto tagged = response; // an untagged reply is the i-th distinct member
+        for (size_t i = 0; i < tagged.size(); ++i)
+            if (tagged[i].member.is_nil()) tagged[i].member = test_member_id(i + 1);
+        co_return tagged;
     }
 
-    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+    async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
