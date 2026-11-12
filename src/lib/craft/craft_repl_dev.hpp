@@ -210,8 +210,8 @@ public:
 
 // Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
-// my_id is this member's replica id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
-unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t my_id);
+// replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
 
 #ifdef _PRERELEASE
 // Test seam for proposal completion: the same ctx make_homestore_raft_proposer() hands HomeStore, and its

@@ -60,20 +60,31 @@ std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& r
     return std::nullopt;
 }
 
-// Counts one round's quorum replies by sender: only voters other than this member count, each once. Any other
-// reply except this member's own is still usable evidence: a repeat's content merges with the member's first
-// reply (an "absent" is only a snapshot, so a slot any reply holds is held), and a learner's evidence is real but
-// isn't a vote. Fails closed: no quorum if the voter list is empty or doesn't include this member.
+// Counts one round's quorum replies by sender: only voters other than this member count, each once. Fails closed if
+// the voter list is empty or excludes this member. Replies a correct transport never sends are logged under `round`.
 class VoterTally {
 public:
-    enum class Reply { drop, use, count }; // drop: this member's own reply
+    // drop: this member's own reply. use: evidence but not a vote (a learner's, an untagged one, or a repeat, which
+    // merges with the member's first reply since "absent" is only a snapshot). count: a distinct voter.
+    enum class Reply { drop, use, count };
 
-    VoterTally(craft::peer_id_t self, std::vector< craft::peer_id_t > voters) :
-            self_{self}, voters_{std::move(voters)} {}
+    VoterTally(char const* round, craft::peer_id_t self, std::vector< craft::peer_id_t > voters) :
+            round_{round}, self_{self}, voters_{std::move(voters)} {}
 
     Reply add(craft::peer_id_t const& member) {
-        if (member == self_) return Reply::drop;
-        if (!is_voter(member) || !seen_.insert(member).second) return Reply::use;
+        if (member == self_) {
+            LOGW("{}: dropping a reply from this member itself", round_);
+            return Reply::drop;
+        }
+        if (member.is_nil()) {
+            LOGW("{}: a reply carries no member id -- used as evidence, not counted", round_);
+            return Reply::use;
+        }
+        if (!seen_.insert(member).second) {
+            LOGW("{}: repeat reply from {} -- merged, not counted", round_, boost::uuids::to_string(member));
+            return Reply::use;
+        }
+        if (!is_voter(member)) return Reply::use; // a learner
         ++counted_;
         return Reply::count;
     }
@@ -88,6 +99,7 @@ private:
         return std::find(voters_.begin(), voters_.end(), m) != voters_.end();
     }
 
+    char const* round_;
     craft::peer_id_t self_;
     std::vector< craft::peer_id_t > voters_;
     std::set< craft::peer_id_t > seen_;
@@ -435,8 +447,8 @@ void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
 
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
-    HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t my_id) :
-            rd_{std::move(rd)}, my_id_{my_id} {}
+    HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
+            rd_{std::move(rd)}, my_id_{replica_id} {}
 
     bool is_leader() const override { return rd_->is_leader(); }
     craft::peer_id_t my_id() const override { return my_id_; }
@@ -468,8 +480,9 @@ private:
 };
 } // namespace
 
-unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t my_id) {
-    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd), my_id);
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd,
+                                                         craft::peer_id_t replica_id) {
+    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd), replica_id);
 }
 
 #ifdef _PRERELEASE
@@ -1587,7 +1600,8 @@ async_status CraftReplDev::watchdog_sync() {
         ~RoundGuard() { dev->watchdog_round_in_flight_.store(false, std::memory_order_release); }
     } round_guard{this};
 
-    if (peer_fetcher_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (peer_fetcher_ == nullptr || raft_proposer_ == nullptr)
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 
     uint64_t term, client_token;
     int64_t target;
@@ -1608,7 +1622,7 @@ async_status CraftReplDev::watchdog_sync() {
     }
     // Only distinct voters other than this leader count toward quorum; every other reply still feeds the
     // target (VoterTally).
-    VoterTally tally{raft_proposer_->my_id(), raft_proposer_->voters()};
+    VoterTally tally{"watchdog_sync", raft_proposer_->my_id(), raft_proposer_->voters()};
     for (auto const& p : *polled) {
         if (tally.add(p.member) == VoterTally::Reply::drop) continue;
         target = std::max(target, p.lsns.last_append_lsn);
@@ -2133,7 +2147,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     empty_by_quorum.reserve(candidates.size());
     // Only distinct voters other than this leader count toward quorum-lacks evidence; a learner's reply or a
     // member's repeat still contributes its slots (VoterTally).
-    VoterTally tally{raft_proposer_->my_id(), raft_proposer_->voters()};
+    VoterTally tally{"pre_resolve_slots", raft_proposer_->my_id(), raft_proposer_->voters()};
     int valid_member_count = 0; // usable replies, counted or not
     for (auto& reply : *responses) {
         if (auto bad_lsn = validate_fetch_response(candidates, reply.slots); bad_lsn) {
@@ -2144,10 +2158,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                  *bad_lsn);
             continue;
         }
-        if (tally.add(reply.member) == VoterTally::Reply::drop) {
-            LOGW("pre_resolve_slots: discarding a reply from this member itself");
-            continue;
-        }
+        if (tally.add(reply.member) == VoterTally::Reply::drop) continue;
         ++valid_member_count;
         for (auto& slot : reply.slots) {
             if (slot.is_empty) {
