@@ -451,8 +451,6 @@ public:
     void seed_term(uint64_t term);
     // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
     void seed_in_flight(int64_t lsn);
-    // Same as raft_listener(), for the tests that drive the RAFT listener's callbacks directly.
-    homestore::repl_dev_listener& test_listener() { return raft_listener_; }
 
     // Test seam for commit(): runs the same apply-one-slot algorithm, but the index write/delete
     // operations are injected rather than routed through indx_tbl_, so tests can exercise commit()'s

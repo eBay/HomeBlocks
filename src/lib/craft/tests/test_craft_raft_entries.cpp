@@ -981,7 +981,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitCompletesOwnProposalOk) {
     auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -994,7 +994,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
     auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -1005,7 +1005,7 @@ TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
 TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_error(homestore::ReplServiceError::NOT_LEADER, {}, {}, ctx);
+    dev_->raft_listener().on_error(homestore::ReplServiceError::NOT_LEADER, {}, {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -1016,7 +1016,7 @@ TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
 TEST_F(CraftRaftEntriesTest, OnErrorOtherFailsProposalWithInternalError) {
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, ctx);
+    dev_->raft_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -1027,7 +1027,7 @@ TEST_F(CraftRaftEntriesTest, OnErrorOtherFailsProposalWithInternalError) {
 TEST_F(CraftRaftEntriesTest, OnRollbackFailsProposalWithNotLeader) {
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_rollback(1, {}, {}, ctx);
+    dev_->raft_listener().on_rollback(1, {}, {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -1041,8 +1041,8 @@ TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
     auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
     auto const ctx = make_test_proposal_ctx();
 
-    dev_->test_listener().on_rollback(1, {}, {}, ctx);
-    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    dev_->raft_listener().on_rollback(1, {}, {}, ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
@@ -1054,8 +1054,8 @@ TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
 TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
     auto const foreign = intrusive< homestore::repl_req_ctx >{new homestore::repl_req_ctx()};
 
-    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, foreign);
-    dev_->test_listener().on_rollback(1, {}, {}, foreign);
+    dev_->raft_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, foreign);
+    dev_->raft_listener().on_rollback(1, {}, {}, foreign);
 
     EXPECT_FALSE(take_test_proposal_outcome(foreign).has_value());
 }
