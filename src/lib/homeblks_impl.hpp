@@ -18,7 +18,11 @@
 #include <atomic>
 #include <future>
 #include <map>
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <boost/uuid/uuid_hash.hpp> // std::hash of volume ids
 #include <sisl/fds/id_reserver.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/utility/obj_life_counter.hpp>
@@ -75,11 +79,14 @@ private:
 
     /// volume management
     mutable std::shared_mutex vol_lock_;
-    std::map< volume_id_t, volume_handle > vol_map_;
+    std::unordered_map< volume_id_t, volume_handle > vol_map_;
+    std::unordered_set< volume_id_t > creating_vols_; // CRAFT creates in flight on this node (guarded by vol_lock_)
 
-    // index table map which only used during recovery;
+    // Index tables recovered and not yet installed in a volume: volume id -> {table, its ordinal}. A volume takes its
+    // table at load; one left by a create that crashed stays, holding its ordinal, until that volume's next create
+    // takes it.
     mutable std::shared_mutex index_lock_;
-    std::unordered_map< std::string, shared< VolumeIndexTable > > idx_tbl_map_;
+    std::unordered_map< std::string, std::pair< shared< VolumeIndexTable >, uint64_t > > idx_tbl_map_;
 
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
@@ -147,6 +154,18 @@ public:
     void on_write(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                   const std::vector< homestore::multi_blk_id >& blkids, cintrusive< homestore::repl_req_ctx >& ctx);
 
+    // CRAFT: applies a committed CreateVolume entry on this member, creating its local replica of the volume. Runs on
+    // the RAFT commit thread. `replaying`: the commit is a log replay at restart.
+    void on_create_volume_commit(int64_t lsn, sisl::blob const& key, cintrusive< homestore::repl_req_ctx > const& ctx,
+                                 bool replaying);
+    // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
+    // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
+    void on_craft_group_destroyed(volume_id_t const& id);
+    // CRAFT: HomeStore asks for a new RAFT group's listener on the thread that instantiated the group.
+    static void on_craft_group_made(volume_id_t const& id) {
+        if (forming_ && forming_->id == id) { forming_->made = true; }
+    }
+
     void start_reaper_thread();
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
@@ -158,6 +177,9 @@ public:
     bool dynamic_chunk_allocation() const;
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
     bool has_pending_chunk_releases() const;
+    home_blocks_config const& config() const { return config_; }
+    // CRAFT process mode: every volume is a CRAFT partition replicated by its own RAFT group.
+    bool is_craft() const { return config_.repl_mode == replication_mode::CRAFT; }
 
 public:
     // public static APIs;
@@ -180,6 +202,23 @@ private:
 
     void update_vol_sb_cb(uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids);
 
+    // CRAFT: creates this member's replica of a volume a committed CreateVolume entry defines.
+    status create_craft_volume_local(volume_info&& info);
+
+    // CRAFT create_volume on the member that receives it. form_craft_volume blocks (group formation, then the wait
+    // for CreateVolume), so it runs on a thread of its own, never on a reactor.
+    async_result< volume_handle > create_craft_volume(volume_info info);
+    status validate_craft_volume(volume_info const& info) const;
+    result< volume_handle > form_craft_volume(volume_info info);
+    void remove_craft_group(volume_id_t const& id);
+    // The group this thread's create_repl_dev forms, and whether that call made it rather than was handed one a peer's
+    // join installed: nuraft_mesg instantiates a group once, on the thread whose create or join won.
+    struct craft_group_forming {
+        volume_id_t id;
+        bool made{false};
+    };
+    static inline thread_local craft_group_forming* forming_{nullptr};
+
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
@@ -189,6 +228,8 @@ private:
     // Coroutine driving the actual volume teardown (co_awaits volume::destroy); launched via detach on a
     // worker reactor by remove_volume so the reactor yields during the destroy's CP flush instead of parking.
     sisl::async::task< void > do_remove_volume(volume_id_t id);
+    // Starts a volume's teardown (do_remove_volume) on a worker. False if the system is restricted or shutting down.
+    bool start_volume_removal(volume_id_t const& id);
 
     uint64_t gc_timer_nsecs() const;
 

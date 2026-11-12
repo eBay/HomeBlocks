@@ -17,13 +17,16 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <vector>
 
+#include <boost/uuid/uuid.hpp>
+#include <homeblks/home_blocks.hpp>
 #include <sisl/fds/buffer.hpp>
 
 // ─── CRAFT RAFT entry types ───────────────────────────────────────────────────
 //
-// Two entry types ride the RAFT log in the CRAFT backend. Neither carries
+// Three entry types ride the RAFT log in the CRAFT backend. None carries
 // volume write data — write data travels point-to-point via the client broadcast
 // and is journalled locally. These entries carry only control-plane metadata:
 //
@@ -35,9 +38,13 @@
 //     by the leader as step 4 of the login sequence; applied by every replica.
 //     All subsequent IO with a mismatched term is rejected STALE_TERM.
 //
+//   CreateVolume — the partition's first entry: proposed by the member that formed
+//     the RAFT group; every member creates its local volume when it commits.
+//     Applied by the volume layer (the partition has no CraftReplDev before it).
+//
 // Wire layout:
 //   header blob → CraftEntryHeader  (discriminant only)
-//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload
+//   key blob    → SyncRSCommitLSNPayload | InternalLoginPayload | CreateVolumeHeader
 //
 // For SyncRSCommitLSN the key blob is variable-length: the fixed
 // SyncRSCommitLSNPayload struct is followed immediately by
@@ -48,7 +55,7 @@
 
 namespace homeblocks {
 
-ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin);
+ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, CreateVolume);
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
@@ -71,6 +78,21 @@ struct SyncRSCommitLSNPayload {
 struct InternalLoginPayload {
     uint64_t client_token;
     uint64_t term;
+};
+
+// ─── key blob: CreateVolume ───────────────────────────────────────────────────
+
+// The key blob's fixed-size part, its header: num_members × member uuid follow it, then name_len name bytes. No
+// ordinal: that is local to each node. The uuid is raw bytes: a packed field can't bind to uuid's copy operations.
+// `version` comes first: an entry written in another layout is rejected rather than misread.
+struct CreateVolumeHeader {
+    static constexpr uint8_t VERSION{1};
+    uint8_t version;
+    uint8_t id[sizeof(boost::uuids::uuid)];
+    uint64_t size_bytes;
+    uint32_t page_size;
+    uint16_t num_members;
+    uint16_t name_len;
 };
 #pragma pack(pop)
 
@@ -115,6 +137,52 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 
     const auto* src = reinterpret_cast< const int64_t* >(p + 1);
     return std::vector< int64_t >(src, src + empty_count);
+}
+
+inline size_t create_volume_key_size(size_t num_members, size_t name_len) {
+    return sizeof(CreateVolumeHeader) + num_members * sizeof(boost::uuids::uuid) + name_len;
+}
+
+// Writes the replicated part of v into buf: its id, size, page size, members and name. The rest is each node's own (the
+// ordinal) or implied (CRAFT). Caller must size buf via create_volume_key_size(v.members.size(), v.name.size()) first,
+// and keep both counts within uint16_t and the page size within uint32_t.
+inline void serialize_create_volume(uint8_t* buf, volume_info const& v) {
+    auto* p = reinterpret_cast< CreateVolumeHeader* >(buf);
+    p->version = CreateVolumeHeader::VERSION;
+    std::memcpy(p->id, &v.id, sizeof(p->id));
+    p->size_bytes = v.size_bytes;
+    p->page_size = static_cast< uint32_t >(v.page_size);
+    p->num_members = static_cast< uint16_t >(v.members.size());
+    p->name_len = static_cast< uint16_t >(v.name.size());
+    auto* tail = reinterpret_cast< uint8_t* >(p + 1);
+    for (auto const& m : v.members) {
+        std::memcpy(tail, &m, sizeof(m));
+        tail += sizeof(m);
+    }
+    if (!v.name.empty()) { std::memcpy(tail, v.name.data(), v.name.size()); }
+}
+
+// `key` is persisted RAFT log data replayed on apply: validated against its version and declared counts before anything
+// is trusted, like parse_empty_slots. Returns the CRAFT volume it defines, without an ordinal (each node assigns its
+// own), or std::nullopt if the entry doesn't parse.
+inline std::optional< volume_info > parse_create_volume(sisl::blob const& key) {
+    if (key.size() < sizeof(CreateVolumeHeader)) { return std::nullopt; }
+    const auto* p = reinterpret_cast< const CreateVolumeHeader* >(key.cbytes());
+    if (p->version != CreateVolumeHeader::VERSION) { return std::nullopt; }
+    if (key.size() != create_volume_key_size(p->num_members, p->name_len)) { return std::nullopt; }
+
+    volume_id_t id;
+    std::memcpy(&id, p->id, sizeof(p->id));
+    const auto* tail = reinterpret_cast< const uint8_t* >(p + 1);
+    std::vector< peer_id_t > members(p->num_members);
+    for (auto& m : members) {
+        std::memcpy(&m, tail, sizeof(m));
+        tail += sizeof(m);
+    }
+    volume_info v{id, p->size_bytes, p->page_size, std::string(reinterpret_cast< const char* >(tail), p->name_len)};
+    v.repl_mode = replication_mode::CRAFT;
+    v.members = std::move(members);
+    return v;
 }
 
 } // namespace homeblocks

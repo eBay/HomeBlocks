@@ -200,6 +200,13 @@ public:
 
     // this will be called by homestore when create_repl_dev is called;
     std::shared_ptr< homestore::repl_dev_listener > create_repl_dev_listener(homestore::group_id_t group_id) override {
+        if (hb_->is_craft()) {
+            // HomeStore loads a recovered group's repl dev before asking for its listener, and creates a new group's
+            // (on create or join) only after.
+            bool const recovered = homestore::hs()->repl_service().get_repl_dev(group_id).has_value();
+            if (!recovered) { HomeBlocksImpl::on_craft_group_made(group_id); }
+            return std::make_shared< CraftGroupListener >(hb_, group_id, recovered);
+        }
         return std::make_shared< HBListener >(hb_);
 #if 0
         std::scoped_lock lock_guard(_repl_sm_map_lock);
@@ -211,15 +218,14 @@ public:
 
     void on_repl_devs_init_completed() override { hb_->on_init_complete(); }
 
+    // Only the RAFT (CRAFT) service looks peers up; init_homestore() checks the hook is set in that mode.
     std::pair< std::string, uint16_t > lookup_peer(homestore::replica_id_t uuid) const override {
-        // r1: should never come here;
-        RELEASE_ASSERT(false, "Unexpected to be called.");
-        return std::make_pair("", 0);
+        return hb_->config().lookup_peer(uuid);
     }
 
     homestore::replica_id_t get_my_repl_id() const override { return hb_->our_uuid(); }
 
-    uint32_t get_my_repl_svc_port() const { return 0; }
+    uint32_t get_my_repl_svc_port() const override { return hb_->config().repl_svc_port; }
 
     void destroy_repl_dev_listener(homestore::group_id_t gid) override {
         LOGI("Destroying repl dev listener for group_id {}", boost::uuids::to_string(gid));
@@ -309,6 +315,8 @@ void HomeBlocksImpl::init_homestore() {
     get_dev_info(device_info, has_data_dev, has_fast_dev);
 
     RELEASE_ASSERT(device_info.size() != 0, "No supported devices found!");
+    RELEASE_ASSERT(!is_craft() || (config_.lookup_peer && config_.repl_svc_port != 0),
+                   "CRAFT mode needs repl_svc_port and lookup_peer");
 
     volume_chunk_selector_ = std::make_shared< VolumeChunkSelector >(
         "volume", [this](uint64_t volume_ordinal, const std::vector< chunk_num_t >& chunk_ids) {
@@ -325,8 +333,10 @@ void HomeBlocksImpl::init_homestore() {
     });
 
     using namespace homestore;
-    // Note: timeline_consistency doesn't matter as we are using solo repl dev;
-    auto repl_app = std::make_shared< HBReplApp >(repl_impl_type::solo, false /*timeline_consistency*/, this);
+    // CRAFT runs HomeStore's RAFT service (one group per volume); legacy volumes keep the solo repl dev. The type is
+    // process-wide in HomeStore. Timeline consistency is not supported by either.
+    auto repl_app = std::make_shared< HBReplApp >(is_craft() ? repl_impl_type::server_side : repl_impl_type::solo,
+                                                  false /*timeline_consistency*/, this);
     bool need_format = false;
     if (fc_on()) {
         need_format = homestore::hs()
@@ -531,9 +541,7 @@ void HomeBlocksImpl::vol_gc() {
 
     for (auto& vol : vols_to_remove) {
         LOGI("Garbage Collecting removed volume with id: {}", vol->id_str());
-        // remove_volume is a coroutine (async_status) whose actual work is scheduled on a worker; we don't await
-        // it here, so start it fire-and-forget (an un-awaited lazy task would otherwise never run).
-        detail::detach(remove_volume(vol->id()));
+        start_volume_removal(vol->id());
     }
 }
 

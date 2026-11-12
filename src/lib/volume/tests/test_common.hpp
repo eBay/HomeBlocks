@@ -219,12 +219,18 @@ class HBTestHelper {
         }
         auto id = svc_id();
         cfg.on_svc_id = [id]() -> homeblocks::async_result< homeblocks::peer_id_t > { co_return id; };
+        if (config_hook_) { config_hook_(cfg); }
         return cfg;
     }
 
 public:
     HBTestHelper(std::string const& name, std::vector< std::string > const& args, char** argv) :
             test_name_{name}, args_{args}, argv_{argv} {}
+
+    // Adjusts the bring-up config of setup() and every restart(), e.g. to run in CRAFT mode. Set it before setup().
+    void set_config_hook(std::function< void(homeblocks::home_blocks_config&) > hook) {
+        config_hook_ = std::move(hook);
+    }
 
     void setup() {
         sisl::logging::SetLogger(test_name_);
@@ -412,6 +418,7 @@ private:
     std::vector< std::string > dev_list_;
     shared< homeblocks::home_blocks > hb_;
     peer_id_t svc_id_;
+    std::function< void(homeblocks::home_blocks_config&) > config_hook_;
     Runner io_runner_;
     Waiter waiter_;
 

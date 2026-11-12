@@ -230,6 +230,17 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
     g_helper->restart(2);
 }
 
+// This instance runs legacy volumes (the default DISABLED mode): a CRAFT volume needs one in CRAFT mode.
+TEST_F(VolumeTest, CraftVolumeNeedsCraftMode) {
+    auto vinfo = gen_vol_info(0);
+    auto const id = vinfo.id;
+    vinfo.repl_mode = replication_mode::CRAFT;
+    auto ret = homeblocks::detail::sync_get(g_helper->inst()->create_volume(std::move(vinfo)));
+    ASSERT_FALSE(ret);
+    EXPECT_EQ(ret.error(), std::errc::not_supported);
+    EXPECT_FALSE(g_helper->inst()->get_volume(id));
+}
+
 TEST_F(VolumeTest, CreateVolumeThenRecover) {
     std::vector< volume_id_t > vol_ids;
     {
@@ -351,6 +362,46 @@ TEST_F(VolumeTest, DestroyVolumeCrashBeforeChunkRelease) {
     hb = g_helper->inst();
     ASSERT_TRUE(hb->get_volume(id).value_or(nullptr) == nullptr);
     ASSERT_EQ(hb->get_stats().used_capacity_bytes, used_before);
+}
+
+// Two removals of one volume at once (e.g. a GC pass and the removal that marked it DESTROYING): only the one that
+// claims the destroy runs it.
+TEST_F(VolumeTest, ConcurrentRemovesDestroyOnce) {
+    auto hb = g_helper->inst();
+    auto vinfo = gen_vol_info(0);
+    auto const id = vinfo.id;
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->create_volume(std::move(vinfo))));
+    auto vol_ptr = hb->get_volume(id).value_or(nullptr);
+    ASSERT_TRUE(vol_ptr != nullptr);
+
+    // The first removal holds on to its claim; the second starts meanwhile, once the volume is DESTROYING.
+    auto const hold = std::chrono::seconds(5);
+    g_helper->set_delay_flip("vol_remove_delay_after_claim",
+                             std::chrono::duration_cast< std::chrono::microseconds >(hold).count());
+    auto const hold_over = std::chrono::steady_clock::now() + hold + std::chrono::seconds(1);
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(id)));
+    while (!vol_ptr->is_destroying()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(id)));
+    vol_ptr.reset();
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}));
+
+    // Destroyed once: a volume created now takes the freed ordinal and keeps it. A second destroy would release that
+    // ordinal and its chunks once more, now the new volume's: the next volume would get the same ordinal, or the
+    // removals below would never settle.
+    auto first = gen_vol_info(1);
+    auto const first_id = first.id;
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->create_volume(std::move(first))));
+    std::this_thread::sleep_until(hold_over);
+    auto second = gen_vol_info(2);
+    auto const second_id = second.id;
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->create_volume(std::move(second))));
+    EXPECT_NE(hb->get_volume(first_id).value()->ordinal(), hb->get_volume(second_id).value()->ordinal());
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(first_id)));
+    ASSERT_TRUE(homeblocks::detail::sync_get(hb->remove_volume(second_id)));
+    ASSERT_TRUE(g_helper->wait_for_volumes_removed({first_id, second_id}));
 }
 #endif
 

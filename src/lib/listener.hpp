@@ -79,4 +79,32 @@ public:
 private:
     HomeBlocksImpl* hb_{nullptr};
 };
+
+// Per-group listener of a CRAFT instance. HomeStore asks for a group's listener when the group is created, joined or
+// recovered: before the volume, and its CraftReplDev, exist on this node. So this one lives at the HomeBlocks level: it
+// applies the group's CreateVolume and forwards every other CRAFT entry to the volume's CraftReplDev.
+class CraftGroupListener : public homestore::repl_dev_listener {
+public:
+    // `recovered`: HomeStore is recovering this group at restart, so its log replay is still to come.
+    CraftGroupListener(HomeBlocksImpl* hb, homestore::group_id_t group_id, bool recovered) :
+            hb_{hb}, group_id_{group_id}, replaying_{recovered} {}
+
+    void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                   std::vector< homestore::multi_blk_id > const& blkids,
+                   cintrusive< homestore::repl_req_ctx >& ctx) override;
+    void on_rollback(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                     cintrusive< homestore::repl_req_ctx >& ctx) override;
+    void on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
+                  cintrusive< homestore::repl_req_ctx >& ctx) override;
+    void on_log_replay_done(homestore::group_id_t const&) override { replaying_ = false; }
+    void on_destroy(homestore::group_id_t const& group_id) override;
+
+private:
+    // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).
+    volume_handle craft_volume(int64_t lsn) const;
+
+    HomeBlocksImpl* hb_;
+    homestore::group_id_t group_id_;
+    std::atomic< bool > replaying_;
+};
 } // namespace homeblocks

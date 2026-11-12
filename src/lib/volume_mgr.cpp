@@ -13,24 +13,41 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <algorithm>
+#include <chrono>
+#include <future>
+#include <limits>
+#include <optional>
+#include <set>
+#include <thread>
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
+#include <iomgr/iomgr_flip.hpp>
 #include <homestore/crc.hpp>
+#include <homestore/replication_service.hpp>
 #include "volume/volume.hpp"
 #include "homeblks_impl.hpp"
 #include "coro_helpers.hpp"
+#include "home_blks_config.hpp"
 
 namespace homeblocks {
 
 void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
     auto vol_ptr = volume::make_volume(buf, cookie, volume_chunk_selector_, index_chunk_selector_);
     auto id = vol_ptr->id();
+    // A volume works only in the mode it was created in, and a CRAFT volume loaded without the RAFT service finds no
+    // group and is torn down below. Only a restart in its mode fixes that: stop before anything changes on disk,
+    // whatever the FC setting.
+    RELEASE_ASSERT(vol_ptr->is_craft() == is_craft(),
+                   "volume {} was created in {} mode, but HomeBlocks runs in {} mode: restart it in {} mode",
+                   vol_ptr->id_str(), enum_name(vol_ptr->info()->repl_mode), enum_name(config_.repl_mode),
+                   enum_name(vol_ptr->info()->repl_mode));
 
     {
         auto lg = std::scoped_lock(index_lock_);
         auto it = idx_tbl_map_.find(vol_ptr->id_str());
         if (it != idx_tbl_map_.end()) {
-            vol_ptr->init_index_table(true /*is_recovery*/, it->second /* table */);
+            vol_ptr->init_index_table(true /*is_recovery*/, it->second.first /* table */);
 
             // don't need it after volume is initialized with index table;
             idx_tbl_map_.erase(it);
@@ -48,14 +65,23 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
                      "volume id: {} already exists in recovery path, not expected!", boost::uuids::to_string(id));
         vol_map_.emplace(std::make_pair(id, vol_ptr));
-        ordinal_reserver_->reserve(vol_ptr->ordinal());
+        // Its index table, recovered before it, already holds the ordinal; one destroyed before the crash doesn't.
+        if (!ordinal_reserver_->is_reserved(vol_ptr->ordinal())) { ordinal_reserver_->reserve(vol_ptr->ordinal()); }
     }
 
     if (vol_ptr->is_destroying()) {
         // resume volume destroying;
         LOGINFO("volume {} is in destroying state, resume destroy", vol_ptr->id_str());
-        // fire-and-forget: remove_volume is a coroutine whose work is scheduled on a worker; start it detached.
-        detail::detach(remove_volume(id));
+        start_volume_removal(id);
+    } else if (vol_ptr->is_craft() && !vol_ptr->rd()) {
+        // Its RAFT group was destroyed while this node was down, or with the destroy still pending at the crash (when
+        // HomeStore drops the group without calling on_destroy): the replica goes with it.
+        LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
+        start_volume_removal(id);
+    } else if (vol_ptr->is_craft()) {
+        // Only now that its index table is installed: the CraftReplDev attached when the journal replays keeps it. A
+        // CRAFT volume torn down above leaves its journal unopened, and HomeStore purges it.
+        vol_ptr->reopen_craft_journal();
     }
 }
 
@@ -73,8 +99,12 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
         bool success = index_chunk_selector_->recover_chunks(sb->ordinal, sb->pdev_id, sb->max_size_bytes, chunk_ids);
         RELEASE_ASSERT(success, "Failed to recover chunks for index table index_uuid: {}, parent_uuid: {} ordinal: {}",
                        boost::uuids::to_string(sb->uuid), pid_str, sb->ordinal);
+        // The table holds its ordinal from here on, whether or not a volume comes to take it: a volume given the
+        // ordinal anew would get the table's chunks.
+        ordinal_reserver_->reserve(sb->ordinal);
+        uint64_t const ordinal = sb->ordinal;
         auto tbl = std::make_shared< VolumeIndexTable >(std::move(sb), cfg);
-        idx_tbl_map_.emplace(pid_str, tbl);
+        idx_tbl_map_.emplace(pid_str, std::pair{tbl, ordinal});
         return tbl->index_table();
     }
 }
@@ -87,12 +117,28 @@ shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superb
 // cause crash;
 //
 async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info) {
+    // Counted before anything else and released on every exit: a shutdown either waits for this create or is seen by
+    // it below, before it touches HomeStore.
+    struct CreateRef {
+        HomeBlocksImpl& hb;
+        ~CreateRef() { hb.dec_ref(); }
+    };
+    inc_ref();
+    CreateRef const ref{*this};
     if (is_restricted()) {
         LOGE("Can't serve volume create, System is in restricted mode.");
         co_return std::unexpected(std::errc::operation_not_supported);
     }
+    if (is_shutting_down()) {
+        LOGE("Can't serve volume create, system is shutting down.");
+        co_return std::unexpected(std::errc::operation_not_supported);
+    }
+    if (is_craft()) { co_return co_await create_craft_volume(std::move(vol_info)); }
+    if (vol_info.repl_mode != replication_mode::DISABLED) {
+        LOGE("vol={}: a CRAFT volume needs an instance in CRAFT mode", boost::uuids::to_string(vol_info.id));
+        co_return std::unexpected(std::errc::not_supported);
+    }
 
-    inc_ref();
     auto id = vol_info.id;
 
     LOGI("[vol={}] is of capacity [{}B]", boost::uuids::to_string(id), vol_info.size_bytes);
@@ -107,7 +153,6 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
 
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             LOGW("create_volume with input id: {} already exists,", boost::uuids::to_string(id));
-            dec_ref();
             co_return std::unexpected(std::errc::invalid_argument);
         }
     }
@@ -119,12 +164,317 @@ async_result< volume_handle > HomeBlocksImpl::create_volume(volume_info vol_info
         LOGW("create_volume with input id: {} ordinal: {} ", boost::uuids::to_string(id), vol_ptr->info()->ordinal);
     } else {
         LOGE("failed to create volume with id: {}", boost::uuids::to_string(id));
-        dec_ref();
         co_return std::unexpected(volume_error::INTERNAL_ERROR);
     }
 
-    dec_ref();
     co_return vol_ptr;
+}
+
+// A CRAFT volume in logs: its id, then its name, the partition ID.
+static std::string craft_vol_str(volume_info const& info) {
+    return fmt::format("{} ({})", boost::uuids::to_string(info.id), info.name);
+}
+
+// CRAFT create on the member that receives it: forms the partition's RAFT group with every member, then replicates the
+// volume itself through the group's first entry, CreateVolume. Returns once that entry committed and this member
+// created its replica; the other members create theirs as they apply it.
+async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info info) {
+    if (auto const valid = validate_craft_volume(info); !valid) { co_return std::unexpected(valid.error()); }
+    auto const id = info.id;
+    auto const vol_str = craft_vol_str(info);
+    // Looked up before taking vol_lock_, so this never calls into HomeStore while holding it.
+    auto const group = homestore::hs()->repl_service().get_repl_dev(id);
+    {
+        auto lg = std::scoped_lock(vol_lock_);
+        // A create of this volume still in flight here decides it, even once its replica exists: it may yet time out
+        // and roll the group back.
+        if (creating_vols_.contains(id)) { co_return std::unexpected(std::errc::operation_in_progress); }
+        if (auto it = vol_map_.find(id); it != vol_map_.end()) {
+            // A replica whose group is gone or going is removed with it: e.g. a failed create whose CreateVolume still
+            // committed before its rollback's destroy. Not a volume to hand back, whatever its parameters.
+            if (it->second->is_destroying() || (it->second->is_craft() && (!group || is_going_away(**group)))) {
+                LOGE("vol={}: its previous replica is still being removed", vol_str);
+                co_return std::unexpected(std::errc::operation_in_progress);
+            }
+            // A retry of a create that already succeeded here.
+            auto const& existing = *it->second->info();
+            if (it->second->is_craft() && existing.size_bytes == info.size_bytes &&
+                existing.page_size == info.page_size && existing.name == info.name) {
+                co_return it->second;
+            }
+            LOGE("vol={}: already exists with different parameters: {}", vol_str, existing.to_string());
+            co_return std::unexpected(std::errc::invalid_argument);
+        }
+        creating_vols_.insert(id);
+    }
+
+    // Group formation blocks this thread until the election and every member's join are done, and HomeStore drives
+    // it with sync_get: it must never run on a reactor. A thread of its own is safe whatever thread the caller is on.
+    auto done = std::make_shared< sisl::async::value_awaitable< result< volume_handle > > >();
+    std::thread([self = shared_from_this(), info = std::move(info), done]() mutable {
+        done->complete(self->form_craft_volume(std::move(info)));
+    }).detach();
+    auto ret = co_await *done;
+
+    {
+        auto lg = std::scoped_lock(vol_lock_);
+        creating_vols_.erase(id);
+    }
+    co_return ret;
+}
+
+status HomeBlocksImpl::validate_craft_volume(volume_info const& info) const {
+    auto const vol_str = craft_vol_str(info);
+    if (info.repl_mode != replication_mode::CRAFT) {
+        LOGE("vol={}: an instance in CRAFT mode only creates CRAFT volumes", vol_str);
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    auto members = info.members;
+    std::sort(members.begin(), members.end());
+    if (members.empty() || members.size() > std::numeric_limits< uint16_t >::max() ||
+        std::adjacent_find(members.begin(), members.end()) != members.end() ||
+        !std::binary_search(members.begin(), members.end(), our_uuid())) {
+        LOGE("vol={}: members must be distinct and include this node {}; got {}", vol_str,
+             boost::uuids::to_string(our_uuid()), info.members.size());
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    // CraftReplDev writes and checksums one page per HomeStore data block, whose size is the node's.
+    if (info.page_size != DATA_BLK_SIZE) {
+        LOGE("vol={}: page size {} is not this node's data block size {}", vol_str, info.page_size, DATA_BLK_SIZE);
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    // CRAFT IO is whole pages within the volume: a partial last page could never be written or read.
+    if (info.size_bytes == 0 || info.size_bytes % info.page_size != 0) {
+        LOGE("vol={}: size {} is not a positive multiple of the page size {}", vol_str, info.size_bytes,
+             info.page_size);
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    // The whole name must come back from the superblock, which keeps it as a C string: a retry, also after a restart,
+    // is matched against the stored one.
+    if (info.name.size() > volume::MAX_NAME_LEN || info.name.find('\0') != std::string::npos) {
+        LOGE("vol={}: invalid name of {} bytes (at most {}, without NUL)", vol_str, info.name.size(),
+             volume::MAX_NAME_LEN);
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    // The id is the name's: a create of the same partition, on any member, forms the same group.
+    if (auto const name_id = craft_volume_id(info.name); info.id != name_id) {
+        LOGE("vol={}: the id is not its name's, {}", vol_str, boost::uuids::to_string(name_id));
+        return std::unexpected(std::errc::invalid_argument);
+    }
+    return ok();
+}
+
+// The CreateVolume entry for `info`, in a ctx that collects its outcome.
+static intrusive< create_volume_ctx > make_create_volume_ctx(volume_info const& info) {
+    auto ctx = intrusive< create_volume_ctx >{new create_volume_ctx()};
+    ctx->hdr_buf_ = sisl::io_blob_safe{static_cast< uint32_t >(sizeof(CraftEntryHeader)), 0};
+    reinterpret_cast< CraftEntryHeader* >(ctx->hdr_buf_.bytes())->type = CraftEntryType::CreateVolume;
+    ctx->key_buf_ =
+        sisl::io_blob_safe{static_cast< uint32_t >(create_volume_key_size(info.members.size(), info.name.size())), 0};
+    serialize_create_volume(ctx->key_buf_.bytes(), info);
+    return ctx;
+}
+
+result< volume_handle > HomeBlocksImpl::form_craft_volume(volume_info info) {
+    auto const id = info.id;
+    auto const vol_str = craft_vol_str(info);
+
+    // A group of this volume is already here, without a replica of it here: an earlier one still being destroyed (e.g.
+    // by a failed create's rollback), or one an earlier create formed that didn't finish on this member (this node
+    // crashed before its rollback, or its local create failed). This create neither proposes into it, since the
+    // definition and members of what it committed aren't known here, nor destroys it, since other members may hold
+    // replicas: its destroy, or the partition's cleanup, comes first. (create_repl_dev would also hand a group being
+    // destroyed back as if formed.)
+    bool check = true;
+#ifdef _PRERELEASE
+    // Stands for a group that a peer's join installs right after this check.
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_skip_group_check")) { check = false; }
+#endif
+    if (auto const old = homestore::hs()->repl_service().get_repl_dev(id); check && old) {
+        LOGE("vol={}: a RAFT group of this volume is already here ({}): not one this create forms", vol_str,
+             is_going_away(**old) ? "being destroyed" : "without a replica here");
+        return std::unexpected(std::errc::operation_in_progress);
+    }
+
+    // 1. Form the group: this node creates it, wins its first election, then adds every other member. A peer's join can
+    // still install a group of this volume first: create_repl_dev then hands that one back, or fails waiting to lead
+    // it. Only a group this call made is proposed into or rolled back.
+    std::set< homestore::replica_id_t > const members(info.members.begin(), info.members.end());
+    craft_group_forming forming{.id = id};
+    forming_ = &forming;
+    auto rd = detail::sync_get(homestore::hs()->repl_service().create_repl_dev(id, members));
+    forming_ = nullptr;
+    if (!forming.made && (rd || homestore::hs()->repl_service().get_repl_dev(id))) {
+        LOGE("vol={}: a RAFT group of this volume was installed meanwhile: not one this create forms", vol_str);
+        return std::unexpected(std::errc::operation_in_progress);
+    }
+    if (!rd) {
+        LOGE("vol={}: failed to form its RAFT group: {}", vol_str, rd.error().message());
+        if (forming.made) { remove_craft_group(id); }
+        return std::unexpected(rd.error());
+    }
+    auto const& group = *rd;
+
+    // create_repl_dev returns once the RAFT layer reports this node as the group's leader. For a group id used before
+    // in this process (a create retried after its group was destroyed), that layer still holds the old group's leader
+    // flag, so it may not have waited: wait for the leadership itself before proposing. The leadership and the commit
+    // share one deadline.
+    auto const deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
+    while (!group->is_leader() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    // 2. Replicate the volume itself: every member creates its replica when this entry commits.
+    auto ctx = make_create_volume_ctx(info);
+    auto applied = ctx->done_.get_future();
+    bool propose = group->is_leader();
+    if (!propose) {
+        LOGE("vol={}: not the leader of its RAFT group in time, CreateVolume not proposed", vol_str);
+        ctx->complete(std::unexpected(std::errc::timed_out));
+    }
+#ifdef _PRERELEASE
+    if (propose && iomgr_flip::instance()->test_flip("craft_create_volume_propose_error")) {
+        LOGI("vol={}: flip craft_create_volume_propose_error set, CreateVolume not proposed", vol_str);
+        ctx->complete(std::unexpected(std::errc::io_error));
+        propose = false;
+    }
+#endif
+    if (propose) { group->async_alloc_write(ctx->hdr_buf_, ctx->key_buf_, sisl::sg_list{}, ctx); }
+
+    status st = std::unexpected(std::make_error_condition(std::errc::timed_out));
+    if (applied.wait_until(deadline) == std::future_status::ready) { st = applied.get(); }
+    if (!st) {
+        LOGE("vol={}: CreateVolume did not commit and apply here: {}", vol_str, st.error().message());
+        bool rollback = true;
+#ifdef _PRERELEASE
+        // Stands for a receiver that crashed before its rollback: the group outlives the create.
+        if (iomgr_flip::instance()->test_flip("craft_create_volume_no_rollback")) { rollback = false; }
+#endif
+        if (rollback) { remove_craft_group(id); }
+        return std::unexpected(st.error());
+    }
+    LOGI("vol={}: created, RAFT group formed with {} members", vol_str, info.members.size());
+    return get_volume(id);
+}
+
+// Rolls a failed create back: destroys the RAFT group on every member that joined it. A member that already created its
+// replica tears it down when the group is destroyed (on_destroy). Bounded: without a quorum the destroy cannot commit,
+// and it stays pending in the group.
+void HomeBlocksImpl::remove_craft_group(volume_id_t const& id) {
+    auto removed = std::make_shared< std::promise< status > >();
+    auto fut = removed->get_future();
+    detail::detach([](async_status remove, std::shared_ptr< std::promise< status > > r) -> sisl::async::task< void > {
+        r->set_value(co_await std::move(remove));
+    }(homestore::hs()->repl_service().remove_repl_dev(id), removed));
+
+    auto const timeout = std::chrono::milliseconds(HB_DYNAMIC_CONFIG(craft_create_volume_timeout_ms));
+    if (fut.wait_for(timeout) != std::future_status::ready) {
+        LOGE("vol={}: destroying its RAFT group did not finish in {}ms", boost::uuids::to_string(id), timeout.count());
+    } else if (auto const st = fut.get(); !st) {
+        LOGE("vol={}: failed to destroy its RAFT group: {}", boost::uuids::to_string(id), st.error().message());
+    }
+}
+
+void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
+                                             cintrusive< homestore::repl_req_ctx > const& ctx, bool replaying) {
+    auto entry = parse_create_volume(key);
+    if (!entry) {
+        LOGE("lsn={}: malformed CreateVolume entry ({} bytes), ignored", lsn, key.size());
+        create_volume_ctx::complete(ctx, std::unexpected(volume_error::INVALID_ENTRY));
+        return;
+    }
+    auto const vol_str = craft_vol_str(*entry);
+    if (std::find(entry->members.begin(), entry->members.end(), our_uuid()) == entry->members.end()) {
+        LOGE("vol={} lsn={}: this node is not a member of the volume, CreateVolume ignored", vol_str, lsn);
+        create_volume_ctx::complete(ctx, std::unexpected(std::errc::invalid_argument));
+        return;
+    }
+    if (auto vol = get_volume(entry->id)) {
+        if ((*vol)->is_destroying()) {
+            // An earlier replica of the same volume, its group destroyed, is still being removed here.
+            LOGE("vol={} lsn={}: its previous replica is still being removed, CreateVolume fails here", vol_str, lsn);
+            create_volume_ctx::complete(ctx, std::unexpected(std::errc::operation_in_progress));
+            return;
+        }
+        // Already applied here: a replay, or a commit re-delivered after a restart.
+        create_volume_ctx::complete(ctx, ok());
+        return;
+    }
+    if (replaying) {
+        // Replay re-applies entries that committed before the restart. Its volume superblock is written before the
+        // commit completes, so a missing one means the create failed here back then. Leave it failed: a journal (a
+        // logdev) must not be created while the log store service replays.
+        LOGW("vol={} lsn={}: CreateVolume failed here before the restart, not retried by the replay", vol_str, lsn);
+        return;
+    }
+
+    // Counted like a create, so a shutdown either waits for this apply or is seen by it: a replica made while HomeStore
+    // shuts down would itself never be shut down.
+    inc_ref();
+    status st = std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    if (is_shutting_down()) {
+        LOGW("vol={} lsn={}: HomeBlocks is shutting down, no replica created here", vol_str, lsn);
+    } else {
+        st = create_craft_volume_local(std::move(*entry));
+    }
+    dec_ref();
+    if (!st) { LOGE("vol={} lsn={}: failed to create the volume locally: {}", vol_str, lsn, st.error().message()); }
+    create_volume_ctx::complete(ctx, st);
+}
+
+status HomeBlocksImpl::create_craft_volume_local(volume_info&& info) {
+    auto const id_str = boost::uuids::to_string(info.id);
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("craft_create_volume_apply_error")) {
+        LOGI("vol={}: flip craft_create_volume_apply_error set, local create fails", id_str);
+        return std::unexpected(volume_error::INTERNAL_ERROR);
+    }
+#endif
+
+    // A create that crashed between its index table and its superblock left the table behind (recovered without a
+    // volume). Take it over, with the ordinal it holds since its recovery: a second table for the same volume would
+    // compete with it at the next recovery.
+    std::optional< std::pair< shared< VolumeIndexTable >, uint64_t > > orphan_idx;
+    {
+        auto lg = std::scoped_lock(index_lock_);
+        if (auto it = idx_tbl_map_.find(id_str); it != idx_tbl_map_.end()) {
+            orphan_idx = std::move(it->second);
+            idx_tbl_map_.erase(it);
+        }
+    }
+
+    if (orphan_idx) {
+        DEBUG_ASSERT(ordinal_reserver_->is_reserved(orphan_idx->second),
+                     "vol={}: leftover index table's ordinal {} free", id_str, orphan_idx->second);
+        info.ordinal = orphan_idx->second;
+    } else {
+        auto lg = std::scoped_lock(vol_lock_);
+        info.ordinal = ordinal_reserver_->reserve();
+        if (info.ordinal >= MAX_NUM_VOLUMES) {
+            ordinal_reserver_->unreserve(info.ordinal);
+            LOGE("vol={}: no free volume ordinal", id_str);
+            return std::unexpected(std::errc::no_space_on_device);
+        }
+    }
+
+    auto const ordinal = info.ordinal;
+    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                         dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr);
+    if (!vol) {
+        if (orphan_idx) {
+            // The table stays behind, holding its ordinal, for the next create of this volume to take over.
+            auto lg = std::scoped_lock(index_lock_);
+            idx_tbl_map_.emplace(id_str, std::move(*orphan_idx));
+        } else {
+            // Nothing is left under the ordinal: a failed create releases its chunks and journal.
+            ordinal_reserver_->unreserve(ordinal);
+        }
+        return std::unexpected(volume_error::INTERNAL_ERROR);
+    }
+    auto lg = std::scoped_lock(vol_lock_);
+    vol_map_.emplace(vol->id(), vol);
+    return ok();
 }
 
 //
@@ -155,9 +505,22 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
 
     vol_ptr->state_change(volume_state::DESTROYING);
 
-    // if vol is already started with destroy or there is any outstanding reqs on the vol, we will not do anything
-    // on this vol and let reaper thread to handle it
-    if (vol_ptr->can_remove()) {
+    // Only the removal that claims the destroy runs it: another removal of this volume may run on another worker. One
+    // that finds requests still in flight leaves the volume to the reaper thread.
+    if (vol_ptr->try_start_destroy()) {
+#ifdef _PRERELEASE
+        // Holds this removal, its destroy claimed, so that a test can start another removal meanwhile. It resumes from
+        // a message on a worker, as it started. The flip's timer fires inside this reactor's timer callback, where the
+        // destroy deadlocks, and a message sent from there to this reactor would run inline: a thread sends it.
+        if (auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
+            iomgr_flip::instance()->delay_flip("vol_remove_delay_after_claim", [held]() {
+                std::thread([held]() {
+                    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
+                }).detach();
+            })) {
+            co_await *held;
+        }
+#endif
         // 2. do volume destroy;
         co_await vol_ptr->destroy();
 #ifdef _PRERELEASE
@@ -176,8 +539,8 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
 
         LOGINFO("volume {} ordinal={} removed successfully", vol_ptr->id_str(), vol_ptr->info()->ordinal);
     } else {
-        LOGD("volume {} is in destroying state or has outstanding requests: {}, backing off and wait for GC to "
-             "cleanup.",
+        LOGD("volume {}: another removal claimed its destroy, or it has outstanding requests: {}, backing off and "
+             "wait for GC to cleanup.",
              vol_ptr->id_str(), vol_ptr->num_outstanding_reqs());
     }
     // volume Destructor will be called after vol_ptr goes out of scope;
@@ -196,25 +559,45 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     } else if ((*vol)->is_offline()) {
         LOGE("volume {} is offline, cannot remove", (*vol)->id_str());
         co_return std::unexpected(volume_error::OFFLINE);
+    } else if ((*vol)->is_craft()) {
+        // A CRAFT volume goes through its RAFT group, which every member's replica follows; removing a single replica
+        // would leave the group behind. That removal is not exposed yet.
+        LOGE("volume {} is a CRAFT volume, remove_volume does not support it yet", (*vol)->id_str());
+        co_return std::unexpected(std::errc::operation_not_supported);
     }
 
+    LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
+    if (!start_volume_removal(id)) { co_return std::unexpected(std::errc::operation_not_supported); }
+    co_return ok();
+}
+
+bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
+    if (is_restricted()) {
+        LOGE("Can't remove volume {}, system is in restricted mode.", boost::uuids::to_string(id));
+        return false;
+    }
     // Shutdown waits for pending removals. Count this one before checking for shutdown: shutdown sets its flag before
     // checking the count, so either shutdown waits for this removal or this removal sees the flag.
     pending_vol_removals_.fetch_add(1);
     if (is_shutting_down()) {
         pending_vol_removals_.fetch_sub(1);
-        LOGE("Can't serve volume remove, system is shutting down.");
-        co_return std::unexpected(std::errc::operation_not_supported);
+        LOGE("Can't remove volume {}, system is shutting down.", boost::uuids::to_string(id));
+        return false;
     }
 
-    LOGINFO("remove_volume with input id: {}", boost::uuids::to_string(id));
     // volume::destroy() co_awaits a forced CP flush (IndexTable::destroy) and the repl-dev removal, so it must
     // run as a coroutine on the worker reactor (detach) -- a blocking callable would park the reactor and the
     // flush it awaits could never run. See do_remove_volume.
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker,
                             [this, id]() { detail::detach(do_remove_volume(id)); });
+    return true;
+}
 
-    co_return ok();
+void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
+    auto const vol = get_volume(id);
+    if (!vol) { return; } // never created here, or already removed
+    LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));
+    start_volume_removal(id);
 }
 
 result< volume_handle > HomeBlocksImpl::get_volume(const volume_id_t& id) const {
@@ -270,8 +653,13 @@ std::vector< volume_id_t > HomeBlocksImpl::volume_ids() const {
 // Shared guard. Returns the volume's block size on success, or the rejecting volume_error.
 static result< uint32_t > io_precheck(volume_handle const& vol, uint64_t addr, uint64_t len, const char* op) {
     auto hb = HomeBlocksImpl::instance();
-    if (hb->is_restricted()) {
-        LOGE("Can't serve {}, system is in restricted mode.", op);
+    if (!hb || hb->is_restricted()) { // the instance is gone once a shutdown finished
+        LOGE("Can't serve {}, system is in restricted mode or shut down.", op);
+        return std::unexpected(std::errc::operation_not_supported);
+    }
+    if (vol->is_craft()) {
+        // A CRAFT volume's data rides the CRAFT API; a legacy op would propose a data entry into its RAFT group.
+        LOGE("Can't serve {} on CRAFT volume {}, use the CRAFT API.", op, vol->id_str());
         return std::unexpected(std::errc::operation_not_supported);
     }
     if (vol->is_offline()) {
