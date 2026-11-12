@@ -124,6 +124,10 @@ public:
 
         m_vol_ptr = vol_mgr->get_volume(m_vol_id).value_or(nullptr);
         ASSERT_TRUE(m_vol_ptr != nullptr);
+
+        auto const nlbas = m_vol_ptr->info()->size_bytes / m_vol_ptr->info()->page_size;
+        m_lba_data.assign(nlbas, 0);
+        m_lba_written.assign(nlbas, false);
     }
 
     void remove_volume() {
@@ -185,6 +189,7 @@ public:
                 if (store_data) {
                     std::lock_guard lock(m_mutex);
                     m_lba_data[lba] = data_pattern;
+                    m_lba_written[lba] = true;
                 }
             }
 
@@ -284,8 +289,8 @@ public:
         auto read_sz = m_vol_ptr->info()->page_size;
         for (auto lba = start_lba; lba < start_lba + nlbas; lba++, buf += read_sz) {
             uint64_t data_pattern = 0;
-            if (auto it = m_lba_data.find(lba); it != m_lba_data.end()) {
-                data_pattern = it->second;
+            if (lba < m_lba_written.size() && m_lba_written[lba]) {
+                data_pattern = m_lba_data[lba];
                 test_common::HBTestHelper::validate_data_buf(buf, m_vol_ptr->info()->page_size, data_pattern);
             } else {
                 test_common::HBTestHelper::validate_zeros(buf, m_vol_ptr->info()->page_size);
@@ -322,10 +327,9 @@ public:
     }
 
     void verify_all_data(uint64_t nlbas_per_io = 1) {
-        LOGTRACE("Verifying data for volume {} from lba={} to lba={} with nlbas_per_io={}", m_vol_name,
-                 m_lba_data.begin()->first, m_lba_data.rbegin()->first, nlbas_per_io);
-        for (auto& [lba, _] : m_lba_data) {
-            read_and_verify(lba, nlbas_per_io);
+        LOGTRACE("Verifying data for volume {} with nlbas_per_io={}", m_vol_name, nlbas_per_io);
+        for (lba_t lba = 0; lba < m_lba_written.size(); ++lba) {
+            if (m_lba_written[lba]) { read_and_verify(lba, nlbas_per_io); }
         }
     }
 
@@ -348,8 +352,12 @@ private:
     volume_handle m_vol_ptr;
     volume_id_t m_vol_id;
     static inline uint32_t m_volume_id_{1};
-    // Mapping from lba to data patttern.
-    std::map< lba_t, uint64_t > m_lba_data;
+    // Data pattern last written to each lba, indexed by lba; m_lba_written tells which entries are valid
+    // (unwritten lbas must read back as zeros). Sized once in create_volume(): a volume's size never changes,
+    // and a flat array costs 8 bytes + 1 bit per lba instead of a std::map node (~64 bytes with ASan) per
+    // written lba, which grew to tens of GB in the long-running test.
+    std::vector< uint64_t > m_lba_data;
+    std::vector< bool > m_lba_written;
     boost::icl::interval_set< int > m_inflight_ios;
     std::shared_ptr< test_common::Runner > m_write_runner;
     std::shared_ptr< test_common::Runner > m_read_runner;
@@ -591,6 +599,7 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
     for (uint32_t restarted_cnt = 0; restarted_cnt <= num_restarts; restarted_cnt++) {
         uint64_t total_reads{0}, total_writes{0};
         auto start_time = std::chrono::high_resolution_clock::now();
+        uint64_t next_progress_log_s = 120;
         do {
             std::vector< std::future< void > > futs;
 
@@ -609,9 +618,10 @@ TEST_F(VolumeIOTest, LongRunningRandomIO) {
             std::chrono::duration< double > elapsed = std::chrono::high_resolution_clock::now() - start_time;
             auto elapsed_seconds = static_cast< uint64_t >(elapsed.count());
 
-            if (elapsed_seconds > 120) {
-                // log read write count every 2 mins;
+            if (elapsed_seconds >= next_progress_log_s) {
+                // log read write count every 2 mins
                 LOGINFO("total_read={} total_write={} elapsed={}", total_reads, total_writes, elapsed_seconds);
+                next_progress_log_s = elapsed_seconds + 120;
             }
 
             static uint64_t log_pct = 0;
