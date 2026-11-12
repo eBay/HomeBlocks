@@ -218,6 +218,8 @@ unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl
 // outcome once CraftRaftListener has completed it (nullopt while pending). Single-shot: takes the outcome.
 intrusive< homestore::repl_req_ctx > make_test_proposal_ctx();
 std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_req_ctx > const& ctx);
+// Does what the proposal's deadline timer does when it fires.
+void expire_test_proposal(intrusive< homestore::repl_req_ctx > const& ctx);
 #endif
 
 // ─── checkpoint_trigger_fn_t ──────────────────────────────────────────────────

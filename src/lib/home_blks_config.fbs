@@ -50,6 +50,10 @@ table HomeBlksSettings{
     // volume's CreateVolume entry to commit and apply locally before it gives up and destroys the group.
     // Also bounds the wait for that destroy.
     craft_create_volume_timeout_ms: uint32 = 30000;
+
+    // CRAFT: deadline (in milliseconds) for a RAFT proposal (SyncRSCommitLSN, InternalLogin) to commit. A proposal
+    // that misses it completes with timed_out, but the entry may still commit later. 0 = no deadline.
+    craft_raft_propose_timeout_ms: uint32 = 10000;
 }
 
 root_type HomeBlksSettings;

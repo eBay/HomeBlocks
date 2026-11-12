@@ -449,6 +449,12 @@ void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
     p->promise_.complete(std::move(s));
 }
 
+// The proposal missed its deadline (craft_raft_propose_timeout_ms). The entry may still commit, so the caller learns
+// "outcome unknown", not a rejection; a later commit is still applied, but its completion is dropped.
+void expire_proposal(cintrusive< homestore::repl_req_ctx >& ctx) {
+    complete_proposal(ctx, std::unexpected(std::make_error_condition(std::errc::timed_out)));
+}
+
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
     HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
@@ -465,9 +471,10 @@ public:
         return ids;
     }
 
-    // TODO(S7): no deadline. Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs()
-    // skips the proposer), so a leader without quorum waits out the outage holding append()'s gate. Add a
-    // one-shot timer (craft_raft_propose_timeout_ms) completing with timed_out; the entry may still commit.
+    // Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs() skips the proposer), so a
+    // leader without quorum would wait out the outage: the deadline completes it with timed_out instead, and the
+    // caller resumes on an iomgr worker, inside the timer's callback. An iomgr one-shot can't be cancelled, so the
+    // timer keeps ctx alive until it fires, even after the proposal completes.
     async_status propose(sisl::blob header, sisl::blob key) override {
         auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
         ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
@@ -475,6 +482,9 @@ public:
         rd_->async_alloc_write(sisl::blob{ctx->header.data(), static_cast< uint32_t >(ctx->header.size())},
                                sisl::blob{ctx->key.data(), static_cast< uint32_t >(ctx->key.size())},
                                sisl::sg_list{} /* key-only entry */, ctx);
+        if (auto const ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms); ms > 0)
+            iomgr::schedule_oneshot(std::chrono::milliseconds{ms}, iomgr::reactor_regex::random_worker,
+                                    [ctx] { expire_proposal(ctx); });
         co_return co_await ctx->promise_;
     }
 
@@ -499,6 +509,8 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
     if (p == nullptr || !p->promise_.await_ready()) return std::nullopt;
     return p->promise_.await_resume();
 }
+
+void expire_test_proposal(intrusive< homestore::repl_req_ctx > const& ctx) { expire_proposal(ctx); }
 #endif
 
 // ─── constructor ──────────────────────────────────────────────────────────────
@@ -1781,7 +1793,11 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
         if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                                       sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
             !r) {
-            LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            if (r.error() == std::errc::timed_out) {
+                LOGW("append: SyncRSCommitLSN({}) proposal timed out -- outcome unknown, it may still commit", target);
+            } else {
+                LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            }
             co_return std::unexpected(r.error());
         }
     }
