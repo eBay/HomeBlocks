@@ -298,7 +298,7 @@ static std::vector< pid_t > start_members(std::vector< std::string > const& args
         }
         argv.push_back(nullptr);
         pid_t pid;
-        RELEASE_ASSERT_EQ(posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ), 0,
+        RELEASE_ASSERT_EQ(posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ), 0,
                           "failed to start member {}", i);
         pids.push_back(pid);
     }
