@@ -23,10 +23,13 @@
 #include <istream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
 
+#include <boost/uuid/name_generator_sha1.hpp>
+#include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/format.h>
@@ -86,11 +89,11 @@ ENUM(volume_state, uint32_t,
 ENUM(replication_mode, uint8_t, DISABLED = 1, CRAFT);
 
 struct volume_info {
-    volume_id_t id;
+    volume_id_t id; // CRAFT: craft_volume_id(name)
     uint64_t size_bytes{0};
     uint64_t page_size{0}; // logical block size for this volume (a per-volume runtime setting)
-    // The caller's name for the volume, opaque to HomeBlocks and kept in its superblock. A CRAFT create retry must
-    // repeat it; a CRAFT volume's is at most 99 bytes, without NUL.
+    // The caller's name for the volume, kept in its superblock. A CRAFT volume's is its partition ID, at most 99
+    // bytes, without NUL: its id derives from it.
     std::string name;
     uint64_t ordinal{0}; // internal: chunk-selector ordinal, assigned by homeblocks on create/recover
     replication_mode repl_mode{replication_mode::DISABLED};
@@ -129,6 +132,15 @@ struct volume_info {
             boost::uuids::to_string(id), size_bytes, page_size, name, ordinal, enum_name(repl_mode), member_ids);
     }
 };
+
+// CRAFT: the id of the volume `name` names, a name-based uuid (RFC 4122 version 5). A CRAFT volume's name is its
+// partition ID (<volume_uuid>_<partition_index>), so every node derives the same id, its RAFT group's, from it. A CRAFT
+// create_volume takes no other id.
+inline volume_id_t craft_volume_id(std::string_view name) {
+    // HomeBlocks' namespace for CRAFT volume names. Never change it: the ids of existing volumes derive from it.
+    static auto const ns = boost::uuids::string_generator()("d038f051-8dd3-447d-a338-90543dd4a507");
+    return boost::uuids::name_generator_sha1{ns}(name.data(), name.size());
+}
 
 struct volume_stats {
     volume_id_t id;

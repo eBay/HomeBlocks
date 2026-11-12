@@ -129,13 +129,12 @@ static uint32_t num_members() { return SISL_OPTIONS["num_replicas"].as< uint32_t
 static uint32_t wait_timeout_sec() { return SISL_OPTIONS["wait_timeout_sec"].as< uint32_t >(); }
 static uint16_t port_of(uint32_t i) { return SISL_OPTIONS["base_port"].as< uint16_t >() + i; }
 
-// Every process derives the same ids: member i's svc id, and the test volumes'.
+// Every process derives the same ids: member i's svc id, and test volume n's, from its name.
 static peer_id_t member_id(uint32_t i) {
     return boost::uuids::string_generator()(fmt::format("{:08x}-0000-4000-8000-0000c0ffee00", i + 1));
 }
-static volume_id_t test_volume_id(uint32_t n) {
-    return boost::uuids::string_generator()(fmt::format("{:08x}-0000-4000-8000-0000ba5e0000", n));
-}
+static std::string test_volume_name(uint32_t n) { return fmt::format("craft_multi_{}", n); }
+static volume_id_t test_volume_id(uint32_t n) { return craft_volume_id(test_volume_name(n)); }
 
 class CraftVolumeMultiTest : public ::testing::Test {
 protected:
@@ -143,8 +142,8 @@ protected:
 
     static shared< home_blocks > hb() { return g_helper->inst(); }
 
-    static volume_info vol_info(volume_id_t const& id, std::string const& name) {
-        volume_info info{id, 1024 * 1024 * 1024, 4096, name};
+    static volume_info vol_info(uint32_t n) {
+        volume_info info{test_volume_id(n), 1024 * 1024 * 1024, 4096, test_volume_name(n)};
         info.repl_mode = replication_mode::CRAFT;
         for (uint32_t i = 0; i < num_members(); ++i) {
             info.members.push_back(member_id(i));
@@ -172,7 +171,7 @@ TEST_F(CraftVolumeMultiTest, CreateReachesEveryMember) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(1);
     if (me() == 0) {
-        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_1")));
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(1)));
         ASSERT_TRUE(vol) << vol.error().message();
         EXPECT_NE((*vol)->craft_dev(), nullptr);
     }
@@ -192,7 +191,7 @@ TEST_F(CraftVolumeMultiTest, VolumeSurvivesRestartOfEveryMember) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(4);
     if (me() == 0) {
-        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_4")));
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(4)));
         ASSERT_TRUE(vol) << vol.error().message();
     }
     ASSERT_TRUE(wait_until([&id] {
@@ -223,7 +222,7 @@ TEST_F(CraftVolumeMultiTest, FailedCreateLeavesNoReplica) {
         // The receiver's own apply fails while the followers' succeed: the rollback destroys the group, and every
         // follower removes the replica it created.
         g_helper->set_flip_point("craft_create_volume_apply_error", 1);
-        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_2")));
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(2)));
         g_helper->remove_flip("craft_create_volume_apply_error");
         ASSERT_FALSE(vol);
     }
@@ -241,7 +240,7 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     if (me() == 1) { g_helper->set_flip_point("craft_create_volume_apply_error", 1); }
     ASSERT_TRUE(sync());
     if (me() == 0) {
-        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(3)));
         ASSERT_TRUE(vol) << vol.error().message();
         // At least CreateVolume's LSN, appended before it committed. Not the commit LSN: the create returns from the
         // apply, before HomeStore advances that.
@@ -262,7 +261,7 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
             return rd != nullptr && rd->get_last_commit_lsn() >= created_at;
         }));
         ASSERT_FALSE(hb()->get_volume(id));
-        auto retry = homeblocks::detail::sync_get(hb()->create_volume(vol_info(id, "craft_multi_3")));
+        auto retry = homeblocks::detail::sync_get(hb()->create_volume(vol_info(3)));
         ASSERT_FALSE(retry);
         EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
     }

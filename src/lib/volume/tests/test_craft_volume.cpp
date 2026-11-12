@@ -44,10 +44,11 @@ using namespace homeblocks;
 
 class CraftVolumeTest : public ::testing::Test {
 public:
-    volume_info craft_vol_info(std::string const& name) {
+    // A new volume each call: `base` and a random uuid name it, and its id derives from that name.
+    volume_info craft_vol_info(std::string const& base) {
         volume_info info;
-        info.id = boost::uuids::random_generator()();
-        info.name = name;
+        info.name = fmt::format("{}_{}", base, boost::uuids::to_string(boost::uuids::random_generator()()));
+        info.id = craft_volume_id(info.name);
         info.size_bytes = 1024 * 1024 * 1024;
         info.page_size = 4096;
         info.repl_mode = replication_mode::CRAFT;
@@ -116,13 +117,6 @@ TEST_F(CraftVolumeTest, CreateRetryReturnsTheVolume) {
     auto clash = create(std::move(other));
     ASSERT_FALSE(clash);
     EXPECT_EQ(clash.error(), std::errc::invalid_argument);
-
-    // Same id, another name: not a retry either.
-    auto renamed = clone(info);
-    renamed.name += "_other";
-    auto rename_clash = create(std::move(renamed));
-    ASSERT_FALSE(rename_clash);
-    EXPECT_EQ(rename_clash.error(), std::errc::invalid_argument);
     EXPECT_EQ(hb()->get_volume(id).value_or(nullptr), *first);
 }
 
@@ -162,6 +156,20 @@ TEST_F(CraftVolumeTest, CreateRejectsInvalidRequests) {
     // Longer than the superblock keeps, or with a NUL: it would come back cut short after a restart.
     expect_rejected(craft_vol_info(std::string(volume::MAX_NAME_LEN + 1, 'n')));
     expect_rejected(craft_vol_info(std::string("nul\0name", 8)));
+
+    // An id that isn't its name's: a create of that name on another member would form another group. Also an existing
+    // volume's id under another name.
+    auto foreign_id = craft_vol_info("foreign_id");
+    foreign_id.id = boost::uuids::random_generator()();
+    expect_rejected(std::move(foreign_id));
+    auto const existing = craft_vol_info("craft_vol_renamed");
+    ASSERT_TRUE(create(clone(existing)));
+    auto renamed = clone(existing);
+    renamed.name += "_other";
+    auto const vol = create(std::move(renamed));
+    ASSERT_FALSE(vol);
+    EXPECT_EQ(vol.error(), std::errc::invalid_argument);
+    EXPECT_TRUE(hb()->get_volume(existing.id)); // untouched
 }
 
 TEST_F(CraftVolumeTest, LegacyOpsRejected) {
