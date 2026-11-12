@@ -25,7 +25,8 @@
 //
 // A volume with no CRAFT backend (a plain HomeStore volume, or a CRAFT volume not yet wired) returns
 // std::errc::not_supported. A system restricted or shutting down, or a volume being destroyed, refuses the op with
-// std::errc::operation_not_supported, and an offline volume with volume_error::OFFLINE.
+// std::errc::operation_not_supported, and an offline volume with volume_error::OFFLINE. A write or read reaching past
+// the end of the volume is std::errc::invalid_argument.
 
 #include <optional>
 
@@ -67,6 +68,15 @@ std::optional< std::error_condition > craft_unavailable(volume_handle const& vol
     if (!vol->craft_dev()) { return std::make_error_condition(std::errc::not_supported); }
     return std::nullopt;
 }
+
+// Why `vol` can't serve [addr, addr + len): the range must lie within the volume. The CraftReplDev checks alignment.
+std::optional< std::error_condition > craft_out_of_range(volume_handle const& vol, uint64_t addr, uint64_t len,
+                                                         char const* op) {
+    auto const size = vol->info()->size_bytes;
+    if (len <= size && addr <= size - len) { return std::nullopt; } // addr + len <= size, without overflow
+    LOGE("Can't serve CRAFT {}: [{}, +{}) is beyond the {} bytes of volume {}.", op, addr, len, size, vol->id_str());
+    return std::make_error_condition(std::errc::invalid_argument);
+}
 } // namespace
 
 async_result< craft::LoginResult > login(volume_handle const& vol, uint64_t client_token) {
@@ -88,6 +98,7 @@ async_result< craft::lsn_pair > async_write(volume_handle const& vol, craft::cli
     if (!vol) co_return no_craft_backend();
     vol_io_guard const guard{vol};
     if (auto const err = craft_unavailable(vol, "write")) co_return std::unexpected(*err);
+    if (auto const err = craft_out_of_range(vol, addr, len, "write")) co_return std::unexpected(*err);
     co_return co_await vol->craft_dev()->write(hdr, dlsn, addr, len, std::move(data));
 }
 
@@ -96,6 +107,7 @@ async_result< craft::read_result > async_read(volume_handle const& vol, craft::c
     if (!vol) co_return no_craft_backend();
     vol_io_guard const guard{vol};
     if (auto const err = craft_unavailable(vol, "read")) co_return std::unexpected(*err);
+    if (auto const err = craft_out_of_range(vol, addr, len, "read")) co_return std::unexpected(*err);
     co_return co_await vol->craft_dev()->read(hdr, read_lsn, addr, len, std::move(dest));
 }
 

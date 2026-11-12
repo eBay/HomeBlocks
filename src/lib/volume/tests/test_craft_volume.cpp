@@ -15,10 +15,11 @@
 
 // CRAFT volume creation (SDSTOR-22894) on a single node: HomeBlocks in CRAFT mode, each volume a one-member RAFT
 // group. Covers what doesn't need peers: the create flow end to end, its validation and idempotency, the legacy-op
-// guards, the journal reattach at restart, the rollback of a failed create, and a replica's teardown when its group
-// is destroyed. test_craft_volume_multi covers a group with several members.
+// guards, the range of CRAFT IO, the journal reattach at restart, the rollback of a failed create, and a replica's
+// teardown when its group is destroyed. test_craft_volume_multi covers a group with several members.
 
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
@@ -189,6 +190,37 @@ TEST_F(CraftVolumeTest, LegacyOpsRejected) {
     ASSERT_FALSE(removed);
     EXPECT_EQ(removed.error(), std::errc::operation_not_supported);
     EXPECT_TRUE(hb()->get_volume((*vol)->id()));
+}
+
+// A CRAFT write or read must lie within the volume, also where addr + len wraps around.
+TEST_F(CraftVolumeTest, IOBeyondTheVolumeRejected) {
+    auto info = craft_vol_info("craft_vol_beyond");
+    uint64_t const size = info.size_bytes;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    craft::client_hdr const hdr{0 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    uint64_t const page = 4096;
+    std::vector< uint8_t > buf(2 * page);
+    auto read = [&](uint64_t addr, uint64_t len) {
+        return homeblocks::detail::sync_get(homeblocks::async_read(
+            *vol, hdr, 0 /* read_lsn */, addr, len, sisl::sg_list{.size = len, .iovs = {iovec{buf.data(), len}}}));
+    };
+
+    // The last page is in: never written, so a hole.
+    auto const last = read(size - page, page);
+    ASSERT_TRUE(last) << last.error().message();
+
+    // Past the end, across it, and wrapping around 2^64.
+    for (auto const& [addr, len] : std::vector< std::pair< uint64_t, uint64_t > >{
+             {size, page}, {size - page, 2 * page}, {std::numeric_limits< uint64_t >::max() - page + 1, 2 * page}}) {
+        auto const w = homeblocks::detail::sync_get(
+            homeblocks::async_write(*vol, hdr, 1 /* dlsn */, addr, len, sisl::sg_list{} /* zeros */));
+        ASSERT_FALSE(w) << addr << "+" << len;
+        EXPECT_EQ(w.error(), std::errc::invalid_argument) << addr << "+" << len;
+        auto const r = read(addr, len);
+        ASSERT_FALSE(r) << addr << "+" << len;
+        EXPECT_EQ(r.error(), std::errc::invalid_argument) << addr << "+" << len;
+    }
 }
 
 TEST_F(CraftVolumeTest, RestartReattachesJournal) {

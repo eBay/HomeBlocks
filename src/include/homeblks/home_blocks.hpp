@@ -64,7 +64,8 @@ using homestore::status;
 // =============================================== volumes ===============================================
 
 // Opaque volume handle. Produced by home_blocks::create_volume() / get_volume(); never constructed directly.
-// All I/O is via the free async_* functions below.
+// All I/O is via the free async_* functions below. A handle is valid until shutdown(): after init_homeblocks() again,
+// get_volume() returns the volume's new handle.
 class volume;
 using volume_handle = std::shared_ptr< volume >;
 
@@ -199,9 +200,10 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 [[nodiscard]] async_status logout(volume_handle const& vol, craft::client_hdr hdr);
 
 // Append one client-assigned write at slot `dlsn`. `addr`/`len` are BYTE offset/length and must be
-// aligned to the volume's lba_size (from craft::LoginResult), else std::errc::invalid_argument. `data` is a
-// caller-owned (iomgr) buffer: pass empty `data` (size==0) for a WRITE_ZEROES/unmap over [addr, addr+len)
-// (metadata-only; no block allocation); pass non-empty `data` of exactly `len` bytes for a data write.
+// aligned to the volume's lba_size (from craft::LoginResult) and within the volume, else
+// std::errc::invalid_argument. `data` is a caller-owned (iomgr) buffer: pass empty `data` (size==0) for a
+// WRITE_ZEROES/unmap over [addr, addr+len) (metadata-only; no block allocation); pass non-empty `data` of
+// exactly `len` bytes for a data write.
 // The write kind is determined by data.empty() -- no separate flag. Not applied to the index directly;
 // `hdr.commit_lsn` rides along and advances the frontier best-effort in dLSN order (CRAFT's piggybacked
 // commit). STALE_TERM if hdr.term != session term.
@@ -220,7 +222,7 @@ async_status async_unmap(volume_handle const& vol, uint64_t addr, uint64_t len);
 // pre-read_lsn version is gone from the index by construction (apply is a blind overwrite past
 // commit_lsn) and is not reconstructible from anything this replica still holds. Returns
 // volume_error::HORIZON_STALE in that case rather than silently serving a too-new version.
-// std::errc::invalid_argument if addr/len are misaligned.
+// std::errc::invalid_argument if addr/len are misaligned or reach past the end of the volume.
 [[nodiscard]] async_result< craft::read_result > async_read(volume_handle const& vol, craft::client_hdr hdr,
                                                             int64_t read_lsn, uint64_t addr, uint64_t len,
                                                             sisl::sg_list dest);
