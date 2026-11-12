@@ -505,9 +505,8 @@ TEST_F(CraftRaftEntriesTest, CatchUpFilledSlotAboveHoleIsInOverlay) {
 TEST_F(CraftRaftEntriesTest, CatchUpFillVoidedByEmptyDuringWriteIsNotPublished) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(5, {3, 4});
-    fetcher_.response = {
-        JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
-        JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}};
+    fetcher_.response = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
+                         JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}};
     // Each slot is voted Empty while its own write is in flight.
     journal_->on_write = [this](int64_t lsn) {
         if (lsn == 3) dev_->seed_empty({3});
