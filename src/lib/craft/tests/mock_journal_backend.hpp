@@ -14,6 +14,8 @@
  *********************************************************************************/
 #pragma once
 
+#include <functional>
+
 #include "craft/craft_repl_dev.hpp"
 
 // Shared free_slot body for CraftJournalBackend test mocks that record write_slot calls into a
@@ -31,6 +33,44 @@ async_result< JournalSlot > mock_read_slot(Mock& mock, int64_t lsn) {
     if (it == mock.slots.end())
         co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
     co_return it->second;
+}
+
+// Leader of a 3-member group by default. propose() records each entry and succeeds unless `fail` is set;
+// on_commit, if set, runs with the entry as RAFT would (typically the device's own listener on_commit).
+class MockCraftRaftProposer : public CraftRaftProposer {
+public:
+    bool leader{true};
+    uint32_t members{3};
+    bool fail{false};
+    std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
+    std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
+
+    bool is_leader() const override { return leader; }
+    uint32_t member_count() const override { return members; }
+
+    async_status propose(sisl::blob header, sisl::blob key) override {
+        if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        proposed.emplace_back(std::vector< uint8_t >(header.cbytes(), header.cbytes() + header.size()),
+                              std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
+        if (on_commit) on_commit(header, key);
+        co_return ok();
+    }
+};
+
+// Decodes one entry MockCraftRaftProposer recorded.
+struct ProposedSync {
+    CraftEntryType type;
+    int64_t rs_commit_lsn;
+    uint64_t client_token;
+    std::vector< int64_t > empty_slots;
+};
+
+inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
+    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
+    auto empties = parse_empty_slots(
+        sisl::blob{const_cast< uint8_t* >(entry.second.data()), static_cast< uint32_t >(entry.second.size())});
+    return {reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, p->rs_commit_lsn, p->client_token,
+            empties.value_or(std::vector< int64_t >{})};
 }
 
 template < typename Mock >

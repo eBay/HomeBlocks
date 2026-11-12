@@ -28,6 +28,7 @@
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_truncate.cpp).
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -35,10 +36,12 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <iomgr/iomgr.hpp>
+#include <sisl/async/value_awaitable.hpp>
 
 #include "craft/craft_repl_dev.hpp"
 #include "home_blks_config.hpp"
 #include "coro_helpers.hpp"
+#include "mock_journal_backend.hpp"
 
 SISL_LOGGING_DEF(HOMEBLOCKS_LOG_MODS)
 SISL_OPTIONS_ENABLE(logging)
@@ -52,10 +55,8 @@ static constexpr uint64_t k_test_watchdog_timeout_ms = 300; // ms; overrides cra
 
 // ── minimal journal mock ────────────────────────────────────────────────────────
 //
-// The watchdog never touches journal_ (touch_watchdog()/on_watchdog_tick() only read/write state_,
-// last_contact_ns_, and watchdog_token_; append() -- called fire-and-forget on expiry -- is still a
-// stub that never reaches journal_ either), so every method is an unreachable stub, same shape as
-// test_craft_truncate.cpp's mock.
+// The watchdog never touches journal_ for data: the sync it triggers only Empty-verdicts slots nobody
+// holds, so every method is an unreachable stub, same shape as test_craft_truncate.cpp's mock.
 
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
@@ -79,6 +80,34 @@ public:
     }
 };
 
+// ── peer fetcher mock ─────────────────────────────────────────────────────────
+//
+// poll_quorum_lsns returns `polled` (one entry per responding peer); fetch_from_quorum reports one
+// responder holding nothing, so any slot beyond the leader's frontier is verdicted Empty. Called on the
+// reactor thread: tests read state only after destroy_dev() (stop_watchdog() joins any in-flight tick).
+
+class MockCraftQuorumPoller : public CraftPeerFetcher {
+public:
+    std::vector< craft::lsn_pair > polled;
+    std::atomic< int > poll_calls{0};
+    // When set, the first poll stays outstanding until the test completes poll_gate (a poll slower than
+    // the tick interval). Later polls return immediately, so overlapping rounds show up in poll_calls.
+    bool hold_first_poll{false};
+    sisl::async::value_awaitable< bool > poll_gate;
+
+    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t, bool) override { co_return craft::lsn_pair{}; }
+    async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >&, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
+        co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{}};
+    }
+    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+        if (++poll_calls == 1 && hold_first_poll) co_await poll_gate;
+        co_return polled;
+    }
+};
+
 // ── test fixture ─────────────────────────────────────────────────────────────
 
 class CraftWatchdogTest : public ::testing::Test {
@@ -92,26 +121,44 @@ protected:
     }
 
     void TearDown() override {
-        dev_.reset();
+        destroy_dev();
         HB_SETTINGS_FACTORY().modifiable_settings([this](auto& s) { s.craft_watchdog_timeout_ms = orig_timeout_ms_; });
     }
 
     // keep_alive() with a matching term is the only public path that both succeeds (term check
     // passes) and calls touch_watchdog() -- write() would work too, but needs a real data payload
     // for the non-all_zeros case; keep_alive() needs nothing but the header.
-    auto do_keep_alive(uint64_t term) {
-        return homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{term, -1, -1}));
+    // commit_lsn is the client's piggybacked resolved prefix (-1 = not sent).
+    auto do_keep_alive(uint64_t term, int64_t commit_lsn = -1) {
+        return homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{term, commit_lsn, -1}));
+    }
+
+    // Wires a leader proposer + quorum poller and logs in at `term` (keep_alive arms the watchdog).
+    void arm_as_leader(uint64_t term, int64_t client_commit_lsn = -1) {
+        dev_->set_peer_fetcher(&fetcher_);
+        dev_->set_raft_proposer(&proposer_);
+        dev_->seed_term(term);
+        ASSERT_TRUE(do_keep_alive(term, client_commit_lsn).has_value());
+    }
+
+    // Stops the watchdog, then drops dev_. A tick in progress holds its own reference, so a bare reset()
+    // can leave the device (and its pointers to fetcher_ and proposer_) alive after this fixture is gone.
+    void destroy_dev() {
+        if (!dev_) return;
+        dev_->stop_watchdog();
+        dev_.reset();
     }
 
     uint64_t orig_timeout_ms_{0};
+    MockCraftQuorumPoller fetcher_;
+    MockCraftRaftProposer proposer_;
     std::shared_ptr< CraftReplDev > dev_;
 };
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-// append() is still a stub with no other observable side effect -- watchdog_fire_count() (test-only)
-// is how this confirms on_watchdog_tick() actually fired after a full interval of no write()/
-// keep_alive() activity.
+// No proposer is wired here, so watchdog_fire_count() (test-only) is how this confirms
+// on_watchdog_tick() actually fired after a full interval of no write()/keep_alive() activity.
 TEST_F(CraftWatchdogTest, FiresAfterInactivity) {
     dev_->seed_term(7);
 
@@ -151,6 +198,108 @@ TEST_F(CraftWatchdogTest, NoLoginNeverArms) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // > 300ms configured timeout
     EXPECT_EQ(dev_->watchdog_fire_count(), 0);
+}
+
+// ── leader sync (SDSTOR-22908) ────────────────────────────────────────────────
+
+// A stale tick on the leader polls the quorum, then syncs to min(quorum max last_append, the client's
+// commit_lsn) -- once: later stale ticks see nothing newly confirmed and don't poll again. A peer holds up to 8,
+// but the client only confirmed 5, so 6..8 (possibly still in flight) are never examined.
+TEST_F(CraftWatchdogTest, LeaderStaleTickProposesUpToClientCommitOnce) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // several stale ticks past the 300ms timeout
+    destroy_dev();                                                // joins any in-flight tick before the mocks are read
+
+    EXPECT_EQ(fetcher_.poll_calls.load(), 1);
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    auto const e = decode(proposer_.proposed[0]);
+    EXPECT_EQ(e.rs_commit_lsn, 5);
+    EXPECT_TRUE(e.empty_slots.empty());
+}
+
+// The skip isn't permanent: once the client confirms more (here 7), the next stale round polls and syncs to it.
+TEST_F(CraftWatchdogTest, StaleTickPollsAgainOnceClientConfirmsMore) {
+    dev_->seed_lsns(8, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620)); // first stale round syncs to 5
+    ASSERT_TRUE(do_keep_alive(7, /*client_commit_lsn=*/7).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(620)); // stale again: the next round syncs to 7
+    destroy_dev();
+
+    EXPECT_EQ(fetcher_.poll_calls.load(), 2);
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 5);
+    EXPECT_EQ(decode(proposer_.proposed[1]).rs_commit_lsn, 7);
+}
+
+// A client that never sent a commit_lsn has confirmed nothing: the watchdog neither polls nor proposes.
+TEST_F(CraftWatchdogTest, StaleTickWithoutClientCommitProposesNothing) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    EXPECT_GE(dev_->watchdog_fire_count(), 1);
+    destroy_dev();
+
+    EXPECT_EQ(fetcher_.poll_calls.load(), 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {
+    proposer_.leader = false;
+    arm_as_leader(7);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    EXPECT_GE(dev_->watchdog_fire_count(), 1);
+    destroy_dev();
+
+    EXPECT_EQ(fetcher_.poll_calls.load(), 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// A poll slower than the tick interval: later stale ticks must not start overlapping rounds (each would hold
+// the device alive). Once the slow poll completes and its round ends, ticks start rounds again. N=5 with one
+// responder, so every round falls short of quorum and later ticks still have something to confirm.
+TEST_F(CraftWatchdogTest, SlowPollDoesNotOverlapRounds) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    fetcher_.hold_first_poll = true;
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(900)); // several stale ticks while poll 1 is held
+    int const fired_while_held = dev_->watchdog_fire_count();
+    int const polls_while_held = fetcher_.poll_calls.load();
+
+    fetcher_.poll_gate.complete(true); // the held round resumes here and ends (short of quorum: no proposal)
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    destroy_dev(); // the gate is always completed before teardown, so no round is left suspended
+
+    EXPECT_GE(fired_while_held, 2);
+    EXPECT_EQ(polls_while_held, 1);
+    EXPECT_GE(fetcher_.poll_calls.load(), 2); // the gate was released: later ticks poll again
+}
+
+// N=5 needs self + 2 responders; one isn't enough to sync. Everything else is set up so the round would
+// propose 5 (a complete local prefix and a client commit at 5): the missing quorum is the only reason
+// it doesn't.
+TEST_F(CraftWatchdogTest, StaleTickWithoutQuorumDoesNotPropose) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    destroy_dev();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
 }
 
 // Destroys a CraftReplDev at an unpredictable point relative to its own watchdog timer's firing --
