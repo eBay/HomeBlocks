@@ -175,6 +175,11 @@ auto hb_res = init_homeblocks(home_blocks_config{
     // Optional: on first boot (no persisted svc id) HomeBlocks calls this to fetch/assign one -- e.g. a gRPC
     // to an orchestrator. Resolve the (possibly rotated) client inside the closure.
     .on_svc_id = [&](/* */) -> async_result<peer_id_t> { co_return co_await orch.register_node(); },
+    // CRAFT: every volume is a CRAFT partition, replicated by its own RAFT group.
+    .repl_mode = replication_mode::CRAFT,
+    .repl_svc_port = 47451, // this node's RAFT port
+    // A member's RAFT {host, port}, e.g. from the orchestrator. Called off-reactor, so it may block.
+    .lookup_peer = [&](peer_id_t const& member) { return orch.raft_endpoint(member); },
 });
 if (!hb_res) { /* hb_res.error().message() -- e.g. OM unreachable */ return; }
 std::shared_ptr<home_blocks> hb = *hb_res;
@@ -188,8 +193,9 @@ each member's handle (`get_volume` on that member); the examples below show one 
 
 ```cpp
 sisl::async::task<void> demo(std::shared_ptr<home_blocks> hb) {
-    // create_volume returns a handle to this member's replica.
-    volume_info info{uuid, /*size*/ 1ull << 30, /*page_size*/ 4096, "vol1"};
+    // create_volume returns a handle to this member's replica. The name is the partition ID,
+    // "<volume_uuid>_<partition_index>", and the id derives from it.
+    volume_info info{craft_volume_id(partition_id), /*size*/ 1ull << 30, /*page_size*/ 4096, partition_id};
     info.repl_mode = replication_mode::CRAFT;
     info.members = {member_a, member_b, member_c}; // this node and its peers
     auto vol = co_await hb->create_volume(std::move(info));
