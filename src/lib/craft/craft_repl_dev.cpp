@@ -69,7 +69,11 @@ public:
     enum class Reply { drop, use, count };
 
     VoterTally(char const* round, craft::peer_id_t self, std::vector< craft::peer_id_t > voters) :
-            round_{round}, self_{self}, voters_{std::move(voters)} {}
+            round_{round}, self_{self}, voters_{std::move(voters)} {
+        if (!is_voter(self_))
+            LOGW("{}: this member ({}) isn't among the {} voter(s) -- failing closed", round_,
+                 boost::uuids::to_string(self_), voters_.size());
+    }
 
     Reply add(craft::peer_id_t const& member) {
         if (member == self_) {
