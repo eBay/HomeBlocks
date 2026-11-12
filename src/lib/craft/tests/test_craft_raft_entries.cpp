@@ -903,6 +903,32 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
+// InternalLogin applies while a write's journal append is in flight: write()'s post-flight sees the new term and
+// fails STALE_TERM. The entry stays journalled and its blocks aren't freed (the journal references them; the next
+// login truncates it), and the slot stays missing.
+TEST_F(CraftRaftEntriesTest, WriteFailsStaleTermWhenLoginLandsDuringWriteSlot) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/1);
+    journal_->on_write = [&](int64_t) {
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    };
+    std::vector< uint8_t > buf(k_page_size);
+    sisl::sg_list data;
+    data.size = k_page_size;
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/0, /*len=*/k_page_size, std::move(data)));
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_TRUE(journal_->has_slot(0));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_TRUE(dev_->is_missing(0));
+}
+
 // InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- neither the
 // stale/old token nor the newly-established one gates the apply; both succeed identically. Guards against
 // reintroducing an equality-fence keyed off InternalLogin's client_token.
