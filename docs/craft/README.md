@@ -23,6 +23,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | transport.md | TCP transport binding behavior — **moved to the `craft_client` repo** (`docs/transport.md`). |
 | [states.md](states.md) | Pointer to the canonical wiki page (slot states, read eligibility) |
 | [subtasks.md](subtasks.md) | Implementation sub-task breakdown (SDSTOR-22382 children) |
+| [resync.md](resync.md) | Resync design: cases with sequence diagrams, invariants, as-built state of `CraftReplDev`, and the implementation plan |
 
 ## Glossary
 
