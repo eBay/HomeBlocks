@@ -887,7 +887,7 @@ TEST_F(CraftCommitTest, ReadRejectsStaleTerm) {
     auto r = homeblocks::detail::sync_get(
         dev_->read(craft::client_hdr{/* term = */ 3, -1, -1}, /* read_lsn = */ 0, 0, k_page_size, std::move(dest)));
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // read()'s own boundary validation -- mirrors write()'s ZeroLenRejected/UnalignedLenRejected/
@@ -1289,7 +1289,7 @@ TEST_F(CraftCommitTest, KeepAliveRejectsStaleTerm) {
     dev_->seed_term(5);
     auto r = homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{/* term = */ 3, -1, -1}));
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // ── C1: csum OOB guard in commit_impl() ───────────────────────────────────────

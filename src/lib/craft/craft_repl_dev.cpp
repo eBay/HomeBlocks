@@ -665,7 +665,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // actually mutates it from the RAFT commit thread.
         if (hdr.term != state_.term) {
             LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
         // Without this, all_committed_lsn only moves via keep_alive() messages, so quiet partitions
@@ -818,7 +818,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
     }
 
-    if (stale_post_flight) { co_return std::unexpected(make_error_condition(volume_error::STALE_TERM)); }
+    if (stale_post_flight) { co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM)); }
     if (voided_post_flight) {
         // Apply didn't free this slot (it was still missing then), so free its blocks here.
         if (auto fr = co_await journal_->free_slot(dlsn); !fr)
@@ -1161,7 +1161,7 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("read rejected: stale term want={} got={}", state_.term, hdr.term);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
         // Reject malformed negative values -- see write()'s doc comment.
@@ -1396,7 +1396,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
         std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("keep_alive rejected: stale term want={} got={}", state_.term, hdr.term);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // Max-monotonic: never let a stale/reordered message regress the floor S8's eventual journal
         // reclaim reads. The reclaim action itself is not implemented here -- see the doc comment.
@@ -1627,7 +1627,7 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
         std::lock_guard lk{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("request_resolution rejected: stale term want={} got={}", state_.term, hdr.term);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         client_token = state_.client_token;
     }
@@ -1657,7 +1657,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
         if (state_.term != term) {
             LOGW("append: term moved past the caller's ({} -> {}) -- abandoning sync_to={}", term, state_.term,
                  sync_to);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
     }
 
@@ -1701,7 +1701,8 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
         {
             std::lock_guard lk{state_mu_};
-            if (state_.term != term) co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            if (state_.term != term)
+                co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
 
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
@@ -1728,7 +1729,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
         // The reply doesn't: if InternalLogin replaced the caller's session during the awaits above, it's gone.
         if (state_.term != term) {
             LOGW("append: term moved past the caller's ({} -> {}) after resolving to {}", term, state_.term, target);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         for (int64_t lsn : empty_lsns_)
             if (lsn <= target) result.empty_slots.push_back(lsn);
@@ -2015,7 +2016,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         if (state_.term != term) {
             LOGW("pre_resolve_slots: term moved past the caller's ({} -> {}) -- abandoning upto={}", term, state_.term,
                  upto);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         candidates.reserve(missing_lsns_.size() +
                            static_cast< size_t >(std::max< int64_t >(0, upto - state_.last_append_lsn)));
@@ -2062,7 +2063,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         if (state_.term != term) {
             LOGW("pre_resolve_slots: term changed during quorum fetch ({} -> {}) -- abandoning upto={}", term,
                  state_.term, upto);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         settled_floor = std::max(applied_sync_lsn_, last_proposed_sync_lsn_);
     }
@@ -2156,7 +2157,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             // own write to this slot.
             if (state_.term != term) {
                 LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", lsn);
-                co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+                co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
             }
             // Same cap write() enforces: journaling this slot would open a gap past it.
             at_capacity = missing_at_capacity_locked(lsn);
@@ -2194,7 +2195,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                     LOGE("pre_resolve_slots: free_data failed lsn={}: {}", slot->lsn, fr.error().message());
             }
             LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", slot->lsn);
-            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         auto res = co_await journal_->write_slot(slot->lsn, term, slot->lba_off_bytes, slot->len_bytes, blkid,
                                                  slot->all_zeros, slot->csums);
@@ -2221,7 +2222,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             std::lock_guard lk{state_mu_};
             if (state_.term != term) {
                 LOGW("pre_resolve_slots: term changed during write_slot -- abandoning at lsn={}", slot->lsn);
-                co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+                co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
             }
             // An Empty verdict applied during write_slot found the slot still missing, so it freed nothing and had
             // no entry to retire: the fill is void, as in write()'s post-flight.
