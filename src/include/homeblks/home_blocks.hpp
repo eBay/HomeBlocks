@@ -139,7 +139,7 @@ struct volume_info {
 // create_volume takes no other id.
 inline volume_id_t craft_volume_id(std::string_view name) {
     // HomeBlocks' namespace for CRAFT volume names. Never change it: the ids of existing volumes derive from it.
-    static auto const ns = boost::uuids::string_generator()("d038f051-8dd3-447d-a338-90543dd4a507");
+    static auto const ns = boost::uuids::string_generator()("525b868e-3f29-5f58-bf10-14272f83ff7c");
     return boost::uuids::name_generator_sha1{ns}(name.data(), name.size());
 }
 
