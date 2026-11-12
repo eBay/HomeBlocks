@@ -570,7 +570,7 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringFetchWritesNothing) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
 }
@@ -587,7 +587,7 @@ TEST_F(CraftPreResolutionTest, TermChangedBeforeSlotWriteFreesBlocksAndStops) {
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_FALSE(journal_->has_slot(4));
     EXPECT_EQ(journal_->free_data_calls, 1);
@@ -610,7 +610,7 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) 
     auto r = do_pre_resolve(/*upto=*/5);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(journal_->has_slot(4));
     EXPECT_EQ(journal_->free_data_calls, 0);
@@ -636,7 +636,7 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringFailedAllocStopsBeforeNextClaim)
     auto r = do_pre_resolve(/*upto=*/5, /*term=*/1);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(allocs, 1); // slot 4 was never claimed
 }
 
@@ -916,7 +916,7 @@ TEST_F(CraftAppendTest, CallerTermReplacedByLoginIsRejected) {
     auto r = homeblocks::detail::sync_get(dev_->append(5, 0, /*term=*/1));
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(fetcher_.call_count, 0);
     EXPECT_TRUE(proposer_.proposed.empty());
     EXPECT_TRUE(do_append(5).has_value()); // the gate was never claimed: a current-session round proceeds
@@ -936,7 +936,7 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     auto r = do_append(5);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
 }
 
@@ -952,7 +952,24 @@ TEST_F(CraftAppendTest, TermChangeBeforeSkippedProposalFailsWithStaleTerm) {
     auto r = do_append(5);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// Pre-resolution returns normally after a failed allocation that moved the term, and the round still has a verdict
+// to propose: append() re-checks the term just before proposing and fails STALE_TERM, proposing nothing.
+TEST_F(CraftAppendTest, TermChangeBeforeProposalFailsWithStaleTerm) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .is_empty = true},
+                                                      JournalSlot{.lsn = 4, .lba_off_bytes = 10, .len_bytes = 4}}}};
+    journal_->fail_alloc = true;
+    journal_->on_alloc = [this] { dev_->seed_term(2); };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_TRUE(proposer_.proposed.empty());
 }
 
@@ -964,7 +981,7 @@ TEST_F(CraftPreResolutionTest, CallerTermReplacedByLoginIsRejected) {
     auto r = do_pre_resolve(5, /*term=*/1);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(fetcher_.call_count, 0);
     EXPECT_TRUE(dev_->is_missing(3));
 }
@@ -1337,7 +1354,7 @@ TEST_F(CraftAppendTest, ResolveWithStaleTermRejected) {
     auto r = do_resolve(5, /*term=*/2);
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(fetcher_.call_count, 0);
 }
 

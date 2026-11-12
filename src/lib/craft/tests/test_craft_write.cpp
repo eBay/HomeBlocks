@@ -18,12 +18,13 @@
 // Tests verify:
 //   - in-order writes update last_append_lsn and clear the missing set
 //   - out-of-order writes fill the missing set for gaps then clear on fill
-//   - stale-term writes are rejected with volume_error::STALE_TERM
+//   - stale-term writes are rejected with craft_error::STALE_TERM
 //
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles
 // craft_repl_dev.cpp directly (same pattern as test_craft_truncate.cpp).
 
 #include <array>
+#include <craft/status.hpp>
 #include <gtest/gtest.h>
 #include <homestore/crc.hpp>
 #include <map>
@@ -163,7 +164,9 @@ TEST_F(CraftWriteTest, TermRejection) {
     // Default state_.term == 0; writing with term=1 must fail.
     auto r = do_write(1, 0);
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    // The wire must see stale_term, not internal: craft::to_wire_status() matches on the craft_error category.
+    EXPECT_EQ(craft::to_wire_status(r.error()), craft::wire::status::stale_term);
     EXPECT_EQ(journal_->slot_count(), 0u);
     EXPECT_EQ(dev_->missing_count(), 0u);
 }
