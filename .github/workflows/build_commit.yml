@@ -78,15 +78,77 @@ jobs:
 
   UblkppDeps:
     needs: CraftClientDeps
-    uses: szmyd/ublkpp/.github/workflows/build_dependencies.yml@main
-    with:
-      branch: main
-      platform: ${{ inputs.platform }}
-      build-type: ${{ inputs.build-type }}
-      malloc-impl: ${{ inputs.malloc-impl }}
-      compiler: ${{ inputs.compiler }}
-      conan-channel: ${{ inputs.conan-channel }}
-      tooling: None
+    runs-on: ${{ inputs.platform }}
+    steps:
+      - name: Retrieve UblkPP
+        uses: actions/checkout@v4
+        with:
+          repository: szmyd/ublkpp
+          ref: main
+
+      - name: Setup Conan
+        uses: ebay/sisl/.github/actions/setup_conan2@dev/v14.x
+        with:
+          platform: ${{ inputs.platform }}
+          compiler: ${{ inputs.compiler }}
+
+      - name: Load UblkPP Cache
+        id: restore-cache
+        uses: ebay/sisl/.github/actions/load_conan2@dev/v14.x
+        with:
+          testing: 'False'
+          key_prefix: UblkPPDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.compiler }}
+
+      - name: Load Sisl Cache
+        uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
+        with:
+          testing: 'False'
+          path: import/sisl
+          key_prefix: SislDeps14-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.compiler }}
+          fail_on_cache_miss: false
+
+      - name: Retrieve Dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: eBay/sisl
+          path: import/sisl
+          ref: dev/v14.x
+
+      - name: Retrieve CraftClient
+        uses: actions/checkout@v4
+        with:
+          repository: eBay/craft_client
+          path: import/craft_client
+          ref: dev/v0.x
+
+      - name: Prepare Recipes
+        run: |
+          pushd import/sisl
+          ./prepare_v2.sh
+          conan export --user oss --channel ${{ inputs.conan-channel }} .
+          popd
+          pushd import/craft_client
+          conan export --user oss --channel ${{ inputs.conan-channel }} .
+          popd
+          ./prepare_v2.sh
+
+      - name: Build Cache
+        run: |
+          conan install \
+              -o sisl/*:malloc_impl=${{ inputs.malloc-impl }} \
+              -s:h build_type=${{ inputs.build-type }} \
+              -c tools.build:skip_test=True \
+              --format=json \
+              --build missing \
+              . > ~/build.json
+          conan list --graph ~/build.json --graph-binaries=build,cache --format=json > ~/pkglist.json
+        if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
+
+      - name: Save Conan Cache
+        uses: ebay/sisl/.github/actions/store_conan2@dev/v14.x
+        with:
+          key_prefix: UblkPPDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.compiler }}
+        if: ${{ github.event_name != 'pull_request' && steps.restore-cache.outputs.cache-hit != 'true' }}
     if: ${{ github.event_name != 'pull_request' }}
 
   HomeStoreDeps:

@@ -190,7 +190,7 @@ jobs:
       with:
         testing: 'False'
         path: import/ublkpp
-        key_prefix: UblkPPDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
+        key_prefix: UblkPPDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.compiler }}
         fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
