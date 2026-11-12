@@ -50,12 +50,13 @@ class MockCraftRaftProposer : public CraftRaftProposer {
 public:
     bool leader{true};
     uint32_t members{3};
+    craft::peer_id_t self{test_member_id(0)}; // set outside the voters to model a leader missing from its own list
     bool fail{false};
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
 
     bool is_leader() const override { return leader; }
-    craft::peer_id_t my_id() const override { return test_member_id(0); }
+    craft::peer_id_t my_id() const override { return self; }
     // Voters are test_member_id(0..members-1); members = 0 is an unknown membership. Any other id is a learner.
     std::vector< craft::peer_id_t > voters() const override {
         std::vector< craft::peer_id_t > ids;
