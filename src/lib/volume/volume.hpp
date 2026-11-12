@@ -283,9 +283,14 @@ public:
     //
     // if destroy_started_ is true, it means volume destroy has started and we should not call remove again;
     // if outstanding_reqs_ is not zero, it means there are still requests outstanding and we should not call remove;
-    // destroy_started_ will be set to true when volume destroy starts processing;
+    // destroy_started_ will be set to true when a removal claims the destroy (try_start_destroy);
     //
     bool can_remove() const { return !destroy_started_ && outstanding_reqs_.test_eq(0); }
+
+    // Claims the volume's destroy once no request is in flight: true for exactly one caller, which then runs destroy().
+    // Two removals of one volume can run at once on different workers (e.g. a GC pass and the removal that marked it
+    // DESTROYING): with can_remove() checked apart from the claim, both would destroy it.
+    bool try_start_destroy() { return outstanding_reqs_.test_eq(0) && !destroy_started_.exchange(true); }
 
     void inc_ref(uint64_t n = 1) { outstanding_reqs_.increment(n); }
     void dec_ref(uint64_t n = 1) { outstanding_reqs_.decrement(n); }

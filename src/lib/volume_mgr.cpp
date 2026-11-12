@@ -505,9 +505,22 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
 
     vol_ptr->state_change(volume_state::DESTROYING);
 
-    // if vol is already started with destroy or there is any outstanding reqs on the vol, we will not do anything
-    // on this vol and let reaper thread to handle it
-    if (vol_ptr->can_remove()) {
+    // Only the removal that claims the destroy runs it: another removal of this volume may run on another worker. One
+    // that finds requests still in flight leaves the volume to the reaper thread.
+    if (vol_ptr->try_start_destroy()) {
+#ifdef _PRERELEASE
+        // Holds this removal, its destroy claimed, so that a test can start another removal meanwhile. It resumes from
+        // a message on a worker, as it started. The flip's timer fires inside this reactor's timer callback, where the
+        // destroy deadlocks, and a message sent from there to this reactor would run inline: a thread sends it.
+        if (auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
+            iomgr_flip::instance()->delay_flip("vol_remove_delay_after_claim", [held]() {
+                std::thread([held]() {
+                    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
+                }).detach();
+            })) {
+            co_await *held;
+        }
+#endif
         // 2. do volume destroy;
         co_await vol_ptr->destroy();
 #ifdef _PRERELEASE
@@ -526,8 +539,8 @@ sisl::async::task< void > HomeBlocksImpl::do_remove_volume(volume_id_t id) {
 
         LOGINFO("volume {} ordinal={} removed successfully", vol_ptr->id_str(), vol_ptr->info()->ordinal);
     } else {
-        LOGD("volume {} is in destroying state or has outstanding requests: {}, backing off and wait for GC to "
-             "cleanup.",
+        LOGD("volume {}: another removal claimed its destroy, or it has outstanding requests: {}, backing off and "
+             "wait for GC to cleanup.",
              vol_ptr->id_str(), vol_ptr->num_outstanding_reqs());
     }
     // volume Destructor will be called after vol_ptr goes out of scope;

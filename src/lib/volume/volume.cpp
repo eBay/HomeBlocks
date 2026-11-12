@@ -261,9 +261,9 @@ void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
     craft_dev_ = std::move(dev); // published only once configured
 }
 
+// Runs once, by the removal that claimed it (try_start_destroy).
 sisl::async::task< void > volume::destroy() {
     LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
-    destroy_started_ = true;
 
     // The CRAFT device goes before the index and journal it works on: no CRAFT op runs anymore (each one counts itself
     // in flight on the volume, and the destroy starts only when none is), and its watchdog stops with it.
