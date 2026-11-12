@@ -900,7 +900,7 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
                     /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
 
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- neither the
