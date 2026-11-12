@@ -1076,6 +1076,48 @@ TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
     EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
 }
 
+// The deadline completes a pending proposal with timed_out: its outcome is unknown, not rejected.
+TEST_F(CraftRaftEntriesTest, ExpiredProposalCompletesWithTimedOut) {
+    auto const ctx = make_test_proposal_ctx();
+
+    expire_test_proposal(ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), std::make_error_condition(std::errc::timed_out));
+}
+
+// The entry commits after its deadline: it's still applied, but the proposer was already told timed_out.
+TEST_F(CraftRaftEntriesTest, CommitAfterDeadlineIsAppliedButOutcomeStaysTimedOut) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    expire_test_proposal(ctx);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(dev_->last_append_lsn(), 3); // applied all the same
+}
+
+// A deadline that fires after the commit changes nothing.
+TEST_F(CraftRaftEntriesTest, DeadlineAfterCommitIsIgnored) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    expire_test_proposal(ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+}
+
 // A ctx this backend didn't create (or none, as on a follower) is left alone.
 TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
     auto const foreign = intrusive< homestore::repl_req_ctx >{new homestore::repl_req_ctx()};
