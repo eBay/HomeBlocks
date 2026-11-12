@@ -105,19 +105,23 @@ struct LoginResult {
     std::vector<replica_endpoint> members;
     int64_t            dLSN;         // starting (per-partition) LSN for new IO
     uint64_t           term;         // 0 == NOT_LEADER redirect; >0 == session term
-    uint32_t           lba_size;     // block size in bytes: client aligns addr/len to it
+    uint32_t           lba_size;     // block size in bytes (the volume's page_size): client aligns addr/len to it
+    uint64_t           capacity;     // volume size in bytes (the volume's size_bytes): the device's size
+    uint32_t           max_tx;       // largest single IO payload in bytes; every member must accept it
     boost::uuids::uuid leader_hint;  // non-nil iff redirect (term==0); retry login there
 };
 
 async_result<LoginResult> login(volume_handle const& vol, uint64_t client_token);
 ```
 
-Orchestrates the full login sequence (GetRSCommitLSN broadcast → optional FetchData →
-`SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both RAFT entries commit. **A follower
+Orchestrates the full login sequence (GetRSCommitLSN broadcast → pre-resolution (FetchData / `Empty`
+verdicts) → `SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both entries have applied on
+the leader. **A follower
 returns LoginResult with `term==0` and `leader_hint` set to the current leader's id (not an error)**;
 the client finds the matching handle by id and retries login there. `NO_QUORUM` / `REPLICA_DOWN` are
-returned as errors. Postconditions: all quorum members have `commit_lsn == rs_commit_lsn`; all reject
-IO whose `term` != the new session term.
+returned as errors. Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
+session term. Other members reach both as they apply the two entries, in the background; the client admits
+IO once a quorum accepts the new term and at least one member has `commit_lsn ≥ dLSN`.
 
 ---
 
@@ -134,8 +138,9 @@ back as a hole); non-empty `data` is a **data write** of exactly `len` bytes (si
 buffer). Both take a `dLSN` and merge by highest-`dLSN`-per-LBA. Does **not** apply to the LBA index;
 `hdr.commit_lsn` rides along and advances the contiguous commit frontier best-effort, in `dLSN` order
 (this is CRAFT's commit — piggybacked on the writes the client is already broadcasting). Rejected with
-`craft_error::STALE_TERM` if `hdr.term` != the session term, or `std::errc::invalid_argument` on
-misalignment. ACK fires on journal-append completion and **returns the achieved
+`craft_error::STALE_TERM` if `hdr.term` != the session term, or if a login quiesce is fencing its term
+(≤ the poll's T; a write already in flight when the quiesce begins still journals its slot, but is not acked), or
+`std::errc::invalid_argument` on misalignment. ACK fires on journal-append completion and **returns the achieved
 `{commit_lsn, last_append_lsn}`** — every CRAFT IO response piggybacks the watermarks, so any
 round-trip refreshes the client's per-member model (its reclaim floor and Missing-map recovery) without
 a separate `keep_alive`.
@@ -226,12 +231,18 @@ verbs and never cross the client wire, so no CRAFT server exposes them.
 ### `get_lsns` / `get_rs_commit_lsn`
 
 ```cpp
-async_result<lsn_pair> get_lsns();           // local snapshot of {commit_lsn, last_append_lsn}
-async_result<lsn_pair> get_rs_commit_lsn();  // alias; used by the login leader's GetRSCommitLSN broadcast
+struct rs_commit_lsn_reply { uint64_t term; int64_t commit_lsn; int64_t last_append_lsn; };
+
+async_result<lsn_pair> get_lsns();   // local snapshot of {commit_lsn, last_append_lsn}
+async_result<rs_commit_lsn_reply> get_rs_commit_lsn(uint64_t term, bool is_login);
 ```
 
-Peer-to-peer; not a client-facing free function. The login leader polls all replicas via
-`get_rs_commit_lsn` to compute `rs_commit_lsn = max(quorum.last_append_lsn)`.
+Peer-to-peer; not a client-facing free function. The leader polls every other member via
+`get_rs_commit_lsn` before proposing a `SyncRSCommitLSN`; at login it takes `rs_commit_lsn` as the max
+`last_append_lsn` over itself and every responder. `term` is the current session term T. With
+`is_login=true` the replica quiesces first, rejecting writes whose term is ≤ T; it fences the request's
+term rather than its own, which may lag. The reply's `term` is the replica's own session term, so the
+leader can abort with `STALE_TERM` if a responder is already past T.
 
 ### `truncate`
 
@@ -242,20 +253,22 @@ async_status truncate(int64_t lsn);
 Drop all journal entries with `dLSN > lsn` (stale prior-term tail; login truncation after
 `InternalLogin` commits).
 
-### `fetch_data` (peer resync)
+### `fetch_data` (peer)
 
 ```cpp
 async_result<std::vector<JournalSlot>> fetch_data(std::vector<int64_t> lsns);
 ```
 
-Server-to-server raw journal read during `SyncRSCommitLSN` apply. Each `JournalSlot` is one of: a data
+Server-to-server raw journal read: the leader's pre-resolution fetches unresolved slots from every member
+before it proposes a `SyncRSCommitLSN`, and a lagging replica fetches its missing slots while applying one.
+Each `JournalSlot` is one of: a data
 slot, a zero write (`all_zeros=true`, no data), or `Empty` (`is_empty=true`); a requested LSN absent
 from the result means not-present-here.
 
 ### RAFT state machine entries
 
 `SyncRSCommitLSN { rs_commit_lsn, client_token, empty_slots[] }` and
-`InternalLogin { client_token, term }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
+`InternalLogin { client_token, term, rs_commit_lsn }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
 (unchanged by the client-surface reshaping above). `CreateVolume { version, id, size, page_size, members[], name }`
 is a partition's first entry, applied by the volume layer (below); an entry of another `version` is rejected.
 
