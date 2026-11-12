@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,6 +91,10 @@ struct JournalSlot {
 // One replica-set member's fetch_data-shaped reply to a pre-resolution broadcast (S5 / SDSTOR-22907).
 // Reuses JournalSlot's existing four-way per-LSN contract (is_empty / present+data / present+zero /
 // omitted-not-held-here) as-is.
+//
+// TODO(S7): carries no peer id, nor do poll_quorum_lsns()'s replies, so a duplicate reply, self or a learner
+// counts toward quorum like a distinct voter. Tag replies with the member, drop duplicates and self, and fail
+// closed if member_count() < 1 (quorum_size() would be 1).
 struct QuorumSlotResponse {
     std::vector< JournalSlot > slots;
 };
@@ -162,14 +167,48 @@ public:
     // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                   uint32_t timeout_ms) = 0;
-    // Broadcasts fetch_data(lsns) to every responding replica-set member; a non-responding member is
-    // simply absent from the result. Deliberately no replica-set-size/majority-count method: the
-    // contract is "trust whichever subset of members responded" -- there is no replica-set
-    // membership concept anywhere in this backend yet (S8/S9/S10 territory).
+    // Broadcasts fetch_data(lsns) to every OTHER responding replica-set member; a non-responding member
+    // is simply absent from the result. Whether the responders amount to a quorum is the caller's
+    // judgement, made against CraftRaftProposer::member_count() -- this interface only transports.
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
+    // Broadcasts GetRSCommitLSN(term, is_login) to every OTHER replica-set member and returns each
+    // responder's {commit_lsn, last_append_lsn}; a non-responding member is absent from the result. Used
+    // by the watchdog trigger (is_login=false, never quiesces) and, once S7 lands, by login (is_login=true).
+    virtual async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t term, bool is_login,
+                                                                            uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
+
+// ─── CraftRaftProposer ────────────────────────────────────────────────────────
+//
+// Abstraction over this partition's RAFT group (a HomeStore repl_dev in production): leadership,
+// membership, and proposing the CRAFT control-plane entries. Injected into CraftReplDev so unit tests
+// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. Production
+// passes make_homestore_raft_proposer()'s result; wiring it to a volume's repl_dev is S8's job. Default
+// (null) leaves every leader-only path failing closed.
+
+class CraftRaftProposer {
+public:
+    virtual bool is_leader() const = 0;
+    // Voting replica-set size, including this member -- the denominator of every quorum decision here.
+    virtual uint32_t member_count() const = 0;
+    // Proposes a key-only RAFT entry (no data payload). Completes once the entry has committed and been
+    // dispatched to this member's CraftRaftListener::on_commit, or with an error if replication fails.
+    virtual async_status propose(sisl::blob header, sisl::blob key) = 0;
+    virtual ~CraftRaftProposer() = default;
+};
+
+// Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
+// what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd);
+
+#ifdef _PRERELEASE
+// Test seam for proposal completion: the same ctx make_homestore_raft_proposer() hands HomeStore, and its
+// outcome once CraftRaftListener has completed it (nullopt while pending). Single-shot: takes the outcome.
+intrusive< homestore::repl_req_ctx > make_test_proposal_ctx();
+std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_req_ctx > const& ctx);
+#endif
 
 // ─── checkpoint_trigger_fn_t ──────────────────────────────────────────────────
 //
@@ -297,10 +336,10 @@ public:
     // unused until S9 needs them (matches craft_client's own reference implementation today).
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
 
-    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn;
-    // prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back write -- leaving it
-    // would let a later read serve stale data from a write that no longer exists in the journal). Called
-    // only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
+    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn and
+    // the periodic-sync baseline; prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back
+    // write -- leaving it would let a later read serve stale data from a write that no longer exists in the
+    // journal). Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
     // FIXME(S4/S7): before dropping entries here, force a completed checkpoint --
     // co_await checkpoint_trigger_(true). Once entries above/below lsn are gone, the journal is
     // no longer a durable record of them; if HomeStore's checkpoint has only been requested and not yet
@@ -308,8 +347,15 @@ public:
     // identical problem and force-flushes before removing its superblock for exactly this reason.
     async_status truncate(int64_t lsn);
 
-    // Propose a SyncRSCommitLSN RAFT entry (called by watchdog or leader during login).
-    async_status append(int64_t sync_to, uint64_t client_token);
+    // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The single proposer
+    // behind every trigger: periodic, watchdog , client-requested,
+    // and login. Runs pre_resolve_slots(sync_to) first and never proposes
+    // past a slot it could not resolve -- the proposed watermark is clamped to just below the first one,
+    // and that achieved watermark is what comes back as resolved_upto, alongside every Empty verdict
+    // <= it (earlier rounds' included). At most one append() runs at a time.
+    // term is the session term the caller validated; the round runs only within that session and fails
+    // with STALE_TERM if InternalLogin has moved state_.term past it.
+    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token, uint64_t term);
 
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
@@ -370,6 +416,9 @@ public:
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
+    // Wires this partition's RAFT group (leadership, membership, proposing). Wired by S8; tests inject a mock.
+    void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
+
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
     void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
@@ -396,6 +445,8 @@ public:
     void seed_empty(std::initializer_list< int64_t > empty);
     // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
     void seed_term(uint64_t term);
+    // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
+    void seed_in_flight(int64_t lsn);
     // Exposes the RAFT listener so tests can drive on_commit() directly -- raft_listener_ has no other
     // accessor (production wiring into HomeStore's repl_dev happens elsewhere).
     homestore::repl_dev_listener& test_listener() { return raft_listener_; }
@@ -413,9 +464,31 @@ public:
     async_result< craft::read_result > read_with(int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest,
                                                  read_index_fn_t read_fn);
 
-    // Test-only observability for the watchdog: append() is still a stub with no other observable
-    // side effect, so this is how a test confirms on_watchdog_tick() actually fired.
+    // Test-only observability for the watchdog: counts ticks that found the session stale, on any member
+    // (counted before the leader check, so it's independent of whether a CraftRaftProposer is wired).
     int watchdog_fire_count() const { return watchdog_fire_count_; }
+
+    // Cancels the watchdog and waits for any in-progress tick to finish (the same cancel the destructor
+    // does). A tick holds its own reference to the device, so tests call this before dropping theirs.
+    void stop_watchdog() { watchdog_token_.cancel(/* wait = */ true); }
+
+    // Overrides the periodic SyncRSCommitLSN cadence read from sync_rs_commit_lsn_interval at construction.
+    void set_sync_lsn_interval(int64_t n) { sync_lsn_interval_ = n; }
+
+    // Overrides the missing_lsns_ capacity, so tests can reach it without millions of entries.
+    void set_max_missing_lsns(size_t n) { max_missing_lsns_ = n; }
+
+    // Highest watermark a committed append() proposed, or -1.
+    int64_t last_proposed_sync_lsn() const {
+        std::lock_guard lk{state_mu_};
+        return last_proposed_sync_lsn_;
+    }
+
+    // Highest commit_lsn the current session has piggybacked, or -1.
+    int64_t client_commit_lsn() const {
+        std::lock_guard lk{state_mu_};
+        return client_commit_lsn_;
+    }
 
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
@@ -432,12 +505,12 @@ public:
 
     // Test-only observability for the SDSTOR-22905 restart-recovery gate (see recovering_'s doc
     // comment): true from the moment on_restart() fires until run_recovery()'s rebuild_overlay() call
-    // completes successfully (see is_recovery_faulted() for the failure outcome instead).
+    // completes successfully (see is_faulted() for the failure outcome instead).
     bool is_recovering() const { return recovering_.load(std::memory_order_acquire); }
 
-    // Test-only observability for recovery_faulted_: true if a restart's rebuild_overlay() ever failed,
-    // permanently. Never transitions back to false.
-    bool is_recovery_faulted() const { return recovery_faulted_.load(std::memory_order_acquire); }
+    // Test-only observability for faulted_: true once the partition is permanently faulted. Never
+    // transitions back to false.
+    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
 #endif
 
 private:
@@ -455,13 +528,15 @@ private:
                        std::vector< homestore::multi_blk_id > const& blkids,
                        cintrusive< homestore::repl_req_ctx >& ctx) override;
 
+        // Fails this member's own pending proposal (see make_homestore_raft_proposer()).
+        void on_error(homestore::ReplServiceError err, const sisl::blob& header, const sisl::blob& key,
+                      cintrusive< homestore::repl_req_ctx >& ctx) override;
+
         // ── no-ops ────────────────────────────────────────────────────────
         bool on_pre_commit(int64_t, const sisl::blob&, const sisl::blob&,
                            cintrusive< homestore::repl_req_ctx >&) override {
             return true;
         }
-        void on_error(homestore::ReplServiceError, const sisl::blob&, const sisl::blob&,
-                      cintrusive< homestore::repl_req_ctx >&) override {}
         homestore::result< homestore::blk_alloc_hints >
         get_blk_alloc_hints(sisl::blob const&, uint32_t, cintrusive< homestore::repl_req_ctx >&) override {
             return homestore::blk_alloc_hints{};
@@ -474,8 +549,8 @@ private:
         void on_clean_replace_member_task(const std::string&, const homestore::replica_member_info&,
                                           const homestore::replica_member_info&, homestore::trace_id_t) override {}
         void on_remove_member(const homestore::replica_id_t&, homestore::trace_id_t) override {}
-        void on_rollback(int64_t, const sisl::blob&, const sisl::blob&,
-                         cintrusive< homestore::repl_req_ctx >&) override {}
+        void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                         cintrusive< homestore::repl_req_ctx >& ctx) override;
         // Fires rebuild_overlay() fire-and-forget (defined out-of-line in the .cpp -- needs
         // coro_helpers.hpp's detail::detach, which this header does not include).
         void on_restart() override;
@@ -510,17 +585,38 @@ private:
     // a slot some responding member has real data for is written into this leader's own journal so it can
     // also correctly serve fetch_data() to others.
     //
-    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited). A slot whose local
-    // journal write fails after a successful quorum fetch is left out of both the return value and
-    // missing_lsns_/empty_lsns_ (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's own
-    // catch-up). The caller (append()/request_resolution(), SDSTOR-22908) must treat "still missing" as
-    // "not yet safe to propose past this slot", independent of whether the overall async_result succeeded.
+    // A fresh Empty verdict needs quorum-lacks evidence: this leader plus enough valid responders to make
+    // quorum_size(). An Empty inherited from a responder's prior verdict needs no count.
     //
-    // Fails closed (no partial resolution) if peer_fetcher_ is unset or the broadcast itself fails
-    // outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a replica's own
-    // best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an inability to
-    // consult the quorum at all must surface as an error, never be silently swallowed.
-    async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
+    // Returns the slots <= upto now verdicted Empty (freshly minted or inherited), and the ones left
+    // unresolved: too few responders to mint Empty, or a local journal write that failed after the
+    // fetch. append() never proposes past the first unresolved slot.
+    //
+    // Fails closed (no partial resolution) if peer_fetcher_ / raft_proposer_ is unset or the broadcast
+    // itself fails outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a
+    // replica's own best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an
+    // inability to consult the quorum at all must surface as an error, never be silently swallowed.
+    // Leadership and term are re-checked once the fetch returns, before any local write: NOT_LEADER /
+    // STALE_TERM with nothing mutated if either changed during the await.
+    struct PreResolution {
+        std::vector< int64_t > empty_slots;
+        std::vector< int64_t > unresolved;
+    };
+    // term: the session the round belongs to (STALE_TERM if state_.term differs, at entry or later).
+    async_result< PreResolution > pre_resolve_slots(int64_t upto, uint64_t term);
+
+    // Majority of member_count(). Requires raft_proposer_.
+    uint32_t quorum_size() const { return raft_proposer_->member_count() / 2 + 1; }
+
+    // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
+    // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
+    // on_watchdog_tick().
+    async_status watchdog_sync();
+
+    // Periodic trigger: every sync_lsn_interval_ appended LSNs, detaches
+    // append(min(last_append_lsn, client_commit_lsn_)) if that's past what was last proposed.
+    // Leader-only; called from write()'s post-flight.
+    void maybe_trigger_periodic_sync();
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
     // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
@@ -577,6 +673,34 @@ private:
     void populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlbas, bool all_zeros,
                           homestore::multi_blk_id const& blkid, std::vector< homestore::csum_t > const& csums);
 
+    // populate_overlay() for one journaled slot. blkid is this replica's own block reference for it (a fetched slot's
+    // blkid is the peer's). A slot shorter than a page is a malformed record: logged, no entry.
+    void populate_overlay_from_slot(int64_t lsn, JournalSlot const& slot, homestore::multi_blk_id const& blkid);
+
+    // Retires the overlay entry for each LBA in [start_lba, end_lba] whose recorded lsn equals retiring_lsn.
+    // A higher-dLSN entry for the same LBA (a later append not yet committed) survives. Used when commit applies
+    // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.
+    void retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn);
+
+    // Claims lsn for one journal write, so pre-resolution, apply catch-up and write() never journal the same slot
+    // (H1). in_flight: another write is outstanding; held: the slot is already journaled or Empty. Caller holds
+    // state_mu_; a claim is released by a SlotWriteClaim.
+    enum class SlotClaim { claimed, in_flight, held };
+    SlotClaim claim_slot_write_locked(int64_t lsn);
+    // What claim_slot_write_locked() would return, without claiming (claimed: free to claim). Caller holds state_mu_.
+    SlotClaim peek_slot_write_locked(int64_t lsn) const;
+    // True if journaling lsn would open a new gap while missing_lsns_ is at capacity. Filling a gap, or appending
+    // right after the frontier, is always allowed so the set can drain. Caller holds state_mu_.
+    bool missing_at_capacity_locked(int64_t lsn) const;
+    struct SlotWriteClaim {
+        CraftReplDev* dev;
+        int64_t lsn;
+        ~SlotWriteClaim() {
+            std::lock_guard lk{dev->state_mu_};
+            dev->in_flight_write_dlsns_.erase(lsn);
+        }
+    };
+
     // Records write()/keep_alive() activity and, on the first call after login, arms the watchdog's
     // recurring iomgr timer (iomgr::timer_token) that periodically checks for staleness -- see
     // on_watchdog_tick()'s doc comment for the full design and why a RECURRING timer (as opposed to
@@ -595,7 +719,7 @@ private:
 
     // Awaits rebuild_overlay() to completion. On SUCCESS, clears recovering_ so the volume resumes
     // accepting client I/O against a now-complete overlay. On FAILURE, does NOT clear recovering_ --
-    // instead sets recovery_faulted_ (checked ahead of recovering_ by every client-facing entry point),
+    // instead sets faulted_ (checked ahead of recovering_ by every client-facing entry point),
     // permanently rejecting I/O rather than resuming against a silently incomplete overlay. This is the
     // coroutine CraftRaftListener::on_restart() detaches, rather than detaching rebuild_overlay()
     // directly, specifically so this outcome-dependent branching has somewhere to live.
@@ -610,13 +734,17 @@ private:
     // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
     // insert one LSN at a time under state_mu_, which is O(gap width) instead of O(log ranges).
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
+    size_t max_missing_lsns_{2'000'000};       // see missing_at_capacity_locked(); overridden only by tests
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
-    // dlsns currently between "claimed as non-idempotent" and "write_slot has completed" in write() --
-    // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
+    // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
+    // to commit_lsn when the run ends. Guarded by state_mu_.
+    int64_t indexing_lsn_{-1};
+    // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
+    // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
-                                  // in_flight_write_dlsns_, and last_checkpoint_lsn_
+                                  // in_flight_write_dlsns_, last_checkpoint_lsn_, and client_commit_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
@@ -642,12 +770,25 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
-    std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
+    // TODO(S8): raw pointers the device doesn't own, yet background work (append, pre-resolution, the watchdog,
+    // apply catch-up) uses them after awaits while holding only the device. Whoever wires them must make them
+    // outlive every round, e.g. by giving the device ownership (shared_ptr setters).
+    CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
+    std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
+    std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
+    int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
+    int64_t applied_sync_lsn_{-1};       // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)
+    int64_t last_periodic_sync_lsn_{-1}; // last_append_lsn at the last periodic trigger (guarded by state_mu_)
+    // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
+    // resolved prefix, so nothing at or below it is still in flight.
+    // Reset when InternalLogin starts a new session. Guarded by state_mu_.
+    int64_t client_commit_lsn_{-1};
+    int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
-    // ONLY on a successful rebuild_overlay() (see recovery_faulted_ below for the failure path) --
+    // ONLY on a successful rebuild_overlay() (see faulted_ below for the failure path) --
     // write()/read()/keep_alive() all reject with volume_error::OFFLINE while this is set, per
     // SDSTOR-22905: the overlay must be fully rebuilt before the volume accepts new client I/O.
     //
@@ -669,14 +810,17 @@ private:
     // writers, and HomeStore's OWN calling contract (not a runtime property of this class) is what
     // ensures they run as one complete cycle before any next one -- see run_recovery()'s comment.
     std::atomic< bool > recovering_{false};
-    // Set (never cleared) by run_recovery() if rebuild_overlay() fails -- a failed rebuild leaves
-    // overlay_ silently INCOMPLETE (some LSNs applied, then it bailed), so resuming client I/O against
-    // it (as recovering_ alone clearing would do) could serve stale pre-write data with no error at
-    // all. write()/read()/keep_alive() check this FIRST, ahead of recovering_, and reject with
-    // volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
-    // data corruption. There is deliberately no self-recovery path: an operator (or a future re-sync-
-    // from-peer mechanism) must intervene.
-    std::atomic< bool > recovery_faulted_{false};
+    // Set (never cleared) when this partition can no longer serve correct data:
+    //   - run_recovery(), if rebuild_overlay() fails: overlay_ is silently INCOMPLETE (some LSNs applied,
+    //     then it bailed), so resuming client I/O could serve stale pre-write data with no error at all;
+    //   - apply_sync_rs_commit_lsn(), if an Empty verdict names a slot already applied to the index, or one
+    //     commit_impl() is indexing: freeing it would leave the index pointing at free blocks.
+    // write()/read()/keep_alive()/request_resolution() check this FIRST, ahead of recovering_, and reject
+    // with volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
+    // data corruption. fetch_data()/get_rs_commit_lsn() reject too, so peers treat it as down, and append()
+    // and the watchdog stop proposing. There is deliberately no self-recovery path: an operator (or a future
+    // re-sync-from-peer mechanism) must intervene.
+    std::atomic< bool > faulted_{false};
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()

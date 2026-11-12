@@ -75,6 +75,7 @@ public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
     int free_data_calls{0};
+    std::function< void(int64_t) > on_write; // runs inside write_slot, to apply an Empty verdict mid-write
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -83,6 +84,7 @@ public:
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
+        if (on_write) on_write(lsn);
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] =
@@ -134,6 +136,10 @@ public:
     // Not exercised by this file -- pre_resolve_slots's quorum broadcast is covered by
     // test_craft_pre_resolution.cpp's own mock.
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+
+    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
@@ -281,6 +287,90 @@ TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataFreesBlock) {
     EXPECT_EQ(journal_->free_data_calls, 1);
 }
 
+// A verdict for a slot this replica already applied (<= commit_lsn) must not free its blocks: the index still
+// points at them. Apply refuses and faults the partition instead (C3).
+TEST_F(CraftRaftEntriesTest, EmptySlotAtOrBelowCommitLsnFaultsInsteadOfFreeing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
+// A slot commit_impl() has started indexing is covered too, though commit_lsn only moves when the run ends: a
+// verdict landing mid-run must fault, not free blocks the index references (F).
+TEST_F(CraftRaftEntriesTest, EmptySlotBeingIndexedFaultsInsteadOfFreeing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(2);
+    journal_->slots[3] = JournalSlot{.lsn = 3,
+                                     .lba_off_bytes = 0,
+                                     .len_bytes = k_page_size,
+                                     .blkid = homestore::multi_blk_id{500, 1, 1},
+                                     .csums = {7}};
+
+    std::optional< status > apply_r;
+    auto c = homeblocks::detail::sync_get(dev_->commit_with(
+        3,
+        [&](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status {
+            // lsn 3 is being indexed; commit_lsn is still 2.
+            apply_r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+            return ok();
+        },
+        [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); }));
+
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(*c, 3);
+    ASSERT_TRUE(apply_r.has_value());
+    ASSERT_FALSE(apply_r->has_value());
+    EXPECT_EQ(apply_r->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
+// Once faulted, the partition stops answering peers and stops proposing: its slots and watermarks no longer
+// match the replica set's.
+TEST_F(CraftRaftEntriesTest, FaultedPartitionStopsAnsweringPeersAndProposing) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+    ASSERT_FALSE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    ASSERT_TRUE(dev_->is_faulted());
+
+    auto const faulted = make_error_condition(volume_error::INTERNAL_ERROR);
+    auto fetched = homeblocks::detail::sync_get(dev_->fetch_data({3}));
+    ASSERT_FALSE(fetched.has_value());
+    EXPECT_EQ(fetched.error(), faulted);
+    auto polled = homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/false));
+    ASSERT_FALSE(polled.has_value());
+    EXPECT_EQ(polled.error(), faulted);
+    auto appended = homeblocks::detail::sync_get(dev_->append(/*sync_to=*/5, /*client_token=*/0, dev_->term()));
+    ASSERT_FALSE(appended.has_value());
+    EXPECT_EQ(appended.error(), faulted);
+}
+
+// Freeing an Empty slot's blocks also retires its overlay entry: apply moves commit_lsn past the slot directly,
+// so commit never visits it to retire the entry, and reads would keep serving the slot (C3).
+TEST_F(CraftRaftEntriesTest, EmptySlotOverLocalDataRetiresOverlay) {
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/5 * k_page_size, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+    ASSERT_TRUE(w.has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(5), 0);
+
+    auto r = do_apply(/*rs_commit_lsn=*/0, /*client_token=*/0, /*empty_slots=*/{0});
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    EXPECT_EQ(dev_->overlay_lsn_for(5), -1);
+}
+
 // Double-free guard: an lsn already verdicted Empty by a prior apply must not be re-freed if it
 // appears again in a later (redundant/overlapping) SyncRSCommitLSN's empty_slots -- nothing in the
 // protocol strictly forbids this, and re-adding it here would double-free the same blkid.
@@ -377,6 +467,57 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
     EXPECT_FALSE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_EQ(dev_->last_append_lsn(), 2);
+}
+
+// Catch-up leaves a slot whose write() is still in flight to that write, rather than journaling a peer's copy
+// alongside it (H1).
+TEST_F(CraftRaftEntriesTest, CatchUpSkipsSlotWithWriteInFlight) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    dev_->seed_in_flight(3);
+    fetcher_.response = {JournalSlot{.lsn = 3, .lba_off_bytes = 10, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+}
+
+// A slot catch-up fills above one still missing gets an overlay entry: commit stops at the hole, so the overlay
+// is the only place a read can find it (E/Q).
+TEST_F(CraftRaftEntriesTest, CatchUpFilledSlotAboveHoleIsInOverlay) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3, 5});
+    fetcher_.response = {
+        JournalSlot{.lsn = 5, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(dev_->overlay_lsn_for(2), 5);
+}
+
+// Same race in catch-up: an Empty verdict applied during the fill's journal write leaves the fill void.
+TEST_F(CraftRaftEntriesTest, CatchUpFillVoidedByEmptyDuringWriteIsNotPublished) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {JournalSlot{.lsn = 3, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size},
+                         JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}};
+    // Each slot is voted Empty while its own write is in flight.
+    journal_->on_write = [this](int64_t lsn) {
+        if (lsn == 3) dev_->seed_empty({3});
+        if (lsn == 4) dev_->seed_empty({3, 4});
+    };
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // slot 3 was never published
+    EXPECT_EQ(journal_->free_data_calls, 1); // slot 4's blocks were freed
 }
 
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_data verbatim.
@@ -777,6 +918,92 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// ── proposal completion (make_homestore_raft_proposer's ctx) ──────────────────
+
+TEST_F(CraftRaftEntriesTest, OnCommitCompletesOwnProposalOk) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->last_append_lsn(), 3); // and it was applied
+}
+
+TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
+    std::vector< uint8_t > empty_header;
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_commit(1, as_blob(empty_header), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+}
+
+TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::NOT_LEADER, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+TEST_F(CraftRaftEntriesTest, OnErrorOtherFailsProposalWithInternalError) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+TEST_F(CraftRaftEntriesTest, OnRollbackFailsProposalWithNotLeader) {
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_rollback(1, {}, {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+// value_awaitable must complete exactly once: a later report for the same proposal is dropped.
+TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->test_listener().on_rollback(1, {}, {}, ctx);
+    dev_->test_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+// A ctx this backend didn't create (or none, as on a follower) is left alone.
+TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
+    auto const foreign = intrusive< homestore::repl_req_ctx >{new homestore::repl_req_ctx()};
+
+    dev_->test_listener().on_error(homestore::ReplServiceError::TIMEOUT, {}, {}, foreign);
+    dev_->test_listener().on_rollback(1, {}, {}, foreign);
+
+    EXPECT_FALSE(take_test_proposal_outcome(foreign).has_value());
 }
 
 } // namespace
