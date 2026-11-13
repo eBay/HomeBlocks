@@ -559,7 +559,7 @@ private:
     public:
         explicit CraftRaftListener(CraftReplDev* owner) : owner_{owner} {}
 
-        // Dispatches on entry type; the real work is in the two apply_* helpers below.
+        // Validates the entry and queues it on the device's apply queue (see PendingApply).
         void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                        std::vector< homestore::multi_blk_id > const& blkids,
                        cintrusive< homestore::repl_req_ctx >& ctx) override;
@@ -655,6 +655,7 @@ private:
     // ── RAFT apply queue ──
     // Committed entries apply one at a time, in log order, each fully (catch-up included) before the next starts:
     // on_commit() only validates and queues. The drainer starts inline in on_commit() and runs until the queue empties.
+    // The queue is unbounded: on a follower whose catch-up keeps timing out, later entries pile up behind it.
     struct PendingApply {
         int64_t lsn{-1};
         CraftEntryType type{};

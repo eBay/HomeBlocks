@@ -2066,7 +2066,18 @@ std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
 async_status CraftReplDev::drain_apply() {
     auto self = shared_from_this(); // holds the device across every apply's co_awaits
     while (auto entry = next_apply()) {
-        auto outcome = co_await apply_one(*entry);
+        // An escaping exception would end the drainer with apply_running_ still set: the queue would never drain
+        // again, and stop_apply() would never return.
+        status outcome;
+        try {
+            outcome = co_await apply_one(*entry);
+        } catch (std::exception const& e) {
+            LOGE("apply lsn={} threw: {}", entry->lsn, e.what());
+            outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        } catch (...) {
+            LOGE("apply lsn={} threw an unknown exception", entry->lsn);
+            outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
         if (!outcome) LOGW("apply lsn={} failed: {}", entry->lsn, outcome.error().message());
         complete_proposal(entry->ctx, std::move(outcome));
     }

@@ -127,6 +127,7 @@ public:
     // When set, the next fetch_data() waits for fetch_gate before replying: an apply suspended mid-catch-up.
     bool hold_fetch{false};
     sisl::async::value_awaitable< bool > fetch_gate;
+    bool should_throw{false}; // fetch_data() throws, as a transport bug might
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
         co_return craft::lsn_pair{};
@@ -137,6 +138,7 @@ public:
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
         if (std::exchange(hold_fetch, false)) co_await fetch_gate;
+        if (should_throw) throw std::runtime_error("fetch_data threw");
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
@@ -1030,6 +1032,61 @@ TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
     ASSERT_TRUE(outcome.has_value());
     ASSERT_FALSE(outcome->has_value());
     EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+}
+
+// The proposal completes with its apply's outcome, not just "dispatched": an entry that parses but whose apply rejects
+// it (a verdict past its own watermark) fails the proposal.
+TEST_F(CraftRaftEntriesTest, OnCommitApplyRejectionFailsProposal) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{5});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // nothing applied
+}
+
+// An apply that faults the partition (a verdict for a slot already in the index) fails the proposal too.
+TEST_F(CraftRaftEntriesTest, OnCommitApplyFaultFailsProposal) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
+// An exception escaping an apply fails that entry's proposal, and the queue keeps applying the entries after it.
+TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.should_throw = true; // the Sync's catch-up of slots 3..5 throws
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const sync_ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {});
+
+    auto const outcome = take_test_proposal_outcome(sync_ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ(dev_->term(), 5u); // not wedged: the login behind it applied
 }
 
 TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
