@@ -455,10 +455,52 @@ void expire_proposal(cintrusive< homestore::repl_req_ctx >& ctx) {
     complete_proposal(ctx, std::unexpected(std::make_error_condition(std::errc::timed_out)));
 }
 
+// True once ctx has an outcome, or if it isn't one of ours (nothing to expire).
+bool proposal_completed(cintrusive< homestore::repl_req_ctx >& ctx) {
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    return p == nullptr || p->completed_.load(std::memory_order_acquire);
+}
+} // namespace
+
+void ProposalDeadlines::add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline) {
+    std::lock_guard lk{mu_};
+    pending_.emplace_back(std::move(ctx), deadline);
+}
+
+void ProposalDeadlines::sweep(clock::time_point now) {
+    std::vector< intrusive< homestore::repl_req_ctx > > expired;
+    {
+        std::lock_guard lk{mu_};
+        std::erase_if(pending_, [&](auto const& entry) {
+            if (proposal_completed(entry.first)) return true;
+            if (entry.second > now) return false;
+            expired.push_back(entry.first);
+            return true;
+        });
+    }
+    // Outside the lock: completing resumes the proposer's caller, which may propose again.
+    for (auto const& ctx : expired)
+        expire_proposal(ctx);
+}
+
+size_t ProposalDeadlines::pending() const {
+    std::lock_guard lk{mu_};
+    return pending_.size();
+}
+
+namespace {
+// How often a proposer sweeps its deadlines: a deadline fires up to this late.
+constexpr auto k_deadline_sweep_interval = std::chrono::seconds{1};
+
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
     HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
-            rd_{std::move(rd)}, my_id_{replica_id} {}
+            rd_{std::move(rd)}, my_id_{replica_id} {
+        sweep_timer_ = iomgr::schedule_recurring(k_deadline_sweep_interval, iomgr::reactor_regex::all_worker,
+                                                 [this] { deadlines_.sweep(ProposalDeadlines::clock::now()); });
+    }
+    // Waits out a sweep in progress, which reads deadlines_.
+    ~HomeStoreCraftRaftProposer() override { sweep_timer_.cancel(/* wait = */ true); }
 
     bool is_leader() const override { return rd_->is_leader(); }
     craft::peer_id_t my_id() const override { return my_id_; }
@@ -472,25 +514,25 @@ public:
     }
 
     // Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs() skips the proposer), so a
-    // leader without quorum would wait out the outage: the deadline completes it with timed_out instead, and the
-    // caller resumes on an iomgr worker, inside the timer's callback. An iomgr one-shot can't be cancelled, so the
-    // timer keeps ctx alive until it fires, even after the proposal completes.
+    // leader without quorum would wait out the outage: the deadline sweep completes it with timed_out instead, and
+    // the caller then resumes on an iomgr worker, inside the sweep.
     async_status propose(sisl::blob header, sisl::blob key) override {
         auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
         ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
         ctx->key.assign(key.cbytes(), key.cbytes() + key.size());
+        if (auto const ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms); ms > 0)
+            deadlines_.add(ctx, ProposalDeadlines::clock::now() + std::chrono::milliseconds{ms});
         rd_->async_alloc_write(sisl::blob{ctx->header.data(), static_cast< uint32_t >(ctx->header.size())},
                                sisl::blob{ctx->key.data(), static_cast< uint32_t >(ctx->key.size())},
                                sisl::sg_list{} /* key-only entry */, ctx);
-        if (auto const ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms); ms > 0)
-            iomgr::schedule_oneshot(std::chrono::milliseconds{ms}, iomgr::reactor_regex::random_worker,
-                                    [ctx] { expire_proposal(ctx); });
         co_return co_await ctx->promise_;
     }
 
 private:
     shared< homestore::repl_dev > rd_;
     craft::peer_id_t my_id_;
+    ProposalDeadlines deadlines_;
+    iomgr::timer_token sweep_timer_;
 };
 } // namespace
 
@@ -509,8 +551,6 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
     if (p == nullptr || !p->promise_.await_ready()) return std::nullopt;
     return p->promise_.await_resume();
 }
-
-void expire_test_proposal(intrusive< homestore::repl_req_ctx > const& ctx) { expire_proposal(ctx); }
 #endif
 
 // ─── constructor ──────────────────────────────────────────────────────────────
