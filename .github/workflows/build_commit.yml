@@ -78,7 +78,7 @@ jobs:
 
   UblkppDeps:
     needs: CraftClientDeps
-    uses: szmyd/ublkpp/.github/workflows/build_dependencies.yml@main
+    uses: eBay/ublkpp/.github/workflows/build_dependencies.yml@main
     with:
       branch: main
       platform: ${{ inputs.platform }}

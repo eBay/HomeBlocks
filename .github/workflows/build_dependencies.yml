@@ -214,7 +214,7 @@ jobs:
     - name: Retrieve Dependencies
       uses: actions/checkout@v4
       with:
-        repository: szmyd/ublkpp
+        repository: eBay/ublkpp
         path: import/ublkpp
         ref: main
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
