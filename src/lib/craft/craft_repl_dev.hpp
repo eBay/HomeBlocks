@@ -18,10 +18,12 @@
 #include "craft_raft_entries.hpp"
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
-#include <iomgr/timer.hpp> // iomgr::timer_token -- RAII recurring timer used by the watchdog
+#include <iomgr/timer.hpp>                // iomgr::timer_token -- RAII recurring timer used by the watchdog
+#include <sisl/async/value_awaitable.hpp> // stop_apply() waits for the apply queue to go idle
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -466,6 +468,11 @@ public:
     // this device exists) forwards to it.
     homestore::repl_dev_listener& raft_listener() { return raft_listener_; }
 
+    // Stops applying committed RAFT entries: waits out the one being applied, and fails the queued ones and any that
+    // commit later with operation_canceled, unapplied. volume::destroy() calls it (once) before tearing down the index
+    // and journal the applies use.
+    async_status stop_apply();
+
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
@@ -645,9 +652,31 @@ private:
     // Leader-only; called from write()'s post-flight.
     void maybe_trigger_periodic_sync();
 
-    // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
-    // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
-    // fetch + journal writes.
+    // ── RAFT apply queue ──
+    // Committed entries apply one at a time, in log order, each fully (catch-up included) before the next starts:
+    // on_commit() only validates and queues. The drainer starts inline in on_commit() and runs until the queue empties.
+    struct PendingApply {
+        int64_t lsn{-1};
+        CraftEntryType type{};
+        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
+        uint64_t client_token{0};
+        std::vector< int64_t > empty_slots{};       // SyncRSCommitLSN
+        uint64_t term{0};                           // InternalLogin
+        intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
+    };
+    void enqueue_apply(PendingApply entry);
+    std::optional< PendingApply > next_apply();
+    async_status drain_apply();
+    async_status apply_one(PendingApply const& entry);
+
+    std::mutex apply_mu_;
+    std::deque< PendingApply > apply_queue_; // guarded by apply_mu_
+    bool apply_running_{false};              // guarded by apply_mu_: a drainer is active
+    bool apply_stopped_{false};              // guarded by apply_mu_
+    bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
+    sisl::async::value_awaitable< bool > apply_idle_;
+
+    // The two entries' applies, run by the apply queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
     void apply_internal_login(uint64_t client_token, uint64_t term);

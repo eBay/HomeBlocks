@@ -1972,76 +1972,134 @@ async_status CraftReplDev::rebuild_overlay() {
 
 // ─── RAFT listener ────────────────────────────────────────────────────────────
 
+// Validates the entry and queues it for the apply queue, which applies it in log order and then completes this
+// member's own proposal. An entry that doesn't parse fails the proposal here and never enters the queue.
 void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                                                 std::vector< homestore::multi_blk_id > const& /* blkids */,
                                                 cintrusive< homestore::repl_req_ctx >& ctx) {
-    // Completes this member's own proposal on every exit: ok once dispatched, an error if the entry didn't parse.
-    struct ProposalCompleter {
-        cintrusive< homestore::repl_req_ctx >& ctx;
-        status outcome{std::unexpected(make_error_condition(volume_error::INVALID_ENTRY))};
-        ~ProposalCompleter() { complete_proposal(ctx, std::move(outcome)); }
-    } completer{ctx};
-
+    auto const invalid = [&ctx] {
+        complete_proposal(ctx, std::unexpected(make_error_condition(volume_error::INVALID_ENTRY)));
+    };
     if (header.size() < sizeof(CraftEntryHeader)) {
         LOGE("on_commit lsn={} header too small ({} bytes)", lsn, header.size());
-        return;
+        return invalid();
     }
-    const auto* entry_hdr = reinterpret_cast< const CraftEntryHeader* >(header.cbytes());
+    PendingApply entry{
+        .lsn = lsn, .type = reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type, .ctx = ctx};
 
-    switch (entry_hdr->type) {
+    switch (entry.type) {
     case CraftEntryType::SyncRSCommitLSN: {
         if (key.size() < sizeof(SyncRSCommitLSNPayload)) {
             LOGE("on_commit lsn={} SyncRSCommitLSN key too small ({} bytes)", lsn, key.size());
-            return;
+            return invalid();
         }
-        const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
         auto empty_slots = parse_empty_slots(key);
         if (!empty_slots) {
             LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
-            return;
+            return invalid();
         }
-        // apply_sync_rs_commit_lsn co_awaits peer fetch + journal writes; on_commit itself is a synchronous
-        // HomeStore callback, so fire-and-forget it.
-        //
-        // Lifetime: on_commit itself only touches the raw `owner_` pointer, which is safe since HomeStore
-        // never calls on_commit on a dead device. The DETACHED coroutine this dispatches into is a separate
-        // concern -- apply_sync_rs_commit_lsn opens with `auto self = shared_from_this()`, so the coroutine
-        // frame holds a strong reference across every co_await, keeping CraftReplDev alive even if every
-        // external owner (e.g. a volume-removal path) drops its shared_ptr mid-apply. Requires every
-        // CraftReplDev to be owned via shared_ptr
-        //
-        // FIXME: KNOWN GAP (not yet fixed): detaching here also breaks strict RAFT apply ordering.
-        // on_commit returns to HomeStore as soon as this coroutine hits its first co_await, so
-        // HomeStore can call on_commit for the NEXT committed entry -- a synchronous InternalLogin, or
-        // another detached SyncRSCommitLSN -- before this one's effects are fully applied.
-        // No individual field access races (state_mu_ still guards every access), but replicas can end up
-        // applying entries in different effective orders depending on async completion timing, which
-        // violates the determinism RAFT relies on for replicas to converge. See the commit_lsn advance at
-        // the tail of apply_sync_rs_commit_lsn and the client_token overwrite in apply_internal_login for
-        // the two mutation points this exposes. Real fix: one per-device serialized apply queue that both
-        // entry types funnel through, processing one entry's full effect (including all its co_awaits)
-        // before starting the next -- not independent detached tasks.
-        detail::detach(
-            owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token, std::move(*empty_slots)));
-        completer.outcome = ok();
+        const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
+        entry.rs_commit_lsn = payload->rs_commit_lsn;
+        entry.client_token = payload->client_token;
+        entry.empty_slots = std::move(*empty_slots);
         break;
     }
     case CraftEntryType::InternalLogin: {
         // Fixed-size payload, no variable trailing data (unlike SyncRSCommitLSN) -- exact-size check.
         if (key.size() != sizeof(InternalLoginPayload)) {
             LOGE("on_commit lsn={} InternalLogin key wrong size ({} bytes)", lsn, key.size());
-            return;
+            return invalid();
         }
         const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
-        // Pure in-memory state transition (no co_await) -- called directly, not detached.
-        owner_->apply_internal_login(login_payload->client_token, login_payload->term);
-        completer.outcome = ok();
+        entry.client_token = login_payload->client_token;
+        entry.term = login_payload->term;
         break;
     }
     default:
-        LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
-        break;
+        LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry.type));
+        return invalid();
     }
+    owner_->enqueue_apply(std::move(entry));
+}
+
+// ─── RAFT apply queue ─────────────────────────────────────────────────────────
+
+void CraftReplDev::enqueue_apply(PendingApply entry) {
+    bool stopped = false;
+    bool start = false;
+    {
+        std::lock_guard lk{apply_mu_};
+        if (apply_stopped_) {
+            stopped = true;
+        } else {
+            apply_queue_.push_back(std::move(entry));
+            start = !std::exchange(apply_running_, true); // else the running drainer picks it up
+        }
+    }
+    if (stopped) {
+        LOGW("apply lsn={}: the apply queue is stopped, entry not applied", entry.lsn);
+        complete_proposal(entry.ctx, std::unexpected(std::make_error_condition(std::errc::operation_canceled)));
+        return;
+    }
+    // Starts inline: with nothing awaited, the entry has applied by the time on_commit() returns.
+    if (start) detail::detach(drain_apply());
+}
+
+// Pops the next entry to apply, or marks the queue idle (waking stop_apply()) and returns nullopt.
+std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
+    bool notify;
+    {
+        std::lock_guard lk{apply_mu_};
+        if (!apply_queue_.empty() && !apply_stopped_) {
+            auto entry = std::move(apply_queue_.front());
+            apply_queue_.pop_front();
+            return entry;
+        }
+        apply_running_ = false;
+        notify = std::exchange(apply_idle_wanted_, false);
+    }
+    if (notify) apply_idle_.complete(true); // outside the lock: resumes stop_apply()'s caller
+    return std::nullopt;
+}
+
+// Applies queued entries one at a time until the queue is empty, completing each entry's proposal with its outcome.
+async_status CraftReplDev::drain_apply() {
+    auto self = shared_from_this(); // holds the device across every apply's co_awaits
+    while (auto entry = next_apply()) {
+        auto outcome = co_await apply_one(*entry);
+        if (!outcome) LOGW("apply lsn={} failed: {}", entry->lsn, outcome.error().message());
+        complete_proposal(entry->ctx, std::move(outcome));
+    }
+    co_return ok();
+}
+
+async_status CraftReplDev::apply_one(PendingApply const& entry) {
+    switch (entry.type) {
+    case CraftEntryType::SyncRSCommitLSN:
+        co_return co_await apply_sync_rs_commit_lsn(entry.rs_commit_lsn, entry.client_token, entry.empty_slots);
+    case CraftEntryType::InternalLogin:
+        apply_internal_login(entry.client_token, entry.term);
+        co_return ok();
+    default: // on_commit() queues only the types above
+        co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
+    }
+}
+
+async_status CraftReplDev::stop_apply() {
+    std::deque< PendingApply > dropped;
+    bool wait;
+    {
+        std::lock_guard lk{apply_mu_};
+        apply_stopped_ = true;
+        dropped.swap(apply_queue_);
+        wait = apply_running_;
+        if (wait) apply_idle_wanted_ = true;
+    }
+    for (auto& entry : dropped)
+        complete_proposal(entry.ctx, std::unexpected(std::make_error_condition(std::errc::operation_canceled)));
+    if (!dropped.empty()) LOGI("apply queue stopped: {} committed entr(ies) not applied", dropped.size());
+    if (wait) co_await apply_idle_;
+    co_return ok();
 }
 
 void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, sisl::blob const& /* header */,
@@ -2395,8 +2453,8 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
-    // Lives in the coroutine frame across every co_await below -- see the lifetime comment at the
-    // on_commit call site (detail::detach) for why this is required.
+    // Lives in the coroutine frame across every co_await below, so the device outlives the apply even if every
+    // external owner drops it mid-apply (drain_apply() holds one too). Requires a shared_ptr-owned CraftReplDev.
     auto self = shared_from_this();
 
     // Validated before any state is touched -- an out-of-range verdict means the entry itself cannot be
@@ -2561,10 +2619,6 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
     // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
-    //
-    // KNOWN GAP: this can land late. Because on_commit detaches this coroutine (see the FIXME there),
-    // a later-committed entry (InternalLogin, or another SyncRSCommitLSN) may have already applied by
-    // the time this advance actually runs, breaking strict RAFT apply ordering.
     int64_t commit_lsn_snapshot;
     bool should_checkpoint;
     {
