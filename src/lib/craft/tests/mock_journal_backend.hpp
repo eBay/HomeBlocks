@@ -44,14 +44,17 @@ inline craft::peer_id_t test_member_id(uint32_t i) {
 }
 
 // Leader of a 3-voter group by default (this member is test_member_id(0)). propose() records each entry and
-// succeeds unless `fail` is set; on_commit, if set, runs with the entry as RAFT would (typically the device's own
-// listener on_commit).
+// succeeds unless `fail` or `time_out` is set; on_commit, if set, runs with the entry as RAFT would (typically the
+// device's own listener on_commit).
 class MockCraftRaftProposer : public CraftRaftProposer {
 public:
     bool leader{true};
     uint32_t members{3};
     craft::peer_id_t self{test_member_id(0)}; // set outside the voters to model a leader missing from its own list
     bool fail{false};
+    // As the adapter's deadline would: the entry is recorded (it may still commit) but not applied, and propose()
+    // returns timed_out.
+    bool time_out{false};
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
 
@@ -69,6 +72,7 @@ public:
         if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         proposed.emplace_back(std::vector< uint8_t >(header.cbytes(), header.cbytes() + header.size()),
                               std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
+        if (time_out) co_return std::unexpected(std::make_error_condition(std::errc::timed_out));
         if (on_commit) on_commit(header, key);
         co_return ok();
     }

@@ -1076,6 +1076,84 @@ TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
     EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
 }
 
+// The deadline sweep completes an overdue proposal with timed_out (its outcome is unknown, not rejected), and leaves
+// one still within its deadline pending.
+TEST_F(CraftRaftEntriesTest, DeadlineSweepExpiresOverdueProposal) {
+    ProposalDeadlines deadlines;
+    auto const t0 = ProposalDeadlines::clock::now();
+    auto const ctx = make_test_proposal_ctx();
+    deadlines.add(ctx, t0 + std::chrono::seconds{10});
+
+    deadlines.sweep(t0 + std::chrono::seconds{9});
+    EXPECT_FALSE(take_test_proposal_outcome(ctx).has_value()); // still pending
+    deadlines.sweep(t0 + std::chrono::seconds{10});
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(deadlines.pending(), 0u);
+}
+
+// Overlapping proposals keep their own deadlines: one added later with an earlier deadline expires first, and none
+// postpones another (as iomgr v13's shared one-shot timer would).
+TEST_F(CraftRaftEntriesTest, OverlappingDeadlinesExpireIndependently) {
+    ProposalDeadlines deadlines;
+    auto const t0 = ProposalDeadlines::clock::now();
+    auto const a = make_test_proposal_ctx();
+    auto const b = make_test_proposal_ctx();
+    auto const c = make_test_proposal_ctx();
+    deadlines.add(a, t0 + std::chrono::seconds{10});
+    deadlines.add(b, t0 + std::chrono::seconds{1});
+    deadlines.add(c, t0 + std::chrono::seconds{20});
+
+    deadlines.sweep(t0 + std::chrono::seconds{1});
+    EXPECT_FALSE(take_test_proposal_outcome(a).has_value());
+    EXPECT_TRUE(take_test_proposal_outcome(b).has_value());
+
+    deadlines.sweep(t0 + std::chrono::seconds{10});
+    EXPECT_TRUE(take_test_proposal_outcome(a).has_value());
+    EXPECT_FALSE(take_test_proposal_outcome(c).has_value());
+    EXPECT_EQ(deadlines.pending(), 1u);
+}
+
+// The entry commits after its deadline: it's still applied, but the proposer was already told timed_out.
+TEST_F(CraftRaftEntriesTest, CommitAfterDeadlineIsAppliedButOutcomeStaysTimedOut) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    ProposalDeadlines deadlines;
+    auto const t0 = ProposalDeadlines::clock::now();
+    auto const ctx = make_test_proposal_ctx();
+    deadlines.add(ctx, t0);
+
+    deadlines.sweep(t0);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(dev_->last_append_lsn(), 3); // applied all the same
+}
+
+// A proposal that commits before its deadline is released by the next sweep, not held until its deadline.
+TEST_F(CraftRaftEntriesTest, SweepDropsCommittedProposalWithoutExpiringIt) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    ProposalDeadlines deadlines;
+    auto const t0 = ProposalDeadlines::clock::now();
+    auto const ctx = make_test_proposal_ctx();
+    deadlines.add(ctx, t0 + std::chrono::seconds{10});
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+    deadlines.sweep(t0 + std::chrono::seconds{1}); // well before the deadline
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(deadlines.pending(), 0u);
+}
+
 // A ctx this backend didn't create (or none, as on a follower) is left alone.
 TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
     auto const foreign = intrusive< homestore::repl_req_ctx >{new homestore::repl_req_ctx()};

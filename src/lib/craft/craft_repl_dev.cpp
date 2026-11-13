@@ -449,10 +449,58 @@ void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
     p->promise_.complete(std::move(s));
 }
 
+// The proposal missed its deadline (craft_raft_propose_timeout_ms). The entry may still commit, so the caller learns
+// "outcome unknown", not a rejection; a later commit is still applied, but its completion is dropped.
+void expire_proposal(cintrusive< homestore::repl_req_ctx >& ctx) {
+    complete_proposal(ctx, std::unexpected(std::make_error_condition(std::errc::timed_out)));
+}
+
+// True once ctx has an outcome, or if it isn't one of ours (nothing to expire).
+bool proposal_completed(cintrusive< homestore::repl_req_ctx >& ctx) {
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    return p == nullptr || p->completed_.load(std::memory_order_acquire);
+}
+} // namespace
+
+void ProposalDeadlines::add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline) {
+    std::lock_guard lk{mu_};
+    pending_.emplace_back(std::move(ctx), deadline);
+}
+
+void ProposalDeadlines::sweep(clock::time_point now) {
+    std::vector< intrusive< homestore::repl_req_ctx > > expired;
+    {
+        std::lock_guard lk{mu_};
+        std::erase_if(pending_, [&](auto const& entry) {
+            if (proposal_completed(entry.first)) return true;
+            if (entry.second > now) return false;
+            expired.push_back(entry.first);
+            return true;
+        });
+    }
+    // Outside the lock: completing resumes the proposer's caller, which may propose again.
+    for (auto const& ctx : expired)
+        expire_proposal(ctx);
+}
+
+size_t ProposalDeadlines::pending() const {
+    std::lock_guard lk{mu_};
+    return pending_.size();
+}
+
+namespace {
+// How often a proposer sweeps its deadlines: a deadline fires up to this late.
+constexpr auto k_deadline_sweep_interval = std::chrono::seconds{1};
+
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
     HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
-            rd_{std::move(rd)}, my_id_{replica_id} {}
+            rd_{std::move(rd)}, my_id_{replica_id} {
+        sweep_timer_ = iomgr::schedule_recurring(k_deadline_sweep_interval, iomgr::reactor_regex::all_worker,
+                                                 [this] { deadlines_.sweep(ProposalDeadlines::clock::now()); });
+    }
+    // Waits out a sweep in progress, which reads deadlines_.
+    ~HomeStoreCraftRaftProposer() override { sweep_timer_.cancel(/* wait = */ true); }
 
     bool is_leader() const override { return rd_->is_leader(); }
     craft::peer_id_t my_id() const override { return my_id_; }
@@ -465,13 +513,15 @@ public:
         return ids;
     }
 
-    // TODO(S7): no deadline. Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs()
-    // skips the proposer), so a leader without quorum waits out the outage holding append()'s gate. Add a
-    // one-shot timer (craft_raft_propose_timeout_ms) completing with timed_out; the entry may still commit.
+    // Once the entry is in the log, only commit or rollback completes it (gc_repl_reqs() skips the proposer), so a
+    // leader without quorum would wait out the outage: the deadline sweep completes it with timed_out instead, and
+    // the caller then resumes on an iomgr worker, inside the sweep.
     async_status propose(sisl::blob header, sisl::blob key) override {
         auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
         ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
         ctx->key.assign(key.cbytes(), key.cbytes() + key.size());
+        if (auto const ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms); ms > 0)
+            deadlines_.add(ctx, ProposalDeadlines::clock::now() + std::chrono::milliseconds{ms});
         rd_->async_alloc_write(sisl::blob{ctx->header.data(), static_cast< uint32_t >(ctx->header.size())},
                                sisl::blob{ctx->key.data(), static_cast< uint32_t >(ctx->key.size())},
                                sisl::sg_list{} /* key-only entry */, ctx);
@@ -481,6 +531,8 @@ public:
 private:
     shared< homestore::repl_dev > rd_;
     craft::peer_id_t my_id_;
+    ProposalDeadlines deadlines_;
+    iomgr::timer_token sweep_timer_;
 };
 } // namespace
 
@@ -1781,7 +1833,11 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
         if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                                       sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
             !r) {
-            LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            if (r.error() == std::errc::timed_out) {
+                LOGW("append: SyncRSCommitLSN({}) proposal timed out -- outcome unknown, it may still commit", target);
+            } else {
+                LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            }
             co_return std::unexpected(r.error());
         }
     }

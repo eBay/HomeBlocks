@@ -1344,6 +1344,46 @@ TEST_F(CraftAppendTest, ProposeFailurePropagatesAndReleasesGate) {
     EXPECT_TRUE(do_append(5).has_value());
 }
 
+// A proposal that misses its deadline reports timed_out ("outcome unknown"), leaves the watermark alone, and releases
+// the single-flight gate: the next round proposes the same watermark again rather than skipping it.
+TEST_F(CraftAppendTest, ProposeTimeoutReleasesGateAndNextRoundReproposes) {
+    dev_->seed_lsns(5, {});
+    proposer_.time_out = true;
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(proposer_.proposed.size(), 1u); // it did reach the log
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), -1);
+
+    proposer_.time_out = false;
+    ASSERT_TRUE(do_append(5).has_value());
+    EXPECT_EQ(proposer_.proposed.size(), 2u); // re-proposed, not skipped
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
+}
+
+// A timed-out entry may still commit. Two rounds time out carrying the same Empty verdict (the leader still lacks
+// slot 3 when the second one resolves), then both commit in log order. The second verdict lands at or below the
+// commit point the first one advanced, which must not fault the partition: the slot is already Empty.
+TEST_F(CraftAppendTest, TimedOutVerdictCommittingLateThenReproposedIsHarmless) {
+    dev_->seed_lsns(5, {3}); // 3 lacked by self + the one responder: quorum of 3
+    proposer_.time_out = true;
+    ASSERT_FALSE(do_append(5).has_value());
+    ASSERT_FALSE(do_append(5).has_value()); // re-proposed before the first entry applied
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_EQ(decode(proposer_.proposed[1]).empty_slots, (std::vector< int64_t >{3}));
+
+    for (auto& [header, key] : proposer_.proposed) // both commit, in log order
+        proposer_.on_commit(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                            sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
+
+    EXPECT_FALSE(dev_->is_faulted());
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
 // A second append() while one is in flight (here, issued from inside the first one's commit) is rejected.
 TEST_F(CraftAppendTest, ConcurrentAppendRejected) {
     dev_->seed_lsns(5, {});

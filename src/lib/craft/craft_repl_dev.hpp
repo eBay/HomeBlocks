@@ -213,6 +213,24 @@ public:
 // replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
 
+// The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by the proposer's recurring
+// timer. Not an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its
+// own delay and nothing re-arms after a fire, so concurrent deadlines postpone or drop each other.
+class ProposalDeadlines {
+public:
+    using clock = std::chrono::steady_clock;
+
+    void add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline);
+    // Completes every pending proposal whose deadline is at or before `now` with timed_out (its outcome is unknown:
+    // the entry may still commit), and forgets the ones that already completed.
+    void sweep(clock::time_point now);
+    size_t pending() const;
+
+private:
+    mutable std::mutex mu_;
+    std::vector< std::pair< intrusive< homestore::repl_req_ctx >, clock::time_point > > pending_;
+};
+
 #ifdef _PRERELEASE
 // Test seam for proposal completion: the same ctx make_homestore_raft_proposer() hands HomeStore, and its
 // outcome once CraftRaftListener has completed it (nullopt while pending). Single-shot: takes the outcome.
