@@ -1136,17 +1136,17 @@ TEST_F(CraftRaftEntriesTest, CommitAfterDeadlineIsAppliedButOutcomeStaysTimedOut
     EXPECT_EQ(dev_->last_append_lsn(), 3); // applied all the same
 }
 
-// A proposal that commits before its deadline is dropped by the next sweep, not expired.
+// A proposal that commits before its deadline is released by the next sweep, not held until its deadline.
 TEST_F(CraftRaftEntriesTest, SweepDropsCommittedProposalWithoutExpiringIt) {
     auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
     auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
     ProposalDeadlines deadlines;
     auto const t0 = ProposalDeadlines::clock::now();
     auto const ctx = make_test_proposal_ctx();
-    deadlines.add(ctx, t0);
+    deadlines.add(ctx, t0 + std::chrono::seconds{10});
 
     dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
-    deadlines.sweep(t0 + std::chrono::seconds{1});
+    deadlines.sweep(t0 + std::chrono::seconds{1}); // well before the deadline
 
     auto const outcome = take_test_proposal_outcome(ctx);
     ASSERT_TRUE(outcome.has_value());
