@@ -1,6 +1,12 @@
 pipeline {
     agent { label 'sds-builder-v8' }
 
+    // Rebuild dev/v6.x nightly so the long-running test image (stage "Image") picks up new homestore/iomgr
+    // releases even when HomeBlocks itself did not change. Other branches are not scheduled.
+    triggers {
+        cron(env.BRANCH_NAME == 'dev/v6.x' ? 'TZ=US/Pacific\nH H(0-2) * * *' : '')
+    }
+
     environment {
         ARTIFACTORY_PASS = credentials('ARTIFACTORY_PASS')
     }
@@ -70,7 +76,8 @@ pipeline {
                 expression { !(env.BRANCH_NAME =~ /PR-/) }
             }
             steps {
-                sh "conan create -s:h build_type=Debug -o ${PROJECT}/*:sanitize=address ${CONAN_FLAGS} ."
+                // --update: resolve homestore/iomgr version ranges against the remote, not a stale agent cache.
+                sh "conan create -s:h build_type=Debug -o ${PROJECT}/*:sanitize=address --update ${CONAN_FLAGS} ."
                 // Pick the newest sanitized binary; the plain Debug build and older builds leave their own copies in the cache.
                 sh '''
                     BIN=$(find "$(conan config home)" -type f -path '*/Sanitized-address/*' -name test_volume_io -printf '%T@ %p\\n' | sort -n | tail -1 | cut -d' ' -f2-)
