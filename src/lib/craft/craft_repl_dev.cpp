@@ -2399,13 +2399,9 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                  res.error().message());
             if (blkid_allocated) {
-                detail::detach(
-                    [](shared< CraftReplDev > self, homestore::multi_blk_id blkid, int64_t lsn) -> async_status {
-                        if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                            LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", lsn,
-                                 fr.error().message());
-                        co_return ok();
-                    }(self, blkid, slot->lsn));
+                if (auto fr = co_await journal_->free_data(blkid); !fr)
+                    LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", slot->lsn,
+                         fr.error().message());
             }
             result.unresolved.push_back(slot->lsn);
             continue;
@@ -2594,14 +2590,11 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
                          res.error().message());
+                    // Awaited, not detached: once the apply ends, stop_apply() may let the volume release the chunks.
                     if (blkid_allocated) {
-                        detail::detach([](shared< CraftReplDev > self, homestore::multi_blk_id blkid,
-                                          int64_t lsn) -> async_status {
-                            if (auto fr = co_await self->journal_->free_data(blkid); !fr)
-                                LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
-                                     lsn, fr.error().message());
-                            co_return ok();
-                        }(self, blkid, slot.lsn));
+                        if (auto fr = co_await journal_->free_data(blkid); !fr)
+                            LOGE("apply_sync_rs_commit_lsn: free_data failed after write_slot failure lsn={}: {}",
+                                 slot.lsn, fr.error().message());
                     }
                     continue;
                 }
@@ -2655,7 +2648,7 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 // ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────
 //
 // Pure in-memory state transition -- no journal I/O, no peer fetch -- so this stays synchronous
-// (unlike apply_sync_rs_commit_lsn) and on_commit calls it directly rather than via detail::detach().
+// (unlike apply_sync_rs_commit_lsn); the apply queue runs it in log order like any other entry.
 // "Enforce single-writer exclusivity" needs no explicit rejection here: every other RPC's term-fence
 // check (STALE_TERM on mismatch) already does that. Overwriting state_.term is what invalidates any
 // existing session -- a caller still presenting the old term is fenced out on its very next call.
