@@ -653,15 +653,17 @@ private:
     void maybe_trigger_periodic_sync();
 
     // ── RAFT apply queue ──
-    // Committed entries apply one at a time, in log order, each fully (catch-up included) before the next starts:
-    // on_commit() only validates and queues. The drainer starts inline in on_commit() and runs until the queue empties.
-    // The queue is unbounded: on a follower whose catch-up keeps timing out, later entries pile up behind it.
+    // Committed entries apply one at a time, in log order, each fully (catch-up included) before the next starts.
+    // on_commit() validates and queues; a SyncRSCommitLSN's state change (its verdicts and watermarks) is made there
+    // too, also in log order, so its fences take effect at commit rather than when the queue reaches it. The drainer
+    // starts inline in on_commit() and runs until the queue empties. The queue is unbounded: on a follower whose
+    // catch-up keeps timing out, later entries pile up behind it.
     struct PendingApply {
         int64_t lsn{-1};
         CraftEntryType type{};
         int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
         uint64_t client_token{0};
-        std::vector< int64_t > empty_slots{};       // SyncRSCommitLSN
+        std::vector< int64_t > to_free{};           // SyncRSCommitLSN: held slots its verdicts voided
         uint64_t term{0};                           // InternalLogin
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
@@ -677,9 +679,19 @@ private:
     bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
     sisl::async::value_awaitable< bool > apply_idle_;
 
-    // The two entries' applies, run by the apply queue.
+    // A SyncRSCommitLSN's state change, made at commit: the range and index checks, its Empty verdicts (their slots
+    // stop being readable now), the newly spanned missing range, last_append_lsn and applied_sync_lsn_. Returns the
+    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees.
+    result< std::vector< int64_t > > install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
+                                                                std::vector< int64_t > const& empty_slots);
+    // Its I/O, run by the apply queue: frees the voided slots' blocks, catches up the slots still missing at or below
+    // rs_commit_lsn from a peer, and advances commit_lsn.
+    async_status finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                           std::vector< int64_t > to_free);
+    // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
+    // InternalLogin's apply, run by the apply queue.
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal

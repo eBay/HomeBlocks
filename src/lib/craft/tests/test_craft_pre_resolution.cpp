@@ -124,7 +124,12 @@ public:
         co_return craft::lsn_pair{};
     }
 
+    // When set, the next fetch_data() (a Sync apply's catch-up) waits for fetch_gate: the apply is held mid-flight.
+    bool hold_fetch{false};
+    sisl::async::value_awaitable< bool > fetch_gate;
+
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >&, uint32_t) override {
+        if (std::exchange(hold_fetch, false)) co_await fetch_gate;
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
@@ -1277,6 +1282,33 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
     EXPECT_FALSE(dev_->is_empty_slot(4));
     EXPECT_TRUE(dev_->is_missing(4));
     EXPECT_TRUE(dev_->is_missing(5));
+}
+
+// The same floor holds while that Sync is still waiting in the apply queue: it settled its slots as present when it
+// committed, so a round must not vote them Empty before the queue reaches it. Sync(3)'s catch-up is held, Sync(5) is
+// queued behind it, and the responder lacks 3..5 (self + 1 is a quorum of 3).
+TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowQueuedWatermark) {
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto const commit_sync = [this](int64_t rs_commit_lsn) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    };
+    commit_sync(3); // held in catch-up
+    commit_sync(5); // queued behind it
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3, 4, 5}));
+
+    fetcher_.fetch_gate.complete(true);
 }
 
 // A verdict voting slot 0 Empty applies while write(0) is inside write_slot. The write must not be acked (every

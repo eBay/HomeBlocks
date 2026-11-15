@@ -1068,7 +1068,8 @@ TEST_F(CraftRaftEntriesTest, OnCommitApplyFaultFailsProposal) {
     EXPECT_TRUE(dev_->is_faulted());
 }
 
-// An exception escaping an apply fails that entry's proposal, and the queue keeps applying the entries after it.
+// An exception escaping an apply fails that entry's proposal and faults the partition (the apply stopped partway), and
+// the queue keeps applying the entries after it.
 TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(2, {});
@@ -1086,6 +1087,7 @@ TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
     ASSERT_TRUE(outcome.has_value());
     ASSERT_FALSE(outcome->has_value());
     EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(dev_->is_faulted());
     EXPECT_EQ(dev_->term(), 5u); // not wedged: the login behind it applied
 }
 
@@ -1255,7 +1257,8 @@ TEST_F(CraftRaftEntriesTest, InternalLoginWaitsForSuspendedSyncApply) {
     EXPECT_EQ(dev_->term(), 5u);
 }
 
-// A second Sync committed during the first one's apply starts only after it.
+// A second Sync committed during the first one's apply changes its state at once, but its I/O (the catch-up) starts
+// only after the first apply finishes.
 TEST_F(CraftRaftEntriesTest, SyncsApplyInLogOrder) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(2, {});
@@ -1266,11 +1269,55 @@ TEST_F(CraftRaftEntriesTest, SyncsApplyInLogOrder) {
 
     dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key5), {}, {});
     dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key8), {}, {});
-    EXPECT_EQ(dev_->last_append_lsn(), 5); // the second hasn't started
+    EXPECT_EQ(dev_->last_append_lsn(), 8);                                 // state: at commit
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5})); // I/O: only the first catch-up so far
 
     fetcher_.fetch_gate.complete(true);
 
-    EXPECT_EQ(dev_->last_append_lsn(), 8);
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5, 6, 7, 8}));
+}
+
+// A Sync waiting in the queue already fences writes: its Empty verdict takes effect at commit, so a late write to the
+// voided slot is rejected before it can be acked, not discarded once the queue reaches the verdict.
+TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictFencesWritesAtCommit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key3 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{4});
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key3), {}, {}); // held in catch-up
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key5), {}, {}); // queued behind it
+    EXPECT_TRUE(dev_->is_empty_slot(4));
+
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/4,
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
+
+    fetcher_.fetch_gate.complete(true);
+}
+
+// ...and stops serving the voided slot at commit: its overlay entry is retired then, not when its blocks are freed.
+TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictStopsServingVoidedSlotAtCommit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/4,
+                    /*addr=*/5 * k_page_size, /*len=*/k_page_size, sisl::sg_list{})); // all_zeros write at lba 5
+    ASSERT_TRUE(w.has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(5), 4);
+    fetcher_.hold_fetch = true;
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key3 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{4});
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key3), {}, {}); // held catching up 0..3
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key5), {}, {}); // voids the held slot 4
+    EXPECT_EQ(dev_->overlay_lsn_for(5), -1);
+
+    fetcher_.fetch_gate.complete(true);
 }
 
 // A malformed entry fails its proposal at once, even while an apply is in progress, and doesn't block later entries.

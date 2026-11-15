@@ -1999,9 +1999,16 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
             return invalid();
         }
         const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
+        // Its state changes now, so its verdicts fence write() and its watermark fences pre_resolve_slots() from the
+        // moment it commits; only its I/O waits for the queue.
+        auto to_free = owner_->install_sync_rs_commit_lsn(payload->rs_commit_lsn, *empty_slots);
+        if (!to_free) {
+            LOGW("apply lsn={} failed: {}", lsn, to_free.error().message());
+            return complete_proposal(ctx, std::unexpected(to_free.error()));
+        }
         entry.rs_commit_lsn = payload->rs_commit_lsn;
         entry.client_token = payload->client_token;
-        entry.empty_slots = std::move(*empty_slots);
+        entry.to_free = std::move(*to_free);
         break;
     }
     case CraftEntryType::InternalLogin: {
@@ -2072,10 +2079,13 @@ async_status CraftReplDev::drain_apply() {
         try {
             outcome = co_await apply_one(*entry);
         } catch (std::exception const& e) {
-            LOGE("apply lsn={} threw: {}", entry->lsn, e.what());
+            // The apply stopped partway, so its state can't be trusted: fault the partition, as a failed recovery does.
+            LOGE("apply lsn={} threw: {} -- faulting the partition", entry->lsn, e.what());
+            faulted_.store(true, std::memory_order_release);
             outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         } catch (...) {
-            LOGE("apply lsn={} threw an unknown exception", entry->lsn);
+            LOGE("apply lsn={} threw an unknown exception -- faulting the partition", entry->lsn);
+            faulted_.store(true, std::memory_order_release);
             outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
         if (!outcome) LOGW("apply lsn={} failed: {}", entry->lsn, outcome.error().message());
@@ -2086,8 +2096,8 @@ async_status CraftReplDev::drain_apply() {
 
 async_status CraftReplDev::apply_one(PendingApply const& entry) {
     switch (entry.type) {
-    case CraftEntryType::SyncRSCommitLSN:
-        co_return co_await apply_sync_rs_commit_lsn(entry.rs_commit_lsn, entry.client_token, entry.empty_slots);
+    case CraftEntryType::SyncRSCommitLSN: // its state change was made at commit
+        co_return co_await finish_sync_rs_commit_lsn(entry.rs_commit_lsn, entry.client_token, entry.to_free);
     case CraftEntryType::InternalLogin:
         apply_internal_login(entry.client_token, entry.term);
         co_return ok();
@@ -2444,6 +2454,9 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
 //
+// A SyncRSCommitLSN applies in two halves: install_sync_rs_commit_lsn() changes its state at commit (on_commit), and
+// finish_sync_rs_commit_lsn() does its I/O when the apply queue reaches it.
+//
 // apply_sync_rs_commit_lsn (22886): empty_slots is range-checked against rs_commit_lsn first -- the only
 // all-or-nothing gate on this apply. SyncRSCommitLSN verdicts are only ever defined for slots the leader
 // pre-resolved up to rs_commit_lsn (S5). client_token is NOT checked against the current session. Past the
@@ -2458,80 +2471,84 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 // whole apply (gap marking and last_append_lsn already advanced by the time the response arrives), so a
 // malformed response is instead treated exactly like a failed fetch
 
-async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
-                                                    std::vector< int64_t > empty_slots) {
-    // Lives in the coroutine frame across every co_await below, so the device outlives the apply even if every
-    // external owner drops it mid-apply (drain_apply() holds one too). Requires a shared_ptr-owned CraftReplDev.
-    auto self = shared_from_this();
-
+result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
+                                                                          std::vector< int64_t > const& empty_slots) {
     // Validated before any state is touched -- an out-of-range verdict means the entry itself cannot be
     // trusted, not that this one slot should be skipped, so it gates the entire apply.
     for (int64_t lsn : empty_slots) {
         if (lsn < 0 || lsn > rs_commit_lsn) {
             LOGE("apply_sync_rs_commit_lsn: empty_slots lsn={} out of range [0, {}] -- rejecting entire apply", lsn,
                  rs_commit_lsn);
-            co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
+            return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
         }
     }
 
     std::unordered_set< int64_t > to_free;
+    std::lock_guard lk{state_mu_};
+    // The entry's client_token is NOT gated against state_.client_token. Per the login sequence (CRAFT-Design),
+    // SyncRSCommitLSN applies BEFORE InternalLogin (which sets state_.client_token), so an equality-fence
+    // here would veto the very entry that carries login's own Empty verdicts,
+    // and would also veto every post-restart watchdog SyncRSCommitLSN, since state_ is
+    // in-memory-only and client_token resets to 0 across a restart. craft_client's reference
+    // (MemCraftReplica::cold_apply_sync) discards the parameter outright for the same reason.
+    // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
+    // checks (see apply_internal_login's header comment), not from an equality check here.
+
+    // A verdict can't void a slot this replica already applied to its index, or one a running commit_impl() has
+    // started indexing: freeing it would leave the index pointing at free blocks.
+    for (int64_t lsn : empty_slots) {
+        if (lsn <= std::max(state_.commit_lsn, indexing_lsn_) && !empty_lsns_.contains(lsn)) {
+            LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} (indexing_lsn={}) "
+                 "-- faulting the partition rather than freeing indexed blocks",
+                 lsn, state_.commit_lsn, indexing_lsn_);
+            faulted_.store(true, std::memory_order_release);
+            return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
+    }
+    applied_sync_lsn_ = std::max(applied_sync_lsn_, rs_commit_lsn);
+
+    for (int64_t lsn : empty_slots) {
+        bool const was_missing = missing_lsns_.erase(lsn) > 0;
+        if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
+    }
+    empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
+
+    // Everything newly spanned by this advance that isn't Empty-verdicted is a gap until catch-up
+    // resolves it -- same idiom write() uses for gaps opened by an out-of-order dlsn.
+    for (int64_t lsn = state_.last_append_lsn + 1; lsn <= rs_commit_lsn; ++lsn) {
+        if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
+    }
+    state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
+
+    // The voided slots stop being readable now, not once their blocks are freed: commit never retires their overlay
+    // entries, since its advance steps over Empty slots.
+    if (!to_free.empty()) {
+        std::lock_guard olk{overlay_mu_};
+        std::erase_if(overlay_, [&](auto const& entry) { return to_free.contains(entry.second.lsn); });
+    }
+    return std::vector< int64_t >(to_free.begin(), to_free.end());
+}
+
+async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                                     std::vector< int64_t > to_free) {
+    // Lives in the coroutine frame across every co_await below, so the device outlives the apply even if every
+    // external owner drops it mid-apply (drain_apply() holds one too). Requires a shared_ptr-owned CraftReplDev.
+    auto self = shared_from_this();
+
+    for (int64_t lsn : to_free) {
+        if (auto fr = co_await journal_->free_slot(lsn); !fr) {
+            LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn, fr.error().message());
+        }
+    }
+
     std::vector< int64_t > to_fetch;
     uint64_t term;
     {
         std::lock_guard lk{state_mu_};
-        // client_token is NOT gated against state_.client_token here. Per the login sequence (CRAFT-Design),
-        // SyncRSCommitLSN applies BEFORE InternalLogin (which sets state_.client_token), so an equality-fence
-        // here would veto the very entry that carries login's own Empty verdicts,
-        // and would also veto every post-restart watchdog SyncRSCommitLSN, since state_ is
-        // in-memory-only and client_token resets to 0 across a restart. craft_client's reference
-        // (MemCraftReplica::cold_apply_sync) discards the parameter outright for the same reason.
-        // Exclusivity comes from RAFT's commit ordering plus the term fence every other IO already
-        // checks (see apply_internal_login's header comment), not from an equality check here.
-        term = state_.term;
-
-        // A verdict can't void a slot this replica already applied to its index, or one a running commit_impl() has
-        // started indexing: freeing it would leave the index pointing at free blocks.
-        for (int64_t lsn : empty_slots) {
-            if (lsn <= std::max(state_.commit_lsn, indexing_lsn_) && !empty_lsns_.contains(lsn)) {
-                LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} (indexing_lsn={}) "
-                     "-- faulting the partition rather than freeing indexed blocks",
-                     lsn, state_.commit_lsn, indexing_lsn_);
-                faulted_.store(true, std::memory_order_release);
-                co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-            }
-        }
-        applied_sync_lsn_ = std::max(applied_sync_lsn_, rs_commit_lsn);
-
-        for (int64_t lsn : empty_slots) {
-            bool const was_missing = missing_lsns_.erase(lsn) > 0;
-            if (!was_missing && lsn <= state_.last_append_lsn && !empty_lsns_.contains(lsn)) { to_free.insert(lsn); }
-        }
-        empty_lsns_.insert(empty_slots.begin(), empty_slots.end());
-
-        // Everything newly spanned by this advance that isn't Empty-verdicted is a gap until catch-up
-        // (below) resolves it -- same idiom write() uses for gaps opened by an out-of-order dlsn.
-        for (int64_t lsn = state_.last_append_lsn + 1; lsn <= rs_commit_lsn; ++lsn) {
-            if (!empty_lsns_.contains(lsn)) missing_lsns_.insert(lsn);
-        }
-        state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
-
+        term = state_.term; // stamps the catch-up writes
         for (int64_t lsn : missing_lsns_) {
-            if (lsn <= rs_commit_lsn) to_fetch.push_back(lsn);
-        }
-    }
-
-    if (!to_free.empty()) {
-        for (int64_t lsn : to_free) {
-            // Retire the overlay entry before freeing: commit never visits this slot to retire it, since the
-            // commit_lsn advance below steps over it directly.
-            if (auto slot = co_await journal_->read_slot(lsn); slot && slot->len_bytes >= lba_size_) {
-                lba_t const start_lba = static_cast< lba_t >(slot->lba_off_bytes) / lba_size_;
-                retire_overlay_range(start_lba, start_lba + slot->len_bytes / lba_size_ - 1, lsn);
-            }
-            if (auto fr = co_await journal_->free_slot(lsn); !fr) {
-                LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn,
-                     fr.error().message());
-            }
+            if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
+            to_fetch.push_back(lsn);
         }
     }
 
@@ -2643,6 +2660,13 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
+}
+
+async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                                    std::vector< int64_t > empty_slots) {
+    auto to_free = install_sync_rs_commit_lsn(rs_commit_lsn, empty_slots);
+    if (!to_free) co_return std::unexpected(to_free.error());
+    co_return co_await finish_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(*to_free));
 }
 
 // ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────
