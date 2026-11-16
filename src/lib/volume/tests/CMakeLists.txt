@@ -57,6 +57,10 @@ target_link_libraries(test_craft_volume_multi
 )
 
 add_test(NAME VolumeTest COMMAND test_volume --gc_timer_nsecs=3 --index_chunk_size_mb=128 --data_chunk_size_mb=128)
+# The same cases in CRAFT mode, every volume a one-member RAFT group: those that remove a volume skip until CRAFT volumes
+# can be removed.
+add_test(NAME VolumeCraftTest COMMAND test_volume --craft=true --repl_port=47452 --index_chunk_size_mb=128
+         --data_chunk_size_mb=128)
 # HomeStore's repl dev reaper (which runs a destroyed group's on_destroy) every second instead of every minute. Small
 # index chunks: each volume takes at least one, and these tests keep most of the volumes they create.
 add_test(NAME CraftVolumeTest COMMAND test_craft_volume --index_chunk_size_mb=32 --data_chunk_size_mb=128
