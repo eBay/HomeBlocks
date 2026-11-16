@@ -496,8 +496,11 @@ class HomeStoreCraftRaftProposer : public CraftRaftProposer {
 public:
     HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
             rd_{std::move(rd)}, my_id_{replica_id} {
-        sweep_timer_ = iomgr::schedule_recurring(k_deadline_sweep_interval, iomgr::reactor_regex::all_worker,
-                                                 [this] { deadlines_.sweep(ProposalDeadlines::clock::now()); });
+        // Armed on every worker before this returns: iomgr ignores the cancel of a timer some reactor has not armed
+        // yet, which would then fire on a destroyed proposer.
+        sweep_timer_ = iomgr::schedule_recurring(
+            k_deadline_sweep_interval, iomgr::reactor_regex::all_worker,
+            [this] { deadlines_.sweep(ProposalDeadlines::clock::now()); }, /* wait_to_schedule = */ true);
     }
     // Waits out a sweep in progress, which reads deadlines_.
     ~HomeStoreCraftRaftProposer() override { sweep_timer_.cancel(/* wait = */ true); }
