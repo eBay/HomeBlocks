@@ -84,6 +84,39 @@ void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl
 
 void CraftGroupListener::on_destroy(homestore::group_id_t const& group_id) { hb_->on_craft_group_destroyed(group_id); }
 
+static void log_member_change(homestore::group_id_t const& group_id, char const* event, std::string const& task_id,
+                              homestore::replica_member_info const& out, homestore::replica_member_info const& in) {
+    LOGW("group={}: {} (task {}, out={}, in={}): membership changes are not supported yet",
+         boost::uuids::to_string(group_id), event, task_id, boost::uuids::to_string(out.id),
+         boost::uuids::to_string(in.id));
+}
+
+void CraftGroupListener::on_start_replace_member(std::string const& task_id,
+                                                 homestore::replica_member_info const& member_out,
+                                                 homestore::replica_member_info const& member_in,
+                                                 homestore::trace_id_t) {
+    log_member_change(group_id_, "replace member started", task_id, member_out, member_in);
+}
+
+void CraftGroupListener::on_complete_replace_member(std::string const& task_id,
+                                                    homestore::replica_member_info const& member_out,
+                                                    homestore::replica_member_info const& member_in,
+                                                    homestore::trace_id_t) {
+    log_member_change(group_id_, "replace member completed", task_id, member_out, member_in);
+}
+
+void CraftGroupListener::on_clean_replace_member_task(std::string const& task_id,
+                                                      homestore::replica_member_info const& member_out,
+                                                      homestore::replica_member_info const& member_in,
+                                                      homestore::trace_id_t) {
+    log_member_change(group_id_, "replace member task cleaned", task_id, member_out, member_in);
+}
+
+void CraftGroupListener::on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t) {
+    LOGW("group={}: member {} removed: membership changes are not supported yet", boost::uuids::to_string(group_id_),
+         boost::uuids::to_string(member));
+}
+
 void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {

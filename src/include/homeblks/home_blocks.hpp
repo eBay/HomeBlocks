@@ -330,6 +330,11 @@ public:
     [[nodiscard]] virtual result< volume_handle > get_volume(volume_id_t const& id) const = 0;
     [[nodiscard]] virtual result< volume_stats > get_stats(volume_id_t id) const = 0;
     virtual std::vector< volume_id_t > volume_ids() const = 0;
+
+    // CRAFT partition move: replaces member `out` of volume `id`'s RAFT group with `in`. Not supported yet: returns
+    // std::errc::not_supported until reconfiguration lands behind this same call.
+    [[nodiscard]] virtual async_status replace_member(volume_id_t const& id, peer_id_t const& out,
+                                                      peer_id_t const& in) = 0;
 };
 
 // Bring up homeblocks. Operational failures (device open, format, on_svc_id RPC) -> result error; precondition

@@ -99,6 +99,17 @@ public:
     void on_log_replay_done(homestore::group_id_t const&) override { replaying_ = false; }
     void on_destroy(homestore::group_id_t const& group_id) override;
 
+    // Membership changes come with reconfiguration: until then, one reaching the group is logged, nothing more.
+    void on_start_replace_member(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                 homestore::replica_member_info const& member_in, homestore::trace_id_t tid) override;
+    void on_complete_replace_member(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                    homestore::replica_member_info const& member_in,
+                                    homestore::trace_id_t tid) override;
+    void on_clean_replace_member_task(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                      homestore::replica_member_info const& member_in,
+                                      homestore::trace_id_t tid) override;
+    void on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t tid) override;
+
 private:
     // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).
     volume_handle craft_volume(int64_t lsn) const;

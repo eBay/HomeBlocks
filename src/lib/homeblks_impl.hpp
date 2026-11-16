@@ -140,6 +140,8 @@ public:
     [[nodiscard]] result< volume_stats > get_stats(volume_id_t id) const final;
     std::vector< volume_id_t > volume_ids() const final;
 
+    [[nodiscard]] async_status replace_member(volume_id_t const& id, peer_id_t const& out, peer_id_t const& in) final;
+
     // Index
     shared< hs_index_table_t > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
 

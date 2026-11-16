@@ -571,6 +571,13 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     co_return ok();
 }
 
+// Reconfiguration (S10) replaces this stub behind the same signature.
+async_status HomeBlocksImpl::replace_member(volume_id_t const& id, peer_id_t const& out, peer_id_t const& in) {
+    LOGW("vol={}: replace_member out={} in={}: membership changes are not supported yet", boost::uuids::to_string(id),
+         boost::uuids::to_string(out), boost::uuids::to_string(in));
+    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+}
+
 bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
     if (is_restricted()) {
         LOGE("Can't remove volume {}, system is in restricted mode.", boost::uuids::to_string(id));

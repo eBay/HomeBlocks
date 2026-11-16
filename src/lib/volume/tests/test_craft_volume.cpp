@@ -121,6 +121,19 @@ TEST_F(CraftVolumeTest, CreateRetryReturnsTheVolume) {
     EXPECT_EQ(hb()->get_volume(id).value_or(nullptr), *first);
 }
 
+// Membership changes are not supported yet: the call answers not_supported and the group keeps its members.
+TEST_F(CraftVolumeTest, ReplaceMemberNotSupportedYet) {
+    auto info = craft_vol_info("craft_vol_replace");
+    auto const id = info.id;
+    ASSERT_TRUE(create(std::move(info)));
+
+    auto const st =
+        homeblocks::detail::sync_get(hb()->replace_member(id, g_helper->svc_id(), boost::uuids::random_generator()()));
+    ASSERT_FALSE(st);
+    EXPECT_EQ(st.error(), std::errc::not_supported);
+    EXPECT_EQ(group(id)->get_replication_quorum(), std::vector< homestore::replica_id_t >{g_helper->svc_id()});
+}
+
 TEST_F(CraftVolumeTest, CreateRejectsInvalidRequests) {
     auto expect_rejected = [this](volume_info info) {
         auto const id = info.id;
