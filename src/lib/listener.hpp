@@ -98,6 +98,7 @@ public:
                   cintrusive< homestore::repl_req_ctx >& ctx) override;
     void on_log_replay_done(homestore::group_id_t const&) override { replaying_ = false; }
     void on_destroy(homestore::group_id_t const& group_id) override;
+    void on_become_leader(homestore::group_id_t const&) override { hb_->on_craft_group_leader(group_id_); }
 
     // Membership changes come with reconfiguration: until then, one reaching the group is logged, nothing more.
     void on_start_replace_member(std::string const& task_id, homestore::replica_member_info const& member_out,

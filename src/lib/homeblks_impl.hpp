@@ -53,6 +53,8 @@ public:
         REGISTER_GAUGE(craft_groups_without_replica,
                        "CRAFT groups this node is a member of without a replica here, until a partition move "
                        "replaces this member");
+        REGISTER_COUNTER(craft_leaderships_handed_off,
+                         "RAFT leaderships this node handed to another member, having no replica of the volume");
         register_me_to_farm();
     }
     ~HomeBlocksMetrics() { deregister_me_from_farm(); }
@@ -179,6 +181,10 @@ public:
     // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
     // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
     void on_craft_group_destroyed(volume_id_t const& id);
+    // CRAFT: this member was elected leader of a volume's RAFT group. Without a replica here it would fail every CRAFT
+    // op of the volume, so it hands leadership to another member. Called on a nuraft thread: the hand-off runs on a
+    // worker.
+    void on_craft_group_leader(volume_id_t const& id);
     // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
     // leaves one), other than those of a create in flight here and those being destroyed.
     int64_t craft_groups_without_replica() const;

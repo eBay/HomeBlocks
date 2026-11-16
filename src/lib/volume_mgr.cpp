@@ -20,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <boost/uuid/nil_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
 #include <iomgr/iomgr_flip.hpp>
@@ -605,6 +606,26 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
     if (!vol) { return; } // never created here, or already removed
     LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));
     start_volume_removal(id);
+}
+
+// A member whose local create failed stays in the group without a replica, reported, until a partition move replaces
+// it; RAFT may still elect it, as it has the whole log. Not while a create of the volume runs here (that create needs
+// this member to lead), nor when alone in the group: there is nobody to hand leadership to.
+void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
+    if (is_shutting_down()) { return; }
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
+        if (is_shutting_down()) { return; }
+        {
+            auto lg = std::shared_lock(vol_lock_);
+            if (vol_map_.contains(id) || creating_vols_.contains(id)) { return; }
+        }
+        auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
+        if (!rd || !(*rd)->is_leader() || is_going_away(**rd) || (*rd)->get_replication_quorum().size() < 2) { return; }
+        LOGW("vol={}: elected RAFT leader without a replica here: handing leadership to another member",
+             boost::uuids::to_string(id));
+        COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
+        (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
+    });
 }
 
 int64_t HomeBlocksImpl::craft_groups_without_replica() const {
