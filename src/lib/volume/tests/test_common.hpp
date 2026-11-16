@@ -252,10 +252,18 @@ public:
 
     void restart(uint64_t delay_secs = 0) {
         LOGINFO("Restart home_blocks");
-        hb_->shutdown();
-        hb_.reset();
+        stop();
         LOGINFO("Start home_blocks after {} secs", delay_secs);
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
+        start();
+    }
+
+    // A restart in two steps, for a node that stays down while others go on.
+    void stop() {
+        hb_->shutdown();
+        hb_.reset();
+    }
+    void start() {
         auto hb = init_homeblocks(make_config());
         RELEASE_ASSERT(hb.has_value(), "init_homeblocks failed on restart");
         hb_ = hb.value();

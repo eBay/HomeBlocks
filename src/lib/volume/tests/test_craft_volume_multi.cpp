@@ -17,7 +17,8 @@
 // others (re-executing this binary with --replica_num) and receives every create; the processes share nothing but a
 // shared-memory barrier, and each one checks its own HomeBlocks. Every member must end up with the volume, keep it
 // across a restart of the whole group, and lose it again when a create fails after the followers applied it; a member
-// left without a replica must not take the group down. Each test creates its own volume.
+// left without a replica must not take the group down, and one behind the RAFT log compaction gets no snapshot. Each
+// test creates its own volume.
 
 #include <filesystem>
 #include <spawn.h>
@@ -36,6 +37,8 @@
 #include <homestore/replication_service.hpp>
 #include "hb_internal.hpp"
 #include "test_common.hpp"
+#include "craft/craft_raft_entries.hpp"
+#include "craft/craft_repl_dev.hpp"
 #include <volume/volume.hpp>
 
 extern char** environ;
@@ -273,6 +276,61 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     ASSERT_TRUE(sync());
 }
 #endif
+
+// HomeStore compacts a group's RAFT log. A member that falls behind the compaction needs a RAFT snapshot, which CRAFT
+// can't serve yet: the leader refuses to send it, and the member stays behind, its replica untouched.
+TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(5);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(5)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    // While member 2 is down, the leader commits entries it misses, then compacts its log past them.
+    if (me() == 0) {
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
+        for (uint64_t i = 1; i <= 10; ++i) {
+            CraftEntryHeader hdr{CraftEntryType::InternalLogin};
+            InternalLoginPayload login{.client_token = i, .term = i};
+            auto const st = homeblocks::detail::sync_get(
+                proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
+                                  sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+            ASSERT_TRUE(st) << st.error().message();
+        }
+        rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), true /* wait_for_commit */);
+        g_barrier->publish(rd->get_last_commit_lsn());
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) { g_helper->start(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+        EXPECT_TRUE(wait_until([&impl] {
+            using namespace sisl; // the metric's name literal
+            return COUNTER_VALUE(impl->metrics(), craft_snapshot_transfers_refused) > 0;
+        }));
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) {
+        EXPECT_TRUE(hb()->get_volume(id));
+        EXPECT_LT(group(id)->get_last_commit_lsn(), g_barrier->published());
+    }
+    ASSERT_TRUE(sync());
+}
 
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
 // settings directory each (they rewrite their settings files at startup).

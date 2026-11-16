@@ -66,8 +66,8 @@ add_test(NAME VolumeCraftTest COMMAND test_volume --craft=true --repl_port=47452
 add_test(NAME CraftVolumeTest COMMAND test_craft_volume --index_chunk_size_mb=32 --data_chunk_size_mb=128
          --repl_port=47451 --config_path=craft_volume_cfg
          --override_config homestore_config.generic.repl_dev_cleanup_interval_sec:1)
-# Three processes, one per member of each RAFT group; RAFT ports 47460..47462.
-add_test(NAME CraftVolumeMultiTest COMMAND test_craft_volume_multi --index_chunk_size_mb=128
+# Three processes, one per member of each RAFT group; RAFT ports 47460..47462. Small index chunks, as above.
+add_test(NAME CraftVolumeMultiTest COMMAND test_craft_volume_multi --index_chunk_size_mb=32
          --data_chunk_size_mb=128 --base_port=47460 --config_path=craft_volume_multi_cfg
          --override_config homestore_config.generic.repl_dev_cleanup_interval_sec:1)
 add_test(NAME VolumeIOTest COMMAND test_volume_io --index_chunk_size_mb=128 --data_chunk_size_mb=128)

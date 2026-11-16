@@ -117,6 +117,37 @@ void CraftGroupListener::on_remove_member(homestore::replica_id_t const& member,
          boost::uuids::to_string(member));
 }
 
+int CraftGroupListener::read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                                          std::shared_ptr< homestore::snapshot_obj >) {
+    COUNTER_INCREMENT(hb_->metrics(), craft_snapshot_transfers_refused, 1);
+    // nuraft asks again at every heartbeat: logged once.
+    if (!snapshot_refusal_logged_.test_and_set()) {
+        LOGE("group={}: refused a RAFT snapshot up to lsn {} to a member behind the log compaction: CRAFT can't "
+             "serve one yet, so that member stays behind until it is replaced",
+             boost::uuids::to_string(group_id_), context->get_lsn());
+    }
+    return -1;
+}
+
+homestore::async_status CraftGroupListener::create_snapshot(std::shared_ptr< homestore::snapshot_context > context) {
+    std::lock_guard lk{snapshot_mu_};
+    if (!last_snapshot_ || context->get_lsn() > last_snapshot_->get_lsn()) { last_snapshot_ = std::move(context); }
+    co_return homestore::ok();
+}
+
+std::shared_ptr< homestore::snapshot_context > CraftGroupListener::last_snapshot() {
+    std::lock_guard lk{snapshot_mu_};
+    return last_snapshot_;
+}
+
+bool CraftGroupListener::apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) {
+    // Unreachable while every leader refuses to send one. Applying one would leave this replica without the entries the
+    // snapshot covers; failing it makes nuraft stop this process instead.
+    LOGE("group={}: a RAFT snapshot up to lsn {} arrived, which CRAFT can't apply", boost::uuids::to_string(group_id_),
+         context->get_lsn());
+    return false;
+}
+
 void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,
                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {

@@ -44,6 +44,17 @@ struct hs_chunk_size_cfg_t {
     uint64_t data;
 };
 
+// This node's metrics; each volume has its own (VolumeMetrics).
+class HomeBlocksMetrics : public sisl::MetricsGroup {
+public:
+    HomeBlocksMetrics() : sisl::MetricsGroup("homeblocks", "node") {
+        REGISTER_COUNTER(craft_snapshot_transfers_refused,
+                         "RAFT snapshot transfers this node refused to send: CRAFT has no snapshots yet");
+        register_me_to_farm();
+    }
+    ~HomeBlocksMetrics() { deregister_me_from_farm(); }
+};
+
 class HomeBlocksImpl : public home_blocks, public std::enable_shared_from_this< HomeBlocksImpl > {
     // The free data-plane functions need the system-level guards (restricted / shutting-down / fake-io delay).
     friend async_result< size_t > async_read(volume_handle const&, uint64_t, sisl::sg_list);
@@ -106,6 +117,8 @@ private:
     std::promise< void > shutdown_promise_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
+
+    HomeBlocksMetrics metrics_;
 
 public:
     // static uint64_t _hs_chunk_size;
@@ -180,6 +193,7 @@ public:
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
     bool has_pending_chunk_releases() const;
     home_blocks_config const& config() const { return config_; }
+    HomeBlocksMetrics& metrics() { return metrics_; }
     // CRAFT process mode: every volume is a CRAFT partition replicated by its own RAFT group.
     bool is_craft() const { return config_.repl_mode == replication_mode::CRAFT; }
 

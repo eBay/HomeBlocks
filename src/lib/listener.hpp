@@ -110,6 +110,18 @@ public:
                                       homestore::trace_id_t tid) override;
     void on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t tid) override;
 
+    // CRAFT has no snapshots yet, while HomeStore compacts the group's RAFT log: a member that falls behind the
+    // compaction needs one. As its leader, this member refuses to send it (nuraft asks again later), and that member
+    // stays behind until a partition move replaces it. As a member, it never applies one.
+    int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                          std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
+    bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
+    // Each snapshot nuraft takes (every snapshot_freq_distance entries) holds its position alone: nuraft reads it back
+    // through last_snapshot() to compact the log, and dereferences it. Kept in memory: after a restart there is none
+    // until the next one, which nuraft tolerates.
+    homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
+    std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
+
 private:
     // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).
     volume_handle craft_volume(int64_t lsn) const;
@@ -117,5 +129,8 @@ private:
     HomeBlocksImpl* hb_;
     homestore::group_id_t group_id_;
     std::atomic< bool > replaying_;
+    std::atomic_flag snapshot_refusal_logged_{};
+    std::mutex snapshot_mu_;
+    std::shared_ptr< homestore::snapshot_context > last_snapshot_; // guarded by snapshot_mu_
 };
 } // namespace homeblocks
