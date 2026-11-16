@@ -75,13 +75,7 @@ public:
         return rd ? rd.value() : nullptr;
     }
 
-    // This node's gauge of CRAFT groups without a replica here, as a metrics scrape reads it.
-    static int64_t groups_without_replica() {
-        using namespace sisl; // the metric's name literal
-        auto& metrics = std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->metrics();
-        metrics.gather();
-        return GAUGE_VALUE(metrics, craft_groups_without_replica);
-    }
+    static int64_t groups_without_replica() { return g_helper->groups_without_replica(); }
 
     // Waits until the RAFT group is gone from HomeStore: its destroy committed and the reaper removed it.
     static bool wait_for_group_gone(volume_id_t const& id, std::chrono::seconds timeout = std::chrono::seconds(60)) {

@@ -236,10 +236,12 @@ TEST_F(CraftVolumeMultiTest, FailedCreateLeavesNoReplica) {
 }
 
 // A follower's own apply fails, so the group lives on without a replica there. A create sent to that follower leaves
-// the group alone: it neither proposes into nor destroys it, and the other members keep their replicas.
+// the group alone: it neither proposes into nor destroys it, and the other members keep their replicas. The follower
+// reports the group, also after it restarts, and when elected leader it hands leadership to another member.
 TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(3);
+    auto const without_replica = g_helper->groups_without_replica();
     if (me() == 1) { g_helper->set_flip_point("craft_create_volume_apply_error", 1); }
     ASSERT_TRUE(sync());
     if (me() == 0) {
@@ -273,6 +275,30 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     EXPECT_NE(group(id), nullptr);
     if (me() != 1) { EXPECT_TRUE(hb()->get_volume(id)); }
     if (me() == 1) { g_helper->remove_flip("craft_create_volume_apply_error"); }
+    EXPECT_EQ(g_helper->groups_without_replica(), without_replica + (me() == 1 ? 1 : 0));
+    ASSERT_TRUE(sync());
+
+    // Member 1 restarts, after a checkpoint: a CreateVolume committed after the last one would be committed again
+    // after the restart, rather than replayed, and create the replica.
+    if (me() == 1) {
+        ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->cp_mgr().trigger_cp_flush(true /* force */)));
+        g_helper->restart();
+        EXPECT_FALSE(hb()->get_volume(id));
+        EXPECT_NE(group(id), nullptr);
+        EXPECT_EQ(g_helper->groups_without_replica(), without_replica + 1);
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        auto const handed_off = g_helper->leaderships_handed_off();
+        // Fails if it times out: member 1 hands leadership off as soon as it has it.
+        (void)homeblocks::detail::sync_get(group(id)->become_leader());
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
     ASSERT_TRUE(sync());
 }
 #endif

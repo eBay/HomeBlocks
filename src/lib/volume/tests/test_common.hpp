@@ -297,6 +297,16 @@ public:
         remove_files();
     }
 
+    // This node's metrics (HomeBlocksMetrics), as a scrape reads them.
+    int64_t groups_without_replica() {
+        using namespace sisl; // the metric's name literal
+        return GAUGE_VALUE(gathered_metrics(), craft_groups_without_replica);
+    }
+    int64_t leaderships_handed_off() {
+        using namespace sisl; // the metric's name literal
+        return COUNTER_VALUE(gathered_metrics(), craft_leaderships_handed_off);
+    }
+
     peer_id_t svc_id() { return svc_id_; }
     std::vector< std::string > const& dev_list() const { return dev_list_; }
     Runner& runner() { return io_runner_; }
@@ -367,6 +377,12 @@ public:
     }
 
 private:
+    homeblocks::HomeBlocksMetrics& gathered_metrics() {
+        auto& metrics = std::dynamic_pointer_cast< homeblocks::HomeBlocksImpl >(hb_)->metrics();
+        metrics.gather();
+        return metrics;
+    }
+
     void init_devices(bool is_file, uint64_t dev_size = 0) {
         if (is_file) {
             for (const auto& fpath : dev_list_) {
