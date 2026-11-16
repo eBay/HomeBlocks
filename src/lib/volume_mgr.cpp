@@ -607,6 +607,17 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
     start_volume_removal(id);
 }
 
+int64_t HomeBlocksImpl::craft_groups_without_replica() const {
+    // The groups first, then vol_lock_: never call into HomeStore while holding it.
+    std::vector< volume_id_t > groups;
+    homestore::hs()->repl_service().iterate_repl_devs([&groups](cshared< homestore::repl_dev >& rd) {
+        if (!is_going_away(*rd)) { groups.push_back(rd->group_id()); }
+    });
+    auto lg = std::shared_lock(vol_lock_);
+    return std::ranges::count_if(
+        groups, [this](auto const& id) { return !vol_map_.contains(id) && !creating_vols_.contains(id); });
+}
+
 result< volume_handle > HomeBlocksImpl::get_volume(const volume_id_t& id) const {
     auto lg = std::shared_lock(vol_lock_);
     if (auto it = vol_map_.find(id); it != vol_map_.end()) { return it->second; }

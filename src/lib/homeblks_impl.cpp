@@ -62,6 +62,8 @@ home_blocks_stats HomeBlocksImpl::get_stats() const {
 std::future< void > HomeBlocksImpl::shutdown_start() {
     LOGI("Setting shutdown start flag");
     shutdown_started_.test_and_set();
+    // A scrape no longer reads HomeStore, which goes down next; this waits out one in progress.
+    metrics_.detach_gather_cb();
 
     // Pending chunk releases skip write-back cache eviction from now on; can_shutdown() waits for them.
     if (volume_chunk_selector_) { volume_chunk_selector_->start_shutdown(); }
@@ -422,6 +424,12 @@ void HomeBlocksImpl::init_homestore() {
     }
 
     recovery_done_ = true;
+    // Counted at each scrape from HomeStore's groups and this node's replicas, now that both are recovered; until
+    // shutdown starts.
+    if (is_craft()) {
+        metrics_.attach_gather_cb(
+            [this] { GAUGE_UPDATE(metrics_, craft_groups_without_replica, craft_groups_without_replica()); });
+    }
     LOGI("Initialize and start HomeStore is successfully");
 }
 

@@ -75,6 +75,14 @@ public:
         return rd ? rd.value() : nullptr;
     }
 
+    // This node's gauge of CRAFT groups without a replica here, as a metrics scrape reads it.
+    static int64_t groups_without_replica() {
+        using namespace sisl; // the metric's name literal
+        auto& metrics = std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->metrics();
+        metrics.gather();
+        return GAUGE_VALUE(metrics, craft_groups_without_replica);
+    }
+
     // Waits until the RAFT group is gone from HomeStore: its destroy committed and the reaper removed it.
     static bool wait_for_group_gone(volume_id_t const& id, std::chrono::seconds timeout = std::chrono::seconds(60)) {
         auto const deadline = std::chrono::steady_clock::now() + timeout;
@@ -354,17 +362,18 @@ TEST_F(CraftVolumeTest, FailedCreateRollsBack) {
 // A create whose local apply failed and whose rollback never ran (the receiver crashed first) leaves its group without
 // a replica here. A retry neither proposes into that group nor destroys it, also when the group shows up only after
 // the retry's own check (as a peer's join may install one), and after a restart: once the group is destroyed, the
-// volume can be created again.
+// volume can be created again. Meanwhile the node reports the group among those without a replica here.
 TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
     auto const info = craft_vol_info("craft_vol_unfinished");
     auto const id = info.id;
+    auto const without_replica = groups_without_replica();
     g_helper->set_flip_point("craft_create_volume_apply_error", 1);
     g_helper->set_flip_point("craft_create_volume_no_rollback", 1);
     ASSERT_FALSE(create(clone(info)));
     g_helper->remove_flip("craft_create_volume_apply_error");
     g_helper->remove_flip("craft_create_volume_no_rollback");
 
-    auto const expect_left_alone = [this, &info, &id] {
+    auto const expect_left_alone = [this, &info, &id, without_replica] {
         auto retry = create(clone(info));
         ASSERT_FALSE(retry);
         EXPECT_EQ(retry.error(), std::errc::operation_in_progress);
@@ -372,6 +381,7 @@ TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
         auto const rd = group(id);
         ASSERT_NE(rd, nullptr);
         EXPECT_FALSE(is_going_away(*rd));
+        EXPECT_EQ(groups_without_replica(), without_replica + 1);
     };
     expect_left_alone();
 
@@ -397,10 +407,12 @@ TEST_F(CraftVolumeTest, RetryLeavesAnUnfinishedGroupAlone) {
     }
     ASSERT_TRUE(leads());
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+    EXPECT_EQ(groups_without_replica(), without_replica); // being destroyed, if not gone yet
     ASSERT_TRUE(wait_for_group_gone(id));
     auto vol = create(clone(info));
     ASSERT_TRUE(vol) << vol.error().message();
     EXPECT_NE((*vol)->craft_dev(), nullptr);
+    EXPECT_EQ(groups_without_replica(), without_replica);
 }
 
 // A create that crashed between its index table and its superblock leaves the table behind. The table keeps its
