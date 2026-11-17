@@ -289,11 +289,17 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     }
     ASSERT_TRUE(sync());
 
+    // Made leader, member 1 hands leadership off at once, so become_leader() may well time out. It also fails until
+    // member 1, just restarted, knows the leader: asked again until the hand-off shows.
     if (me() == 1) {
         auto const handed_off = g_helper->leaderships_handed_off();
-        // Fails if it times out: member 1 hands leadership off as soon as it has it.
-        (void)homeblocks::detail::sync_get(group(id)->become_leader());
-        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+        EXPECT_TRUE(wait_until([&id, handed_off] {
+            if (g_helper->leaderships_handed_off() > handed_off) { return true; }
+            if (auto const rd = group(id); rd && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return g_helper->leaderships_handed_off() > handed_off;
+        }));
     }
     EXPECT_TRUE(wait_until([&id] {
         auto const leader = group(id)->get_leader_id();
