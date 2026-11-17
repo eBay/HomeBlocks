@@ -104,6 +104,7 @@ protected:
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
+    void TearDown() override { EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{}); }
 
     auto do_write(uint64_t term, int64_t lsn) {
         return homeblocks::detail::sync_get(

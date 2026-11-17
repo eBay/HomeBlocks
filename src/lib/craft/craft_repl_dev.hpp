@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -482,7 +483,8 @@ public:
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
-    // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
+    // Seeds the session term so tests can exercise write() with a non-zero term without a full login. Raises the login
+    // fence with it, as a committed and applied login would.
     void seed_term(uint64_t term);
     // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
     void seed_in_flight(int64_t lsn);
@@ -530,6 +532,15 @@ public:
         std::lock_guard lk{overlay_mu_};
         return overlay_extent_.contains(lsn);
     }
+
+    // Holds the apply queue: committed entries still make their commit-time effects, but none applies until
+    // resume_apply(). Lets a test observe an entry between its commit and its apply.
+    void pause_apply();
+    void resume_apply();
+
+    // Checks the invariants that hold whenever no operation or apply is running; returns one line per violation.
+    // Every CRAFT test fixture checks it in TearDown().
+    std::vector< std::string > invariant_violations();
 
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
@@ -684,6 +695,7 @@ private:
     std::deque< PendingApply > apply_queue_; // guarded by apply_mu_
     bool apply_running_{false};              // guarded by apply_mu_: a drainer is active
     bool apply_stopped_{false};              // guarded by apply_mu_
+    bool apply_paused_{false};               // guarded by apply_mu_; set only by the test seam pause_apply()
     bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
     sisl::async::value_awaitable< bool > apply_idle_;
 

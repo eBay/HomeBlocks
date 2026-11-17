@@ -694,6 +694,7 @@ void CraftReplDev::seed_commit_lsn(int64_t commit) {
 void CraftReplDev::seed_term(uint64_t term) {
     std::lock_guard lk{state_mu_};
     state_.term = term;
+    login_fence_term_ = std::max(login_fence_term_, term);
 }
 
 void CraftReplDev::seed_in_flight(int64_t lsn) {
@@ -2080,7 +2081,8 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
             }
             if (!rejected) {
                 apply_queue_.push_back(std::move(entry));
-                start = !std::exchange(apply_running_, true); // else the running drainer picks it up
+                // else the running drainer, or resume_apply(), picks it up
+                start = !apply_paused_ && !std::exchange(apply_running_, true);
             }
         }
     }
@@ -2098,7 +2100,7 @@ std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
     bool notify;
     {
         std::lock_guard lk{apply_mu_};
-        if (!apply_queue_.empty() && !apply_stopped_) {
+        if (!apply_queue_.empty() && !apply_stopped_ && !apply_paused_) {
             auto entry = std::move(apply_queue_.front());
             apply_queue_.pop_front();
             return entry;
@@ -2163,6 +2165,62 @@ async_status CraftReplDev::stop_apply() {
     if (wait) co_await apply_idle_;
     co_return ok();
 }
+
+#ifdef _PRERELEASE
+void CraftReplDev::pause_apply() {
+    std::lock_guard lk{apply_mu_};
+    apply_paused_ = true; // an apply in progress finishes; the drainer then stops
+}
+
+void CraftReplDev::resume_apply() {
+    bool start;
+    {
+        std::lock_guard lk{apply_mu_};
+        apply_paused_ = false;
+        start = !apply_queue_.empty() && !std::exchange(apply_running_, true);
+    }
+    if (start) detail::detach(drain_apply());
+}
+
+std::vector< std::string > CraftReplDev::invariant_violations() {
+    std::vector< std::string > found;
+    {
+        std::lock_guard lk{apply_mu_};
+        if (apply_running_ || !apply_queue_.empty())
+            found.push_back(fmt::format("apply queue not idle: {} queued, drainer {}", apply_queue_.size(),
+                                        apply_running_ ? "running" : "not running"));
+    }
+    std::lock_guard sl{state_mu_};
+    if (login_fence_term_ < state_.term)
+        found.push_back(fmt::format("login fence term {} below the session term {}", login_fence_term_, state_.term));
+    for (int64_t lsn : empty_lsns_)
+        if (missing_lsns_.contains(lsn)) found.push_back(fmt::format("lsn {} is both missing and Empty", lsn));
+
+    std::lock_guard ol{overlay_mu_};
+    std::unordered_map< int64_t, uint32_t > owned; // overlay entries per lsn
+    for (auto const& [lba, entry] : overlay_) {
+        ++owned[entry.lsn];
+        auto const extent = overlay_extent_.find(entry.lsn);
+        if (extent == overlay_extent_.end()) {
+            found.push_back(fmt::format("overlay lba {} (lsn {}) has no extent", lba, entry.lsn));
+        } else if (lba < extent->second.start_lba || lba >= extent->second.start_lba + extent->second.nlbas) {
+            found.push_back(fmt::format("overlay lba {} (lsn {}) is outside its extent [{}, +{})", lba, entry.lsn,
+                                        extent->second.start_lba, extent->second.nlbas));
+        }
+    }
+    for (auto const& [lsn, extent] : overlay_extent_) {
+        auto const it = owned.find(lsn);
+        uint32_t const live = it == owned.end() ? 0 : it->second;
+        if (live == 0) {
+            found.push_back(fmt::format("extent of lsn {} outlived its overlay entries", lsn));
+        } else if (extent.live != live) {
+            found.push_back(
+                fmt::format("extent of lsn {} counts {} entries, the overlay has {}", lsn, extent.live, live));
+        }
+    }
+    return found;
+}
+#endif
 
 void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, sisl::blob const& /* header */,
                                                sisl::blob const& /* key */,

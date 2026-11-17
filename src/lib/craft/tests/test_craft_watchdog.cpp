@@ -125,6 +125,10 @@ protected:
     }
 
     void TearDown() override {
+        if (dev_) {
+            dev_->stop_watchdog(); // no tick runs during the check
+            EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{});
+        }
         destroy_dev();
         HB_SETTINGS_FACTORY().modifiable_settings([this](auto& s) { s.craft_watchdog_timeout_ms = orig_timeout_ms_; });
     }

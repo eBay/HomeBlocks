@@ -167,6 +167,7 @@ protected:
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
         dev_->set_raft_proposer(&proposer_);
     }
+    void TearDown() override { EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{}); }
 
     // pre_resolve_slots is private and only this fixture is a friend (TEST_F bodies are subclasses, which
     // don't inherit friendship), so tests reach it through these helpers.
@@ -1039,9 +1040,9 @@ protected:
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
-    void commit_sync(int64_t rs_commit_lsn) {
-        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
+    void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
     void commit_login(uint64_t term) {
@@ -1679,11 +1680,113 @@ TEST_F(CraftAppendTest, LoginCommittedDuringFetchStopsOldSessionRound) {
     fetcher_.fetch_gate.complete(true);
 }
 
+// ── fence matrix (SDSTOR-26655) ───────────────────────────────────────────────
+//
+// What each entry point makes of an entry that has committed but not yet applied. Each cell commits one entry with
+// the apply queue paused and calls one entry point, then resumes the queue and calls it again. A new entry type or
+// entry point adds its cells here, so moving an effect between commit and apply fails a cell.
+//
+// Start: slots 0..2 appended, session term 0.
+//   Sync   SyncRSCommitLSN(rs=5, Empty={4})
+//   Login  InternalLogin(term=5)
+// Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
+// (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
+
+enum class Queued { sync, login };
+enum class Call { write, write_voided_slot, write_new_term, read, keep_alive, resolve, append, pre_resolve };
+
+struct FenceCell {
+    char const* name;
+    Queued entry;
+    Call call;
+    std::error_condition while_queued; // {} = accepted
+    std::error_condition once_applied;
+};
+void PrintTo(FenceCell const& cell, std::ostream* os) { *os << cell.name; }
+
+std::vector< FenceCell > fence_cells() {
+    auto const stale = craft::make_error_condition(craft::craft_error::STALE_TERM);
+    auto const empty_slot = make_error_condition(volume_error::EMPTY_SLOT);
+    auto const no_index = std::make_error_condition(std::errc::not_supported); // read() got past its term check
+    return {
+        // A Sync doesn't fence the session; its verdicts fence the slots they void.
+        {"Sync_Write", Queued::sync, Call::write, {}, {}},
+        {"Sync_WriteVoidedSlot", Queued::sync, Call::write_voided_slot, empty_slot, empty_slot},
+        // A login fences the old session's writes and leader rounds at commit. Reads and keep_alive aren't fenced
+        // (quiesce blocks writes only): like the new term's writes, they change over when the login applies.
+        {"Login_Write", Queued::login, Call::write, stale, stale},
+        {"Login_WriteNewTerm", Queued::login, Call::write_new_term, stale, {}},
+        {"Login_Read", Queued::login, Call::read, no_index, stale},
+        {"Login_KeepAlive", Queued::login, Call::keep_alive, {}, stale},
+        {"Login_Resolve", Queued::login, Call::resolve, stale, stale},
+        {"Login_Append", Queued::login, Call::append, stale, stale},
+        {"Login_PreResolve", Queued::login, Call::pre_resolve, stale, stale},
+    };
+}
+
+class CraftFenceMatrixTest : public CraftAppendTest, public ::testing::WithParamInterface< FenceCell > {
+protected:
+    // The cell's entry point, called by the old session (term 0) unless it says otherwise. Phase 0 runs while the
+    // entry is queued, phase 1 once it has applied; each phase writes its own dlsn.
+    std::error_condition call(int phase) {
+        auto const outcome = [](auto const& r) { return r ? std::error_condition{} : r.error(); };
+        craft::client_hdr const old_session{0, -1, -1};
+        switch (GetParam().call) {
+        case Call::write:
+            return outcome(do_write(/*dlsn=*/8 + phase, /*term=*/0));
+        case Call::write_voided_slot:
+            return outcome(do_write(/*dlsn=*/4, /*term=*/0));
+        case Call::write_new_term:
+            return outcome(do_write(/*dlsn=*/8 + phase, /*term=*/5));
+        case Call::read: {
+            static std::array< uint8_t, k_page_size > buf{};
+            sisl::sg_list dest;
+            dest.size = k_page_size;
+            dest.iovs.push_back(iovec{buf.data(), buf.size()});
+            return outcome(homeblocks::detail::sync_get(
+                dev_->read(old_session, /*read_lsn=*/2, /*addr=*/0, k_page_size, std::move(dest))));
+        }
+        case Call::keep_alive:
+            return outcome(homeblocks::detail::sync_get(dev_->keep_alive(old_session)));
+        case Call::resolve:
+            return outcome(do_resolve(/*upto=*/5, /*term=*/0));
+        case Call::append:
+            return outcome(homeblocks::detail::sync_get(dev_->append(/*sync_to=*/5, /*client_token=*/0, /*term=*/0)));
+        case Call::pre_resolve:
+            return outcome(do_pre_resolve(/*upto=*/5, /*term=*/0));
+        }
+        return std::make_error_condition(std::errc::invalid_argument);
+    }
+};
+
+TEST_P(CraftFenceMatrixTest, CommitTimeThenApplyTime) {
+    auto const& cell = GetParam();
+    dev_->seed_lsns(2, {});
+    dev_->pause_apply();
+    if (cell.entry == Queued::sync) {
+        commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{4});
+    } else {
+        commit_login(/*term=*/5);
+    }
+
+    auto const queued = call(0);
+    EXPECT_EQ(queued, cell.while_queued) << "while queued, got: " << queued.message();
+    dev_->resume_apply();
+    auto const applied = call(1);
+    EXPECT_EQ(applied, cell.once_applied) << "once applied, got: " << applied.message();
+}
+
+INSTANTIATE_TEST_SUITE_P(Cells, CraftFenceMatrixTest, ::testing::ValuesIn(fence_cells()),
+                         [](auto const& info) { return std::string{info.param.name}; });
+
 } // namespace
 } // namespace homeblocks
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     SISL_OPTIONS_LOAD(argc, argv, logging);
+    // This light suite never starts iomgr, so the watchdog's real recurring timer must stay
+    // disabled -- same reasoning as every other light CRAFT test binary.
+    HB_SETTINGS_FACTORY().load_json("{\"craft_watchdog_timeout_ms\": 0}");
     return RUN_ALL_TESTS();
 }
