@@ -526,6 +526,11 @@ public:
         return client_commit_lsn_;
     }
 
+    bool overlay_has_extent(int64_t lsn) const {
+        std::lock_guard lk{overlay_mu_};
+        return overlay_extent_.contains(lsn);
+    }
+
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
     int64_t overlay_lsn_for(lba_t lba) const {
@@ -667,7 +672,10 @@ private:
         uint64_t term{0};                           // InternalLogin
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
-    void enqueue_apply(PendingApply entry);
+    // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
+    // empty_slots, an InternalLogin's write fence) and queues the rest. Under apply_mu_, so once stop_apply() has run,
+    // nothing changes.
+    void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
     std::optional< PendingApply > next_apply();
     async_status drain_apply();
     async_status apply_one(PendingApply const& entry);
@@ -750,6 +758,8 @@ private:
     // A higher-dLSN entry for the same LBA (a later append not yet committed) survives. Used when commit applies
     // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.
     void retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn);
+    // Retires every overlay entry lsn still holds, over the range it was published over (no overlay scan, no I/O).
+    void retire_overlay_slot(int64_t lsn);
 
     // Claims lsn for one journal write, so pre-resolution, apply catch-up and write() never journal the same slot
     // (H1). in_flight: another write is outstanding; held: the slot is already journaled or Empty. Caller holds
@@ -834,6 +844,9 @@ private:
         bool all_zeros{false};
     };
     std::unordered_map< lba_t, OverlayEntry > overlay_;
+    // The LBA range each lsn was published over ({start_lba, nlbas}), so retire_overlay_slot() visits only that range.
+    // Guarded by overlay_mu_.
+    std::unordered_map< int64_t, std::pair< lba_t, uint32_t > > overlay_extent_;
     mutable std::mutex overlay_mu_; // lock order: state_mu_ before overlay_mu_
 
     bool login_in_progress_{false};
@@ -854,6 +867,9 @@ private:
     // resolved prefix, so nothing at or below it is still in flight.
     // Reset when InternalLogin starts a new session. Guarded by state_mu_.
     int64_t client_commit_lsn_{-1};
+    // write() rejects a term below this (STALE_TERM). Raised when an InternalLogin commits, ahead of its apply, so the
+    // old session can't write while the login waits in the apply queue. Guarded by state_mu_.
+    uint64_t write_fence_term_{0};
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()

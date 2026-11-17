@@ -674,6 +674,7 @@ async_status CraftReplDev::truncate(int64_t lsn) {
                 ++it;
             }
         }
+        std::erase_if(overlay_extent_, [lsn](auto const& extent) { return extent.first > lsn; });
     }
     co_return ok();
 }
@@ -778,6 +779,11 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // actually mutates it from the RAFT commit thread.
         if (hdr.term != state_.term) {
             LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
+        if (hdr.term < write_fence_term_) { // a newer login has committed and waits to apply
+            LOGW("write rejected: term={} fenced by a committed login (term {}) dlsn={}", hdr.term, write_fence_term_,
+                 dlsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
@@ -915,8 +921,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term) {
-            LOGW("write discarded post-flight: term changed dlsn={}", dlsn);
+        if (hdr.term != state_.term || hdr.term < write_fence_term_) {
+            LOGW("write discarded post-flight: term changed or fenced dlsn={}", dlsn);
             stale_post_flight = true;
         } else if (empty_lsns_.contains(dlsn)) {
             // Voted Empty while this write was in flight.
@@ -1178,6 +1184,19 @@ void CraftReplDev::retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t 
         auto it = overlay_.find(l);
         if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
     }
+    overlay_extent_.erase(retiring_lsn);
+}
+
+void CraftReplDev::retire_overlay_slot(int64_t lsn) {
+    std::lock_guard lk{overlay_mu_};
+    auto const extent = overlay_extent_.find(lsn);
+    if (extent == overlay_extent_.end()) return; // never published, or already retired
+    auto const [start_lba, nlbas] = extent->second;
+    for (uint32_t i = 0; i < nlbas; ++i) {
+        auto it = overlay_.find(start_lba + i);
+        if (it != overlay_.end() && it->second.lsn == lsn) overlay_.erase(it);
+    }
+    overlay_extent_.erase(extent);
 }
 
 CraftReplDev::SlotClaim CraftReplDev::peek_slot_write_locked(int64_t lsn) const {
@@ -1202,6 +1221,7 @@ void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlba
                                     std::vector< homestore::csum_t > const& csums) {
     lba_t lba = start_lba;
     std::lock_guard lk{overlay_mu_};
+    overlay_extent_[dlsn] = {start_lba, nlbas};
     if (all_zeros) {
         for (uint32_t i = 0; i < nlbas; ++i, ++lba) {
             auto it = overlay_.find(lba);
@@ -1986,6 +2006,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
     }
     PendingApply entry{
         .lsn = lsn, .type = reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type, .ctx = ctx};
+    std::vector< int64_t > empty_slots;
 
     switch (entry.type) {
     case CraftEntryType::SyncRSCommitLSN: {
@@ -1993,22 +2014,15 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
             LOGE("on_commit lsn={} SyncRSCommitLSN key too small ({} bytes)", lsn, key.size());
             return invalid();
         }
-        auto empty_slots = parse_empty_slots(key);
-        if (!empty_slots) {
+        auto parsed = parse_empty_slots(key);
+        if (!parsed) {
             LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
             return invalid();
         }
         const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
-        // Its state changes now, so its verdicts fence write() and its watermark fences pre_resolve_slots() from the
-        // moment it commits; only its I/O waits for the queue.
-        auto to_free = owner_->install_sync_rs_commit_lsn(payload->rs_commit_lsn, *empty_slots);
-        if (!to_free) {
-            LOGW("apply lsn={} failed: {}", lsn, to_free.error().message());
-            return complete_proposal(ctx, std::unexpected(to_free.error()));
-        }
         entry.rs_commit_lsn = payload->rs_commit_lsn;
         entry.client_token = payload->client_token;
-        entry.to_free = std::move(*to_free);
+        empty_slots = std::move(*parsed);
         break;
     }
     case CraftEntryType::InternalLogin: {
@@ -2026,26 +2040,41 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry.type));
         return invalid();
     }
-    owner_->enqueue_apply(std::move(entry));
+    owner_->enqueue_apply(std::move(entry), empty_slots);
 }
 
 // ─── RAFT apply queue ─────────────────────────────────────────────────────────
 
-void CraftReplDev::enqueue_apply(PendingApply entry) {
-    bool stopped = false;
+void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots) {
+    std::optional< std::error_condition > rejected;
     bool start = false;
     {
         std::lock_guard lk{apply_mu_};
         if (apply_stopped_) {
-            stopped = true;
+            rejected = std::make_error_condition(std::errc::operation_canceled);
         } else {
-            apply_queue_.push_back(std::move(entry));
-            start = !std::exchange(apply_running_, true); // else the running drainer picks it up
+            // Fences take effect at commit; only I/O waits for the queue.
+            if (entry.type == CraftEntryType::SyncRSCommitLSN) {
+                // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
+                if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                    entry.to_free = std::move(*to_free);
+                } else {
+                    rejected = to_free.error();
+                }
+            } else if (entry.type == CraftEntryType::InternalLogin) {
+                // The old session can't write while the login waits for its turn; the login itself applies in order.
+                std::lock_guard sl{state_mu_};
+                write_fence_term_ = std::max(write_fence_term_, entry.term);
+            }
+            if (!rejected) {
+                apply_queue_.push_back(std::move(entry));
+                start = !std::exchange(apply_running_, true); // else the running drainer picks it up
+            }
         }
     }
-    if (stopped) {
-        LOGW("apply lsn={}: the apply queue is stopped, entry not applied", entry.lsn);
-        complete_proposal(entry.ctx, std::unexpected(std::make_error_condition(std::errc::operation_canceled)));
+    if (rejected) {
+        LOGW("apply lsn={} not applied: {}", entry.lsn, rejected->message());
+        complete_proposal(entry.ctx, std::unexpected(*rejected));
         return;
     }
     // Starts inline: with nothing awaited, the entry has applied by the time on_commit() returns.
@@ -2522,10 +2551,8 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
 
     // The voided slots stop being readable now, not once their blocks are freed: commit never retires their overlay
     // entries, since its advance steps over Empty slots.
-    if (!to_free.empty()) {
-        std::lock_guard olk{overlay_mu_};
-        std::erase_if(overlay_, [&](auto const& entry) { return to_free.contains(entry.second.lsn); });
-    }
+    for (int64_t lsn : to_free)
+        retire_overlay_slot(lsn);
     return std::vector< int64_t >(to_free.begin(), to_free.end());
 }
 
