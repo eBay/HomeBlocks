@@ -124,6 +124,10 @@ public:
     uint32_t last_timeout_ms{0};
     std::vector< JournalSlot > response;
     bool should_fail{false};
+    // When set, the next fetch_data() waits for fetch_gate before replying: an apply suspended mid-catch-up.
+    bool hold_fetch{false};
+    sisl::async::value_awaitable< bool > fetch_gate;
+    bool should_throw{false}; // fetch_data() throws, as a transport bug might
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
         co_return craft::lsn_pair{};
@@ -133,6 +137,8 @@ public:
                                                           uint32_t timeout_ms) override {
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
+        if (std::exchange(hold_fetch, false)) co_await fetch_gate;
+        if (should_throw) throw std::runtime_error("fetch_data threw");
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
@@ -208,6 +214,7 @@ protected:
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
+    void TearDown() override { EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{}); }
 
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
         return homeblocks::detail::sync_get(
@@ -1028,6 +1035,63 @@ TEST_F(CraftRaftEntriesTest, OnCommitMalformedEntryFailsProposal) {
     EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
 }
 
+// The proposal completes with its apply's outcome, not just "dispatched": an entry that parses but whose apply rejects
+// it (a verdict past its own watermark) fails the proposal.
+TEST_F(CraftRaftEntriesTest, OnCommitApplyRejectionFailsProposal) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{5});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // nothing applied
+}
+
+// An apply that faults the partition (a verdict for a slot already in the index) fails the proposal too.
+TEST_F(CraftRaftEntriesTest, OnCommitApplyFaultFailsProposal) {
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(dev_->is_faulted());
+}
+
+// An exception escaping an apply fails that entry's proposal and faults the partition (the apply stopped partway), and
+// the queue keeps applying the entries after it.
+TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.should_throw = true; // the Sync's catch-up of slots 3..5 throws
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const sync_ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {});
+
+    auto const outcome = take_test_proposal_outcome(sync_ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 5u); // not wedged: the login behind it applied
+}
+
 TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
     auto const ctx = make_test_proposal_ctx();
 
@@ -1162,6 +1226,262 @@ TEST_F(CraftRaftEntriesTest, ForeignProposalCtxIgnored) {
     dev_->raft_listener().on_rollback(1, {}, {}, foreign);
 
     EXPECT_FALSE(take_test_proposal_outcome(foreign).has_value());
+}
+
+// ── apply queue (SDSTOR-26655) ────────────────────────────────────────────────
+//
+// Committed entries apply one at a time, in log order, each fully before the next. Each test holds a Sync(5) apply
+// mid-catch-up on the fetcher's gate (slots 3..5 are missing), then commits more entries behind it.
+
+// An InternalLogin committed while a Sync is still applying waits for it, and the Sync's proposal completes only once
+// its apply has finished.
+TEST_F(CraftRaftEntriesTest, InternalLoginWaitsForSuspendedSyncApply) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const sync_ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {});
+    EXPECT_FALSE(take_test_proposal_outcome(sync_ctx).has_value()); // still applying
+    EXPECT_EQ(dev_->term(), 0u);                                    // the login waits behind it
+
+    fetcher_.fetch_gate.complete(true);
+
+    auto const outcome = take_test_proposal_outcome(sync_ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// A second Sync committed during the first one's apply changes its state at once, but its I/O (the catch-up) starts
+// only after the first apply finishes.
+TEST_F(CraftRaftEntriesTest, SyncsApplyInLogOrder) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto key8 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/8, /*client_token=*/0, /*empty_slots=*/{});
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key5), {}, {});
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key8), {}, {});
+    EXPECT_EQ(dev_->last_append_lsn(), 8);                                 // state: at commit
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5})); // I/O: only the first catch-up so far
+
+    fetcher_.fetch_gate.complete(true);
+
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5, 6, 7, 8}));
+}
+
+// A Sync waiting in the queue already fences writes: its Empty verdict takes effect at commit, so a late write to the
+// voided slot is rejected before it can be acked, not discarded once the queue reaches the verdict.
+TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictFencesWritesAtCommit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key3 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{4});
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key3), {}, {}); // held in catch-up
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key5), {}, {}); // queued behind it
+    EXPECT_TRUE(dev_->is_empty_slot(4));
+
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/4,
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
+
+    fetcher_.fetch_gate.complete(true);
+}
+
+// ...and stops serving the voided slot at commit: its overlay entry is retired then, not when its blocks are freed.
+TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictStopsServingVoidedSlotAtCommit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/4,
+                    /*addr=*/5 * k_page_size, /*len=*/k_page_size, sisl::sg_list{})); // all_zeros write at lba 5
+    ASSERT_TRUE(w.has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(5), 4);
+    fetcher_.hold_fetch = true;
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key3 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/3, /*client_token=*/0, /*empty_slots=*/{});
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{4});
+
+    ASSERT_TRUE(dev_->overlay_has_extent(4));
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key3), {}, {}); // held catching up 0..3
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key5), {}, {}); // voids the held slot 4
+    EXPECT_EQ(dev_->overlay_lsn_for(5), -1);
+    EXPECT_FALSE(dev_->overlay_has_extent(4)); // retired through its extent, not an overlay scan
+
+    fetcher_.fetch_gate.complete(true);
+}
+
+// An lsn's extent lasts only while it owns an overlay entry: later writes take over its LBAs, and the extent goes
+// with the last one, so the extents never outnumber the overlay.
+TEST_F(CraftRaftEntriesTest, SupersededWriteDropsItsOverlayExtent) {
+    auto const write_at = [this](int64_t dlsn, uint64_t lba, uint64_t nlbas) {
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn,
+                        /*addr=*/lba * k_page_size, /*len=*/nlbas * k_page_size, sisl::sg_list{})); // all_zeros
+    };
+    ASSERT_TRUE(write_at(/*dlsn=*/4, /*lba=*/5, /*nlbas=*/2).has_value()); // lbas 5..6
+    ASSERT_TRUE(write_at(/*dlsn=*/6, /*lba=*/5, /*nlbas=*/1).has_value());
+    EXPECT_TRUE(dev_->overlay_has_extent(4)); // still owns lba 6
+
+    ASSERT_TRUE(write_at(/*dlsn=*/7, /*lba=*/6, /*nlbas=*/1).has_value());
+
+    EXPECT_FALSE(dev_->overlay_has_extent(4));
+    EXPECT_TRUE(dev_->overlay_has_extent(6));
+    EXPECT_TRUE(dev_->overlay_has_extent(7));
+}
+
+// A committed InternalLogin waiting in the queue already fences the old session: its writes are rejected from the
+// login's commit, not once the queue reaches it. The new term is admitted only when the login applies.
+TEST_F(CraftRaftEntriesTest, QueuedLoginFencesOldSessionWritesAtCommit) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const write_at = [this](uint64_t term, int64_t dlsn) {
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{.term = term, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn,
+                        /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+    };
+    auto const stale = craft::make_error_condition(craft::craft_error::STALE_TERM);
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {});   // held in catch-up
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {}); // queued behind it
+
+    auto old_session = write_at(/*term=*/0, /*dlsn=*/6);
+    ASSERT_FALSE(old_session.has_value());
+    EXPECT_EQ(old_session.error(), stale);
+    auto new_session = write_at(/*term=*/5, /*dlsn=*/6); // not admitted until the login applies
+    ASSERT_FALSE(new_session.has_value());
+    EXPECT_EQ(new_session.error(), stale);
+
+    fetcher_.fetch_gate.complete(true);
+
+    EXPECT_TRUE(write_at(/*term=*/5, /*dlsn=*/6).has_value());
+}
+
+// An old-session write already in flight when the login commits isn't acked either: its post-flight check sees the
+// fence, though the login itself is still queued.
+TEST_F(CraftRaftEntriesTest, QueuedLoginFencesInFlightOldSessionWrite) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {}); // held in catch-up
+    journal_->on_write = [&](int64_t) {
+        dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {}); // queued behind it
+    };
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/6,
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{})); // empty data -> all_zeros write
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(dev_->term(), 0u); // the login hasn't applied yet
+
+    journal_->on_write = nullptr;
+    fetcher_.fetch_gate.complete(true);
+}
+
+// A malformed entry fails its proposal at once, even while an apply is in progress, and doesn't block later entries.
+TEST_F(CraftRaftEntriesTest, MalformedEntryFailsAtOnceWithoutStallingTheQueue) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    std::vector< uint8_t > bad_hdr; // too small to hold an entry type
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const bad_ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {});
+    dev_->raft_listener().on_commit(2, as_blob(bad_hdr), as_blob(sync_key), {}, bad_ctx);
+    auto const bad = take_test_proposal_outcome(bad_ctx);
+    ASSERT_TRUE(bad.has_value());
+    ASSERT_FALSE(bad->has_value());
+    EXPECT_EQ(bad->error(), make_error_condition(volume_error::INVALID_ENTRY));
+    dev_->raft_listener().on_commit(3, as_blob(login_hdr), as_blob(login_key), {}, {});
+
+    fetcher_.fetch_gate.complete(true);
+
+    EXPECT_EQ(dev_->term(), 5u);
+}
+
+// stop_apply() waits out the apply in progress and fails the queued entry unapplied; an entry committed after it
+// fails too.
+TEST_F(CraftRaftEntriesTest, StopApplyWaitsOutInFlightApplyAndDropsTheRest) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto const sync_ctx = make_test_proposal_ctx();
+    auto const login_ctx = make_test_proposal_ctx();
+    auto const canceled = std::make_error_condition(std::errc::operation_canceled);
+
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, login_ctx);
+    bool stopped = false;
+    homeblocks::detail::detach([](std::shared_ptr< CraftReplDev > dev, bool& done) -> async_status {
+        auto r = co_await dev->stop_apply();
+        done = true;
+        co_return r;
+    }(dev_, stopped));
+
+    EXPECT_FALSE(stopped); // the Sync is still applying
+    auto const dropped = take_test_proposal_outcome(login_ctx);
+    ASSERT_TRUE(dropped.has_value());
+    ASSERT_FALSE(dropped->has_value());
+    EXPECT_EQ(dropped->error(), canceled);
+
+    fetcher_.fetch_gate.complete(true);
+
+    EXPECT_TRUE(stopped);
+    auto const applied = take_test_proposal_outcome(sync_ctx);
+    ASSERT_TRUE(applied.has_value());
+    EXPECT_TRUE(applied->has_value());
+    EXPECT_EQ(dev_->term(), 0u); // the dropped login never applied
+
+    auto const late_ctx = make_test_proposal_ctx();
+    dev_->raft_listener().on_commit(3, as_blob(login_hdr), as_blob(login_key), {}, late_ctx);
+    auto const late = take_test_proposal_outcome(late_ctx);
+    ASSERT_TRUE(late.has_value());
+    ASSERT_FALSE(late->has_value());
+    EXPECT_EQ(late->error(), canceled);
+    EXPECT_EQ(dev_->term(), 0u);
+
+    // A Sync committed after the stop changes no state either: no watermark, no verdict.
+    auto late_sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/8, /*client_token=*/0, /*empty_slots=*/{7});
+    auto const late_sync_ctx = make_test_proposal_ctx();
+    dev_->raft_listener().on_commit(4, as_blob(sync_hdr), as_blob(late_sync_key), {}, late_sync_ctx);
+    auto const late_sync = take_test_proposal_outcome(late_sync_ctx);
+    ASSERT_TRUE(late_sync.has_value());
+    ASSERT_FALSE(late_sync->has_value());
+    EXPECT_EQ(late_sync->error(), canceled);
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_FALSE(dev_->is_empty_slot(7));
 }
 
 } // namespace

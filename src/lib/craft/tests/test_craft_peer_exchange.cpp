@@ -92,6 +92,7 @@ protected:
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
     }
+    void TearDown() override { EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{}); }
 
     auto do_get_rs_commit_lsn() { return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(0, false)); }
     auto do_fetch_data(std::vector< int64_t > lsns) {

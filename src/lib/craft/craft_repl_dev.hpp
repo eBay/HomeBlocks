@@ -18,16 +18,19 @@
 #include "craft_raft_entries.hpp"
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
-#include <iomgr/timer.hpp> // iomgr::timer_token -- RAII recurring timer used by the watchdog
+#include <iomgr/timer.hpp>                // iomgr::timer_token -- RAII recurring timer used by the watchdog
+#include <sisl/async/value_awaitable.hpp> // stop_apply() waits for the apply queue to go idle
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -466,6 +469,11 @@ public:
     // this device exists) forwards to it.
     homestore::repl_dev_listener& raft_listener() { return raft_listener_; }
 
+    // Stops applying committed RAFT entries: waits out the one being applied, and fails the queued ones and any that
+    // commit later with operation_canceled, unapplied. volume::destroy() calls it (once) before tearing down the index
+    // and journal the applies use.
+    async_status stop_apply();
+
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
@@ -475,7 +483,8 @@ public:
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
-    // Seeds the session term so tests can exercise write() with a non-zero term without a full login.
+    // Seeds the session term so tests can exercise write() with a non-zero term without a full login. Raises the login
+    // fence with it, as a committed and applied login would.
     void seed_term(uint64_t term);
     // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
     void seed_in_flight(int64_t lsn);
@@ -519,6 +528,20 @@ public:
         return client_commit_lsn_;
     }
 
+    bool overlay_has_extent(int64_t lsn) const {
+        std::lock_guard lk{overlay_mu_};
+        return overlay_extent_.contains(lsn);
+    }
+
+    // Holds the apply queue: committed entries still make their commit-time effects, but none applies until
+    // resume_apply(). Lets a test observe an entry between its commit and its apply.
+    void pause_apply();
+    void resume_apply();
+
+    // Checks the invariants that hold whenever no operation or apply is running; returns one line per violation.
+    // Every CRAFT test fixture checks it in TearDown().
+    std::vector< std::string > invariant_violations();
+
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
     int64_t overlay_lsn_for(lba_t lba) const {
@@ -552,7 +575,7 @@ private:
     public:
         explicit CraftRaftListener(CraftReplDev* owner) : owner_{owner} {}
 
-        // Dispatches on entry type; the real work is in the two apply_* helpers below.
+        // Validates the entry and queues it on the device's apply queue (see PendingApply).
         void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                        std::vector< homestore::multi_blk_id > const& blkids,
                        cintrusive< homestore::repl_req_ctx >& ctx) override;
@@ -645,11 +668,50 @@ private:
     // Leader-only; called from write()'s post-flight.
     void maybe_trigger_periodic_sync();
 
-    // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
-    // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
-    // fetch + journal writes.
+    // ── RAFT apply queue ──
+    // Committed entries apply one at a time, in log order, each fully (catch-up included) before the next starts.
+    // on_commit() validates and queues; a SyncRSCommitLSN's state change (its verdicts and watermarks) is made there
+    // too, also in log order, so its fences take effect at commit rather than when the queue reaches it. The drainer
+    // starts inline in on_commit() and runs until the queue empties. The queue is unbounded: on a follower whose
+    // catch-up keeps timing out, later entries pile up behind it.
+    struct PendingApply {
+        int64_t lsn{-1};
+        CraftEntryType type{};
+        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
+        uint64_t client_token{0};
+        std::vector< int64_t > to_free{};           // SyncRSCommitLSN: held slots its verdicts voided
+        uint64_t term{0};                           // InternalLogin
+        intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
+    };
+    // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
+    // empty_slots, an InternalLogin's write fence) and queues the rest. Under apply_mu_, so once stop_apply() has run,
+    // nothing changes.
+    void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
+    std::optional< PendingApply > next_apply();
+    async_status drain_apply();
+    async_status apply_one(PendingApply const& entry);
+
+    std::mutex apply_mu_;
+    std::deque< PendingApply > apply_queue_; // guarded by apply_mu_
+    bool apply_running_{false};              // guarded by apply_mu_: a drainer is active
+    bool apply_stopped_{false};              // guarded by apply_mu_
+    bool apply_paused_{false};               // guarded by apply_mu_; set only by the test seam pause_apply()
+    bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
+    sisl::async::value_awaitable< bool > apply_idle_;
+
+    // A SyncRSCommitLSN's state change, made at commit: the range and index checks, its Empty verdicts (their slots
+    // stop being readable now), the newly spanned missing range, last_append_lsn and applied_sync_lsn_. Returns the
+    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees.
+    result< std::vector< int64_t > > install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
+                                                                std::vector< int64_t > const& empty_slots);
+    // Its I/O, run by the apply queue: frees the voided slots' blocks, catches up the slots still missing at or below
+    // rs_commit_lsn from a peer, and advances commit_lsn.
+    async_status finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
+                                           std::vector< int64_t > to_free);
+    // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
+    // InternalLogin's apply, run by the apply queue.
     void apply_internal_login(uint64_t client_token, uint64_t term);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
@@ -708,6 +770,8 @@ private:
     // A higher-dLSN entry for the same LBA (a later append not yet committed) survives. Used when commit applies
     // a slot or skips an Empty one, and when apply frees an Empty slot's blocks.
     void retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t retiring_lsn);
+    // Retires every overlay entry lsn still holds, over the range it was published over (no overlay scan, no I/O).
+    void retire_overlay_slot(int64_t lsn);
 
     // Claims lsn for one journal write, so pre-resolution, apply catch-up and write() never journal the same slot
     // (H1). in_flight: another write is outstanding; held: the slot is already journaled or Empty. Caller holds
@@ -719,6 +783,8 @@ private:
     // True if journaling lsn would open a new gap while missing_lsns_ is at capacity. Filling a gap, or appending
     // right after the frontier, is always allowed so the set can drain. Caller holds state_mu_.
     bool missing_at_capacity_locked(int64_t lsn) const;
+    // True if term is the current session and no newer login has committed. Caller holds state_mu_.
+    bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;
@@ -792,7 +858,22 @@ private:
         bool all_zeros{false};
     };
     std::unordered_map< lba_t, OverlayEntry > overlay_;
+    // The LBA range each lsn was published over, kept while the lsn still owns an overlay entry, so
+    // retire_overlay_slot() visits only that range. Bounded by the overlay itself. Guarded by overlay_mu_.
+    struct OverlayExtent {
+        lba_t start_lba{0};
+        uint32_t nlbas{0};
+        uint32_t live{0}; // overlay entries the lsn still owns; the extent goes when this reaches 0
+    };
+    std::unordered_map< int64_t, OverlayExtent > overlay_extent_;
     mutable std::mutex overlay_mu_; // lock order: state_mu_ before overlay_mu_
+
+    // Every overlay_ insert and erase goes through these two, which keep overlay_extent_'s counts. Caller holds
+    // overlay_mu_. The first publishes entry at lba (an lsn published over [start_lba, start_lba + nlbas)); the second
+    // erases it and returns the next iterator.
+    void set_overlay_entry_locked(lba_t lba, OverlayEntry entry, lba_t start_lba, uint32_t nlbas);
+    std::unordered_map< lba_t, OverlayEntry >::iterator
+    drop_overlay_entry_locked(std::unordered_map< lba_t, OverlayEntry >::iterator it);
 
     bool login_in_progress_{false};
     std::mutex login_mu_;
@@ -812,6 +893,10 @@ private:
     // resolved prefix, so nothing at or below it is still in flight.
     // Reset when InternalLogin starts a new session. Guarded by state_mu_.
     int64_t client_commit_lsn_{-1};
+    // The term of the latest committed InternalLogin, raised at commit ahead of its apply: writes and leader rounds at
+    // a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply queue.
+    // Guarded by state_mu_.
+    uint64_t login_fence_term_{0};
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
