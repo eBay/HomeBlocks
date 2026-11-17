@@ -669,12 +669,11 @@ async_status CraftReplDev::truncate(int64_t lsn) {
         std::lock_guard lk{overlay_mu_};
         for (auto it = overlay_.begin(); it != overlay_.end();) {
             if (it->second.lsn > lsn) {
-                it = overlay_.erase(it);
+                it = drop_overlay_entry_locked(it);
             } else {
                 ++it;
             }
         }
-        std::erase_if(overlay_extent_, [lsn](auto const& extent) { return extent.first > lsn; });
     }
     co_return ok();
 }
@@ -781,8 +780,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write rejected: stale term want={} got={} dlsn={}", state_.term, hdr.term, dlsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        if (hdr.term < write_fence_term_) { // a newer login has committed and waits to apply
-            LOGW("write rejected: term={} fenced by a committed login (term {}) dlsn={}", hdr.term, write_fence_term_,
+        if (hdr.term < login_fence_term_) { // a newer login has committed and waits to apply
+            LOGW("write rejected: term={} fenced by a committed login (term {}) dlsn={}", hdr.term, login_fence_term_,
                  dlsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
@@ -921,7 +920,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term || hdr.term < write_fence_term_) {
+        if (!session_current_locked(hdr.term)) {
             LOGW("write discarded post-flight: term changed or fenced dlsn={}", dlsn);
             stale_post_flight = true;
         } else if (empty_lsns_.contains(dlsn)) {
@@ -1182,21 +1181,34 @@ void CraftReplDev::retire_overlay_range(lba_t start_lba, lba_t end_lba, int64_t 
     std::lock_guard lk{overlay_mu_};
     for (lba_t l = start_lba; l <= end_lba; ++l) {
         auto it = overlay_.find(l);
-        if (it != overlay_.end() && it->second.lsn == retiring_lsn) overlay_.erase(it);
+        if (it != overlay_.end() && it->second.lsn == retiring_lsn) drop_overlay_entry_locked(it);
     }
-    overlay_extent_.erase(retiring_lsn);
 }
 
 void CraftReplDev::retire_overlay_slot(int64_t lsn) {
     std::lock_guard lk{overlay_mu_};
     auto const extent = overlay_extent_.find(lsn);
-    if (extent == overlay_extent_.end()) return; // never published, or already retired
-    auto const [start_lba, nlbas] = extent->second;
+    if (extent == overlay_extent_.end()) return; // owns no overlay entry
+    auto const start_lba = extent->second.start_lba;
+    auto const nlbas = extent->second.nlbas;
     for (uint32_t i = 0; i < nlbas; ++i) {
         auto it = overlay_.find(start_lba + i);
-        if (it != overlay_.end() && it->second.lsn == lsn) overlay_.erase(it);
+        if (it != overlay_.end() && it->second.lsn == lsn) drop_overlay_entry_locked(it); // the last drops the extent
     }
-    overlay_extent_.erase(extent);
+}
+
+void CraftReplDev::set_overlay_entry_locked(lba_t lba, OverlayEntry entry, lba_t start_lba, uint32_t nlbas) {
+    if (auto it = overlay_.find(lba); it != overlay_.end()) drop_overlay_entry_locked(it);
+    ++overlay_extent_.try_emplace(entry.lsn, OverlayExtent{.start_lba = start_lba, .nlbas = nlbas}).first->second.live;
+    overlay_.emplace(lba, entry);
+}
+
+auto CraftReplDev::drop_overlay_entry_locked(std::unordered_map< lba_t, OverlayEntry >::iterator it)
+    -> std::unordered_map< lba_t, OverlayEntry >::iterator {
+    if (auto extent = overlay_extent_.find(it->second.lsn);
+        extent != overlay_extent_.end() && --extent->second.live == 0)
+        overlay_extent_.erase(extent);
+    return overlay_.erase(it);
 }
 
 CraftReplDev::SlotClaim CraftReplDev::peek_slot_write_locked(int64_t lsn) const {
@@ -1221,12 +1233,11 @@ void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlba
                                     std::vector< homestore::csum_t > const& csums) {
     lba_t lba = start_lba;
     std::lock_guard lk{overlay_mu_};
-    overlay_extent_[dlsn] = {start_lba, nlbas};
     if (all_zeros) {
         for (uint32_t i = 0; i < nlbas; ++i, ++lba) {
             auto it = overlay_.find(lba);
             if (it == overlay_.end() || dlsn > it->second.lsn) {
-                overlay_[lba] = OverlayEntry{.lsn = dlsn, .all_zeros = true};
+                set_overlay_entry_locked(lba, OverlayEntry{.lsn = dlsn, .all_zeros = true}, start_lba, nlbas);
             }
         }
     } else {
@@ -1252,7 +1263,8 @@ void CraftReplDev::populate_overlay(int64_t dlsn, lba_t start_lba, uint32_t nlba
                 if (it != overlay_.end() && dlsn <= it->second.lsn) continue;
                 homestore::blk_id single_bid{static_cast< homestore::blk_num_t >(piece->blk_num() + i), 1,
                                              piece->chunk_num()};
-                overlay_[lba] = OverlayEntry{.lsn = dlsn, .blkid = single_bid, .csum = csums[csum_idx]};
+                set_overlay_entry_locked(lba, OverlayEntry{.lsn = dlsn, .blkid = single_bid, .csum = csums[csum_idx]},
+                                         start_lba, nlbas);
             }
         }
     }
@@ -1765,8 +1777,8 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
     uint64_t client_token;
     {
         std::lock_guard lk{state_mu_};
-        if (hdr.term != state_.term) {
-            LOGW("request_resolution rejected: stale term want={} got={}", state_.term, hdr.term);
+        if (!session_current_locked(hdr.term)) {
+            LOGW("request_resolution rejected: stale or fenced term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         client_token = state_.client_token;
@@ -1794,7 +1806,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     // pre_resolve_slots() and the pre-propose check below re-verify it after every await.
     {
         std::lock_guard lk{state_mu_};
-        if (state_.term != term) {
+        if (!session_current_locked(term)) {
             LOGW("append: term moved past the caller's ({} -> {}) -- abandoning sync_to={}", term, state_.term,
                  sync_to);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
@@ -1841,7 +1853,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
         {
             std::lock_guard lk{state_mu_};
-            if (state_.term != term)
+            if (!session_current_locked(term))
                 co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
 
@@ -1871,7 +1883,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
         // The entry committed whichever session is current now, so the watermark moves either way.
         if (!skip) last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, target);
         // The reply doesn't: if InternalLogin replaced the caller's session during the awaits above, it's gone.
-        if (state_.term != term) {
+        if (!session_current_locked(term)) {
             LOGW("append: term moved past the caller's ({} -> {}) after resolving to {}", term, state_.term, target);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
@@ -2064,7 +2076,7 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
             } else if (entry.type == CraftEntryType::InternalLogin) {
                 // The old session can't write while the login waits for its turn; the login itself applies in order.
                 std::lock_guard sl{state_mu_};
-                write_fence_term_ = std::max(write_fence_term_, entry.term);
+                login_fence_term_ = std::max(login_fence_term_, entry.term);
             }
             if (!rejected) {
                 apply_queue_.push_back(std::move(entry));
@@ -2245,7 +2257,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
                  state_.last_append_lsn);
             co_return std::unexpected(make_error_condition(std::errc::value_too_large));
         }
-        if (state_.term != term) {
+        if (!session_current_locked(term)) {
             LOGW("pre_resolve_slots: term moved past the caller's ({} -> {}) -- abandoning upto={}", term, state_.term,
                  upto);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
@@ -2292,7 +2304,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     int64_t settled_floor;
     {
         std::lock_guard lk{state_mu_};
-        if (state_.term != term) {
+        if (!session_current_locked(term)) {
             LOGW("pre_resolve_slots: term changed during quorum fetch ({} -> {}) -- abandoning upto={}", term,
                  state_.term, upto);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
@@ -2354,7 +2366,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
 
     auto const term_changed = [this, term] {
         std::lock_guard lk{state_mu_};
-        return state_.term != term;
+        return !session_current_locked(term);
     };
 
     PreResolution result;
@@ -2390,7 +2402,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             std::lock_guard lk{state_mu_};
             // A failed write above continues without a term check; claiming here would block the new session's
             // own write to this slot.
-            if (state_.term != term) {
+            if (!session_current_locked(term)) {
                 LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", lsn);
                 co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
             }
@@ -2451,7 +2463,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             // entry stays journalled (blkid not freed -- the journal references it, same as write()'s
             // post-flight) under its stale term for the next login to truncate; missing_lsns_ is untouched.
             std::lock_guard lk{state_mu_};
-            if (state_.term != term) {
+            if (!session_current_locked(term)) {
                 LOGW("pre_resolve_slots: term changed during write_slot -- abandoning at lsn={}", slot->lsn);
                 co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
             }

@@ -1030,6 +1030,25 @@ protected:
     auto do_resolve(int64_t upto, uint64_t term = 0) {
         return homeblocks::detail::sync_get(dev_->request_resolution(craft::client_hdr{term, -1, -1}, upto));
     }
+
+    // Commit an entry on this member as RAFT would, with no proposal of its own.
+    void commit_entry(CraftEntryType type, std::vector< uint8_t > const& key) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = type;
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    }
+    void commit_sync(int64_t rs_commit_lsn) {
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
+        commit_entry(CraftEntryType::SyncRSCommitLSN, key);
+    }
+    void commit_login(uint64_t term) {
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        commit_entry(CraftEntryType::InternalLogin, key);
+    }
 };
 
 // ── preconditions ─────────────────────────────────────────────────────────────
@@ -1290,15 +1309,6 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
 TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowQueuedWatermark) {
     dev_->seed_lsns(2, {});
     fetcher_.hold_fetch = true;
-    auto const commit_sync = [this](int64_t rs_commit_lsn) {
-        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
-        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
-        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
-        cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
-                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
-    };
     commit_sync(3); // held in catch-up
     commit_sync(5); // queued behind it
 
@@ -1618,6 +1628,55 @@ TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     EXPECT_EQ(decode(proposer_.proposed[0]).client_token, 99u);
+}
+
+// ── a committed login fences the old session (SDSTOR-26655) ───────────────────
+//
+// Each test holds a Sync(5) apply mid-catch-up (slots 3..5 are missing), so an InternalLogin committed behind it
+// stays queued: its fence is up, but the device's term is still the old session's.
+
+// An old-session round is rejected from the login's commit, before it fetches or proposes anything.
+TEST_F(CraftAppendTest, QueuedLoginFencesOldSessionRounds) {
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    commit_sync(5);  // held in catch-up
+    commit_login(5); // queued behind it
+    ASSERT_EQ(dev_->term(), 0u);
+    auto const stale = craft::make_error_condition(craft::craft_error::STALE_TERM);
+
+    auto a = do_append(5);
+    ASSERT_FALSE(a.has_value());
+    EXPECT_EQ(a.error(), stale);
+    auto r = do_resolve(5, /*term=*/0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale);
+    auto p = do_pre_resolve(/*upto=*/5);
+    ASSERT_FALSE(p.has_value());
+    EXPECT_EQ(p.error(), stale);
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+
+    fetcher_.fetch_gate.complete(true);
+}
+
+// A round already past its first check when the login commits stops at the next one, writing nothing.
+TEST_F(CraftAppendTest, LoginCommittedDuringFetchStopsOldSessionRound) {
+    dev_->seed_lsns(2, {});
+    fetcher_.hold_fetch = true;
+    commit_sync(5); // held in catch-up
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    fetcher_.on_fetch = [this] { commit_login(5); }; // queued behind the Sync
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->term(), 0u); // stopped by the fence, not by the login's apply
+
+    fetcher_.on_fetch = nullptr;
+    fetcher_.fetch_gate.complete(true);
 }
 
 } // namespace

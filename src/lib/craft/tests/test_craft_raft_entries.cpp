@@ -1323,6 +1323,25 @@ TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictStopsServingVoidedSlotAtCommit) {
     fetcher_.fetch_gate.complete(true);
 }
 
+// An lsn's extent lasts only while it owns an overlay entry: later writes take over its LBAs, and the extent goes
+// with the last one, so the extents never outnumber the overlay.
+TEST_F(CraftRaftEntriesTest, SupersededWriteDropsItsOverlayExtent) {
+    auto const write_at = [this](int64_t dlsn, uint64_t lba, uint64_t nlbas) {
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn,
+                        /*addr=*/lba * k_page_size, /*len=*/nlbas * k_page_size, sisl::sg_list{})); // all_zeros
+    };
+    ASSERT_TRUE(write_at(/*dlsn=*/4, /*lba=*/5, /*nlbas=*/2).has_value()); // lbas 5..6
+    ASSERT_TRUE(write_at(/*dlsn=*/6, /*lba=*/5, /*nlbas=*/1).has_value());
+    EXPECT_TRUE(dev_->overlay_has_extent(4)); // still owns lba 6
+
+    ASSERT_TRUE(write_at(/*dlsn=*/7, /*lba=*/6, /*nlbas=*/1).has_value());
+
+    EXPECT_FALSE(dev_->overlay_has_extent(4));
+    EXPECT_TRUE(dev_->overlay_has_extent(6));
+    EXPECT_TRUE(dev_->overlay_has_extent(7));
+}
+
 // A committed InternalLogin waiting in the queue already fences the old session: its writes are rejected from the
 // login's commit, not once the queue reaches it. The new term is admitted only when the login applies.
 TEST_F(CraftRaftEntriesTest, QueuedLoginFencesOldSessionWritesAtCommit) {

@@ -771,6 +771,8 @@ private:
     // True if journaling lsn would open a new gap while missing_lsns_ is at capacity. Filling a gap, or appending
     // right after the frontier, is always allowed so the set can drain. Caller holds state_mu_.
     bool missing_at_capacity_locked(int64_t lsn) const;
+    // True if term is the current session and no newer login has committed. Caller holds state_mu_.
+    bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;
@@ -844,10 +846,22 @@ private:
         bool all_zeros{false};
     };
     std::unordered_map< lba_t, OverlayEntry > overlay_;
-    // The LBA range each lsn was published over ({start_lba, nlbas}), so retire_overlay_slot() visits only that range.
-    // Guarded by overlay_mu_.
-    std::unordered_map< int64_t, std::pair< lba_t, uint32_t > > overlay_extent_;
+    // The LBA range each lsn was published over, kept while the lsn still owns an overlay entry, so
+    // retire_overlay_slot() visits only that range. Bounded by the overlay itself. Guarded by overlay_mu_.
+    struct OverlayExtent {
+        lba_t start_lba{0};
+        uint32_t nlbas{0};
+        uint32_t live{0}; // overlay entries the lsn still owns; the extent goes when this reaches 0
+    };
+    std::unordered_map< int64_t, OverlayExtent > overlay_extent_;
     mutable std::mutex overlay_mu_; // lock order: state_mu_ before overlay_mu_
+
+    // Every overlay_ insert and erase goes through these two, which keep overlay_extent_'s counts. Caller holds
+    // overlay_mu_. The first publishes entry at lba (an lsn published over [start_lba, start_lba + nlbas)); the second
+    // erases it and returns the next iterator.
+    void set_overlay_entry_locked(lba_t lba, OverlayEntry entry, lba_t start_lba, uint32_t nlbas);
+    std::unordered_map< lba_t, OverlayEntry >::iterator
+    drop_overlay_entry_locked(std::unordered_map< lba_t, OverlayEntry >::iterator it);
 
     bool login_in_progress_{false};
     std::mutex login_mu_;
@@ -867,9 +881,10 @@ private:
     // resolved prefix, so nothing at or below it is still in flight.
     // Reset when InternalLogin starts a new session. Guarded by state_mu_.
     int64_t client_commit_lsn_{-1};
-    // write() rejects a term below this (STALE_TERM). Raised when an InternalLogin commits, ahead of its apply, so the
-    // old session can't write while the login waits in the apply queue. Guarded by state_mu_.
-    uint64_t write_fence_term_{0};
+    // The term of the latest committed InternalLogin, raised at commit ahead of its apply: writes and leader rounds at
+    // a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply queue.
+    // Guarded by state_mu_.
+    uint64_t login_fence_term_{0};
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
