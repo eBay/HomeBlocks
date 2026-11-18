@@ -42,7 +42,7 @@ replica that lacks them, and, at login only, decide the fate of writes that neve
 | 5. Login aborted | The leader crashes in the middle of a login |
 | 6. Snapshot for a replica past retention | The writes a replica needs are no longer in any journal |
 | 7. New member joins | A replica is added or replaced |
-| 8. Snapshot source fails | The replica serving a snapshot dies mid-transfer |
+| 8. Snapshot interrupted | The leader or the receiving replica fails mid-transfer |
 | 9. UBD disappears | UBD stops without logging out |
 
 ### Case 1: One replica misses a write
@@ -329,21 +329,21 @@ sequenceDiagram
 ### Case 6: Snapshot for a replica past retention
 
 Journals are bounded. If a replica fell so far behind that the writes it needs were cleaned up everywhere, it
-cannot heal through Case 2. It instead copies the whole volume state (the HomeBlocks B-tree with its data) from
-one healthy replica, then replays that replica's journal from the snapshot point. This happens **directly between
-the two replicas**; RAFT is not involved, so it works even for a replica that was online all along.
+cannot heal through Case 2. It instead receives a **snapshot**: the volume's whole state (the HomeBlocks B-tree with
+its data) as of one point, then the writes after that point. The transfer rides **nuraft's own snapshot
+mechanism** on the volume's RAFT group, the way HomeObject resyncs a PG; HomeBlocks only supplies the content
+through the RAFT listener's snapshot callbacks (§4.9).
 
 #### Flow
 
-1. A fetch answers "reclaimed". The leader sets the replica's election priority to 0, so it cannot become leader
-   while behind.
-2. The replica picks a healthy source (any replica, preferably not the leader) and opens a snapshot session. The
-   source freezes its B-tree at a point (`startLSN`) and keeps its journal from there, for as long as the session
-   is alive.
-3. The replica pulls the B-tree in chunks. Each chunk replaces one LBA range (data and holes) in its own B-tree.
-   It keeps storing new UBD writes but does not apply them yet.
-4. It fetches the source's journal from the snapshot point, closes the session, and resumes normal catch-up. The
-   leader restores its priority.
+1. The RAFT log is compacted in step with the journal cleanup floor (§4.8). A replica that missed writes now
+   cleaned up has also missed RAFT entries that were compacted, so the leader's nuraft sends it a snapshot.
+2. The leader serves the snapshot as a sequence of objects that the replica pulls one at a time: first the
+   partition's control state and its data watermark `W`, then the volume's LBA regions in batches.
+3. The replica installs each batch by replacing that LBA range in its own B-tree (data and holes). nuraft keeps
+   its RAFT apply paused meanwhile, and the replica serves no client IO.
+4. After the last object the replica sets its commit point to `W`, marks everything above `W` up to the leader's
+   Sync watermark as missing, and resumes. Normal catch-up (Case 2) fetches those writes from any member.
 
 ![Figure 6](resync-diagrams/fig6.png)
 
@@ -351,56 +351,48 @@ the two replicas**; RAFT is not involved, so it works even for a replica that wa
 
 ```mermaid
 sequenceDiagram
+    participant L as Leader (snapshot donor)
     participant R as Behind replica
-    participant S as Source replica
-    participant L as Leader
-    R->>S: fetch the writes I am missing
-    S-->>R: reclaimed (no longer in the journal)
-    L->>R: how far are you?
-    R-->>L: behind, past retention
-    L->>L: R is behind: election priority 0
-    R->>S: start snapshot
-    S->>S: freeze the B-tree at startLSN, keep the journal after it
-    S-->>R: session, startLSN
-    loop until the whole volume is copied
-        R->>S: next chunk
-        S-->>R: LBA range with data and holes (checksummed)
+    participant P as Any member
+    L->>L: RAFT log compacted up to the cleanup floor
+    L->>R: nuraft: you are behind the log, install a snapshot
+    R->>L: object 0
+    L-->>R: control state, watermark W, region count
+    loop every LBA region, in batches
+        R->>L: next object (region, batch)
+        L-->>R: LBA range with data and holes (checksummed)
         R->>R: replace that range in its own B-tree
     end
-    Note over R: R keeps storing UBD writes, applies nothing yet
-    R->>S: fetch the journal after startLSN
-    S-->>R: write data
-    R->>S: end snapshot
-    S->>S: release the freeze and the journal
-    R->>R: commit point = startLSN, apply resumes
-    L->>L: R caught up: restore priority
+    R->>R: commit point = W, writes above W marked missing
+    L->>R: RAFT entries after the snapshot apply as usual
+    R->>P: fetch the writes above W (Case 2)
+    P-->>R: write data
 ```
 
 </details>
 
-*Figure 6: Snapshot for a replica past retention (option b′), sequence diagram*
+*Figure 6: Snapshot for a replica past retention, sequence diagram*
 
 #### Guarantees
 
-- **Works whatever the RAFT state:** triggered by the data ("reclaimed"), not by RAFT. That covers the replica that
-  stayed online but fell behind on data.
-- **No leader load required:** any healthy replica can be the source.
-- **A dead receiver pins nothing for long:** the source keeps its journal under a lease that each chunk renews.
+- **No new transport:** nuraft carries the objects, retries them and paces them (the receiver pulls).
+- **A crash on either side loses nothing:** the receiver records its region cursor durably and resumes; a new
+  leader simply serves the snapshot again (Case 8).
 - **Cost:** proportional to the volume's mapped data, whatever the gap. Region-level deltas are a later
   optimization.
+- **One case needs an explicit trigger:** a replica that applied every RAFT entry but whose data still fell behind
+  (C2). Compaction alone never makes nuraft send it a snapshot, so the leader re-adds it as a learner (§4.9).
 
 ### Case 7: New member joins
 
-A new or replacement replica starts empty. RAFT adds it as a non-voting learner. RAFT gives it the control state,
-the data comes through the Case 6 stream, and it is promoted once it holds the data.
+A new or replacement replica starts empty. RAFT adds it as a non-voting learner (HomeStore's `replace_member`), and
+nuraft sends it a snapshot as in Case 6. It is promoted once it holds the data.
 
 #### Flow
 
-1. The leader adds the replica as a learner through RAFT and records the volume's current position as its promotion
-   gate.
-2. If the RAFT log it needs was compacted, RAFT sends a small snapshot with control state only (session, verdicts).
-3. The replica's first fetch answers "reclaimed", so it copies the volume as in Case 6, then fetches the tail.
-4. Once its commit point passes the gate, the leader promotes it to voter. UBD re-logs in and picks up the new
+1. The leader adds the replica as a learner and records the volume's current position as its promotion gate.
+2. nuraft sends the snapshot (Case 6); the replica then fetches the writes above `W` from any member.
+3. Once its commit point passes the gate, the leader promotes it to voter. UBD re-logs in and picks up the new
    member list.
 
 ![Figure 7](resync-diagrams/fig7.png)
@@ -411,13 +403,12 @@ the data comes through the Case 6 stream, and it is promoted once it holds the d
 sequenceDiagram
     participant L as Leader
     participant N as New replica
-    participant S as Source replica
+    participant P as Any member
     participant C as UBD
     L->>N: RAFT: add as learner (gate = current position)
-    L->>N: RAFT snapshot: control state only
-    N->>S: fetch writes
-    S-->>N: reclaimed
-    N->>S: snapshot (as in Case 6), then the journal tail
+    L->>N: nuraft snapshot (as in Case 6)
+    N->>P: fetch the writes above W
+    P-->>N: write data
     N-->>L: commit point passes the gate
     L->>N: RAFT: promote to voter
     L-->>C: term changes (member list updated)
@@ -433,18 +424,17 @@ sequenceDiagram
 - **A replica votes only once it holds the data** up to the gate.
 - **UBD never writes to a learner**, so the new replica pulls everything; it is never pushed.
 
-### Case 8: Snapshot source fails
+### Case 8: Snapshot interrupted
 
-A snapshot can take hours, so the source may fail during it. The snapshot restarts from another source; nothing
-needs cleaning up.
+A snapshot can take hours, so the leader or the receiver may fail during it.
 
 #### Flow
 
-1. The source crashes mid-transfer. Its freeze and journal hold disappear with it.
-2. The receiver's next chunk request fails, so it picks another source and starts a new session.
-3. The new chunks replace every range, including those the first source had sent, so the result is consistent.
-4. If the **receiver** crashes instead, it resumes the same session from its saved position, provided the source's
-   lease has not expired.
+1. **The receiver crashes:** it restarts with its saved snapshot context (snapshot point and region cursor). When
+   nuraft resumes the same snapshot, the receiver asks for the region after the last one it made durable.
+2. **The leader fails or changes:** the new leader's nuraft starts a snapshot of its own (a new snapshot point).
+   The receiver sees a different snapshot point and starts over. Every batch replaces its whole range, so whatever
+   the first leader had sent is overwritten consistently.
 
 ![Figure 8](resync-diagrams/fig8.png)
 
@@ -453,29 +443,27 @@ needs cleaning up.
 ```mermaid
 sequenceDiagram
     participant R as Receiver
-    participant S1 as Source 1
-    participant S2 as Source 2
-    R->>S1: snapshot chunks
-    S1-->>R: chunks
-    S1-xS1: crashes (freeze and journal hold disappear)
-    R->>S1: next chunk
-    S1--xR: no answer
-    R->>S2: start snapshot (new freeze point)
-    loop from the beginning
-        R->>S2: next chunk
-        S2-->>R: LBA range (replaces what Source 1 sent)
+    participant L1 as Leader 1
+    participant L2 as Leader 2
+    R->>L1: regions 1..k
+    L1-->>R: batches
+    L1-xL1: crashes
+    L2->>R: nuraft: install snapshot (new snapshot point)
+    R->>R: different snapshot point: start over
+    loop every region
+        R->>L2: next object
+        L2-->>R: LBA range (replaces what Leader 1 sent)
     end
-    R->>S2: journal tail, end snapshot
 ```
 
 </details>
 
-*Figure 8: Snapshot source fails, sequence diagram*
+*Figure 8: Snapshot interrupted, sequence diagram*
 
 #### Guarantees
 
-- **Always correct:** each chunk replaces its whole range.
-- **Cost:** a source failure restarts the copy; resuming across sources is a later optimization.
+- **Always correct:** each batch replaces its whole range, and the writes above `W` are fetched again in order.
+- **Cost:** a leader change restarts the copy; a receiver crash resumes at a region boundary.
 
 ### Case 9: UBD disappears
 
@@ -526,8 +514,8 @@ sequenceDiagram
 | Topic | Decision | Rejected |
 |---|---|---|
 | Login fence (C1) | Lifts only on a committed InternalLogin or LoginAborted, with a pre-sync before fencing (Cases 4–5) | A timeout release, which loses acknowledged writes when a login is slow; relying on the attach layer alone |
-| Snapshot path (C2) | Data streamed replica-to-replica over the CRAFT peer plane; RAFT carries control state only (Cases 6–8) | Keeping the bulk snapshot inside nuraft: remove and re-add, the `receiving_snapshot` flag, a leader-side fork API |
-| Snapshot receive | Probably merge onto the existing B-tree, with range-replace chunks | Open question 9 |
+| Snapshot path | nuraft's snapshot mechanism on the volume's RAFT group, with HomeBlocks' content through the listener callbacks, modeled on HomeObject (Cases 6–8, §4.9). RAFT-log compaction follows the journal cleanup floor; a member current on RAFT but behind on data is re-added as a learner (C2) | A CRAFT peer-plane snapshot stream (the earlier option b′): a second transport with new wire ops (§6) |
+| Snapshot receive | Merge onto the existing B-tree; every batch replaces its whole LBA range | Open question 9 |
 | Failed writes | Error to the application, which (XFS) goes offline; the volume detaches and the slot is filled or marked Empty at the next login (Case 3) | UBD resending the write; a mid-session leader resolution round |
 | Who drives resync | The CRAFT BM side (leader BM); data moves BM to BM | UBD driving or carrying resync |
 | Region-level delta snapshots | Later optimization | — |
@@ -548,7 +536,7 @@ sequenceDiagram
    - 4.6 [Login-time resync](#46-login-time-resync)
    - 4.7 [Peer-plane wire v2](#47-peer-plane-wire-v2)
    - 4.8 [Journal reclaim and the retention floor](#48-journal-reclaim-and-the-retention-floor)
-   - 4.9 [Baseline resync (snapshot) and large gaps — option (b′)](#49-baseline-resync-snapshot-and-large-gaps--option-b)
+   - 4.9 [Baseline resync (snapshot) and large gaps](#49-baseline-resync-snapshot-and-large-gaps)
    - 4.10 [Detached operation: logout, lease, and the stand-in](#410-detached-operation-logout-lease-and-the-stand-in)
    - 4.11 [Threading, persistence, observability](#411-threading-persistence-observability)
 5. [Failure walk-throughs](#5-failure-walk-throughs)
@@ -614,6 +602,11 @@ them.
 
 ## 3. As-built: HomeBlocks `CraftReplDev` today
 
+> **Status (2026-11-18).** This section was measured at `51d051a`. Since then `dev/v6.x` gained CRAFT volume creation
+> with a RAFT group per volume (#195), `append()` and the Sync triggers (#189), distinct-voter quorum evidence
+> (#206), proposal deadlines (#207) and log-order apply (#211); the login poll with quiesce fencing is in review
+> (#212). The snapshot callbacks are still stubs.
+
 **In one sentence:** the resync building blocks exist in `src/lib/craft/craft_repl_dev.{hpp,cpp}` (below:
 `CRD.cpp`), but almost nothing drives them. `login`, `logout`, the `SyncRSCommitLSN` proposer `append()` and
 `request_resolution` are stubs, pre-resolution runs only in tests, and the peer channel has no production
@@ -672,7 +665,7 @@ tooling, not for HomeBlocks.
 | Follower catch-up with retry, chunked fetch v2 (§4.3, §4.7) | `apply_sync_rs_commit_lsn` (catch-up part), `fetch_data`, `CraftPeerFetcher` | **Fix/New** (PR E) |
 | Failed writes resolved at login only (§4.4) | `request_resolution` | **Keep as stub**; client side in craft_client (PR F) |
 | Reclaim floor, persistence (§4.8, §4.11) | `TODO(S8)` | **New** (S8) |
-| Snapshot (b′) (§4.9) | snapshot callbacks, new peer ops | **New** (later) |
+| Snapshot (§4.9) | `CraftGroupListener` snapshot callbacks (stubs) forwarded to `CraftReplDev` | **New** (SN1–SN4) |
 | Lease, logout, stand-in (§4.10) | `touch_watchdog`, `logout` | **New** (later) |
 
 ## 4. Design
@@ -902,7 +895,6 @@ The opcodes keep the request-odd/response-even convention. `k_max_op` is bumped.
 |---|---|---|---|
 | `get_rs_commit_lsn` | 17/18 | add `partition_id[16]`, `leader_raft_term` | add `session_term`, `fence_term` (so a new leader can find unfinished logins, §4.6) |
 | `fetch_data` (v2) | 19/20 | `partition_id`, `range_count`, `max_bytes`, body: `[lo, hi]` i64 pairs | `slot_count`, `next` (continuation dLSN, −1 = done), `reclaimed_below` (−1 = none), then descriptors and data as today |
-| `snap_begin` / `snap_chunk` / `snap_end` (new) | 23/24, 25/26, 27/28 | See §4.9 (option b′) | See §4.9 |
 | `probe_slots` (new) | 21/22 | `partition_id`, `leader_raft_term`, `[lo, hi]` | `commit_lsn`, `last_append_lsn`, `journal_floor`, `session_term`, `fence_term`, `snapshot_receiving`, `snapshot_sessions_served`, body: run-length intervals tagged `held_data`, `held_zero`, `tombstone` (absent = gaps) |
 
 - **Status codes:** add `reclaimed = 8`. `CraftTcpPeer` maps statuses properly instead of returning `INTERNAL`
@@ -923,151 +915,125 @@ The opcodes keep the request-odd/response-even convention. `k_max_op` is bumped.
 Each member may reclaim journal slots below:
 
 ```
-floor = min(checkpointed commit_lsn, all_committed_lsn, snapshot_pin)
+floor = min(checkpointed commit_lsn, all_committed_lsn)
 ```
-
-`snapshot_pin` is **local** to a member serving as a snapshot source: `min(startLSN + 1)` over the snapshot
-sessions it currently serves (§4.9). Each session holds it under a lease. With no session it is +∞. Only the
-source pins anything: the receiver fetches its tail from that same source, so no other member has to keep journal
-for it, and nothing about it is replicated.
 
 `all_committed_lsn` already arrives in every `client_hdr` (the client computes it as the min of the members'
 `commit_lsn`). The leader's stand-in computes it from probes when no client is attached. A member never re-fetches
-below its own monotonic `commit_lsn`, so a stale min is merely conservative.
+below its own monotonic `commit_lsn`, so a stale min is merely conservative. A replica that just installed a
+snapshot reports `commit_lsn = W` (§4.9), which holds every member's floor at or below `W` until it has fetched
+the writes above `W`. No separate snapshot pin is needed.
 
-- `probe_slots` and `fetch_data` report `journal_floor`. A request for slots below it gets `reclaimed_below`,
-  and the requester escalates to baseline (I7).
+- `probe_slots` and `fetch_data` report `journal_floor`. A request for slots below it gets `reclaimed_below`; that
+  replica needs a snapshot (§4.9, I7).
 - **A silent member freezes the floor** (its `commit_lsn` is stale in the min). That is bounded by a retention
   cap: once the journal exceeds `R` slots or bytes above the floor, the cap **relaxes only `all_committed_lsn`** (the
-  silent member's stale vote) and the silent member is consigned to baseline resync. The other two bounds are
-  hard: never reclaim above the checkpointed `commit_lsn` (local durability) or into an active `snapshot_pin`. If
-  those still block, apply backpressure or end the snapshot session explicitly. That is the wiki's "relegated to the snapshot path". The cap is a **local**
-  decision, so it cannot tell *silent* from *slow*: a live member that is merely slow can be pushed to baseline
-  too. Set `R` well above the expected catch-up lag. Open question 7 asks whether the leader should own the
-  decision instead.
-- **RAFT log compaction is independent of the data floor.** With option (b′) (§4.9) a nuraft snapshot carries
-  only control state, and data recovery is triggered by `reclaimed_below`, not by RAFT position. So the RAFT log
-  can be compacted on its own policy (for example nuraft's `snapshot_distance`). This replaces the wiki's "the
-  RAFT log is the snapshot trigger", which fails for a member that is current on RAFT but behind on data (§9.1
-  C2). It requires the metadata snapshot callbacks of §4.9. Until those land, compaction stays **disabled** (D12).
+  silent member's stale vote) and the silent member is consigned to a snapshot. The checkpointed `commit_lsn`
+  bound stays hard (local durability). The cap never relaxes for a member that reports it is installing a snapshot
+  or fetching the writes after one. The cap is a **local** decision, so it cannot tell *silent* from *slow*: a live
+  member that is merely slow can be pushed to a snapshot too. Set `R` well above the expected catch-up lag. Open
+  question 7 asks whether the leader should own the decision instead.
+- **RAFT log compaction follows the floor** (`docs/craft/subtasks.md` S8). The leader compacts the RAFT log below
+  the `SyncRSCommitLSN` entry whose watermark is at or below the floor (HomeStore's `trigger_snapshot_creation`).
+  A member that missed writes now reclaimed has then also missed compacted RAFT entries, so nuraft sends it a
+  snapshot (§4.9) with no separate trigger: returning voters and joiners alike. The exception is a member that
+  applied every RAFT entry but whose data still fell behind (C2); §4.9 gives it an explicit trigger.
 
-### 4.9 Baseline resync (snapshot) and large gaps — option (b′)
+### 4.9 Baseline resync (snapshot) and large gaps
 
-**Decision (b′): RAFT carries control state, CRAFT carries data.** The bulk transfer of the B-tree and its blocks
-is a **CRAFT peer-plane stream between two members**. nuraft's snapshot mechanism carries only the small control
-state a member needs when the RAFT log it is missing has been compacted. One data-transfer path then serves every
-"behind on data" case: a new member, a replacement member, a returning voter, and a member that is current on
-RAFT but behind on data (§9.1 C2). Rejected alternatives are in §6.
+**Decision: nuraft carries the snapshot.** The volume's RAFT group (one per CRAFT volume, since #195) already has
+a snapshot transport: nuraft decides when a follower needs one, moves it as a sequence of objects the follower
+pulls, retries and paces them, and pauses the follower's apply until it is installed. HomeBlocks supplies only the
+content, through the RAFT listener's snapshot callbacks, modeled on HomeObject's `ReplicationStateMachine`
+(`create_snapshot`, `read_snapshot_obj`, `write_snapshot_obj`, `apply_snapshot`, `last_snapshot`,
+`free_user_snp_ctx`). This is what `docs/craft/subtasks.md` specifies (S8, S10). An earlier draft of this document
+streamed the snapshot over the CRAFT peer plane instead; §6 says why that was dropped.
 
 #### Choosing the tier
 
 | Gap | Mechanism | Cost proportional to |
 |---|---|---|
-| Still in the journal (every missing slot is above the source's reclaim floor) | The FetchData loop (§4.3): range requests, byte-bounded and continued, pipelined | The **writes** missed. Every version is replayed, including overwritten ones |
-| Past retention (any fetch returns `reclaimed_below`, or the member is empty) | **CRAFT snapshot:** stream the whole HomeBlocks B-tree with its data from one source member, then replay that source's journal from `startLSN + 1` | The volume's **mapped data**, whatever the gap size |
+| Still in the journal (every missing slot is above the members' reclaim floor) | The FetchData loop (§4.3): range requests, byte-bounded and continued | The **writes** missed. Every version is replayed, including overwritten ones |
+| Past retention | **nuraft snapshot:** the leader's B-tree with its data as of watermark `W`, then FetchData for the writes above `W` | The volume's **mapped data**, whatever the gap size |
 
-The rule: **replay from the journal whenever it still has the data; snapshot only past retention.** The trigger
-is purely data-side (`reclaimed_below`), so it fires for every member that needs it, whatever its RAFT position.
-The retention size `R` (§4.8) trades journal space on every member against the frequency of full copies.
-Region-level delta snapshots (§6) are a later optimization.
+#### Triggers
 
-#### The nuraft part: control state only
+- **Compaction (the common case).** RAFT-log compaction follows the journal cleanup floor (§4.8), so a member that
+  is past retention is also behind the compacted RAFT log, and nuraft sends it a snapshot. This covers returning
+  voters and joiners (S10's learners).
+- **A member current on RAFT but behind on data (C2).** It applied every RAFT entry, so compaction never makes
+  nuraft send it a snapshot, while every fetch answers `reclaimed_below`. The member reports this in its probe
+  replies; the leader then removes it and re-adds it as a learner through HomeStore's `replace_member` (S10), which
+  makes nuraft send a snapshot, and promotes it back once it passes the gate. Until then it has nuraft priority 0
+  so it cannot become leader.
 
-When nuraft needs to send a snapshot (a follower is behind the compacted RAFT log, or a new member joins), the
-listener's snapshot callbacks carry **one small object**:
+#### The snapshot context (`create_snapshot`, `last_snapshot`, `apply_snapshot`)
 
-`{session_term, fence_term, client_token, last_sync_target N, outstanding tombstones}`
+As in HomeObject, creating a snapshot copies no data. `create_snapshot(ctx)` records nuraft's snapshot context
+(its RAFT index `L`) and persists it in a per-volume snapshot superblock after a checkpoint flush, so that
+`last_snapshot()` survives restarts. `apply_snapshot(ctx)` records the installed context the same way. HomeStore
+only lets the leader serve a snapshot once every RAFT entry up to `L` has been committed and applied.
 
-- *Outstanding tombstones* are the Empty verdicts (all from logins) at dLSNs above the group's reclaim floor. A
-  member that holds a late copy of such a slot must still learn it is void. They are rare, so the list is short.
-- On install the member adopts this state, and **reconciles its journal for the logins it skipped**: every held
-  slot above its own `commit_lsn` whose term is older than the snapshot's `session_term` is dropped before any IO
-  is admitted. The compacted `InternalLogin` entries would have truncated those slots. Dropping an unapplied slot
-  is always safe: if it was durable, catch-up fetches it again. Without this, a returning replica keeps old-session
-  slot 101 across a login at 100 and reproduces H1.
-- It then behaves exactly as if it had applied the compacted entries. Then normal data
-  catch-up starts toward `N`, and it falls into the CRAFT snapshot below if its fetches say `reclaimed_below`.
-- Because the snapshot holds no data, RAFT log compaction no longer depends on the data floor (§4.8).
+#### The object stream (`read_snapshot_obj` on the leader, `write_snapshot_obj` on the receiver)
 
-#### The CRAFT part: the data stream
+The receiver pulls objects by a 64-bit id, the same layout HomeObject uses: `type (1) | region (48) | batch (15)`,
+with `LAST_OBJ_ID` (all ones) as the end marker. The receiver's `write_snapshot_obj` answers each object with the id
+it wants next, which is how it asks for a resend or resumes after a crash.
 
-**Roles.** The **receiver** is the member that needs a baseline; it drives the transfer by pulling. The **source**
-is one other **data** member (never an arbiter, G1), chosen by the receiver:
-- it must have responded to a probe recently;
-- prefer the highest `commit_lsn`;
-- among those, prefer a non-leader, so the leader keeps serving IO and running consensus.
+| Object | Content |
+|---|---|
+| `0 \| 0`: partition metadata | The control state (session term, client token, fence and abort state once they exist), the volume geometry, the data watermark `W` (the leader's `commit_lsn` when the object is built), the Sync watermark `S` (the highest `rs_commit_lsn` the leader has applied), the Empty verdicts in `(W, S]`, and the number of LBA regions |
+| `r \| b` (r ≥ 1): region batch | One LBA range `[a, b)` of region `r`, read from the leader's index: every mapped LBA with its data and checksum; holes are implicit. Batches are cut at a byte budget; the last batch of a region says so |
+| `LAST_OBJ_ID` | End of the snapshot |
 
-The leader is used only if it is the only eligible member.
+Every object starts with a sealed header (magic, version, payload size, payload CRC, header CRC), like HomeObject's
+`SyncMessageHeader`. A receiver that finds it corrupt asks for the same object again.
 
-**Peer-plane ops** (§4.7): receiver-paced pull, which gives natural flow control.
-
-| Op | Request | Response |
-|---|---|---|
-| `snap_begin` | `partition_id`, `receiver_id`, optional `resume{session_id, cursor}` | `session_id`, `startLSN`, `lease_ms`; or `restart_required` (the resumed session is gone) or `busy` (the source is at its session limit) |
-| `snap_chunk` | `session_id`, `cursor`, `max_bytes` | `range [a, b)`, extent list (data or hole), data bytes, CRC32C over the chunk, `next_cursor`, `done` |
-| `snap_keepalive` | `session_id` | ok; renews the lease (also renewed by tail `fetch_data` carrying `session_id`) |
-| `snap_end` | `session_id` | ok; the source releases its checkpoint and journal pin |
+The leader's side is an iterator kept in nuraft's `user_ctx` for the length of the transfer (HomeObject's
+`PGBlobIterator`), freed by `free_user_snp_ctx`. It answers a repeated id by rebuilding the same batch, and a
+request for `r | 0` by restarting region `r`.
 
 **Requirements.**
 
-1. **Frozen at exactly `startLSN`.** On `snap_begin` the source pins a checkpoint and sets `startLSN` to its
-   `commit_lsn` at that checkpoint. `snap_begin` carries the receiver's current `commit_lsn`, and the source refuses
-   (`behind`) unless `startLSN ≥` it. The receiver then retries later or picks another source. A snapshot must
-   never lower a commit point the receiver has already advertised, because the client may have cleared Missing
-   entries on the strength of it. The B-tree is walked from the pinned checkpoint, never the live tree.
-2. **Chunks carry data, not B-tree nodes.** A B-tree entry points to a `blkid` on the source's own disk, which
-   means nothing on the receiver. The source walks the frozen tree in LBA order and emits `{lba range → data
-   extents | hole}`, reading blocks through their `blkid`. The receiver allocates its own blocks and inserts its
-   own entries. Holes are never sent, so a thin volume stays thin.
-3. **Each chunk replaces its whole LBA range.** A chunk for `[a, b)` means "the volume's state over `[a, b)` is
-   exactly this, holes included". The receiver deletes any mapping it holds in `[a, b)` that the chunk does not
-   carry, which removes LBAs unmapped while it was away. That makes merging onto the existing tree correct (open
-   question 9), and it makes resuming correct.
-4. **The receiver suspends apply while receiving.** It ignores piggybacked commits and Sync targets, but it still
-   journals incoming client writes, until the transfer completes. A chunk carries the state at `startLSN`, so a
-   newer slot applied before a later chunk covering its range would be rolled back.
-5. **The source pins its journal from `startLSN + 1` for the session.** That pin is `snapshot_pin` in the
-   source's floor (§4.8). It is **local and lease-bounded**: every `snap_chunk` renews the lease, and the source
-   drops the session (checkpoint and pin) if the receiver is silent for `lease_ms` (default 60 s). No cluster-wide
-   pin exists, so a dead receiver cannot freeze anyone's journal (this resolves C6).
-6. **Integrity and throttling.** Each chunk carries a CRC32C that the receiver verifies before installing (G4).
-   The source limits concurrent sessions and bytes per second, with a floor that guarantees progress (G13).
-7. **Restartable.** The receiver persists `{source, session_id, startLSN, cursor}` after each installed chunk.
-   - **Receiver crash:** it resumes with the same source session if the lease has not expired. Otherwise it
-     restarts.
-   - **Source crash or lease expiry:** the receiver picks a source again and restarts from cursor 0 with a new
-     `startLSN`. Range-replace makes the restart correct, and merge keeps whatever is already in place readable
-     at the end (resuming across different sources is a later optimization, §9.5).
-   - **Leader change:** no effect. The transfer does not involve the leader.
-8. **Tail from the same source.** After the last chunk the receiver fetches `startLSN + 1 …` **from the source**,
-   which is guaranteed to hold it because of its pin. Tail fetches carry the `session_id`, and each one renews the
-   lease just like `snap_chunk`. An idle gap sends `snap_keepalive{session_id}`, so a long tail transfer never loses
-   its pin. Once caught up to the source's pin it sends `snap_end`, and
-   normal §4.3 catch-up from any member continues toward the current Sync target. Completion: `commit_lsn =
-   startLSN` when the last chunk is installed; journal slots ≤ `startLSN` are dropped; `last_append_lsn =
-   max(startLSN, last_append_lsn)`. A returning member **keeps** the journal slots it holds above `startLSN`,
-   because they are the live writes the client kept broadcasting during the transfer. From then on the member
-   answers `reclaimed_below = startLSN` for anything below.
-9. **Non-convergence.** If the receiver's tail catch-up cannot overtake the write rate, the source pin grows on
-   one member only. That member alerts after a bound and may end the session (open question 10).
+1. **Data, not B-tree nodes.** An index entry points to a `blkid` on the leader's disk, which means nothing on the
+   receiver. The leader reads each mapped LBA's data and sends it with the checksum the index holds for it; the
+   receiver allocates its own blocks and writes its own index entries.
+2. **Each batch replaces its whole range.** A batch for `[a, b)` means "the volume over `[a, b)` is exactly this,
+   holes included". The receiver deletes its own mappings in `[a, b)` first. That makes a resend, a resume and a
+   restart from a new leader all correct, and the receiver can merge onto whatever B-tree it already has (open
+   question 9).
+3. **A fuzzy read is enough.** The leader records `W` and `S` before it reads any region and then reads the live
+   index, while commits continue. A region may therefore carry versions newer than `W`. The receiver re-fetches
+   and applies every slot above `W` in order after the install, so it converges to the same state, as a fuzzy
+   checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the index and reads
+   the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is never sent.
+4. **The receiver serves nothing while installing.** nuraft pauses its RAFT apply. CRAFT additionally rejects client
+   IO (`OFFLINE`), answers peer fetches with an error, and flags itself in poll replies so the leader does not
+   count it as a data holder.
+5. **Resumable.** The receiver persists `{snapshot index L, W, S, region cursor}` in a superblock at each region
+   boundary, after a checkpoint flush, so the cursor never runs ahead of durable data (HomeObject's per-shard
+   cursor). After a crash it reloads the context; if nuraft resumes the same snapshot `L`, it asks for the region
+   after the cursor, otherwise it starts over.
+6. **Completion.** On the last object the receiver drops its journal above `W` (stale slots of earlier sessions;
+   anything durable is fetched again), sets `commit_lsn = W`, `last_append_lsn = max(W, S)`, marks `(W, S]` minus
+   the shipped Empty verdicts as missing, adopts the control state, clears its overlay, persists the snapshot
+   context and lifts the IO gate. RAFT entries after `L` then apply normally, and catch-up fetches `(W, S]` and
+   beyond from any member over the peer plane (block_mgr2, S9).
+7. **Integrity and throttling.** Batches are CRC-checked (G4). The batch byte budget is configurable (HomeObject's
+   `max_snapshot_batch_size_mb`, default 128 MB).
 
-**Leadership and visibility.** A member whose `commit_lsn` is below the group floor, or that is receiving a
-snapshot, is set to nuraft **priority 0** by the leader (`set_priority`), so it cannot win an election and block
-logins (C2). Its priority is restored once it reports `commit_lsn` at or above the floor. Probe and
-`get_rs_commit_lsn` replies carry `snapshot_receiving` and `snapshot_sessions_served`, so the leader can drive
-priorities and alerts.
+**The donor is always the leader** (nuraft's choice). That costs the leader read bandwidth during a snapshot; it is
+accepted for now (G13).
 
 **Promotion gate (new and replacement members).** When the member change is committed, the leader records
 `gate_lsn` (the replica set's dLSN at that moment). The learner is promoted to voter only once it reports
-`commit_lsn ≥ gate_lsn`. That is the wiki's `commit_lsn ≥ startLSN` gate, decoupled from the snapshot's own
-`startLSN`: if the snapshot froze below `gate_lsn`, the tail fetch simply continues until it passes it. It does
-*not* use nuraft's log-index monitor, which cannot see CRAFT data. A returning voter has no promotion step; the
-client's `commit_lsn` certificate makes it readable again as usual.
+`commit_lsn ≥ gate_lsn`, which is the wiki's `commit_lsn ≥ startLSN` gate. It does *not* use nuraft's log-index
+monitor, which cannot see CRAFT data.
 
-**Reads during and after.** The member serves no reads until it reaches `Synced ≥ L`, because the client's
-Missing map treats its stale range as a dirty window. The client keeps broadcasting writes to a returning voter,
-so the live edge stays warm and only the backlog has to cross the snapshot. A catching-up learner is not a client
-IO target (wiki, *Reconfiguration*).
+**Reads during and after.** The member serves no reads until it reaches `Synced ≥ L`, because the client's Missing
+map treats its stale range as a dirty window. The client keeps broadcasting writes to a returning voter, which the
+member journals once the install has finished. A catching-up learner is not a client IO target (wiki,
+*Reconfiguration*).
 
 ### 4.10 Detached operation: logout, lease, and the stand-in
 
@@ -1146,9 +1112,9 @@ N = 3, members A, B, C, leader A unless stated.
 | **Slow login while the old client is still writing** | Phase 1 pre-syncs the leader with nobody fenced. The fenced phase then takes about two round trips. If it still runs long (a slow RAFT commit), B and C **stay fenced** until `InternalLogin` is applied, so the zombie's writes are rejected and never acked. | No acked write is lost (I8; the C1 scenario). |
 | **Login leader crashes after fencing** | B and C remain fenced and reject both sessions. The new RAFT leader sees `fence_term > session_term` in its own state or its probes, commits `LoginAborted{term}`, and the old owner is re-admitted. Alternatively, the new client retries and the new leader runs a fresh login. | The owner is wedged only until a new leader is elected. If RAFT has no quorum, until it regains one (the accepted trade-off). |
 | **Leader change mid-round** | The old leader's proposal fails or never commits. Its probes carried the old RAFT term, so they are ignored. The new leader's next trigger runs a fresh round. | No partial verdict ever takes effect. Rounds are atomic at the entry. |
-| **C down for an hour (past retention)** | If C is behind the compacted RAFT log, nuraft sends the small control-state snapshot. Either way, C's data catch-up gets `reclaimed_below`, so C picks a source (say B), opens `snap_begin`, streams the B-tree, then fetches B's journal from `startLSN + 1`. The leader keeps C at priority 0 throughout. | Re-admitted when its `commit_lsn` certificate reaches the client's view. No promotion gate, because C is already a voter. |
-| **C online but its data path failed for hours** (current on RAFT) | Every RAFT entry was applied, but fetches kept failing until retention passed C, after which it gets `reclaimed_below`. The trigger is data-side, so C starts a snapshot from B exactly as above, with no nuraft involvement. | The C2 case: recovered, not stuck. C could not win an election meanwhile (priority 0). |
-| **Snapshot source B crashes mid-transfer** | C's next `snap_chunk` fails. C picks A, restarts from cursor 0 with a new `startLSN`, and range-replace overwrites what B had sent. B's pin died with B, so nothing stays pinned. | Correct, at the cost of a restart. |
+| **C down for an hour (past retention)** | The RAFT log was compacted with the cleanup floor, so C is behind it and the leader's nuraft sends C a snapshot: control state and `W`, then every LBA region. C then fetches the writes above `W` from any member. The leader keeps C at priority 0 throughout. | Re-admitted when its `commit_lsn` certificate reaches the client's view. No promotion gate, because C is already a voter. |
+| **C online but its data path failed for hours** (current on RAFT) | Every RAFT entry was applied, but fetches kept failing until retention passed C, after which it gets `reclaimed_below` and says so in its probe replies. Compaction alone would never send C a snapshot, so the leader removes C and re-adds it as a learner (`replace_member`); nuraft then sends the snapshot as above, and C is promoted back once it passes the gate. | The C2 case: recovered, not stuck. C could not win an election meanwhile (priority 0). |
+| **The leader crashes mid-snapshot** | The new leader's nuraft sends C a snapshot of its own, with a new snapshot index. C sees the new index and starts over; every batch replaces its whole range, so what the old leader sent is overwritten. If C itself crashes instead, it resumes the same snapshot from its saved region cursor. | Correct, at the cost of a restart. |
 | **Client vanishes** | The watchdog round heals up to `F_seen`. The lease expires, `InternalLogout` commits, and the stand-in login converges everyone to `max(quorum.last_append)`. | The volume is fully converged before the next attach, so the next login is cheap. |
 
 ---
@@ -1177,17 +1143,18 @@ depend on regions touched, not volume size, and needs no per-entry dLSN in the i
 dLSN would *not* work: zero writes erase index entries, so unmaps would be invisible. *Deferred: the full B-tree
 snapshot is the baseline. Revisit once outage-length and volume-size data are available.*
 
-**Keeping the bulk snapshot inside nuraft (for C2).** Considered:
-- (a) remove the member and re-add it as a learner, which forces a nuraft snapshot;
-- (e) set the follower's `receiving_snapshot` flag in `srv_state` (via our state manager plus a group restart, or a
-  small NuRaft fork API), so the leader resends a snapshot (`RECEIVING_SNAPSHOT` hint, `set_snapshot_sync_is_needed`);
-- a leader-side fork API marking a peer as needing a snapshot;
-- replacing the member outright;
-- never letting retention pass a live member.
+**A CRAFT peer-plane snapshot stream (the earlier option b′).** An earlier draft streamed the B-tree member to
+member over the CRAFT peer plane (`snap_begin` / `snap_chunk` / `snap_end`), with nuraft snapshots carrying control
+state only and a data-side trigger (`reclaimed_below`). It would let any healthy member be the source and would
+cover the C2 member without a membership change. *Rejected:* it is a second snapshot transport, with new wire ops,
+leases, pins and source selection, when nuraft already provides one on the volume's RAFT group, and the team's
+plan (`subtasks.md` S8, S10) specifies nuraft's snapshot callbacks modeled on HomeObject. The C2 member is handled
+by re-adding it as a learner instead (§4.9).
 
-All of these keep the leader as the only source, tie data recovery to RAFT state, and add either membership
-changes or fork changes and restart tricks. (e) also depends on safe replay of already-applied entries. *Rejected
-in favour of (b′): data over the CRAFT peer plane from any member, control state over nuraft.*
+**Other ways to force a nuraft snapshot for the C2 member.** Setting the follower's `receiving_snapshot` flag in
+`srv_state` (through our state manager and a group restart, or a small NuRaft fork API), or a leader-side fork API
+marking a peer as needing a snapshot. *Rejected for now:* both need NuRaft changes; `replace_member` already exists
+and is needed for S10 anyway.
 
 **Server-side fan-out variant** (`docs/peer-plane.md`, parked). It would make the peer plane hot. Nothing here
 forecloses it. Its `appended_upto` watermark is computable from the same Missing intervals §4.3 maintains.
@@ -1224,11 +1191,15 @@ forecloses it. Its `appended_upto` watermark is computable from the same Missing
 - Kill or restart a member during fio, then verify byte-for-byte convergence across members (new `verify`
   command: hash the index per member at a quiesced `commit_lsn`).
 - Leader failover mid-round; member restart mid-catch-up; member down past retention leading to snapshot.
-- **Snapshot (b′):** a member current on RAFT but data-behind recovers through the CRAFT stream (the C2 case).
-  The source crashes mid-transfer and the receiver restarts on another source. The receiver crashes and resumes
-  the same session within the lease, or restarts after it. Lease expiry releases the source's journal pin.
-  Chunk CRC corruption is detected. A nuraft metadata snapshot delivers outstanding tombstones, so a member
-  holding a late copy of a voided slot does not apply it. A data-behind member cannot become leader.
+- **Snapshot:** a member past retention is RAFT-log-behind after compaction and receives a nuraft snapshot,
+  then fetches the writes above `W`. A member current on RAFT but data-behind is re-added as a learner and recovers
+  the same way (the C2 case). The leader crashes mid-transfer and the receiver starts over with the new leader. The
+  receiver crashes and resumes from its region cursor. A corrupt object header or payload is detected and asked
+  for again. Empty verdicts in `(W, S]` reach the receiver, so a member holding a late copy of a voided slot does
+  not apply it. A member installing a snapshot rejects client IO and cannot become leader.
+- **Unit (mock journal and index):** the object id codec; the donor iterator (metadata, region batches at the
+  byte budget, resend, restart of a region, checksum mismatch re-read); the receiver (range replace, idempotent
+  resend, resume from the cursor, start over on a new snapshot index, completion state).
 - Thin check: zero writes stay unmapped after resync (`mapped_blocks` equal across members).
 
 Run the suites under TSAN (`tsan.supp` exists). The catch-up task, the commit worker, and the IO path share `mu_`.
@@ -1236,6 +1207,10 @@ Run the suites under TSAN (`tsan.supp` exists). The catch-up task, the commit wo
 ---
 
 ## 8. Implementation plan
+
+> **Status (2026-11-18).** Overlaps with work merged meanwhile: A's apply ordering landed as #211 (InternalLogin v2
+> truncation and `LoginAborted` are not on `dev/v6.x`); B overlaps #206; C overlaps #212. S8a and S8b are closed.
+> The snapshot work is SN1–SN4.
 
 Each PR is small and testable with the existing mock scaffold (`src/lib/craft/tests/`). Target: **≥ 80% line
 coverage** for `src/lib/craft/` and for every function a PR adds or changes (the repo's `gcovr.cfg` threshold).
@@ -1250,8 +1225,12 @@ coverage** for `src/lib/craft/` and for every function a PR adds or changes (the
 | **F. UBD side** | craft_client | this work | Stop calling `request_resolution` on a failed write; drop the connection on any send failure (D17); data digests on by default for peer traffic | D3, D4, D11, D17 |
 | **E1. Catch-up retry + range fetch** ([#200](https://github.com/eBay/HomeBlocks/pull/200)) | HomeBlocks | this work | Retry with backoff; range-based, byte-bounded `fetch_range` with continuation and `reclaimed_below` (callee side) | H4, H7 (callee) |
 | **S8a. Durable state + restart** | HomeBlocks | this work | `CraftStateStore` / `CraftDurableState` written ahead of each control change (§4.11); restart restores it and rebuilds the range from the journal; replay-safe re-apply; checkpoint trigger reports whether it flushed; Sync/catch-up advance goes through `commit()` | H6, H9 |
-| **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn, snapshot pins)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
-| Later | HomeBlocks | tbd | CRAFT volume wiring (superblock store, multi-member group); snapshot (b′); lease / `InternalLogout` / stand-in; membership promotion gate | — |
+| **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
+| **SN1. Snapshot context** | HomeBlocks | this work | `CraftGroupListener` forwards the snapshot callbacks to `CraftReplDev`; `create_snapshot` / `last_snapshot` / `apply_snapshot` persist the context in a per-volume superblock | — |
+| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, resend and resume), `free_user_snp_ctx` | — |
+| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: range replace, resumable region cursor persisted after a checkpoint flush, completion (journal above `W` dropped, `commit_lsn = W`, `(W, S]` missing), IO gate while installing | — |
+| **SN4. Triggers** | HomeBlocks | this work | RAFT-log compaction following the cleanup floor (`trigger_snapshot_creation`); the C2 re-add as a learner (with S10) | C2 |
+| Later | HomeBlocks | tbd | Lease / `InternalLogout` / stand-in; membership promotion gate (S10) | — |
 
 PR A should land after the S7/S9 owner agrees the entry formats (`InternalLogin` v2, `LoginAborted`), because
 their login code proposes them.
@@ -1301,8 +1280,8 @@ when CSI is most likely to be late.
 
 This **changes the wiki** (open question 6).
 
-**C2. "The RAFT log is the snapshot trigger" missed a member that is current on RAFT but behind on data.
-Decided: option (b′), see §4.9.** Each member has two independent positions: its **RAFT position** (how many of
+**C2. "The RAFT log is the snapshot trigger" misses a member that is current on RAFT but behind on data.
+Decided: re-add it as a learner, see §4.9.** Each member has two independent positions: its **RAFT position** (how many of
 the small control entries it has applied) and its **data position** (`commit_lsn`). In classic RAFT they are the
 same thing, because the data is the log. CRAFT moves the data out of the log, so they diverge. Applying
 `SyncRSCommitLSN(N)` takes a microsecond, while fetching the data up to `N` can take a long time or keep failing:
@@ -1312,12 +1291,13 @@ receive a snapshot**. It would be stuck permanently, silently reducing the volum
 voting. Worse, if it became RAFT leader, every login and every round would fail, because the leader must fill
 itself first.
 
-**Resolution.** Data recovery no longer goes through nuraft. The trigger is data-side (`reclaimed_below`), and the
-B-tree and its data are streamed member-to-member over the CRAFT peer plane (§4.9). nuraft snapshots carry control
-state only. In addition, a data-behind or snapshot-receiving member gets nuraft priority 0, so it cannot become
-leader. Options considered and rejected: remove and re-add as a learner; forcing a nuraft snapshot through the
-follower's `receiving_snapshot` flag or a leader-side fork API; replacing the member; never letting retention
-pass a live member (§6).
+**Resolution.** Snapshots go through nuraft (§4.9), and compaction follows the cleanup floor, which covers every
+member that is behind on RAFT. For the member that is current on RAFT but past retention on data, the trigger is
+data-side: it reports `reclaimed_below` in its probe replies, and the leader removes it and re-adds it as a learner
+through HomeStore's `replace_member`, which makes nuraft send it a snapshot. A data-behind or snapshot-receiving
+member gets nuraft priority 0, so it cannot become leader. Options considered: a CRAFT peer-plane snapshot stream
+(the earlier option b′), forcing a nuraft snapshot through the follower's `receiving_snapshot` flag or a
+leader-side fork API, and never letting retention pass a live member (§6).
 
 **C3. The verdict epoch reconnected the data path to consensus. Resolved: no mid-session verdicts (§4.5).** The
 epoch, and with it the read rejection on replicas lagging on RAFT, are gone.
@@ -1331,26 +1311,25 @@ Any such value came from the client, so it is safe. This should go into §4.1/§
 no longer void an acked write; it can only delay or over-request healing. Empty verdicts come only from login,
 under the fence.
 
-**C6. Retention pins had no owner and no expiry. Resolved by (b′).** The earlier design pinned every
-member's journal through a replicated `retain_from`, and a dead snapshot target could freeze that pin
-indefinitely. With (b′) the only pin is held **locally by the source** of a snapshot session (`snapshot_pin`,
-§4.8). It is lease-bounded (every `snap_chunk` renews it), and it disappears with the session. What remains is the
-non-convergence case: a single source's journal grows while a receiver cannot catch up (§4.9 requirement 9, open
-question 10).
+**C6. Retention pins had no owner and no expiry. Resolved.** The earlier design pinned every member's journal
+through a replicated `retain_from`, and a dead snapshot target could freeze that pin indefinitely. Now there is no
+pin: a member that just installed a snapshot reports `commit_lsn = W`, which keeps every member's floor at or below
+`W` through `all_committed_lsn` until it has fetched the writes above `W` (§4.8). The retention cap bounds a member
+that goes silent, and never relaxes for one that reports it is installing or catching up.
 
 **C7. Tombstones above the watermark. Resolved:** verdicts happen only at login and are always ≤ `N`, as in the
 wiki.
 
 **C8. Many interacting mechanisms, none verified together.** Fewer now: the fence/session term split,
-`LoginAborted`, pre-sync, `F_seen`-bounded fill rounds, lease-bounded snapshot pins, apply suspension during
+`LoginAborted`, pre-sync, `F_seen`-bounded fill rounds, compaction following the cleanup floor, the IO gate during
 snapshot receive, idempotent replay, and partial-progress rounds. Their combination is still unproven. Before
 PR 2, write a model (TLA+ or P), check I1–I8 under loss, delay, reordering and crash, and prefer the simpler
 mechanism wherever safety is equal.
 
-**C9. Snapshot economics (accepted).** A full copy of the mapped volume, a pinned checkpoint on the source
-whose space grows with the overwrite rate, and possible non-convergence under a sustained write rate. (b′)
-removes the "leader only" part: the source is any healthy data member, preferably not the leader. Region deltas
-are deferred (§6), and the policy for non-convergence is open question 10.
+**C9. Snapshot economics (accepted).** A full copy of the mapped volume, always served by the leader (nuraft's
+choice), and possible non-convergence under a sustained write rate. The fuzzy read needs no pinned checkpoint, so
+the leader's space does not grow during a transfer. Region deltas are deferred (§6), and the policy for
+non-convergence is open question 10.
 
 ### 9.2 Safety and correctness
 
@@ -1364,14 +1343,14 @@ are deferred (§6), and the policy for non-convergence is open question 10.
 | **G6** | ~~RESOLVE when the client cannot reach the leader~~ | — | **Removed** with the client-requested round (§4.4). |
 | **G7** | ~~Coarse read rejection under the verdict epoch~~ | — | **Removed** with the verdict epoch (§4.5). |
 | **G8** | **No formal model.** The fixes interact: fence/session split, `LoginAborted`, pre-sync, snapshot sessions and pins, apply suspension during snapshot receive, replay idempotence. | D3, D4 and D14 were ordering races found only by reading. The fixes may have their own. | **Design.** Write a TLA+ or P model of login, resolution, catch-up and snapshot before PR 2. Model-check I1–I7 under message loss, delay, and crash. |
-| **G9** | **The wiki and this doc disagree** until the protocol changes are upstreamed: failed writes resolved at login only, the fence/session term split, data-side snapshot triggering (b′), and apply suspension during snapshot receive. | A HomeBlocks implementer following the wiki would rebuild D3, D4 and D14. | **Decide** (open question 6). |
+| **G9** | **The wiki and this doc disagree** until the protocol changes are upstreamed: failed writes resolved at login only, the fence/session term split, snapshot triggering by compaction plus the learner re-add for C2, and the IO gate during snapshot receive. | A HomeBlocks implementer following the wiki would rebuild D3, D4 and D14. | **Decide** (open question 6). |
 
 ### 9.3 Performance and resources
 
 | # | Gap | Impact | Handling |
 |---|---|---|---|
 | **G10** | **Journal replay copies history.** Every version of every slot in the gap is shipped and applied. | Hot-overwrite workloads replay much more than what actually changed. | **Defer.** The tier is chosen by retention only (§4.9). |
-| **G11** | **Snapshot cost scales with the whole volume.** With (b′) the source is any healthy data member, preferably not the leader. | Multi-TB copies take hours and load the source's disk and NIC. The pinned checkpoint holds superseded blocks, so the **source's space grows** by the overwrite volume during the transfer. | **Defer** region-level deltas (§6). **Design** a pin bound by time *and* by held space. |
+| **G11** | **Snapshot cost scales with the whole volume, and the leader serves it.** | Multi-TB copies take hours and load the leader's disk and NIC while it also serves IO and consensus. | **Defer** region-level deltas (§6). **Design** a byte-rate limit on `read_snapshot_obj`. |
 | **G12** | **A snapshot may never converge** under a sustained write rate. | The member never rejoins, and the source's journal pin keeps growing (one member, lease-bounded). | **Decide** (open question 10). |
 | **G13** | **No QoS.** Catch-up and snapshot traffic are unthrottled against client IO, or they starve behind it. | Latency spikes during resync, or resync never finishes. | **Design.** Token-bucket limits per partition and per node, with a floor that guarantees progress. |
 | **G14** | **Journal growth while a member lags or a snapshot is pinned.** Every member holds the journal. | Risk of a full disk on healthy members. | **Design.** A journal budget per partition, an alert, and the retention cap (open question 7 decides who owns it). |
@@ -1408,9 +1387,8 @@ are deferred (§6), and the policy for non-convergence is open question 10.
 6. **Wiki follow-up.** Upstream these to *CRAFT Design*, because they refine the protocol, not just this
    implementation: failed writes resolved at login only, never mid-session (§4.4–§4.5); §4.6 (fence term separate from session term; the wiki's quiesce text does not say which term a polled replica
    admits); and **C1's decision**: no quiesce timeout, the fence lifts only on a committed `InternalLogin` /
-   `LoginAborted`, plus pre-sync before fencing; and **(b′)**: data recovery is triggered data-side and streamed
-   over the peer plane, nuraft snapshots carry control state only, so RAFT log compaction is no longer the
-   snapshot trigger.
+   `LoginAborted`, plus pre-sync before fencing; and the **snapshot triggers**: RAFT-log compaction follows the journal cleanup
+   floor, and a member current on RAFT but behind on data is re-added as a learner.
 7. **Retention cap ownership.** Should the leader decide when a member is relegated to baseline (it sees every
    member's progress in probes) instead of each member capping locally (§4.8)?
 8. ~~**Read rejection granularity.**~~ Moot: no read rejection (§4.5).
@@ -1420,7 +1398,7 @@ are deferred (§6), and the policy for non-convergence is open question 10.
    correct.
 10. **Snapshot vs write rate.** What limit on transfer time or size triggers a re-freeze, and what happens when a
     snapshot never catches up: alert, temporarily throttle client writes, or neither?
-11. ~~**Data-behind but RAFT-current members (C2).**~~ **Decided: (b′).** Data over a CRAFT peer-plane stream from any member, control state over nuraft, priority 0 while behind. See §4.9.
+11. ~~**Data-behind but RAFT-current members (C2).**~~ **Decided:** nuraft snapshots throughout; such a member is re-added as a learner (`replace_member`), with priority 0 while behind. See §4.9.
 12. ~~**Verdict delivery (C3).**~~ **Decided:** no mid-session verdicts; failed writes are resolved at login (§4.4–§4.5).
 13. ~~**Quiesce release (C1).**~~ **Decided:** (a) lift the fence only on a committed outcome, plus (d) pre-sync before fencing. See §4.6 and I8.
 
