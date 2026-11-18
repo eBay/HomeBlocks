@@ -105,7 +105,7 @@ public:
         {
             // Plain (non-coroutine) blocking wait: this mock's coroutines never suspend across a real
             // async boundary, so whatever thread calls into read_slot() (directly, or transitively via
-            // rebuild_overlay()'s detached run_recovery()) physically blocks here until released --
+            // rebuild_overlay()'s detached recover()) physically blocks here until released --
             // exactly what a test needs to create an observable in-progress-recovery window.
             std::unique_lock lk{read_gate_mu};
             read_gate_cv.wait(lk, [this] { return read_gate_open; });
@@ -1052,7 +1052,7 @@ TEST_F(CraftCommitTest, RebuildOverlayPropagatesReadSlotError) {
 
 // Per subtasks.md/SDSTOR-22905, the overlay must be fully rebuilt before the volume accepts new
 // client I/O. trigger_on_restart() drives the EXACT production path (CraftRaftListener::on_restart()
-// -> run_recovery() -> rebuild_overlay()), with the mock's read_slot() gated closed so the rebuild
+// -> recover() -> rebuild_overlay()), with the mock's read_slot() gated closed so the rebuild
 // genuinely blocks -- proving write()/read()/keep_alive() all reject with OFFLINE while recovering_
 // is set, and the gate is gone (recovering_ false, overlay actually rebuilt) once it completes.
 //
@@ -1072,7 +1072,7 @@ TEST_F(CraftCommitTest, RestartRecoveryGatesClientIoUntilOverlayRebuilt) {
     EXPECT_FALSE(dev_->is_recovering());
     std::thread restart_thread([this] { dev_->trigger_on_restart(); });
 
-    // trigger_on_restart() sets recovering_ BEFORE detaching run_recovery() (which is what then blocks
+    // trigger_on_restart() sets recovering_ BEFORE detaching recover() (which is what then blocks
     // on the closed read gate) -- so this becomes true almost immediately; a short, generous wait
     // avoids a hard poll loop without making the test slow in the common case.
     for (int i = 0; i < 1000 && !dev_->is_recovering(); ++i) {
@@ -1141,7 +1141,7 @@ TEST_F(CraftCommitTest, FailedRestartRecoveryPermanentlyFaultsThePartition) {
     journal_->fail_on_read = 1;
 
     EXPECT_FALSE(dev_->is_faulted());
-    // read_gate stays open (default) -- run_recovery() runs to completion (with a failure) synchronously
+    // read_gate stays open (default) -- recover() runs to completion (with a failure) synchronously
     // within this call, same as every other trigger_on_restart() use in this file.
     dev_->trigger_on_restart();
     EXPECT_TRUE(dev_->is_faulted());

@@ -2211,8 +2211,10 @@ std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
         if (!apply_queue_.empty() && !apply_stopped_ && !apply_paused_) {
             auto entry = std::move(apply_queue_.front());
             apply_queue_.pop_front();
+            applying_ = entry.as_pending();
             return entry;
         }
+        applying_.reset();
         apply_running_ = false;
         notify = std::exchange(apply_idle_wanted_, false);
     }
@@ -2244,13 +2246,15 @@ async_status CraftReplDev::drain_apply() {
         complete_proposal(entry->ctx, std::move(outcome));
 
         // Then the image records the entry as applied -- after the durable effects its apply wrote ahead -- so the log
-        // replay after a restart skips it. Not once an apply has failed in this process: a restart then applies the
-        // failed entry again instead of skipping it for good (later entries again too; that's what a failed persist
-        // here leads to as well).
+        // replay after a restart skips it. A failed one too: what its apply wrote ahead is in the image either way (a
+        // login's session, admitted after a restart), and applying it again would change nothing. If this persist
+        // fails, the entry is applied again after a restart (from the image's pending entries or the log replay).
         {
+            // In one step for every image taken: the entry is either pending or recorded as applied.
+            std::lock_guard al{apply_mu_};
             std::lock_guard lk{state_mu_};
-            if (!applied) apply_failed_ = true;
-            if (!apply_failed_) durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, entry->lsn);
+            durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, entry->lsn);
+            applying_.reset();
         }
         if (auto r = co_await persist_state(); !r)
             LOGE("persisting the last applied raft lsn={} failed: {}", entry->lsn, r.error().message());
@@ -2309,6 +2313,8 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
         if (apply_running_ || !apply_queue_.empty())
             found.push_back(fmt::format("apply queue not idle: {} queued, drainer {}", apply_queue_.size(),
                                         apply_running_ ? "running" : "not running"));
+        if (!apply_running_ && applying_)
+            found.push_back(fmt::format("raft lsn {} still marked as being applied", applying_->raft_idx));
     }
     std::lock_guard sl{state_mu_};
     if (login_fence_term_ < state_.term)
@@ -2372,7 +2378,7 @@ void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const&
 // keep_alive() that arrives after on_restart() fires but before rebuild_overlay() completes can ever
 // observe a partially-rebuilt overlay (write()/read()/keep_alive() all reject with OFFLINE while
 // recovering_ is set -- per SDSTOR-22905, the overlay must be fully rebuilt before the volume accepts
-// new client I/O). run_recovery() clears the flag once rebuild_overlay() actually succeeds -- see its
+// new client I/O). recover() clears the flag once rebuild_overlay() actually succeeds -- see its
 // own doc comment for what happens on failure instead.
 //
 // Reachable more than once, in principle, if HomeStore's repl_dev_listener contract ever allows
@@ -2380,14 +2386,15 @@ void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const&
 // correctness for that case currently rests entirely on HomeStore's calling convention (observed today:
 // fired at most once per instance per restart cycle), not on anything this class enforces itself.
 //
-// With a state store, run_recovery() first restores state_ from the durable image and the journal, then rebuilds the
+// With a state store, recover() first restores state_ from the durable image and the journal, then rebuilds the
 // overlay over (commit_lsn, last_append_lsn]. Without one, state_ stays at its defaults and the walk is empty.
 void CraftReplDev::CraftRaftListener::on_restart() {
     owner_->recovering_.store(true, std::memory_order_release);
-    detail::detach(owner_->run_recovery());
+    detail::detach(owner_->recover());
 }
 
-// Awaits restore_state(), then rebuild_overlay(), to completion. On success, clears recovering_ -- the volume resumes
+// Awaits restore_state(), then rebuild_overlay(), to completion, then queues again the entries the image held as
+// pending. On success, clears recovering_ -- the volume resumes
 // accepting client I/O against a now-complete overlay. On FAILURE (e.g. a corrupt journal record),
 // does the opposite of what a naive "always clear, log and move on" version would: leaves recovering_
 // set and additionally sets faulted_ (checked first, ahead of recovering_, by every client-
@@ -2398,11 +2405,17 @@ void CraftReplDev::CraftRaftListener::on_restart() {
 // all. A stuck-rejecting partition is a visible, actionable failure; a partition silently serving stale
 // data is not. There is deliberately no self-healing path out of this state here -- an operator
 // decision (or a future re-sync-from-peer mechanism) is required.
-async_status CraftReplDev::run_recovery() {
+async_status CraftReplDev::recover() {
+    recovering_.store(true, std::memory_order_release);
     // An image or journal tail that can't be read faults the partition just as a failed rebuild does: restarting it
     // empty would forget its session and verdicts.
-    auto r = co_await restore_state();
-    if (r) r = co_await rebuild_overlay();
+    auto pending = co_await restore_state();
+    status r;
+    if (!pending) {
+        r = std::unexpected(pending.error());
+    } else {
+        r = co_await rebuild_overlay();
+    }
     if (!r) {
         LOGE("restart recovery failed: {} -- partition permanently faulted, will "
              "not accept client I/O (see faulted_'s doc comment)",
@@ -2410,8 +2423,36 @@ async_status CraftReplDev::run_recovery() {
         faulted_.store(true, std::memory_order_release);
         co_return r;
     }
+    requeue_pending(std::move(*pending));
     recovering_.store(false, std::memory_order_release);
     co_return r;
+}
+
+// An entry queued again here applies without its commit-time state change: the image already holds a Sync's verdicts
+// above the frontier and its watermark (restore_state()), the journal walk rebuilt the rest, and making the change
+// again could find a verdict the restored frontier has passed. A Sync's frees are left out too: they may have happened
+// before the restart, and freeing twice is worse than leaking. An InternalLogin raises the login fence again, as at
+// commit.
+void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
+    bool start = false;
+    {
+        std::lock_guard lk{apply_mu_};
+        for (auto const& p : pending) {
+            if (p.raft_idx <= restored_raft_idx_) continue; // applied before the restart
+            if (p.type == CraftEntryType::InternalLogin) {
+                std::lock_guard sl{state_mu_};
+                login_fence_term_ = std::max(login_fence_term_, p.term);
+            }
+            apply_queue_.push_back(PendingApply{.lsn = p.raft_idx,
+                                                .type = p.type,
+                                                .rs_commit_lsn = p.rs_commit_lsn,
+                                                .client_token = p.client_token,
+                                                .term = p.term});
+            restored_raft_idx_ = p.raft_idx; // the log replay delivers it too
+        }
+        start = !apply_queue_.empty() && !apply_paused_ && !std::exchange(apply_running_, true);
+    }
+    if (start) detail::detach(drain_apply());
 }
 
 // ─── durable partition state (S8 / SDSTOR-22745) ─────────────────────────────
@@ -2424,33 +2465,50 @@ struct DurableHeader {
     uint64_t magic;
     uint32_t version;
     uint32_t n_empty;
+    uint32_t n_pending;
     uint64_t term;
     uint64_t client_token;
     int64_t last_applied_raft_idx;
     int64_t durable_commit_lsn;
     int64_t sync_watermark;
 };
+struct PendingRecord {
+    int64_t raft_idx;
+    uint8_t type;
+    int64_t rs_commit_lsn;
+    uint64_t client_token;
+    uint64_t term;
+};
 #pragma pack(pop)
 } // namespace
 
 std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
-    // Verdicts above the frontier are pruned as it advances, so this is a backlog of unresolved slots, never near 2^32.
-    RELEASE_ASSERT(s.empty_lsns.size() <= std::numeric_limits< uint32_t >::max(),
-                   "{} Empty verdicts overflow the image", s.empty_lsns.size());
+    // Verdicts above the frontier are pruned as it advances, and the pending entries are the apply queue's: neither
+    // gets near 2^32.
+    RELEASE_ASSERT(s.empty_lsns.size() <= std::numeric_limits< uint32_t >::max() &&
+                       s.pending.size() <= std::numeric_limits< uint32_t >::max(),
+                   "{} Empty verdicts or {} pending entries overflow the image", s.empty_lsns.size(), s.pending.size());
     DurableHeader const h{k_durable_magic,
                           k_durable_version,
                           static_cast< uint32_t >(s.empty_lsns.size()),
+                          static_cast< uint32_t >(s.pending.size()),
                           s.term,
                           s.client_token,
                           s.last_applied_raft_idx,
                           s.durable_commit_lsn,
                           s.sync_watermark};
-    std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t));
+    std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t) +
+                               s.pending.size() * sizeof(PendingRecord));
     std::memcpy(out.data(), &h, sizeof(h));
     size_t off = sizeof(h);
     for (int64_t lsn : s.empty_lsns) {
         std::memcpy(out.data() + off, &lsn, sizeof(lsn));
         off += sizeof(lsn);
+    }
+    for (auto const& p : s.pending) {
+        PendingRecord const r{p.raft_idx, static_cast< uint8_t >(p.type), p.rs_commit_lsn, p.client_token, p.term};
+        std::memcpy(out.data() + off, &r, sizeof(r));
+        off += sizeof(r);
     }
     return out;
 }
@@ -2460,7 +2518,10 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
     DurableHeader h;
     std::memcpy(&h, buf, sizeof(h));
     if (h.magic != k_durable_magic || h.version != k_durable_version) return std::nullopt;
-    if (len != sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t)) return std::nullopt;
+    if (len !=
+        sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t) +
+            static_cast< size_t >(h.n_pending) * sizeof(PendingRecord))
+        return std::nullopt;
     CraftDurableState s{.term = h.term,
                         .client_token = h.client_token,
                         .last_applied_raft_idx = h.last_applied_raft_idx,
@@ -2473,6 +2534,21 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
         if (lsn <= prev) return std::nullopt; // strictly ascending, and above the frontier
         s.empty_lsns.insert(s.empty_lsns.end(), lsn);
         prev = lsn;
+    }
+    uint8_t const* const records = buf + sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t);
+    int64_t prev_idx = -1;
+    for (uint32_t i = 0; i < h.n_pending; ++i) {
+        PendingRecord r;
+        std::memcpy(&r, records + i * sizeof(PendingRecord), sizeof(r));
+        auto const type = static_cast< CraftEntryType >(r.type);
+        if (r.raft_idx <= prev_idx) return std::nullopt; // strictly ascending
+        if (type != CraftEntryType::SyncRSCommitLSN && type != CraftEntryType::InternalLogin) return std::nullopt;
+        s.pending.push_back(CraftPendingEntry{.raft_idx = r.raft_idx,
+                                              .type = type,
+                                              .rs_commit_lsn = r.rs_commit_lsn,
+                                              .client_token = r.client_token,
+                                              .term = r.term});
+        prev_idx = r.raft_idx;
     }
     return s;
 }
@@ -2500,6 +2576,9 @@ async_status CraftReplDev::run_persist() {
         shared< sisl::async::shared_awaitable< bool > > round;
         CraftDurableState image;
         {
+            // The entries not applied yet go with the image, taken together: apply_mu_ first, as enqueue_apply() takes
+            // the two.
+            std::lock_guard al{apply_mu_};
             std::lock_guard lk{state_mu_};
             round = std::exchange(persist_next_, nullptr);
             if (!round) {
@@ -2507,6 +2586,9 @@ async_status CraftReplDev::run_persist() {
                 co_return ok();
             }
             image = durable_;
+            if (applying_) image.pending.push_back(*applying_);
+            for (auto const& e : apply_queue_)
+                image.pending.push_back(e.as_pending());
         }
         // An escaping exception would end the writer with persist_running_ still set: no persist would complete again.
         status r;
@@ -2524,8 +2606,8 @@ async_status CraftReplDev::run_persist() {
     }
 }
 
-async_status CraftReplDev::restore_state() {
-    if (!state_store_) co_return ok();
+async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
+    if (!state_store_) co_return std::vector< CraftPendingEntry >{};
     result< std::optional< CraftDurableState > > loaded;
     try {
         loaded = state_store_->load();
@@ -2537,7 +2619,7 @@ async_status CraftReplDev::restore_state() {
         LOGE("restore_state: durable partition state unreadable: {}", loaded.error().message());
         co_return std::unexpected(loaded.error());
     }
-    if (!*loaded) co_return ok(); // never persisted: a new partition
+    if (!*loaded) co_return std::vector< CraftPendingEntry >{}; // never persisted: a new partition
     CraftDurableState const& d = **loaded;
 
     auto tail = co_await journal_->tail_lsn();
@@ -2548,6 +2630,7 @@ async_status CraftReplDev::restore_state() {
     {
         std::lock_guard lk{state_mu_};
         durable_ = d;
+        durable_.pending.clear(); // returned instead, and queued again by recover()
         state_.term = d.term;
         state_.client_token = d.client_token;
         login_fence_term_ = std::max(login_fence_term_, d.term);
@@ -2564,9 +2647,11 @@ async_status CraftReplDev::restore_state() {
         std::lock_guard lk{apply_mu_};
         restored_raft_idx_ = d.last_applied_raft_idx;
     }
-    LOGI("restore_state: term={} commit_lsn={} journal tail={} sync_watermark={} empties={} last_applied_raft_idx={}",
-         d.term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(), d.last_applied_raft_idx);
-    co_return ok();
+    LOGI("restore_state: term={} commit_lsn={} journal tail={} sync_watermark={} empties={} last_applied_raft_idx={} "
+         "pending={}",
+         d.term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(), d.last_applied_raft_idx,
+         d.pending.size());
+    co_return d.pending;
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────

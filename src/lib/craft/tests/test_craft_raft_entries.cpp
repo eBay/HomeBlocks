@@ -1632,9 +1632,9 @@ TEST_F(CraftRaftEntriesTest, InternalLoginPersistsTheSessionBeforeAdmittingIt) {
     EXPECT_EQ(store->saved->last_applied_raft_idx, 1);
 }
 
-// A session that can't be made durable isn't admitted, and from then on the image stops recording entries as applied:
-// a restart applies the failed login again. Later entries still apply here.
-TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureDoesNotAdmitAndFreezesTheAppliedIndex) {
+// A session that can't be made durable isn't admitted here. Later entries still apply, and the next image that is
+// written holds the committed login's session: a restart admits it.
+TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureDoesNotAdmit) {
     auto* store = with_store();
     commit(1, make_header(CraftEntryType::InternalLogin), make_internal_login_key(42, 3));
     ASSERT_EQ(store->saved->last_applied_raft_idx, 1);
@@ -1647,7 +1647,9 @@ TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureDoesNotAdmitAndFreezesTh
     commit(3, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {}));
     EXPECT_EQ(dev_->last_append_lsn(), 2);
     EXPECT_EQ(store->saved->sync_watermark, 2);
-    EXPECT_EQ(store->saved->last_applied_raft_idx, 1) << "a restart must apply the failed login again";
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 3);
+    EXPECT_EQ(store->saved->term, 5u);
+    EXPECT_EQ(store->saved->client_token, 43u);
 }
 
 // A Sync's verdicts and watermark are durable before any block a verdict voids is freed.
@@ -1940,6 +1942,121 @@ TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterARestart) {
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_TRUE(dev_->is_empty_slot(4));
     EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 3);
+}
+
+// ── entries committed but not applied (pending) ──
+
+CraftPendingEntry pending_sync(int64_t raft_idx, int64_t rs_commit_lsn) {
+    return CraftPendingEntry{
+        .raft_idx = raft_idx, .type = CraftEntryType::SyncRSCommitLSN, .rs_commit_lsn = rs_commit_lsn};
+}
+
+CraftPendingEntry pending_login(int64_t raft_idx, uint64_t client_token, uint64_t term) {
+    return CraftPendingEntry{
+        .raft_idx = raft_idx, .type = CraftEntryType::InternalLogin, .client_token = client_token, .term = term};
+}
+
+TEST(CraftDurableStateCodec, RoundTripsPendingEntries) {
+    auto s = sample_state();
+    s.pending = {pending_sync(10, 7), pending_login(11, 55, 6)};
+    auto const bytes = encode_durable_state(s);
+    auto const d = decode_durable_state(bytes.data(), bytes.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, s);
+}
+
+TEST(CraftDurableStateCodec, RejectsMalformedPendingEntries) {
+    auto s = sample_state();
+    s.pending = {pending_sync(10, 7), pending_login(11, 55, 6)};
+    auto const good = encode_durable_state(s);
+    size_t const record = 33; // packed: raft_idx, type, rs_commit_lsn, client_token, term
+    size_t const second = good.size() - record;
+
+    EXPECT_FALSE(decode_durable_state(good.data(), good.size() - 1).has_value()); // cut short
+    auto unsorted = good;
+    int64_t const ten = 10;
+    std::memcpy(unsorted.data() + second, &ten, sizeof(ten)); // raft_idx 10 twice
+    EXPECT_FALSE(decode_durable_state(unsorted.data(), unsorted.size()).has_value());
+    auto create_volume = good;
+    create_volume[second + sizeof(int64_t)] = static_cast< uint8_t >(CraftEntryType::CreateVolume); // not queued
+    EXPECT_FALSE(decode_durable_state(create_volume.data(), create_volume.size()).has_value());
+}
+
+// Every image holds the entries committed but not yet applied, in log order; once applied they leave it.
+TEST_F(CraftRaftEntriesTest, ImageHoldsTheEntriesNotYetApplied) {
+    auto* store = with_store();
+    dev_->pause_apply();
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(3, 0, {}));
+    commit(6, make_header(CraftEntryType::InternalLogin), make_internal_login_key(42, 7));
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->pending, (std::vector< CraftPendingEntry >{pending_sync(5, 3), pending_login(6, 42, 7)}));
+    EXPECT_TRUE(dev_->durable_state().pending.empty()) << "the in-memory image keeps none";
+
+    dev_->resume_apply();
+    EXPECT_EQ(dev_->term(), 7u);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    EXPECT_TRUE(store->saved->pending.empty());
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 6);
+}
+
+// The entry being applied is pending until its apply completes.
+TEST_F(CraftRaftEntriesTest, ImageHoldsTheEntryBeingApplied) {
+    auto* store = with_store();
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(0, {});
+    fetcher_.hold_fetch = true; // the Sync's catch-up waits for the gate
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {}));
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    EXPECT_EQ(store->saved->pending, (std::vector< CraftPendingEntry >{pending_sync(5, 2)}));
+
+    fetcher_.fetch_gate.complete(true);
+    EXPECT_TRUE(store->saved->pending.empty());
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 5);
+}
+
+// A restart applies again the image's pending entries above its last applied index, in log order, and the log replay
+// then skips them.
+TEST_F(CraftRaftEntriesTest, RestartAppliesThePendingEntriesAgain) {
+    auto image = sample_state(); // last applied raft idx 9, session term 3
+    image.pending = {pending_login(8, 88, 9), pending_sync(10, 7), pending_login(11, 55, 6)};
+    auto* store = restart(image, page_slots({0, 1, 2, 3, 7}, /*zeros=*/true));
+    ASSERT_FALSE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 6u) << "the login at raft 8 was applied before the restart";
+    EXPECT_EQ(dev_->client_token(), 55u);
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 11);
+    EXPECT_TRUE(store->saved->pending.empty());
+    EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{}); // e.g. the login fence raised again
+
+    commit(11, make_header(CraftEntryType::InternalLogin), make_internal_login_key(99, 12));
+    EXPECT_EQ(dev_->term(), 6u) << "the log replay applied a pending entry a second time";
+    commit(12, make_header(CraftEntryType::InternalLogin), make_internal_login_key(77, 8));
+    EXPECT_EQ(dev_->term(), 8u);
+}
+
+// A pending Sync applies again without its commit-time state change, which the image already holds: no verdict check
+// against the restored frontier (its verdicts here are at or below it), and no frees (they may have happened before).
+TEST_F(CraftRaftEntriesTest, RestartAppliesAPendingSyncWithoutItsVerdictsOrFrees) {
+    auto image = sample_state();
+    image.durable_commit_lsn = 3; // the Sync voided slot 3 before the restart; the frontier has passed it
+    image.empty_lsns.clear();
+    image.sync_watermark = 3;
+    image.pending = {pending_sync(10, 3)};
+    restart(image, page_slots({0, 1, 2, 3}));
+    EXPECT_FALSE(dev_->is_faulted());
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 10);
+}
+
+// recover() is the awaitable form of the restart path: client I/O waits for it.
+TEST_F(CraftRaftEntriesTest, RecoverRestoresAndClearsTheGate) {
+    auto* store = with_store();
+    store->saved = sample_state();
+    journal_->slots = page_slots({0, 1, 2, 3});
+    auto const r = homeblocks::detail::sync_get(dev_->recover());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(dev_->is_recovering());
+    EXPECT_EQ(dev_->term(), 3u);
 }
 
 } // namespace
