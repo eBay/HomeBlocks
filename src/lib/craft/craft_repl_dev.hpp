@@ -65,18 +65,13 @@ struct CraftPartitionState {
     uint64_t client_token{0};      // token from the last successful InternalLogin
     uint64_t term{0};              // current session term
     int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
-                                   // floors journal reclaim (S8: truncate below min(this, checkpointed apply
-                                   // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
-                                   // TODO(S8): this is client-controlled wire input with only a narrow
-                                   // malformed-negative check applied where it's captured (write()/read()/
-                                   // keep_alive()) -- there is NO per-call bound possible there: a lagging
-                                   // replica legitimately sees this arrive ahead of its own last_append_lsn/
-                                   // commit_lsn (that gap is the signal it needs to catch up via S6 peer
-                                   // exchange), so clamping against local state would break that. Before using
-                                   // this as a reclaim floor, S8 must validate it against real journal/
-                                   // checkpoint state (e.g. never reclaim past what's actually durable/
-                                   // replicated here), since a buggy/malicious client could otherwise poison
-                                   // it with an absurdly large value with no local signal to catch it.
+                                   // floors journal reclaim (see reclaim_floor_locked()). Client-controlled wire
+                                   // input with only a narrow malformed-negative check where it's captured
+                                   // (write()/read()/keep_alive()) -- there is NO per-call bound possible there: a
+                                   // lagging replica legitimately sees this arrive ahead of its own
+                                   // last_append_lsn/commit_lsn (that gap is the signal it needs to catch up via
+                                   // S6 peer exchange). The reclaim floor bounds it by this member's persisted
+                                   // durable commit frontier instead.
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
@@ -148,6 +143,13 @@ public:
     virtual async_result< int64_t > tail_lsn() {
         co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
     }
+    // Journal reclaim: drops every entry with lsn <= upto (not past the journal's last entry). Their data blocks are
+    // NOT freed: the index references them by then. Default: not_supported, and the device stops asking.
+    virtual async_status reclaim_upto(int64_t /* upto */) {
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    }
+    // Highest lsn reclaimed so far, -1 for none. Read at restart.
+    virtual int64_t reclaimed_upto() const { return -1; }
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -409,8 +411,7 @@ public:
     // Advance the frontier toward hdr.commit_lsn + reset the client-liveness watchdog -- which is WHY it is
     // term-fenced: a deposed client must not be able to keep its session alive. hdr.all_committed_lsn is the
     // client-computed set-wide min commit_lsn; captured into state_ (max-monotonic, never regresses on a
-    // stale/reordered message) so a floor of min(all_committed_lsn, checkpointed apply frontier) is available
-    // for S8's journal reclaim -- the reclaim ACTION itself is S8's job, not implemented here. Returns the
+    // stale/reordered message), it can raise the journal reclaim floor, so the reclaim runs again. Returns the
     // achieved watermarks.
     async_result< craft::lsn_pair > keep_alive(craft::client_hdr hdr);
 
@@ -502,9 +503,7 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.term;
     }
-    // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim
-    // (S8's job, not read anywhere yet in this class); exposed so S8's eventual reclaim logic has
-    // something to read.
+    // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim.
     int64_t all_committed_lsn() const {
         std::lock_guard lk{state_mu_};
         return state_.all_committed_lsn;
@@ -630,6 +629,12 @@ public:
     CraftDurableState durable_state() const {
         std::lock_guard lk{state_mu_};
         return durable_;
+    }
+
+    // The journal is reclaimed up to here (entries at or below it are gone).
+    int64_t reclaimed_upto() const {
+        std::lock_guard lk{state_mu_};
+        return reclaimed_upto_;
     }
 
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
@@ -871,6 +876,19 @@ private:
     // once the verdict is durable; leaks them if it can't be made durable (see the .cpp).
     async_status free_voided(int64_t lsn, std::optional< homestore::multi_blk_id > fill = std::nullopt);
 
+    // ── journal reclaim (S8) ──
+    // The journal is reclaimed up to floor = min(durable commit frontier as persisted, all_committed_lsn):
+    //   - below the persisted frontier the index is durable, so a restart no longer applies those slots again;
+    //   - below all_committed_lsn every member has committed, so no member's catch-up needs them. It is the client's
+    //     word: taking the min with our own durable frontier keeps a wrong value from reclaiming anything a restart
+    //     here still needs. One that is too large can leave a lagging member unable to catch up (liveness, not
+    //     safety: a fetch of a reclaimed slot fails, it never reads as not held).
+    // Recomputed when a durable frontier is persisted and on each keep_alive; one runner at a time. Never without a
+    // state store: the journal is then the only copy.
+    int64_t reclaim_floor_locked() const;
+    void request_reclaim();
+    async_status run_reclaim();
+
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
     // declared at the top of this class) so tests can exercise it against a fake index instead of a
     // real VolumeIndexTable. read() binds this to indx_tbl_'s real read_from_index; read_with()
@@ -1105,6 +1123,12 @@ private:
     // Blocks an index write superseded, each with the slot that replaced it, until the durable commit frontier reaches
     // that slot. Lost on a crash: a bounded leak. Guarded by state_mu_.
     std::vector< std::pair< int64_t, homestore::blk_id > > deferred_frees_;
+
+    // ── journal reclaim (S8), all guarded by state_mu_ ──
+    int64_t reclaimed_upto_{-1};           // journal entries at or below this are gone
+    int64_t persisted_durable_commit_{-1}; // durable_commit_lsn as last persisted: the floor's input
+    bool reclaim_running_{false};          // a run_reclaim() is active
+    bool reclaim_unsupported_{false};      // the backend said not_supported: stop asking
 };
 
 } // namespace homeblocks

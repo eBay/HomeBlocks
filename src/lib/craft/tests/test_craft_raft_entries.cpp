@@ -119,6 +119,22 @@ public:
         co_return slots.empty() ? -1 : slots.rbegin()->first;
     }
 
+    // Journal reclaim: drops the slots <= upto.
+    int64_t reclaimed{-1};
+    int reclaim_calls{0};
+    bool reclaim_unsupported{false};
+    bool fail_reclaim{false};
+    async_status reclaim_upto(int64_t upto) override {
+        ++reclaim_calls;
+        if (reclaim_unsupported)
+            co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+        if (fail_reclaim) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        slots.erase(slots.begin(), slots.upper_bound(upto));
+        reclaimed = std::max(reclaimed, upto);
+        co_return ok();
+    }
+    int64_t reclaimed_upto() const override { return reclaimed; }
+
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
 };
 
@@ -2057,6 +2073,123 @@ TEST_F(CraftRaftEntriesTest, RecoverRestoresAndClearsTheGate) {
     ASSERT_TRUE(r.has_value());
     EXPECT_FALSE(dev_->is_recovering());
     EXPECT_EQ(dev_->term(), 3u);
+}
+
+// ── journal reclaim ──
+
+// A keep_alive of the current session carrying the set-wide committed prefix.
+auto keep_alive_with(CraftReplDev& dev, int64_t all_committed_lsn) {
+    return homeblocks::detail::sync_get(dev.keep_alive(craft::client_hdr{dev.term(), -1, all_committed_lsn}));
+}
+
+// The journal is reclaimed up to the lower of the persisted durable commit frontier and the set-wide committed prefix
+// the client reports.
+TEST_F(CraftRaftEntriesTest, ReclaimFollowsTheLowerOfTheDurableCommitAndAllCommitted) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    ASSERT_EQ(dev_->durable_state().durable_commit_lsn, 10);
+    EXPECT_EQ(journal_->reclaim_calls, 0) << "no committed prefix from the client yet";
+
+    ASSERT_TRUE(keep_alive_with(*dev_, 6).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 6);
+    EXPECT_EQ(journal_->slots.begin()->first, 7);
+
+    ASSERT_TRUE(keep_alive_with(*dev_, 20).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 10) << "past the durable commit frontier";
+}
+
+// Without a state store the journal is the only copy: never reclaimed.
+TEST_F(CraftRaftEntriesTest, NoReclaimWithoutAStore) {
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2}, /*zeros=*/true);
+    dev_->seed_lsns(2, {});
+    ASSERT_TRUE(do_apply(2, 0).has_value());
+    ASSERT_TRUE(keep_alive_with(*dev_, 2).has_value());
+    EXPECT_EQ(journal_->reclaim_calls, 0);
+}
+
+// The floor follows the frontier as persisted: one recorded in memory but not written yet doesn't count, until a later
+// persist writes it -- which then reclaims.
+TEST_F(CraftRaftEntriesTest, ReclaimWaitsForTheFrontierToBePersisted) {
+    auto* store = with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5}, /*zeros=*/true);
+    dev_->seed_lsns(5, {});
+    store->fail_persist = true;
+    ASSERT_TRUE(do_apply(5, 0).has_value());
+    ASSERT_EQ(dev_->durable_state().durable_commit_lsn, 5);
+    ASSERT_TRUE(keep_alive_with(*dev_, 4).has_value());
+    EXPECT_EQ(journal_->reclaim_calls, 0);
+
+    store->fail_persist = false;
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 4);
+}
+
+// A backend that can't reclaim is asked once; a failed reclaim is tried again on the next trigger.
+TEST_F(CraftRaftEntriesTest, ReclaimStopsWhenUnsupportedAndRetriesAfterAFailure) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3}, /*zeros=*/true);
+    dev_->seed_lsns(3, {});
+    ASSERT_TRUE(do_apply(3, 0).has_value());
+
+    journal_->fail_reclaim = true;
+    ASSERT_TRUE(keep_alive_with(*dev_, 1).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), -1);
+    journal_->fail_reclaim = false;
+    ASSERT_TRUE(keep_alive_with(*dev_, 1).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 1);
+
+    journal_->reclaim_unsupported = true;
+    int const calls = journal_->reclaim_calls;
+    ASSERT_TRUE(keep_alive_with(*dev_, 2).has_value());
+    ASSERT_TRUE(keep_alive_with(*dev_, 3).has_value());
+    EXPECT_EQ(journal_->reclaim_calls, calls + 1);
+    EXPECT_EQ(dev_->reclaimed_upto(), 1);
+}
+
+// A peer's fetch of a reclaimed slot fails the whole batch: it was held here, and reporting it as not held could let a
+// leader verdict a committed slot Empty. Slots above the reclaim point, and Empty verdicts, are still served.
+TEST_F(CraftRaftEntriesTest, FetchOfAReclaimedSlotFailsTheBatch) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 4, 5}, /*zeros=*/true);
+    dev_->seed_lsns(5, {3});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    ASSERT_TRUE(keep_alive_with(*dev_, 4).has_value());
+    ASSERT_EQ(dev_->reclaimed_upto(), 4);
+
+    EXPECT_FALSE(homeblocks::detail::sync_get(dev_->fetch_data({2, 5})).has_value());
+    auto const above = homeblocks::detail::sync_get(dev_->fetch_data({5}));
+    ASSERT_TRUE(above.has_value());
+    EXPECT_EQ(above->size(), 1u);
+    auto const empty = homeblocks::detail::sync_get(dev_->fetch_data({3}));
+    ASSERT_TRUE(empty.has_value());
+    ASSERT_EQ(empty->size(), 1u);
+    EXPECT_TRUE(empty->front().is_empty);
+}
+
+// A restart reads the reclaim point back from the journal, and the floor's frontier from the durable state.
+TEST_F(CraftRaftEntriesTest, RestartReadsTheReclaimPoint) {
+    auto* store = with_store();
+    store->saved = sample_state(); // durable commit frontier 1
+    journal_->slots = page_slots({1, 2, 3}, /*zeros=*/true);
+    journal_->reclaimed = 0;
+    dev_->trigger_on_restart();
+    ASSERT_FALSE(dev_->is_faulted());
+    EXPECT_EQ(dev_->reclaimed_upto(), 0);
+
+    ASSERT_TRUE(keep_alive_with(*dev_, 5).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 1) << "the restored frontier caps the floor";
 }
 
 } // namespace

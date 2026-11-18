@@ -127,6 +127,29 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 2);
 }
 
+// Journal reclaim against the real log store: entries <= upto become unreadable, later ones stay, and the reclaim
+// point is reported back (a restart reads it from here). Never past the last entry: the tail stays.
+TEST_F(CraftHomeStoreBackendTest, ReclaimUptoDropsTheJournalPrefix) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    for (int64_t lsn = 0; lsn <= 4; ++lsn) {
+        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
+                                                                  std::vector< homestore::csum_t >{}));
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(backend->reclaimed_upto(), -1);
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->reclaim_upto(2)).has_value());
+    EXPECT_EQ(backend->reclaimed_upto(), 2);
+    EXPECT_FALSE(homeblocks::detail::sync_get(backend->read_slot(2)).has_value());
+    EXPECT_TRUE(homeblocks::detail::sync_get(backend->read_slot(3)).has_value());
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->reclaim_upto(10)).has_value());
+    EXPECT_EQ(backend->reclaimed_upto(), 4);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 4);
+}
+
 // A journal never written to has tail -1: restart recovery takes max(tail, ...) for last_append_lsn, so any other
 // value would invent appended slots.
 TEST_F(CraftHomeStoreBackendTest, TailLsnOfANewJournalIsMinusOne) {

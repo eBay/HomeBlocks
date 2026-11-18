@@ -409,6 +409,19 @@ public:
     // 0). A reopened store has its tail once its log replay is done, which is before the device is attached to it.
     async_result< int64_t > tail_lsn() override { co_return static_cast< int64_t >(logstore_->tail_lsn()); }
 
+    // home_log_store::truncate() drops every entry <= upto at once (reading one fails from then on). The log device
+    // releases their space at its next device truncation, which HomeStore's resource manager runs periodically; a
+    // crash before that brings them back, and the restart reports the older reclaim point, so the device reclaims
+    // again. Not past the last entry: truncating beyond the tail would move it (HomeStore's baseline-resync path).
+    async_status reclaim_upto(int64_t upto) override {
+        upto = std::min< int64_t >(upto, logstore_->tail_lsn());
+        if (upto <= static_cast< int64_t >(logstore_->truncated_upto())) co_return ok();
+        if (!logstore_->truncate(static_cast< homestore::logstore_seq_num_t >(upto)))
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        co_return ok();
+    }
+    int64_t reclaimed_upto() const override { return static_cast< int64_t >(logstore_->truncated_upto()); }
+
 private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
@@ -1632,15 +1645,14 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
             LOGW("keep_alive rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        // Max-monotonic: never let a stale/reordered message regress the floor S8's eventual journal
-        // reclaim reads. The reclaim action itself is not implemented here -- see the doc comment.
+        // Max-monotonic: never let a stale/reordered message regress the floor journal reclaim reads.
         // hdr.all_committed_lsn is client-controlled wire input with no per-call bound to validate
         // against (it legitimately advances independently of this call's own commit_lsn/
         // last_append_lsn -- confirmed by existing tests). -1 is the "unset" sentinel (skip); any
         // OTHER negative value is unambiguously malformed and is ignored rather than corrupting this
         // long-lived floor. Does not catch an absurdly-large-but-positive value (no bound exists for
-        // that here) -- S8's eventual reclaim implementation must validate against real journal state
-        // before consuming this floor, not this layer.
+        // that here): the reclaim floor bounds it by the persisted durable commit frontier
+        // (reclaim_floor_locked()).
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
         // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
@@ -1648,6 +1660,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
     }
 
     touch_watchdog();
+    request_reclaim(); // all_committed_lsn may have raised the reclaim floor
 
     // Unlike write()'s piggyback, advancing the frontier IS this call's entire purpose -- a genuine
     // commit() fault (not a stall, which is never an error) propagates to the caller instead of being
@@ -2004,7 +2017,8 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
 // serialised by the login sequence (no concurrent writes while fetch_data runs), so the snapshot
 // taken under the lock is stable for the whole batch.
 //
-// A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
+// A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded. So does a slot
+// the journal reclaim has dropped (see the classification below).
 
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
     // A faulted partition's slots no longer match the replica set's, so they can't be evidence for anyone's
@@ -2022,6 +2036,11 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
         for (int64_t lsn : lsns) {
             if (empty_lsns_.contains(lsn)) {
                 kinds.push_back(SlotKind::Empty);
+            } else if (lsn >= 0 && lsn <= reclaimed_upto_) {
+                // Held here, and reclaimed from the journal since: the batch fails. Omitting the slot would read as
+                // "not held here", which a leader can count toward verdicting a committed slot Empty.
+                LOGW("fetch_data rejected: lsn={} is reclaimed (journal reclaimed up to {})", lsn, reclaimed_upto_);
+                co_return std::unexpected(std::make_error_condition(std::errc::result_out_of_range));
             } else if (lsn >= 0 && lsn <= state_.last_append_lsn && !missing_lsns_.contains(lsn)) {
                 kinds.push_back(SlotKind::Present);
             } else {
@@ -2602,7 +2621,18 @@ async_status CraftReplDev::run_persist() {
             r = std::unexpected(std::make_error_condition(std::errc::io_error));
         }
         if (!r) LOGE("persisting the durable partition state failed: {}", r.error().message());
+        // Whichever round makes a durable commit frontier durable -- the checkpoint's own, or a later one after that
+        // failed -- is what the journal reclaim follows.
+        bool frontier_persisted = false;
+        if (r) {
+            std::lock_guard lk{state_mu_};
+            if (image.durable_commit_lsn > persisted_durable_commit_) {
+                persisted_durable_commit_ = image.durable_commit_lsn;
+                frontier_persisted = true;
+            }
+        }
         round->complete(static_cast< bool >(r)); // never under state_mu_: resumes the round's callers
+        if (frontier_persisted) request_reclaim();
     }
 }
 
@@ -2642,6 +2672,8 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
         missing_lsns_.clear(); // rebuild_overlay() marks every slot above commit_lsn that the journal doesn't hold
         replay_upto_ = std::max(*tail, d.durable_commit_lsn);
         last_checkpoint_lsn_ = d.durable_commit_lsn;
+        reclaimed_upto_ = journal_->reclaimed_upto();
+        persisted_durable_commit_ = d.durable_commit_lsn;
     }
     {
         std::lock_guard lk{apply_mu_};
@@ -2652,6 +2684,59 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
          d.term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(), d.last_applied_raft_idx,
          d.pending.size());
     co_return d.pending;
+}
+
+// ─── journal reclaim (S8) ─────────────────────────────────────────────────────
+
+// Without a state store nothing is persisted, so the persisted frontier stays -1 and nothing is ever reclaimed: the
+// journal is then the only copy.
+int64_t CraftReplDev::reclaim_floor_locked() const {
+    return std::min(persisted_durable_commit_, state_.all_committed_lsn);
+}
+
+void CraftReplDev::request_reclaim() {
+    {
+        std::lock_guard lk{state_mu_};
+        if (reclaim_running_ || reclaim_unsupported_ || reclaim_floor_locked() <= reclaimed_upto_) return;
+        reclaim_running_ = true;
+    }
+    detail::detach(run_reclaim());
+}
+
+// The one runner: reclaims to the current floor, and again while the floor keeps rising meanwhile.
+async_status CraftReplDev::run_reclaim() {
+    auto self = shared_from_this();
+    for (;;) {
+        int64_t floor;
+        {
+            std::lock_guard lk{state_mu_};
+            floor = reclaim_floor_locked();
+            if (floor <= reclaimed_upto_) {
+                reclaim_running_ = false;
+                co_return ok();
+            }
+        }
+        // An escaping exception would end the runner with reclaim_running_ still set: no reclaim would run again.
+        status r;
+        try {
+            r = co_await journal_->reclaim_upto(floor);
+        } catch (std::exception const& e) {
+            LOGE("journal reclaim to {} threw: {}", floor, e.what());
+            r = std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        std::lock_guard lk{state_mu_};
+        if (!r) {
+            if (r.error() == std::errc::operation_not_supported) {
+                reclaim_unsupported_ = true;
+            } else {
+                LOGE("journal reclaim to {} failed: {} -- tried again on the next trigger", floor, r.error().message());
+            }
+            reclaim_running_ = false;
+            co_return r;
+        }
+        reclaimed_upto_ = floor;
+        LOGD("journal reclaimed to {}", floor);
+    }
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
