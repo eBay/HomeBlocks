@@ -26,9 +26,11 @@
 #include <sisl/flip/flip_client.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore.hpp>
+#include <homestore/blkdata_service.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/replication_service.hpp>
 #include "hb_internal.hpp"
+#include "home_blks_config.hpp"
 #include "test_common.hpp"
 #include <volume/volume.hpp>
 
@@ -498,6 +500,65 @@ TEST_F(CraftVolumeTest, RequestResolutionCommitsThroughTheGroup) {
     ASSERT_TRUE(res2) << res2.error().message();
     EXPECT_EQ(res2->resolved_upto, 3);
     EXPECT_EQ((*again)->craft_dev()->commit_lsn(), 3);
+    remove(id);
+}
+
+// A restart keeps the blocks of every live slot allocated: those at or below the durable commit frontier, which the
+// allocator kept from their write, and those above it, which the recovery commits again. They read back after new
+// writes that the restarted allocator serves.
+TEST_F(CraftVolumeTest, RestartKeepsTheBlocksOfLiveSlots) {
+    // A checkpoint at every commit, so the frontier moves past the slots committed below.
+    auto const interval = HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.sync_rs_commit_lsn_interval = 1; });
+    auto info = craft_vol_info("craft_vol_live_blocks");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    HB_SETTINGS_FACTORY().modifiable_settings([interval](auto& s) { s.sync_rs_commit_lsn_interval = interval; });
+    ASSERT_TRUE(vol);
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    // Slots 0 and 1 go to the index, and the frontier past them; 2 and 3 stay in the journal.
+    auto const res = homeblocks::detail::sync_get(homeblocks::request_resolution(*vol, hdr, 1 /* upto */));
+    ASSERT_TRUE(res) << res.error().message();
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->persisted_durable_commit() >= 1; }));
+
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_TRUE(wait_until(
+        [&id] {
+            auto const rd = group(id);
+            return rd != nullptr && rd->is_leader();
+        },
+        std::chrono::seconds(60)));
+    // Slots 0 and 1's blocks, as the index holds them, and 2 and 3's, as the journal does.
+    for (int64_t dlsn = 0; dlsn < 2; ++dlsn) {
+        index_kv_list_t kvs;
+        ASSERT_TRUE((*again)->indx_table()->read_from_index(dlsn, dlsn, kvs));
+        ASSERT_EQ(kvs.size(), 1u) << "slot " << dlsn;
+        EXPECT_TRUE(homestore::data_service().is_blk_alloced(kvs[0].second.blkid())) << "slot " << dlsn;
+    }
+    for (int64_t dlsn = 2; dlsn < 4; ++dlsn) {
+        auto const slot = homeblocks::detail::sync_get((*again)->craft_dev()->journal_slot_for_test(dlsn));
+        ASSERT_TRUE(slot) << slot.error().message();
+        auto pieces = slot->blkid.iterate();
+        while (auto const piece = pieces.next()) {
+            EXPECT_TRUE(homestore::data_service().is_blk_alloced(*piece)) << "slot " << dlsn;
+        }
+    }
+    for (int64_t dlsn = 4; dlsn < 12; ++dlsn) {
+        auto const w = write_slot(*again, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        EXPECT_TRUE(reads_back(*again, hdr, 3 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
     remove(id);
 }
 

@@ -114,6 +114,15 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
+    // The blocks committed, as {first block, recovering}.
+    std::vector< std::pair< homestore::blk_num_t, bool > > commits;
+    bool fail_commit{false};
+    status commit_data(homestore::multi_blk_id const& blkid, bool recovering) override {
+        if (fail_commit) return std::unexpected(std::make_error_condition(std::errc::io_error));
+        commits.emplace_back(blkid.to_single_blkid().blk_num(), recovering);
+        return ok();
+    }
+
     async_result< int64_t > tail_lsn() override {
         if (fail_tail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return slots.empty() ? -1 : slots.rbegin()->first;
@@ -1866,6 +1875,29 @@ TEST_F(CraftRaftEntriesTest, RestartRestoresTheSessionAndTheJournalRange) {
     EXPECT_EQ(dev_->overlay_lsn_for(7), 7);
     EXPECT_EQ(dev_->overlay_lsn_for(1), -1) << "at the frontier: in the index, not the overlay";
     EXPECT_EQ(dev_->durable_state(), sample_state());
+}
+
+// A restart commits the blocks of every live slot again, as the allocator's record of them may not have been persisted:
+// the slots above the durable frontier the journal holds, not the zero ones, the Empty ones or those at the frontier.
+TEST_F(CraftRaftEntriesTest, RestartCommitsTheBlocksOfLiveSlotsAgain) {
+    auto slots = page_slots({0, 1, 2, 3, 4, 7});
+    for (auto& [lsn, slot] : slots)
+        slot.blkid = homestore::multi_blk_id{static_cast< homestore::blk_num_t >(100 + lsn), 1, 0};
+    slots[3] = page_slot(3, /*zeros=*/true);
+    restart(sample_state(), std::move(slots)); // frontier 1, 4 Empty, 5 and 6 missing
+    ASSERT_FALSE(dev_->is_faulted());
+    EXPECT_EQ(journal_->commits, (std::vector< std::pair< homestore::blk_num_t, bool > >{{102, true}, {107, true}}));
+}
+
+// Blocks a restart can't commit again could be handed out while a slot still references them: the partition faults.
+TEST_F(CraftRaftEntriesTest, RestartFaultsWhenItCantCommitALiveSlotsBlocks) {
+    auto* store = with_store();
+    store->saved = sample_state();
+    journal_->slots = page_slots({0, 1, 2});
+    journal_->slots[2].blkid = homestore::multi_blk_id{102, 1, 0};
+    journal_->fail_commit = true;
+    dev_->trigger_on_restart();
+    EXPECT_TRUE(dev_->is_faulted());
 }
 
 // The Sync watermark can be above the journal tail: the slots up to it were never received here.

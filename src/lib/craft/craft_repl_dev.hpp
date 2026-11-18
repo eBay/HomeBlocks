@@ -150,6 +150,10 @@ public:
     }
     // Highest lsn reclaimed so far, -1 for none. Read at restart.
     virtual int64_t reclaimed_upto() const { return -1; }
+    // Commits the blocks a durable slot references: HomeStore's allocator persists an allocation only once committed,
+    // so without it a restart frees them. recovering: a restart commits a live slot's blocks again, as the commit may
+    // not have been persisted; it also reserves them in memory, where nothing holds them after a restart.
+    virtual status commit_data(homestore::multi_blk_id const& /* blkid */, bool /* recovering */) { return ok(); }
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -530,6 +534,11 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.commit_lsn;
     }
+    // The durable commit frontier as last persisted (see advance_durable_commit()).
+    int64_t persisted_durable_commit() const {
+        std::lock_guard lk{state_mu_};
+        return persisted_durable_commit_;
+    }
     uint64_t client_token() const {
         std::lock_guard lk{state_mu_};
         return state_.client_token;
@@ -607,6 +616,8 @@ public:
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
     // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
     void seed_commit_lsn(int64_t commit);
+    // The journal's record of slot lsn.
+    async_result< JournalSlot > journal_slot_for_test(int64_t lsn) { return journal_->read_slot(lsn); }
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);

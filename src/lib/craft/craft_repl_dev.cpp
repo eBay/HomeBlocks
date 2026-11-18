@@ -203,6 +203,16 @@ public:
         co_return blkid;
     }
 
+    status commit_data(homestore::multi_blk_id const& blkid, bool recovering) override {
+        if (!blkid.is_valid()) return ok();
+        // recommit: a recovery here runs after HomeStore's start, when commit_blk() no longer reserves in memory.
+        if (auto r = homestore::data_service().commit_blk(blkid, /* recommit = */ recovering); !r) {
+            LOGE("commit_blk {} failed: {}", blkid.to_string(), r.error().message());
+            return std::unexpected(r.error());
+        }
+        return ok();
+    }
+
     // Serialize the journal entry (header + csum array + blkid) and write it to the log store.
     async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                             bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
@@ -939,6 +949,9 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
         co_return std::unexpected(res.error());
     }
+    // The slot references blkid durably now: from here on it is the allocator's to keep across restarts. A failure is
+    // logged; the slot stays (a restart commits it again while it is above the durable frontier).
+    if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false);
 
     // Post-flight term recheck. Per CRAFT-Design, InternalLogin simultaneously bumps the term
     // and truncates, with login quiescing all writes before truncating — so if that invariant holds,
@@ -2090,7 +2103,8 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
 // ─── overlay rebuild on restart (S3) ─────────────────────────────────────────
 //
 // A fresh CraftReplDev's overlay_ starts empty -- nothing else repopulates the appended-but-not-
-// yet-committed entries after a restart. Walks (commit_lsn, last_append_lsn], skipping missing/
+// yet-committed entries after a restart. It also commits each live slot's blocks to the allocator again
+// (CraftJournalBackend::commit_data()). Walks (commit_lsn, last_append_lsn], skipping missing/
 // Empty-verdicted lsns (nothing to read for those), and applies the exact same highest-dLSN-wins
 // rule write()'s own post-flight update uses via the shared populate_overlay() helper. Missing lsns
 // are skipped, not a stop condition (unlike commit_impl(), which must stall at the first gap since
@@ -2125,6 +2139,11 @@ async_status CraftReplDev::rebuild_overlay() {
             std::lock_guard lk{state_mu_};
             missing_lsns_.insert(lsn);
             continue;
+        }
+        // A live slot's blocks: the allocator's record of them may not have been persisted before the restart, and
+        // nothing holds them in memory after it. Committed again before anything here can allocate.
+        if (!slot_r->all_zeros) {
+            if (auto r = journal_->commit_data(slot_r->blkid, /* recovering = */ true); !r) co_return r;
         }
         // A malformed record is skipped, not fatal: the replayed journal isn't being mutated.
         populate_overlay_from_slot(lsn, *slot_r, slot_r->blkid);
@@ -3068,6 +3087,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             result.unresolved.push_back(slot->lsn);
             continue;
         }
+        if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false); // as in write()
         bool voided = false;
         {
             // Term checked in the same critical section as the erase. If it changed during write_slot, the
@@ -3280,6 +3300,7 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                     }
                     continue;
                 }
+                if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false); // as in write()
                 bool voided;
                 {
                     std::lock_guard lk{state_mu_};
