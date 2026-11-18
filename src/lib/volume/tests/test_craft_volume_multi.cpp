@@ -21,6 +21,7 @@
 // test creates its own volume.
 
 #include <filesystem>
+#include <thread>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
@@ -301,6 +302,34 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
             }
             return g_helper->leaderships_handed_off() > handed_off;
         }));
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+
+    // Made leader again within its hand-off backoff, member 1 keeps leadership: two members without a replica would
+    // otherwise hand it to each other forever. Once the backoff is over, HomeBlocks' timer hands it off again.
+    if (me() == 1) {
+        auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
+        auto const handed_off = g_helper->leaderships_handed_off();
+        EXPECT_TRUE(wait_until([&id] {
+            auto const rd = group(id);
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        std::this_thread::sleep_for(std::chrono::seconds{2});
+        EXPECT_TRUE(group(id)->is_leader()) << "kept within the backoff";
+        EXPECT_EQ(g_helper->leaderships_handed_off(), handed_off);
+
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 1000; });
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [backoff](auto& s) { s.craft_leadership_handoff_backoff_ms = backoff; });
     }
     EXPECT_TRUE(wait_until([&id] {
         auto const leader = group(id)->get_leader_id();

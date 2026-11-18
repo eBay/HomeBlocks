@@ -687,7 +687,11 @@ void HomeBlocksImpl::start_reaper_thread() {
         // on every worker, a blocking round that hangs when two workers do it at once.
         craft_sweep_timer_hdl_ = iomanager.schedule_global_timer(
             1'000'000'000 /* 1s: a proposal times out up to this late */, true /* recurring */, nullptr /* cookie */,
-            iomgr::reactor_regex::all_user, [this](void*) { expire_overdue_craft_waits(); },
+            iomgr::reactor_regex::all_user,
+            [this](void*) {
+                expire_overdue_craft_waits();
+                retry_craft_handoffs();
+            },
             true /* wait_to_schedule */);
     }
 }

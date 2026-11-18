@@ -636,19 +636,55 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
 // this member to lead), nor when alone in the group: there is nobody to hand leadership to.
 void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
     if (is_shutting_down()) { return; }
-    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() {
-        if (is_shutting_down()) { return; }
-        {
-            auto lg = std::shared_lock(vol_lock_);
-            if (vol_map_.contains(id) || creating_vols_.contains(id)) { return; }
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
+}
+
+void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
+    auto const forget = [this, &id] {
+        std::lock_guard lk{craft_handoff_mu_};
+        craft_handed_off_at_.erase(id);
+    };
+    if (is_shutting_down()) { return; }
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        if (vol_map_.contains(id) || creating_vols_.contains(id)) { return forget(); }
+    }
+    auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
+    if (!rd || !(*rd)->is_leader() || is_going_away(**rd) || (*rd)->get_replication_quorum().size() < 2) {
+        return forget();
+    }
+    // nuraft nominates the responsive member of the highest priority, deterministically: with the member holding the
+    // replica (the group's creator) unresponsive, two members without one would nominate each other forever.
+    auto const now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lk{craft_handoff_mu_};
+        auto const [it, first] = craft_handed_off_at_.try_emplace(id, now);
+        if (!first) {
+            if (now - it->second < std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)}) {
+                return; // keeps leadership for now: retry_craft_handoffs() tries again
+            }
+            it->second = now;
         }
-        auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
-        if (!rd || !(*rd)->is_leader() || is_going_away(**rd) || (*rd)->get_replication_quorum().size() < 2) { return; }
-        LOGW("vol={}: elected RAFT leader without a replica here: handing leadership to another member",
-             boost::uuids::to_string(id));
-        COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
-        (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
-    });
+    }
+    LOGW("vol={}: RAFT leader without a replica here: handing leadership to another member",
+         boost::uuids::to_string(id));
+    COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
+    (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
+}
+
+void HomeBlocksImpl::retry_craft_handoffs() {
+    auto const now = std::chrono::steady_clock::now();
+    auto const backoff = std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)};
+    std::vector< volume_id_t > due;
+    {
+        std::lock_guard lk{craft_handoff_mu_};
+        for (auto const& [id, at] : craft_handed_off_at_) {
+            if (now - at >= backoff) { due.push_back(id); }
+        }
+    }
+    for (auto const& id : due) {
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
+    }
 }
 
 int64_t HomeBlocksImpl::craft_groups_without_replica() const {

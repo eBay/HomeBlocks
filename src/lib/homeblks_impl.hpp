@@ -20,6 +20,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <boost/uuid/uuid_hash.hpp> // std::hash of volume ids
@@ -134,6 +135,9 @@ private:
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t craft_sweep_timer_hdl_{iomgr::null_timer_handle}; // CRAFT: expire_overdue_craft_waits()
+    // CRAFT: when this member last handed off each group's leadership, while it leads it without a replica.
+    std::mutex craft_handoff_mu_;
+    std::unordered_map< volume_id_t, std::chrono::steady_clock::time_point > craft_handed_off_at_;
 
     HomeBlocksMetrics metrics_;
 
@@ -230,6 +234,11 @@ public:
     // CRAFT, every second from start_reaper_thread()'s timer: fails each device's proposals and journal writes past
     // their deadline (CraftReplDev::expire_overdue()), those of a volume being destroyed too.
     void expire_overdue_craft_waits();
+    // CRAFT, on a worker: hands the group's RAFT leadership off if this member leads it without a replica here, unless
+    // it did within craft_leadership_handoff_backoff_ms (it keeps leadership; retry_craft_handoffs() tries again).
+    void hand_off_craft_leadership(volume_id_t const& id);
+    // CRAFT, every second from the same timer: hands off again the groups whose backoff is over.
+    void retry_craft_handoffs();
     std::vector< volume_handle > craft_volumes() const;
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
