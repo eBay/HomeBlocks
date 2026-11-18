@@ -637,6 +637,7 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
         LOGW("login_poll: lost leadership during the poll -- abandoning term={}", term);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
     }
+    LoginPoll result;
     {
         // A login committed meanwhile (say, an earlier attempt's InternalLogin whose proposal timed out) leaves this
         // round's term stale, though no member may have applied it yet.
@@ -645,9 +646,10 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
             LOGW("login_poll: a login at term {} committed during the poll, past {}", login_fence_term_, term);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
+        // Read after the poll, not before: a Sync committed meanwhile (an old-session round's, say) moves this
+        // member's frontier, and the watermark mustn't fall below the committed prefix.
+        result.rs_commit_lsn = state_.last_append_lsn;
     }
-
-    LoginPoll result{.rs_commit_lsn = own->lsns.last_append_lsn};
     uint64_t newest_term = own->term;
     // Only distinct voters other than this leader count toward quorum; every other reply still feeds the watermark
     // (VoterTally).

@@ -135,13 +135,16 @@ protected:
         *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
         commit_entry(CraftEntryType::InternalLogin, key);
     }
+    void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
+        commit_entry(CraftEntryType::SyncRSCommitLSN, key);
+    }
     // Faults the partition: a verdict for a slot it has already committed.
     void fault_partition() {
         dev_->seed_lsns(5, {});
         dev_->seed_commit_lsn(5);
-        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
-        serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {3});
-        commit_entry(CraftEntryType::SyncRSCommitLSN, key);
+        commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{3});
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -182,6 +185,20 @@ TEST_F(CraftLoginTest, PollCountsTheLeadersOwnLastAppend) {
 
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->rs_commit_lsn, 12);
+}
+
+// A Sync committed while the poll is out (an old-session Resolve's, say) moves this leader past what it read before
+// the poll. The watermark must cover it: the login truncates to it, and can't truncate below the committed prefix.
+TEST_F(CraftLoginTest, PollWatermarkCoversASyncCommittedDuringThePoll) {
+    dev_->seed_lsns(4, {});
+    poller_.replies = {reply(1, 7), reply(2, 7)};
+    poller_.on_poll = [this] { commit_sync(/*rs_commit_lsn=*/9, /*empty_slots=*/{5, 6, 7, 8, 9}); };
+
+    auto r = do_login_poll(/*term=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(dev_->commit_lsn(), 9);
+    EXPECT_EQ(r->rs_commit_lsn, 9);
 }
 
 // A reply from the leader itself is dropped: it neither counts nor feeds the watermark.
