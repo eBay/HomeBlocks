@@ -154,6 +154,8 @@ public:
     // so without it a restart frees them. recovering: a restart commits a live slot's blocks again, as the commit may
     // not have been persisted; it also reserves them in memory, where nothing holds them after a restart.
     virtual status commit_data(homestore::multi_blk_id const& /* blkid */, bool /* recovering */) { return ok(); }
+    // Fails the writes in flight past their deadline (see JournalWriteDeadlines). HomeBlocks calls it every second.
+    virtual void expire_overdue() {}
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -234,6 +236,31 @@ public:
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
 // replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
+
+// The deadlines (craft_journal_write_timeout_ms) of a journal's writes in flight. HomeStore never completes a journal
+// write whose device write failed (SDSTOR-24993): it would wait forever, and with it what awaits it (an apply, and so
+// the device's stop()). Swept by the backend's expire_overdue(), which fails the overdue ones.
+class JournalWriteDeadlines {
+public:
+    using clock = std::chrono::steady_clock;
+    // One write's completion: true once written, false once timed out, whichever comes first.
+    struct Wait {
+        sisl::async::value_awaitable< bool > done;
+        std::atomic< bool > completed{false};
+        void complete(bool written) {
+            if (!completed.exchange(true, std::memory_order_acq_rel)) done.complete(written);
+        }
+    };
+
+    void add(shared< Wait > w, clock::time_point deadline);
+    // Fails every wait whose deadline is at or before `now`, and forgets the completed ones.
+    void sweep(clock::time_point now);
+    size_t pending() const;
+
+private:
+    mutable std::mutex mu_;
+    std::vector< std::pair< shared< Wait >, clock::time_point > > pending_;
+};
 
 // The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by its expire_overdue(). Not
 // an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its own delay
@@ -566,9 +593,11 @@ public:
 
     // Test seam: a proposer the device doesn't own (a mock the test keeps), in place of create()'s.
     void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
-    // See CraftRaftProposer::expire_overdue().
-    void expire_overdue_proposals() {
+    // HomeBlocks' timer, every second: the proposals (CraftRaftProposer::expire_overdue()) and the journal writes
+    // (CraftJournalBackend::expire_overdue()) past their deadline fail.
+    void expire_overdue() {
         if (raft_proposer_) raft_proposer_->expire_overdue();
+        journal_->expire_overdue();
     }
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).

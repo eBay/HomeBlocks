@@ -54,6 +54,11 @@ table HomeBlksSettings{
     // CRAFT: deadline (in milliseconds) for a RAFT proposal (SyncRSCommitLSN, InternalLogin) to commit. A proposal
     // that misses it completes with timed_out, but the entry may still commit later. 0 = no deadline.
     craft_raft_propose_timeout_ms: uint32 = 10000;
+
+    // CRAFT: deadline (in milliseconds) for a journal write to complete. HomeStore never completes one whose device
+    // write failed (SDSTOR-24993): it fails timed_out instead, and the partition faults, as the write may still land.
+    // 0 = no deadline.
+    craft_journal_write_timeout_ms: uint32 = 30000;
 }
 
 root_type HomeBlksSettings;

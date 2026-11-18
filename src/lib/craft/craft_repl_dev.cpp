@@ -254,23 +254,30 @@ public:
         //     at 0 for a fresh logdev and is NOT the lsn/dLSN passed in -- only < 0 means stopping.
         //     Guarded below.
         //   - journal I/O error: the flush path returns on a sync_pwritev failure BEFORE calling
-        //     on_flush_completion (log_dev.cpp:531-539) -- no return-value signal, NOT covered
-        //     below. Needs a HomeStore fix propagating the error into the completion path itself
-        //     (not a status arg on a callback that won't fire); interim: timeout the await.
-        auto va = std::make_shared< sisl::async::value_awaitable< bool > >();
+        //     on_flush_completion (log_dev.cpp:531-539) -- no return-value signal. Needs a HomeStore fix
+        //     propagating the error into the completion path itself (SDSTOR-24993); until then the wait
+        //     has a deadline (craft_journal_write_timeout_ms) and fails timed_out past it.
+        auto w = std::make_shared< JournalWriteDeadlines::Wait >();
         auto write_ret = logstore_->write_async(
             static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
-            [va](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
+            [w](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
                 iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
-                                        [va = std::move(va)]() mutable { va->complete(true); });
+                                        [w = std::move(w)]() mutable { w->complete(true); });
             });
         if (write_ret < 0) {
             LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire", lsn);
             co_return std::unexpected(make_error_condition(std::errc::operation_not_supported));
         }
-        co_await *va;
+        if (auto const ms = HB_DYNAMIC_CONFIG(craft_journal_write_timeout_ms); ms > 0)
+            deadlines_.add(w, JournalWriteDeadlines::clock::now() + std::chrono::milliseconds{ms});
+        if (!co_await w->done) {
+            LOGE("journal write lsn={} not completed within its deadline -- it may still land", lsn);
+            co_return std::unexpected(std::make_error_condition(std::errc::timed_out));
+        }
         co_return ok();
     }
+
+    void expire_overdue() override { deadlines_.sweep(JournalWriteDeadlines::clock::now()); }
 
     // Reads and parses a slot's blob back into a JournalSlot. read_sync is a blocking call (no async
     // log-read API exists in HomeStore today) -- acceptable here: callers are commit/apply (inherently
@@ -436,6 +443,7 @@ private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
     uint32_t lba_size_;
+    JournalWriteDeadlines deadlines_;
 };
 
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore,
@@ -489,6 +497,32 @@ bool proposal_completed(cintrusive< homestore::repl_req_ctx >& ctx) {
     return p == nullptr || p->completed_.load(std::memory_order_acquire);
 }
 } // namespace
+
+void JournalWriteDeadlines::add(shared< Wait > w, clock::time_point deadline) {
+    std::lock_guard lk{mu_};
+    pending_.emplace_back(std::move(w), deadline);
+}
+
+void JournalWriteDeadlines::sweep(clock::time_point now) {
+    std::vector< shared< Wait > > expired;
+    {
+        std::lock_guard lk{mu_};
+        std::erase_if(pending_, [&](auto const& entry) {
+            if (entry.first->completed.load(std::memory_order_acquire)) return true;
+            if (entry.second > now) return false;
+            expired.push_back(entry.first);
+            return true;
+        });
+    }
+    // Outside the lock: failing a wait resumes its writer.
+    for (auto const& w : expired)
+        w->complete(false);
+}
+
+size_t JournalWriteDeadlines::pending() const {
+    std::lock_guard lk{mu_};
+    return pending_.size();
+}
 
 bool ProposalDeadlines::add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline) {
     std::lock_guard lk{mu_};
@@ -943,6 +977,11 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
                                              static_cast< lba_count_t >(len), blkid, all_zeros, csums);
     if (!res) {
         LOGE("write_slot failed dlsn={} addr={} len={}: {}", dlsn, addr, len, res.error().message());
+        // Timed out: it may still land, referencing blkid, so blkid stays; and the journal can't be trusted any more.
+        if (res.error() == std::errc::timed_out) {
+            fault();
+            co_return std::unexpected(res.error());
+        }
         if (blkid_allocated) {
             if (auto fr = co_await journal_->free_data(blkid); !fr)
                 LOGE("free_data failed after write_slot failure dlsn={}: {}", dlsn, fr.error().message());
@@ -3172,6 +3211,10 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         if (!res) {
             LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                  res.error().message());
+            if (res.error() == std::errc::timed_out) { // as in write()
+                fault();
+                co_return std::unexpected(res.error());
+            }
             if (blkid_allocated) {
                 if (auto fr = co_await journal_->free_data(blkid); !fr)
                     LOGE("pre_resolve_slots: free_data failed after write_slot failure lsn={}: {}", slot->lsn,
@@ -3384,6 +3427,10 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
                          res.error().message());
+                    if (res.error() == std::errc::timed_out) { // as in write()
+                        fault();
+                        co_return std::unexpected(res.error());
+                    }
                     // Awaited, not detached: once the apply ends, stop_apply() may let the volume release the chunks.
                     if (blkid_allocated) {
                         if (auto fr = co_await journal_->free_data(blkid); !fr)

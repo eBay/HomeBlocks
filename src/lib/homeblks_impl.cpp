@@ -167,11 +167,13 @@ void HomeBlocksImpl::shutdown() {
         shutdown_timer_hdl_ = iomgr::null_timer_handle;
     }
 
+    // The sweep runs on while the devices stop: a stop waits out the apply in progress, which a journal write that
+    // never completes would hold forever without its deadline.
+    stop_craft_devices();
     if (craft_sweep_timer_hdl_ != iomgr::null_timer_handle) {
         iomanager.cancel_timer(craft_sweep_timer_hdl_, true /* wait: a sweep in progress finishes */);
         craft_sweep_timer_hdl_ = iomgr::null_timer_handle;
     }
-    stop_craft_devices();
 
     // set the shutdown flag so that no new requests are accepted;
     sb_->set_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
@@ -653,9 +655,9 @@ std::vector< volume_handle > HomeBlocksImpl::craft_volumes() const {
     return vols;
 }
 
-void HomeBlocksImpl::expire_overdue_craft_proposals() {
+void HomeBlocksImpl::expire_overdue_craft_waits() {
     for (auto const& vol : craft_volumes()) {
-        if (auto const dev = vol->craft_dev_ref()) { dev->expire_overdue_proposals(); }
+        if (auto const dev = vol->craft_dev_ref()) { dev->expire_overdue(); }
     }
 }
 
@@ -685,7 +687,7 @@ void HomeBlocksImpl::start_reaper_thread() {
         // on every worker, a blocking round that hangs when two workers do it at once.
         craft_sweep_timer_hdl_ = iomanager.schedule_global_timer(
             1'000'000'000 /* 1s: a proposal times out up to this late */, true /* recurring */, nullptr /* cookie */,
-            iomgr::reactor_regex::all_user, [this](void*) { expire_overdue_craft_proposals(); },
+            iomgr::reactor_regex::all_user, [this](void*) { expire_overdue_craft_waits(); },
             true /* wait_to_schedule */);
     }
 }

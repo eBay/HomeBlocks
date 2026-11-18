@@ -78,6 +78,7 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     std::optional< int64_t > fail_on_write;
+    std::errc write_error{std::errc::io_error}; // what fail_on_write fails with
     int free_data_calls{0};
     std::function< void(int64_t) > on_write; // runs inside write_slot, to apply an Empty verdict mid-write
     std::function< void() > on_free;         // runs inside free_data, to look at the durable image at that moment
@@ -91,8 +92,7 @@ public:
                             homestore::multi_blk_id /* blkid */, bool all_zeros,
                             std::vector< homestore::csum_t > const& csums) override {
         if (on_write) on_write(lsn);
-        if (fail_on_write && *fail_on_write == lsn)
-            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (fail_on_write && *fail_on_write == lsn) co_return std::unexpected(std::make_error_condition(write_error));
         slots[lsn] =
             JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .csums = csums};
         co_return ok();
@@ -1212,6 +1212,51 @@ TEST_F(CraftRaftEntriesTest, FirstProposalOutcomeWins) {
     ASSERT_TRUE(outcome.has_value());
     ASSERT_FALSE(outcome->has_value());
     EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+// A journal write that never completes fails at its deadline; one completed before is forgotten, not failed, and a
+// late completion of a failed one changes nothing; one within its deadline waits on.
+TEST_F(CraftRaftEntriesTest, JournalWriteDeadlinesFailTheOverdueWrites) {
+    JournalWriteDeadlines deadlines;
+    auto const t0 = JournalWriteDeadlines::clock::now();
+    auto const lost = std::make_shared< JournalWriteDeadlines::Wait >();
+    auto const written = std::make_shared< JournalWriteDeadlines::Wait >();
+    auto const slow = std::make_shared< JournalWriteDeadlines::Wait >();
+    deadlines.add(lost, t0 + std::chrono::seconds{1});
+    deadlines.add(written, t0 + std::chrono::seconds{1});
+    deadlines.add(slow, t0 + std::chrono::seconds{30});
+    written->complete(true);
+
+    deadlines.sweep(t0 + std::chrono::seconds{1});
+    ASSERT_TRUE(lost->done.await_ready());
+    EXPECT_FALSE(lost->done.await_resume());
+    ASSERT_TRUE(written->done.await_ready());
+    EXPECT_TRUE(written->done.await_resume());
+    EXPECT_FALSE(slow->done.await_ready());
+    EXPECT_EQ(deadlines.pending(), 1u);
+
+    lost->complete(true); // lands after all: its writer was already told
+    slow->complete(true);
+    deadlines.sweep(t0 + std::chrono::seconds{60});
+    EXPECT_EQ(deadlines.pending(), 0u);
+}
+
+// A write whose journal write timed out may still land, referencing its blocks: they stay, and the partition faults,
+// as its journal can't be trusted any more.
+TEST_F(CraftRaftEntriesTest, WriteWhoseJournalWriteTimesOutFaultsAndKeepsItsBlocks) {
+    journal_->fail_on_write = 0;
+    journal_->write_error = std::errc::timed_out;
+    std::vector< uint8_t > buf(k_page_size, 'x');
+    sisl::sg_list data;
+    data.size = k_page_size;
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+    auto const r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/0, /*len=*/k_page_size, std::move(data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(journal_->free_data_calls, 0);
 }
 
 // The deadline sweep completes an overdue proposal with timed_out (its outcome is unknown, not rejected), and leaves
