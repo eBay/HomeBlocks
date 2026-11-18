@@ -96,7 +96,7 @@ public:
     bool hold_first_poll{false};
     sisl::async::value_awaitable< bool > poll_gate;
 
-    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t, bool) override { co_return craft::lsn_pair{}; }
+    async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t, bool) override { co_return RsCommitLsnReply{}; }
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >&, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
@@ -107,7 +107,8 @@ public:
         if (++poll_calls == 1 && hold_first_poll) co_await poll_gate;
         std::vector< QuorumLsnResponse > replies;
         for (size_t i = 0; i < polled.size(); ++i)
-            replies.push_back({i < polled_members.size() ? polled_members[i] : test_member_id(i + 1), polled[i]});
+            replies.push_back({i < polled_members.size() ? polled_members[i] : test_member_id(i + 1),
+                               RsCommitLsnReply{.lsns = polled[i]}});
         co_return replies;
     }
 };

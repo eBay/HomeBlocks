@@ -100,10 +100,17 @@ struct QuorumSlotResponse {
     std::vector< JournalSlot > slots{};
 };
 
+// A member's answer to GetRSCommitLSN: its watermarks and its session term, counting a login it has committed but not
+// yet applied.
+struct RsCommitLsnReply {
+    craft::lsn_pair lsns{};
+    uint64_t term{0};
+};
+
 // One member's reply to a GetRSCommitLSN broadcast (poll_quorum_lsns), tagged the same way.
 struct QuorumLsnResponse {
     craft::peer_id_t member{};
-    craft::lsn_pair lsns{};
+    RsCommitLsnReply reply{};
 };
 
 // ─── journal backend abstraction ─────────────────────────────────────────────
@@ -166,7 +173,7 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 
 class CraftPeerFetcher {
 public:
-    virtual async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
+    virtual async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t term, bool is_login) = 0;
     // `timeout_ms` is the deadline this call must complete within (CraftReplDev passes
     // peer_fetch_timeout_ms_, set from home_blks_config.fbs's peer_fetch_timeout_ms). A real transport
     // (S9) must treat a missed deadline as a hard failure, same as an unreachable peer -- this interface
@@ -181,9 +188,10 @@ public:
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
     // Broadcasts GetRSCommitLSN(term, is_login) to every OTHER replica-set member and returns each
-    // responder's {commit_lsn, last_append_lsn}, tagged with its member; a non-responding member is absent
-    // from the result. Used by the watchdog trigger (is_login=false, never quiesces) and, once S7 lands, by
-    // login (is_login=true).
+    // responder's {commit_lsn, last_append_lsn} and session term, tagged with its member; a non-responding member is
+    // absent from the result. A login poll (is_login) waits for every member up to timeout_ms, not just the first
+    // majority, since login's watermark is the max over every reply; a watchdog poll may return once a majority has
+    // replied. Used by the watchdog trigger (is_login=false, never quiesces) and by login_poll() (is_login=true).
     virtual async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t term, bool is_login,
                                                                               uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
@@ -268,6 +276,8 @@ class CraftReplDev : public std::enable_shared_from_this< CraftReplDev > {
     friend class CraftRaftEntriesTest;
     // Lets test_craft_pre_resolution.cpp call pre_resolve_slots (private) directly -- same reasoning.
     friend class CraftPreResolutionTest;
+    // Lets test_craft_login.cpp call the login steps (private) one at a time.
+    friend class CraftLoginTest;
 #endif
 
 private:
@@ -359,13 +369,12 @@ public:
 
     // ── internal / peer API (server-to-server; NEVER reachable over the client wire) ──
 
-    // Callee side of the GetRSCommitLSN broadcast -- matches craft::craft_peer::get_rs_commit_lsn's
-    // shape (craft_client's include/craft/peer.hpp) so a future wire-decoded request has somewhere
-    // to pass {term, is_login}. is_login=true is meant to quiesce prior-session writes before
-    // reporting last_append (the fencing barrier); watchdog/periodic polls pass is_login=false.
-    // Neither term-fencing nor quiesce is implemented yet -- both parameters are accepted but
-    // unused until S9 needs them (matches craft_client's own reference implementation today).
-    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login);
+    // Callee side of the GetRSCommitLSN broadcast: this member's watermarks and its session term (a login committed but
+    // not yet applied counts). A login poll (is_login) first quiesces writes whose term is at or below `term` (the
+    // poll's, not this member's, which may lag behind a login it hasn't applied): they get STALE_TERM from then on, so
+    // the reported last_append_lsn counts every write this member can still ack. The fence only rises. Watchdog polls
+    // pass is_login=false and never quiesce.
+    async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn and
     // the periodic-sync baseline; prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back
@@ -658,6 +667,18 @@ private:
     // term: the session the round belongs to (STALE_TERM if state_.term differs, at entry or later).
     async_result< PreResolution > pre_resolve_slots(int64_t upto, uint64_t term);
 
+    // Login step 1, leader-only: quiesces this member's writes at or below `term` (the latest committed session
+    // term), then polls every other member with the same fence and waits for all of them up to the poll timeout.
+    // Fails STALE_TERM if any member is already past `term`, and NO_QUORUM unless this member and the counted voters
+    // are a majority.
+    struct LoginPoll {
+        int64_t rs_commit_lsn{-1}; // max last_append_lsn over this member and every responder
+        // The members that replied, so are quiesced (not this one), learners included: quorum coverage counts voters
+        // (VoterTally), not quiesced.size().
+        std::vector< craft::peer_id_t > quiesced{};
+    };
+    async_result< LoginPoll > login_poll(uint64_t term);
+
     // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
     // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
     // on_watchdog_tick().
@@ -785,6 +806,8 @@ private:
     bool missing_at_capacity_locked(int64_t lsn) const;
     // True if term is the current session and no newer login has committed. Caller holds state_mu_.
     bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
+    // True if a login poll has quiesced writes at term. Caller holds state_mu_.
+    bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;
@@ -897,6 +920,10 @@ private:
     // a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply queue.
     // Guarded by state_mu_.
     uint64_t login_fence_term_{0};
+    // Writes at or below this term are quiesced by a login poll (STALE_TERM); unset until the first poll. Only rises.
+    // Fences writes only: reads, keep_alive and leader rounds go on. In memory only: a member that restarts before the
+    // login finishes comes back unquiesced, a case left undefined. Guarded by state_mu_.
+    std::optional< uint64_t > quiesce_term_;
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()

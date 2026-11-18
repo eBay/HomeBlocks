@@ -28,6 +28,7 @@
 // craft_repl_dev.cpp directly (same pattern as test_craft_truncate.cpp).
 
 #include <gtest/gtest.h>
+#include <functional>
 #include <map>
 #include <optional>
 #include <sisl/logging/logging.h>
@@ -56,16 +57,20 @@ static constexpr uint32_t k_page_size = 4096;
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
-    std::optional< int64_t > fail_on_read; // if set, read_slot for that LSN returns io_error
+    std::optional< int64_t > fail_on_read;   // if set, read_slot for that LSN returns io_error
+    std::function< void(int64_t) > on_write; // runs inside write_slot, while the write is in flight
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& /* data */,
                                                              lba_count_t /* len */) override {
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t, uint64_t, lba_t, lba_count_t, homestore::multi_blk_id, bool,
-                            std::vector< homestore::csum_t > const&) override {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+                            bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
+        if (on_write) on_write(lsn);
+        slots[lsn] = JournalSlot{
+            .lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .blkid = blkid, .csums = csums};
+        co_return ok();
     }
 
     async_result< JournalSlot > read_slot(int64_t lsn) override {
@@ -104,6 +109,26 @@ protected:
         journal_->slots[lsn] = JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len};
     }
 
+    // A login poll at term: quiesces this member's writes at or below it.
+    auto do_quiesce(uint64_t term) {
+        return homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(term, /*is_login=*/true));
+    }
+    // A one-block all_zeros write at dlsn (no payload needed).
+    auto do_write(int64_t dlsn, uint64_t term) {
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{term, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
+    }
+    // Commits an InternalLogin at term, as RAFT would on this member; it applies unless the apply queue is paused.
+    void commit_login(uint64_t term) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    }
+
     MockCraftJournalBackend* journal_{nullptr};
     std::shared_ptr< CraftReplDev > dev_;
 };
@@ -114,8 +139,9 @@ protected:
 TEST_F(CraftPeerExchangeTest, GetRsCommitLsnDefaultState) {
     auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->commit_lsn, -1);
-    EXPECT_EQ(r->last_append_lsn, -1);
+    EXPECT_EQ(r->lsns.commit_lsn, -1);
+    EXPECT_EQ(r->lsns.last_append_lsn, -1);
+    EXPECT_EQ(r->term, 0u);
 }
 
 // After seeding, get_rs_commit_lsn reflects both watermarks correctly.
@@ -124,8 +150,98 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
     dev_->seed_commit_lsn(25);
     auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->commit_lsn, 25);
-    EXPECT_EQ(r->last_append_lsn, 50);
+    EXPECT_EQ(r->lsns.commit_lsn, 25);
+    EXPECT_EQ(r->lsns.last_append_lsn, 50);
+}
+
+// The reply carries this member's own session term, not the one the poll asked about.
+TEST_F(CraftPeerExchangeTest, GetRsCommitLsnReportsOwnTerm) {
+    dev_->seed_term(3);
+    auto r = do_quiesce(/*term=*/5);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->term, 3u);
+}
+
+// ...counting a login it has committed but not yet applied: else a leader that hasn't learned of that commit could
+// poll at the replaced session's term and pass.
+TEST_F(CraftPeerExchangeTest, GetRsCommitLsnReportsACommittedLogin) {
+    dev_->seed_term(3);
+    dev_->pause_apply();
+    commit_login(/*term=*/5);
+    ASSERT_EQ(dev_->term(), 3u); // committed, not applied
+
+    auto r = do_quiesce(/*term=*/3);
+    dev_->resume_apply();
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->term, 5u);
+}
+
+// ── login quiesce (SDSTOR-22889) ──────────────────────────────────────────────
+//
+// A login poll (is_login) fences writes whose term is at or below the poll's. The fence matrix in
+// test_craft_pre_resolution.cpp covers what each entry point does under it; these cover the write's two checks.
+
+// A write arriving after the poll is rejected before its journal write: nothing journaled, last_append unmoved.
+TEST_F(CraftPeerExchangeTest, QuiesceRejectsLaterWriteBeforeJournaling) {
+    dev_->seed_lsns(2, {});
+    ASSERT_TRUE(do_quiesce(/*term=*/0).has_value());
+
+    auto w = do_write(/*dlsn=*/5, /*term=*/0);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_FALSE(journal_->slots.contains(5));
+    EXPECT_EQ(dev_->last_append_lsn(), 2);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+}
+
+// A write already in flight when the poll arrives isn't acked, but keeps its slot: journaled, readable, and reported
+// present to peers. The poll's last_append counts it.
+TEST_F(CraftPeerExchangeTest, QuiesceDuringJournalWriteKeepsSlotWithoutAck) {
+    dev_->seed_lsns(2, {});
+    std::optional< int64_t > polled_last_append;
+    journal_->on_write = [&](int64_t) {
+        if (auto r = do_quiesce(/*term=*/0); r) polled_last_append = r->lsns.last_append_lsn;
+    };
+
+    auto w = do_write(/*dlsn=*/3, /*term=*/0);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(polled_last_append, 3);
+    EXPECT_FALSE(dev_->is_missing(3));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 3);
+    auto f = do_fetch_data({3});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_EQ(f->size(), 1u);
+    EXPECT_FALSE((*f)[0].is_empty);
+}
+
+// The fence only rises: a later poll at a lower term doesn't lift it.
+TEST_F(CraftPeerExchangeTest, QuiesceFenceOnlyRises) {
+    dev_->seed_term(2);
+    ASSERT_TRUE(do_quiesce(/*term=*/2).has_value());
+    ASSERT_TRUE(do_quiesce(/*term=*/1).has_value());
+
+    auto w = do_write(/*dlsn=*/0, /*term=*/2);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+}
+
+// The poll fences up to its own term, not the replica's, which may lag behind a login it hasn't applied: a replica
+// still at term 3 keeps fencing session 5 once it applies that session's login.
+TEST_F(CraftPeerExchangeTest, QuiesceFencesThePollTermNotTheReplicaTerm) {
+    dev_->seed_term(3);
+    ASSERT_TRUE(do_quiesce(/*term=*/5).has_value());
+    commit_login(/*term=*/5);
+    ASSERT_EQ(dev_->term(), 5u);
+
+    auto w = do_write(/*dlsn=*/0, /*term=*/5);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────

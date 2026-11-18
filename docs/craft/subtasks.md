@@ -157,7 +157,7 @@ As an I/O engineer, I want `get_rs_commit_lsn()` / `get_lsns()` and `fetch_data(
 pull missing journal data during `SyncRSCommitLSN` apply.
 
 **Acceptance criteria:**
-- `get_lsns(vol_id)` returns `{commit_lsn, last_append_lsn}` for the local partition; `get_rs_commit_lsn(term, is_login)` returns `{term, commit_lsn, last_append_lsn}`. The request's `term` is the current session term to fence (`is_login=true` quiesces writes with term ≤ it first); the reply's `term` is the replica's own session term
+- `get_lsns(vol_id)` returns `{commit_lsn, last_append_lsn}` for the local partition; `get_rs_commit_lsn(term, is_login)` returns `{term, commit_lsn, last_append_lsn}`. The request's `term` is the current session term to fence (`is_login=true` quiesces writes with term ≤ it first); the reply's `term` is the replica's own session term, counting an `InternalLogin` it has committed but not yet applied
 - `fetch_data(lsns)` reads raw journal data for the requested LSNs and returns it (without applying to state machine)
 - These are called server-to-server via `CraftConnector` (see S9); stub the transport for unit tests
 - `fetch_data` returns four-way per slot: present+data, **present+zero** (`all_zeros=true`, no data, applied as a range unmap), **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty (via a prior verdict), never for one it merely lacks

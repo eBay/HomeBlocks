@@ -586,18 +586,100 @@ CraftReplDev::~CraftReplDev() {
 // Snapshot the in-memory partition state under state_mu_ for consistency with
 // write() which updates state_ under the same lock.
 
-async_result< craft::lsn_pair > CraftReplDev::get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) {
+async_result< RsCommitLsnReply > CraftReplDev::get_rs_commit_lsn(uint64_t term, bool is_login) {
     // Same as fetch_data(): a faulted member answers nothing, so it can't count toward anyone's quorum.
     if (faulted_.load(std::memory_order_acquire)) {
         LOGE("get_rs_commit_lsn rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
-    craft::lsn_pair pair{};
+    RsCommitLsnReply reply;
     {
         std::lock_guard lk{state_mu_};
-        pair = {state_.commit_lsn, state_.last_append_lsn};
+        // Fence, then read, under the one lock: a write past write()'s check has already moved last_append_lsn, and
+        // every later one is turned away.
+        if (is_login && !write_quiesced_locked(term)) {
+            LOGI("login poll: quiescing writes at term <= {} (session term {})", term, state_.term);
+            quiesce_term_ = term;
+        }
+        // The term counts a login committed but not yet applied: a leader that hasn't learned of that commit mustn't
+        // pass a poll at the replaced session's term.
+        reply = {.lsns = {state_.commit_lsn, state_.last_append_lsn}, .term = std::max(state_.term, login_fence_term_)};
     }
-    co_return pair;
+    co_return reply;
+}
+
+// ─── login poll (S7 / SDSTOR-22889) ───────────────────────────────────────────
+
+async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) {
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_poll rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (raft_proposer_ == nullptr || peer_fetcher_ == nullptr)
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    auto self = shared_from_this();
+
+    // This member quiesces too: otherwise an old write acked by it and a member the poll misses could land above the
+    // watermark, and the login's truncation would drop an acked write.
+    auto own = co_await get_rs_commit_lsn(term, /*is_login=*/true);
+    if (!own) co_return std::unexpected(own.error());
+    // Already past this round's term here: the poll can only fail STALE_TERM, so don't wait for every member.
+    if (own->term > term) {
+        LOGW("login_poll: this member is already at term {}, past {} -- a newer login exists", own->term, term);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
+    auto polled = co_await peer_fetcher_->poll_quorum_lsns(term, /*is_login=*/true, peer_fetch_timeout_ms_);
+    if (!polled) {
+        LOGE("login_poll: quorum poll failed: {}", polled.error().message());
+        co_return std::unexpected(polled.error());
+    }
+    // Rechecked after the await, as any of these can change during it.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_poll: partition faulted during the poll -- abandoning term={}", term);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (!raft_proposer_->is_leader()) {
+        LOGW("login_poll: lost leadership during the poll -- abandoning term={}", term);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    }
+    LoginPoll result;
+    {
+        // A login committed meanwhile (say, an earlier attempt's InternalLogin whose proposal timed out) leaves this
+        // round's term stale, though no member may have applied it yet.
+        std::lock_guard lk{state_mu_};
+        if (login_fence_term_ > term) {
+            LOGW("login_poll: a login at term {} committed during the poll, past {}", login_fence_term_, term);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
+        // Read after the poll, not before: a Sync committed meanwhile (an old-session round's, say) moves this
+        // member's frontier, and the watermark mustn't fall below the committed prefix.
+        result.rs_commit_lsn = state_.last_append_lsn;
+    }
+    uint64_t newest_term = own->term;
+    // Only distinct voters other than this leader count toward quorum; every other reply still feeds the watermark
+    // (VoterTally).
+    VoterTally tally{"login_poll", raft_proposer_->my_id(), raft_proposer_->voters()};
+    for (auto const& p : *polled) {
+        if (tally.add(p.member) == VoterTally::Reply::drop) continue;
+        newest_term = std::max(newest_term, p.reply.term);
+        result.rs_commit_lsn = std::max(result.rs_commit_lsn, p.reply.lsns.last_append_lsn);
+        if (!p.member.is_nil() && std::ranges::find(result.quiesced, p.member) == result.quiesced.end())
+            result.quiesced.push_back(p.member);
+    }
+    if (newest_term > term) {
+        LOGW("login_poll: a member is already at term {}, past {} -- a newer login exists", newest_term, term);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
+    if (!tally.has_quorum()) {
+        LOGW("login_poll: {} distinct voter(s) + self < quorum {} -- login fails", tally.counted(),
+             tally.quorum_size());
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    LOGI("login_poll: term={} rs_commit_lsn={} from {} quiesced member(s)", term, result.rs_commit_lsn,
+         result.quiesced.size());
+    co_return result;
 }
 
 // ─── truncate (S4) ────────────────────────────────────────────────────────────
@@ -786,6 +868,10 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
                  dlsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
+        if (write_quiesced_locked(hdr.term)) { // a login is replacing this session
+            LOGW("write rejected: term={} quiesced by a login poll (term {}) dlsn={}", hdr.term, *quiesce_term_, dlsn);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
         // Without this, all_committed_lsn only moves via keep_alive() messages, so quiet partitions
         // (write-only, no explicit keep_alive) never advance the reclaim floor at all.
@@ -904,12 +990,11 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(res.error());
     }
 
-    // Post-flight term recheck. Per CRAFT-Design, InternalLogin simultaneously bumps the term
-    // and truncates, with login quiescing all writes before truncating — so if that invariant holds,
-    // this branch is dead code (the term cannot change while write_slot is in flight).
+    // Post-flight recheck: while write_slot was in flight, a login may have committed or applied (the session moved
+    // on), a login poll may have quiesced this term, or the slot may have been voted Empty.
     //
-    // If the race occurs despite the quiescence guarantee, do NOT call free_data: write_slot already
-    // wrote a durable journal entry at dlsn that references blkid. There are only two orderings:
+    // A write whose session moved on is discarded, but do NOT call free_data: write_slot already wrote a durable
+    // journal entry at dlsn that references blkid. There are only two orderings:
     //   truncate ran after write_slot  — truncate drops the entry; no free needed.
     //   truncate ran before write_slot — the entry survives above the new tail; freeing blkid here
     //                                    leaves it dangling (re-allocatable blocks, journal still
@@ -918,6 +1003,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     // CraftJournalEntry.term lets recovery skip the stale entry; the next login truncates it durably.
     bool stale_post_flight = false;
     bool voided_post_flight = false;
+    bool quiesced_post_flight = false;
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
@@ -934,10 +1020,17 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             // write above or retires this entry.
             populate_overlay(dlsn, static_cast< lba_t >(addr) / lba_size_, static_cast< uint32_t >(len / lba_size_),
                              all_zeros, blkid, csums);
+            // Caught in flight by a login poll: the slot stays, as the poll counted it in last_append_lsn, but the
+            // write isn't acked.
+            quiesced_post_flight = write_quiesced_locked(hdr.term);
         }
     }
 
     if (stale_post_flight) { co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM)); }
+    if (quiesced_post_flight) {
+        LOGW("write kept but not acked: quiesced by a login poll while in flight dlsn={}", dlsn);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
     if (voided_post_flight) {
         // Apply didn't free this slot (it was still missing then), so free its blocks here.
         if (auto fr = co_await journal_->free_slot(dlsn); !fr)
@@ -954,9 +1047,14 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     touch_watchdog();
     maybe_trigger_periodic_sync();
 
-    // Snapshot after the piggyback commit() above, so the ack reflects whatever progress it just made.
+    // Snapshot after the piggyback commit() above, so the ack reflects whatever progress it just made. A login poll or
+    // a login can land while commit() awaits; the write isn't acked then either, though its slot stays published.
     {
         std::lock_guard lock{state_mu_};
+        if (!session_current_locked(hdr.term) || write_quiesced_locked(hdr.term)) {
+            LOGW("write kept but not acked: session fenced or quiesced before the ack dlsn={}", dlsn);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
 
@@ -1714,7 +1812,7 @@ async_status CraftReplDev::watchdog_sync() {
     VoterTally tally{"watchdog_sync", raft_proposer_->my_id(), raft_proposer_->voters()};
     for (auto const& p : *polled) {
         if (tally.add(p.member) == VoterTally::Reply::drop) continue;
-        target = std::max(target, p.lsns.last_append_lsn);
+        target = std::max(target, p.reply.lsns.last_append_lsn);
     }
     if (!tally.has_quorum()) {
         LOGW("watchdog_sync: {} distinct voter(s) + self < quorum {} -- not syncing", tally.counted(),
