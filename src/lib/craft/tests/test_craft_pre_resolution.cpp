@@ -120,8 +120,8 @@ public:
     bool tag_untagged{true};
     std::function< void() > on_fetch; // runs inside the fetch, to change leader/term mid-await
 
-    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
-        co_return craft::lsn_pair{};
+    async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
+        co_return RsCommitLsnReply{};
     }
 
     // When set, the next fetch_data() (a Sync apply's catch-up) waits for fetch_gate: the apply is held mid-flight.

@@ -114,8 +114,8 @@ protected:
 TEST_F(CraftPeerExchangeTest, GetRsCommitLsnDefaultState) {
     auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->commit_lsn, -1);
-    EXPECT_EQ(r->last_append_lsn, -1);
+    EXPECT_EQ(r->lsns.commit_lsn, -1);
+    EXPECT_EQ(r->lsns.last_append_lsn, -1);
 }
 
 // After seeding, get_rs_commit_lsn reflects both watermarks correctly.
@@ -124,8 +124,8 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnAfterSeed) {
     dev_->seed_commit_lsn(25);
     auto r = do_get_rs_commit_lsn();
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->commit_lsn, 25);
-    EXPECT_EQ(r->last_append_lsn, 50);
+    EXPECT_EQ(r->lsns.commit_lsn, 25);
+    EXPECT_EQ(r->lsns.last_append_lsn, 50);
 }
 
 // ── fetch_data ────────────────────────────────────────────────────────────────

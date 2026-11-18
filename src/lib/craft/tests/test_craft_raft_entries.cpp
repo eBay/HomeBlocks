@@ -129,8 +129,8 @@ public:
     sisl::async::value_awaitable< bool > fetch_gate;
     bool should_throw{false}; // fetch_data() throws, as a transport bug might
 
-    async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
-        co_return craft::lsn_pair{};
+    async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
+        co_return RsCommitLsnReply{};
     }
 
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,

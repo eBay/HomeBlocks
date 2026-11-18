@@ -119,7 +119,8 @@ verdicts) → `SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once 
 the leader. **A follower
 returns LoginResult with `term==0` and `leader_hint` set to the current leader's id (not an error)**;
 the client finds the matching handle by id and retries login there. `NO_QUORUM` / `REPLICA_DOWN` are
-returned as errors. Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
+returned as errors, and so is `STALE_TERM` when a member is already past the session's term (a newer login
+won). Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
 session term. Other members reach both as they apply the two entries, in the background; the client admits
 IO once a quorum accepts the new term and at least one member has `commit_lsn ≥ dLSN`.
 
@@ -231,10 +232,10 @@ verbs and never cross the client wire, so no CRAFT server exposes them.
 ### `get_lsns` / `get_rs_commit_lsn`
 
 ```cpp
-struct rs_commit_lsn_reply { uint64_t term; int64_t commit_lsn; int64_t last_append_lsn; };
+struct RsCommitLsnReply { lsn_pair lsns; uint64_t term; };
 
 async_result<lsn_pair> get_lsns();   // local snapshot of {commit_lsn, last_append_lsn}
-async_result<rs_commit_lsn_reply> get_rs_commit_lsn(uint64_t term, bool is_login);
+async_result<RsCommitLsnReply> get_rs_commit_lsn(uint64_t term, bool is_login);
 ```
 
 Peer-to-peer; not a client-facing free function. The leader polls every other member via
