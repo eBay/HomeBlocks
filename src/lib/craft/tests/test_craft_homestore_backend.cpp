@@ -508,6 +508,25 @@ TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
     EXPECT_FALSE(make_homestore_state_store(boost::uuids::random_generator()(), std::move(records.at(vol_id)))->load())
         << "another volume's record";
 
+    // Marked faulted: nothing loads or persists any more, also from the record a boot reads.
+    store->mark_faulted();
+    EXPECT_EQ(store->load().error(), std::make_error_condition(std::errc::state_not_recoverable));
+    EXPECT_FALSE(homeblocks::detail::sync_get(store->persist(small)));
+    records = read_state_records();
+    ASSERT_TRUE(records.contains(vol_id));
+    EXPECT_EQ(make_homestore_state_store(vol_id, std::move(records.at(vol_id)))->load().error(),
+              std::make_error_condition(std::errc::state_not_recoverable));
+
+    // A partition faulted before it ever persisted gets a record of its own, saying so.
+    auto const other_id = boost::uuids::random_generator()();
+    auto other = make_homestore_state_store(other_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+    other->mark_faulted();
+    records = read_state_records();
+    ASSERT_TRUE(records.contains(other_id));
+    EXPECT_EQ(make_homestore_state_store(other_id, std::move(records.at(other_id)))->load().error(),
+              std::make_error_condition(std::errc::state_not_recoverable));
+    other->destroy();
+
     store->destroy();
     EXPECT_TRUE(read_state_records().empty());
     auto const gone = store->load();

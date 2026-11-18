@@ -2286,11 +2286,11 @@ async_status CraftReplDev::drain_apply() {
         } catch (std::exception const& e) {
             // The apply stopped partway, so its state can't be trusted: fault the partition, as a failed recovery does.
             LOGE("apply lsn={} threw: {} -- faulting the partition", entry->lsn, e.what());
-            faulted_.store(true, std::memory_order_release);
+            fault();
             outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         } catch (...) {
             LOGE("apply lsn={} threw an unknown exception -- faulting the partition", entry->lsn);
-            faulted_.store(true, std::memory_order_release);
+            fault();
             outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
         bool const applied = static_cast< bool >(outcome);
@@ -2495,7 +2495,7 @@ async_status CraftReplDev::recover() {
         LOGE("restart recovery failed: {} -- partition permanently faulted, will "
              "not accept client I/O (see faulted_'s doc comment)",
              r.error().message());
-        faulted_.store(true, std::memory_order_release);
+        fault();
         co_return r;
     }
     requeue_pending(std::move(*pending));
@@ -2642,9 +2642,8 @@ public:
         auto const buf = sb_.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
         auto const* const hdr = sb_.get();
         std::optional< CraftDurableState > d;
-        if (buf->size() >= sizeof(craft_state_sb_t) && hdr->magic == craft_state_sb_t::k_magic &&
-            hdr->version == craft_state_sb_t::k_version && hdr->vol_id == vol_id_ &&
-            hdr->image_len <= buf->size() - sizeof(craft_state_sb_t)) {
+        if (valid_header_locked()) {
+            if (hdr->faulted) return std::unexpected(std::make_error_condition(std::errc::state_not_recoverable));
             d = decode_durable_state(buf->cbytes() + sizeof(craft_state_sb_t), hdr->image_len);
         }
         if (!d) return std::unexpected(std::make_error_condition(std::errc::illegal_byte_sequence));
@@ -2655,6 +2654,7 @@ public:
         auto const image = encode_durable_state(s);
         std::lock_guard lk{mu_};
         if (destroyed_) co_return std::unexpected(std::make_error_condition(std::errc::operation_canceled));
+        if (faulted_) co_return std::unexpected(std::make_error_condition(std::errc::state_not_recoverable));
         // A new buffer each time, sized to this image; the record keeps its meta blk.
         sb_.create(static_cast< uint32_t >(sizeof(craft_state_sb_t) + image.size()));
         sb_->vol_id = vol_id_;
@@ -2670,16 +2670,49 @@ public:
         sb_.destroy();
     }
 
+    // Keeps the image when the record has one, for whoever looks at it later; otherwise writes a header alone.
+    void mark_faulted() override {
+        std::lock_guard lk{mu_};
+        if (destroyed_ || faulted_) return;
+        faulted_ = true;
+        if (!valid_header_locked()) {
+            sb_.create(static_cast< uint32_t >(sizeof(craft_state_sb_t)));
+            sb_->vol_id = vol_id_;
+        }
+        sb_->faulted = 1;
+        sb_.write();
+    }
+
 private:
+    bool valid_header_locked() {
+        if (sb_.is_empty()) return false;
+        auto const buf = sb_.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
+        auto const* const hdr = sb_.get();
+        return buf->size() >= sizeof(craft_state_sb_t) && hdr->magic == craft_state_sb_t::k_magic &&
+            hdr->version == craft_state_sb_t::k_version && hdr->vol_id == vol_id_ &&
+            hdr->image_len <= buf->size() - sizeof(craft_state_sb_t);
+    }
+
     std::mutex mu_;
     volume_id_t const vol_id_;
     homestore::superblk< craft_state_sb_t > sb_;
     bool destroyed_{false};
+    bool faulted_{false};
 };
 } // namespace
 
 unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb) {
     return std::make_unique< HomeStoreCraftStateStore >(vol_id, std::move(sb));
+}
+
+void CraftReplDev::fault() {
+    if (faulted_.exchange(true, std::memory_order_acq_rel)) return;
+    if (state_store_) state_store_->mark_faulted();
+}
+
+async_status CraftReplDev::save_state() {
+    if (faulted_.load(std::memory_order_acquire)) co_return ok();
+    co_return co_await persist_state();
 }
 
 async_status CraftReplDev::persist_state() {
@@ -2722,7 +2755,11 @@ async_status CraftReplDev::run_persist() {
         // An escaping exception would end the writer with persist_running_ still set: no persist would complete again.
         status r;
         try {
-            r = co_await state_store_->persist(image);
+            // A faulted partition persists nothing more: its record stays as fault() marked it.
+            if (faulted_.load(std::memory_order_acquire))
+                r = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+            else
+                r = co_await state_store_->persist(image);
         } catch (std::exception const& e) {
             LOGE("persisting the durable partition state threw: {}", e.what());
             r = std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -3168,7 +3205,7 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
             LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} (indexing_lsn={}) "
                  "-- faulting the partition rather than freeing indexed blocks",
                  lsn, state_.commit_lsn, indexing_lsn_);
-            faulted_.store(true, std::memory_order_release);
+            fault();
             return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
     }

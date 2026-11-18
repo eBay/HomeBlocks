@@ -1945,6 +1945,35 @@ TEST_F(CraftRaftEntriesTest, RestartFaultsOnAnUnreadableImage) {
     store->fail_load = true;
     dev_->trigger_on_restart();
     EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(store->faulted) << "the record says so, for the next restart";
+}
+
+// A faulted partition persists nothing more: its record keeps the last image, marked faulted, and a checkpoint's save
+// succeeds without writing. Persisting what the partition holds now could make a later restart look healthy.
+TEST_F(CraftRaftEntriesTest, AFaultedPartitionPersistsNothingMore) {
+    auto* store = with_store();
+    ASSERT_TRUE(homeblocks::detail::sync_get(persist()).has_value());
+    auto const saved = store->saved;
+    auto const calls = store->persist_calls;
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    ASSERT_FALSE(do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3}).has_value());
+    ASSERT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(store->faulted);
+
+    EXPECT_FALSE(homeblocks::detail::sync_get(persist()).has_value());
+    EXPECT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    EXPECT_EQ(store->persist_calls, calls);
+    EXPECT_EQ(store->saved, saved);
+}
+
+// A record marked faulted faults the next restart at once.
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnAFaultedRecord) {
+    auto* store = with_store();
+    store->saved = sample_state();
+    store->faulted = true;
+    dev_->trigger_on_restart();
+    EXPECT_TRUE(dev_->is_faulted());
 }
 
 TEST_F(CraftRaftEntriesTest, RestartFaultsOnAnUnreadableJournalTail) {

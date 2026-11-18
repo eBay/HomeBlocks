@@ -334,6 +334,9 @@ public:
     virtual async_status persist(CraftDurableState const& s) = 0;
     // Removes the state for good (the partition is being destroyed). A persist() after it fails.
     virtual void destroy() = 0;
+    // Marks the state faulted for good: persist() fails from then on, and load() too, after a restart as well. The
+    // partition can't be trusted any more, and coming back from its last image would forget what it applied since.
+    virtual void mark_faulted() = 0;
     virtual ~CraftStateStore() = default;
 };
 
@@ -348,6 +351,7 @@ struct craft_state_sb_t {
     uint32_t version{k_version};
     volume_id_t vol_id{}; // the partition (volume) it belongs to
     uint32_t image_len{0};
+    uint8_t faulted{0}; // CraftStateStore::mark_faulted(): the image (if any) is kept, but no longer loads
 };
 #pragma pack(pop)
 inline const std::string craft_state_meta_name{"CraftState"};
@@ -603,7 +607,8 @@ public:
     // Persists the durable image, with the entries committed but not yet applied. HomeBlocks' checkpoint step calls it
     // for every CRAFT partition before HomeStore records the checkpoint: the RAFT log replay after a restart starts
     // above that checkpoint, so an entry it covers that isn't applied yet survives only here. A no-op without a store.
-    async_status save_state() { return persist_state(); }
+    // A faulted partition saves nothing: its record stays marked faulted (see fault()).
+    async_status save_state();
 
     // The partition is being destroyed: removes its durable state from the store for good. Persists after it fail.
     void destroy_state() {
@@ -1140,8 +1145,11 @@ private:
     // with volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
     // data corruption. fetch_data()/get_rs_commit_lsn() reject too, so peers treat it as down, and append()
     // and the watchdog stop proposing. There is deliberately no self-recovery path: an operator (or a future
-    // re-sync-from-peer mechanism) must intervene.
+    // re-sync-from-peer mechanism) must intervene. Set through fault(), which also marks the state record, so a
+    // restart doesn't bring the partition back from an image that lacks what it applied since; and from then on
+    // nothing is persisted.
     std::atomic< bool > faulted_{false};
+    void fault();
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()

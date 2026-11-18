@@ -105,8 +105,11 @@ public:
     bool hold{false};
     sisl::async::value_awaitable< bool > gate;
 
+    bool faulted{false}; // mark_faulted()
+
     result< std::optional< CraftDurableState > > load() override {
         if (fail_load) return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (faulted) return std::unexpected(std::make_error_condition(std::errc::state_not_recoverable));
         if (!saved) return std::optional< CraftDurableState >{};
         auto const bytes = encode_durable_state(*saved);
         auto d = decode_durable_state(bytes.data(), bytes.size());
@@ -117,12 +120,13 @@ public:
     async_status persist(CraftDurableState const& s) override {
         ++persist_calls;
         if (std::exchange(hold, false)) co_await gate;
-        if (fail_persist) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (fail_persist || faulted) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         saved = s;
         co_return ok();
     }
 
     void destroy() override { saved.reset(); }
+    void mark_faulted() override { faulted = true; }
 };
 
 template < typename Mock >
