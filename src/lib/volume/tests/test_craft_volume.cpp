@@ -26,6 +26,7 @@
 #include <sisl/flip/flip_client.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore.hpp>
+#include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/replication_service.hpp>
 #include "hb_internal.hpp"
 #include "test_common.hpp"
@@ -320,6 +321,27 @@ TEST_F(CraftVolumeTest, SessionSurvivesRestarts) {
         EXPECT_EQ((*again)->craft_dev()->term(), 7u) << "restart " << i;
         EXPECT_EQ((*again)->craft_dev()->client_token(), 42u) << "restart " << i;
     }
+}
+
+// A RAFT entry a checkpoint covers is never replayed after a restart. One that hasn't applied yet survives in the
+// partition's durable state, which the checkpoint saves with it, and the restart applies it from there.
+TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
+    auto info = craft_vol_info("craft_vol_checkpoint");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    auto* const dev = (*vol)->craft_dev();
+    dev->pause_apply();
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */); // never delivered again
+    ASSERT_TRUE(homeblocks::detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true /* force */)));
+    EXPECT_EQ(dev->term(), 0u) << "applied before the checkpoint";
+
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_NE((*again)->craft_dev(), nullptr);
+    ASSERT_TRUE(wait_until([&again] { return (*again)->craft_dev()->term() == 7; }));
+    EXPECT_EQ((*again)->craft_dev()->client_token(), 42u);
 }
 
 // The group is destroyed (here directly; by the partition's removal or a create rollback in practice): each member's

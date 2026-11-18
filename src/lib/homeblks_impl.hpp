@@ -192,6 +192,9 @@ public:
     // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
     // leaves one), other than those of a create in flight here and those being destroyed.
     int64_t craft_groups_without_replica() const;
+    // CRAFT: the checkpoint step. Persists every CRAFT partition's durable state, with the RAFT entries it has not
+    // applied yet; stops the process if one can't be.
+    sisl::async::task< void > save_craft_states();
 #ifdef _PRERELEASE
     // Reads every CRAFT state record in the meta service again, as a boot does, and hands them over by volume.
     std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > read_craft_state_records() {

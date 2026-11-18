@@ -19,6 +19,7 @@
 #include <iomgr/io_environment.hpp>
 #include <iomgr/drive.hpp>
 #include <homestore/homestore.hpp>
+#include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/replication_service.hpp>
 #include <homestore/index_service.hpp>
 #include <sisl/options/options.h>
@@ -37,7 +38,6 @@ result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
     // TODO: surface operational init failures (on_svc_id RPC, device open, format) as result<> errors rather than
     // aborting inside init_homestore(); precondition bugs (e.g. no devices) stay asserts.
     inst->init_homestore();
-    inst->init_cp();
     inst->reattach_craft_volumes();
     inst->start_reaper_thread();
     HomeBlocksImpl::s_instance_ = inst;
@@ -488,6 +488,9 @@ void HomeBlocksImpl::on_init_complete() {
     // Add anything that needs to be done here.
     using namespace homestore;
 
+    // While HomeStore starts, ahead of its log replay: a CreateVolume the replay applies makes a CRAFT device then.
+    init_cp();
+
     // CRAFT state records, ahead of the volumes that take them
     homestore::hs()->meta_service().register_handler(
         craft_state_meta_name,
@@ -523,7 +526,60 @@ void HomeBlocksImpl::on_init_complete() {
     index_chunk_selector_->reset_dirty_free_chunks();
 }
 
-void HomeBlocksImpl::init_cp() {}
+namespace {
+// HomeStore records a checkpoint (checkpoint_lsn) in the replication service's flush, after this consumer's
+// (HS_CLIENT), and replays the RAFT log after a restart only above it. Every RAFT entry a checkpoint covers has been
+// committed to its CRAFT partition (HomeStore calls on_commit before advancing the LSN the checkpoint takes), not
+// always applied: this flush saves each partition's durable state with its entries not yet applied, which recovery
+// applies again.
+class CraftCheckpointConsumer : public homestore::CPCallbacks {
+public:
+    explicit CraftCheckpointConsumer(HomeBlocksImpl* hb) : hb_{hb} {}
+
+    std::unique_ptr< homestore::CPContext > on_switchover_cp(homestore::CP*, homestore::CP* new_cp) override {
+        return std::make_unique< homestore::CPContext >(new_cp); // non-null: flushed with every checkpoint
+    }
+    sisl::async::task< bool > cp_flush(homestore::CP*) override {
+        co_await hb_->save_craft_states();
+        co_return true;
+    }
+    void cp_cleanup(homestore::CP*) override {}
+    int cp_progress_percent() override { return 100; }
+
+private:
+    HomeBlocksImpl* hb_;
+};
+} // namespace
+
+void HomeBlocksImpl::init_cp() {
+    if (is_craft()) {
+        homestore::cp_mgr().register_consumer(homestore::cp_consumer_t::HS_CLIENT,
+                                              std::make_unique< CraftCheckpointConsumer >(this));
+    }
+}
+
+// ponytail: one meta blk write per CRAFT volume per checkpoint, in turn (the meta service serializes them anyway); skip
+// the unchanged ones if checkpoints get slow with many partitions.
+sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
+    std::vector< volume_handle > vols;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto const& [id, vol] : vol_map_) {
+            if (vol->is_craft()) { vols.push_back(vol); }
+        }
+    }
+    for (auto const& vol : vols) {
+        // Counted in flight while saved: its destroy, which removes the state record, waits for it or is seen here.
+        vol_io_guard const guard{vol};
+        auto* const dev = vol->craft_dev();
+        if (vol->is_destroying() || !dev) { continue; } // no device yet: nothing to save
+        auto const saved = co_await dev->save_state();
+        // The replication service records the checkpoint whatever this flush returns: stop rather than let it cover
+        // entries whose state isn't durable.
+        RELEASE_ASSERT(saved, "CRAFT volume {}: saving its durable state for a checkpoint failed: {}", vol->id_str(),
+                       saved.error().message());
+    }
+}
 
 uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
     if (SISL_OPTIONS.count("gc_timer_nsecs")) {
