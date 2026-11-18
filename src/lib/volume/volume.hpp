@@ -243,10 +243,15 @@ public:
     // the far side of the wire.
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
-    // CRAFT recovery: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and attaches
-    // the CraftReplDev once HomeStore's log replay opens the journal's store. Call it after init_index_table: the
-    // device keeps the index table it is given.
+    // CRAFT recovery, at load: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and
+    // keeps its store once HomeStore's log replay has replayed it.
     void reopen_craft_journal();
+    // CRAFT recovery, at load: the volume's durable state record (none if it never persisted one).
+    void adopt_craft_state(superblk< craft_state_sb_t > sb) { craft_state_sb_ = std::move(sb); }
+    // CRAFT recovery, once HomeStore has started: makes the CraftReplDev on the journal reopen_craft_journal() kept,
+    // the state record and the index table installed at load, recovers it, then publishes it. init_homeblocks waits for
+    // it.
+    sisl::async::task< void > reattach_craft_dev();
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -306,7 +311,7 @@ private:
     //
     bool init(bool is_recovery);
     bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
-    void attach_craft_dev(shared< homestore::home_log_store > journal);
+    shared< CraftReplDev > make_craft_dev(shared< homestore::home_log_store > journal);
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 
@@ -331,6 +336,10 @@ private:
     std::unique_ptr< VolumeMetrics > metrics_;
     shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
     bool journal_open_{false};                  // CRAFT: this boot created or reopened the volume's journal
+    // CRAFT: the durable state record until the CraftReplDev's store takes it (empty if there is none yet).
+    superblk< craft_state_sb_t > craft_state_sb_{craft_state_meta_name};
+    // CRAFT: the journal the log replay reopened, until reattach_craft_dev() makes the device on it.
+    shared< homestore::home_log_store > craft_journal_;
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

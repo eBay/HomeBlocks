@@ -38,6 +38,7 @@ result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
     // aborting inside init_homestore(); precondition bugs (e.g. no devices) stay asserts.
     inst->init_homestore();
     inst->init_cp();
+    inst->reattach_craft_volumes();
     inst->start_reaper_thread();
     HomeBlocksImpl::s_instance_ = inst;
     return inst;
@@ -487,6 +488,15 @@ void HomeBlocksImpl::on_init_complete() {
     // Add anything that needs to be done here.
     using namespace homestore;
 
+    // CRAFT state records, ahead of the volumes that take them
+    homestore::hs()->meta_service().register_handler(
+        craft_state_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_state_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
+    homestore::hs()->meta_service().read_sub_sb(craft_state_meta_name);
+
     // volume SB
     homestore::hs()->meta_service().register_handler(
         volume::VOL_META_NAME,
@@ -497,6 +507,12 @@ void HomeBlocksImpl::on_init_complete() {
         std::optional< meta_subtype_vec_t >({homestore::hs()->repl_service().get_meta_blk_name()}));
 
     homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
+
+    // A volume removes its record before its superblock, so none should be left; one that is, stays on disk.
+    for (auto const& [id, sb] : craft_state_sbs_) {
+        LOGW("CRAFT state record of volume {} has no volume here: left in place", boost::uuids::to_string(id));
+    }
+    craft_state_sbs_.clear();
 
     // Every index (recovered before repl devs) and volume has claimed its chunks by now, so chunks left in the free
     // pools are unowned. Clear the ones a crash during volume destroy left with allocated blks, before they are reused.
@@ -516,6 +532,19 @@ uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
         return n;
     } else {
         return HB_DYNAMIC_CONFIG(reaper_thread_timer_secs);
+    }
+}
+
+void HomeBlocksImpl::reattach_craft_volumes() {
+    std::vector< volume_handle > vols;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto const& [id, vol] : vol_map_) {
+            if (vol->is_craft()) { vols.push_back(vol); }
+        }
+    }
+    for (auto const& vol : vols) {
+        detail::sync_get(vol->reattach_craft_dev());
     }
 }
 

@@ -45,6 +45,7 @@
 #include <iomgr/iomgr.hpp>
 
 #include "hb_internal.hpp"
+#include "homeblks_impl.hpp"
 #include "craft/craft_repl_dev.hpp"
 #include "coro_helpers.hpp"
 #include "test_common.hpp"
@@ -459,6 +460,61 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFail
         flushed += *r ? 1 : 0;
     }
     EXPECT_GE(flushed, 1);
+}
+
+// Every CRAFT state record in the meta service, by volume, read as a boot reads them.
+static auto read_state_records() {
+    return std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records();
+}
+
+// A partition's durable state in its own meta blk record: each image persisted replaces the last, whatever its size
+// (the large one spans several meta blks), and is what a boot reads back; a record belongs to one volume; destroy()
+// removes it, and nothing is persisted after it.
+TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
+    auto const vol_id = boost::uuids::random_generator()();
+    auto store = make_homestore_state_store(vol_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+    auto const none = store->load();
+    ASSERT_TRUE(none);
+    EXPECT_FALSE(*none) << "nothing persisted yet";
+
+    CraftDurableState small{.term = 7,
+                            .client_token = 42,
+                            .last_applied_raft_idx = 9,
+                            .durable_commit_lsn = 3,
+                            .sync_watermark = 5,
+                            .empty_lsns = {4, 5}};
+    small.pending.push_back(CraftPendingEntry{.raft_idx = 10, .type = CraftEntryType::InternalLogin, .term = 8});
+    CraftDurableState large = small;
+    for (int64_t i = 0; i < 1000; ++i) {
+        large.pending.push_back(CraftPendingEntry{
+            .raft_idx = 11 + i, .type = CraftEntryType::SyncRSCommitLSN, .rs_commit_lsn = i, .client_token = 42});
+    }
+    for (auto const& image : {small, large, small}) {
+        ASSERT_TRUE(homeblocks::detail::sync_get(store->persist(image)));
+        auto const back = store->load();
+        ASSERT_TRUE(back && *back);
+        EXPECT_EQ(**back, image);
+
+        auto records = read_state_records();
+        ASSERT_EQ(records.size(), 1u);
+        ASSERT_TRUE(records.contains(vol_id));
+        auto const reread = make_homestore_state_store(vol_id, std::move(records.at(vol_id)))->load();
+        ASSERT_TRUE(reread && *reread);
+        EXPECT_EQ(**reread, image) << "the record a boot reads";
+    }
+
+    auto records = read_state_records();
+    ASSERT_TRUE(records.contains(vol_id));
+    EXPECT_FALSE(make_homestore_state_store(boost::uuids::random_generator()(), std::move(records.at(vol_id)))->load())
+        << "another volume's record";
+
+    store->destroy();
+    EXPECT_TRUE(read_state_records().empty());
+    auto const gone = store->load();
+    ASSERT_TRUE(gone);
+    EXPECT_FALSE(*gone);
+    EXPECT_FALSE(homeblocks::detail::sync_get(store->persist(small)));
+    EXPECT_TRUE(read_state_records().empty());
 }
 
 int main(int argc, char* argv[]) {

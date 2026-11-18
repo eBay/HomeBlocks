@@ -318,8 +318,29 @@ public:
     // The last image persisted, nullopt if none ever was, an error if what is there can't be used.
     virtual result< std::optional< CraftDurableState > > load() = 0;
     virtual async_status persist(CraftDurableState const& s) = 0;
+    // Removes the state for good (the partition is being destroyed). A persist() after it fails.
+    virtual void destroy() = 0;
     virtual ~CraftStateStore() = default;
 };
+
+// The meta blk record holding one partition's durable state: this header, then the encoded CraftDurableState
+// (encode_durable_state()), image_len bytes. One per partition, removed with it.
+#pragma pack(push, 1)
+struct craft_state_sb_t {
+    static constexpr uint64_t k_magic = 0x54415453'54465243ull; // "CRFTSTAT" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    volume_id_t vol_id{}; // the partition (volume) it belongs to
+    uint32_t image_len{0};
+};
+#pragma pack(pop)
+inline const std::string craft_state_meta_name{"CraftState"};
+
+// A CraftStateStore in the partition's own meta blk record (craft_state_sb_t). `sb` is the record loaded at boot, or an
+// empty one named craft_state_meta_name for a partition that has none yet: its first persist creates it.
+unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb);
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
@@ -550,6 +571,11 @@ public:
     // for every CRAFT partition before HomeStore records the checkpoint: the RAFT log replay after a restart starts
     // above that checkpoint, so an entry it covers that isn't applied yet survives only here. A no-op without a store.
     async_status save_state() { return persist_state(); }
+
+    // The partition is being destroyed: removes its durable state from the store for good. Persists after it fail.
+    void destroy_state() {
+        if (state_store_) state_store_->destroy();
+    }
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().

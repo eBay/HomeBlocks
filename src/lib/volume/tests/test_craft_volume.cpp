@@ -85,6 +85,36 @@ public:
         }
         return group(id) == nullptr;
     }
+
+    template < typename Pred >
+    static bool wait_until(Pred&& pred, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto const deadline = std::chrono::steady_clock::now() + timeout;
+        while (!pred() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return pred();
+    }
+
+    // An InternalLogin the volume's group committed at raft_lsn, handed to its device as HomeStore does. Straight to
+    // the device: this node has no RAFT proposer yet.
+    static void commit_login(volume_handle const& vol, uint64_t client_token, uint64_t term, int64_t raft_lsn) {
+        CraftEntryHeader header{CraftEntryType::InternalLogin};
+        InternalLoginPayload key{client_token, term};
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        vol->craft_dev()->raft_listener().on_commit(
+            raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
+            sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}, {}, ctx);
+    }
+
+    // The volumes with a CRAFT state record in the meta service, read as a boot reads them.
+    static std::set< volume_id_t > state_records() {
+        std::set< volume_id_t > ids;
+        for (auto const& [id, sb] :
+             std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records()) {
+            ids.insert(id);
+        }
+        return ids;
+    }
 };
 
 TEST_F(CraftVolumeTest, CreateFormsGroupAndAttachesCraftDev) {
@@ -271,15 +301,39 @@ TEST_F(CraftVolumeTest, RestartReattachesJournal) {
     EXPECT_NE((*after)->craft_dev(), nullptr);
 }
 
+// A partition's session is in its durable state record, persisted before the login takes effect: a restart restores it,
+// and so does the next one.
+TEST_F(CraftVolumeTest, SessionSurvivesRestarts) {
+    auto info = craft_vol_info("craft_vol_session");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    EXPECT_TRUE(state_records().contains(id));
+
+    for (int i = 0; i < 2; ++i) {
+        g_helper->restart();
+        auto again = hb()->get_volume(id);
+        ASSERT_TRUE(again);
+        ASSERT_NE((*again)->craft_dev(), nullptr) << "restart " << i;
+        EXPECT_EQ((*again)->craft_dev()->term(), 7u) << "restart " << i;
+        EXPECT_EQ((*again)->craft_dev()->client_token(), 42u) << "restart " << i;
+    }
+}
+
 // The group is destroyed (here directly; by the partition's removal or a create rollback in practice): each member's
-// replica follows it, through on_destroy.
+// replica follows it, through on_destroy, and its durable state record with it.
 TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     auto info = craft_vol_info("craft_vol_group_destroy");
     auto const id = info.id;
     auto vol = create(std::move(info));
     ASSERT_TRUE(vol);
-    // A CRAFT op the replica serves until then: no session, so it changes nothing.
-    craft::client_hdr const hdr{0 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    ASSERT_TRUE(state_records().contains(id));
+    // A CRAFT op the replica serves until then, in the session: it changes nothing.
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
     auto alive = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_TRUE(alive) << alive.error().message();
 
@@ -297,18 +351,25 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     auto late = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_FALSE(late);
     EXPECT_EQ(late.error(), std::errc::operation_not_supported);
+    EXPECT_FALSE(state_records().contains(id));
 }
 
 // Same, but the node restarts right after the destroy committed: whether the reaper ran first (on_destroy) or HomeStore
-// dropped the destroy-pending group at load (no on_destroy), the replica is removed.
+// dropped the destroy-pending group at load (no on_destroy, and the volume no device), the replica is removed, and its
+// durable state record with it.
 TEST_F(CraftVolumeTest, GroupDestroyedAcrossRestartRemovesReplica) {
     auto info = craft_vol_info("craft_vol_destroy_restart");
     auto const id = info.id;
-    ASSERT_TRUE(create(std::move(info)));
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    ASSERT_TRUE(state_records().contains(id));
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
     g_helper->restart();
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
+    EXPECT_FALSE(state_records().contains(id));
 }
 
 // After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in

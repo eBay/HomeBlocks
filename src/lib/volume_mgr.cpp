@@ -61,6 +61,12 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         }
     }
 
+    // Its CRAFT state record, if it ever persisted one: a destroy removes it, a reattach recovers from it.
+    if (auto it = craft_state_sbs_.find(id); it != craft_state_sbs_.end()) {
+        vol_ptr->adopt_craft_state(std::move(it->second));
+        craft_state_sbs_.erase(it);
+    }
+
     {
         auto lg = std::scoped_lock(vol_lock_);
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
@@ -80,10 +86,24 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
         start_volume_removal(id);
     } else if (vol_ptr->is_craft()) {
-        // Only now that its index table is installed: the CraftReplDev attached when the journal replays keeps it. A
-        // CRAFT volume torn down above leaves its journal unopened, and HomeStore purges it.
+        // Only now that its index table is installed: the CraftReplDev made once HomeStore has started keeps it
+        // (reattach_craft_volumes). A CRAFT volume torn down above leaves its journal unopened, and HomeStore purges
+        // it.
         vol_ptr->reopen_craft_journal();
     }
+}
+
+void HomeBlocksImpl::on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    superblk< craft_state_sb_t > sb{craft_state_meta_name};
+    sb.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // The CRC passed, so a bad header is a format bug: never restart a partition without its state.
+    RELEASE_ASSERT(sb.size() >= sizeof(craft_state_sb_t) && sb->magic == craft_state_sb_t::k_magic &&
+                       sb->version == craft_state_sb_t::k_version,
+                   "CRAFT state record of {} bytes, magic {:#x} version {}: unknown format", sb.size(), sb->magic,
+                   sb->version);
+    volume_id_t const id = sb->vol_id;
+    auto const [it, added] = craft_state_sbs_.try_emplace(id, std::move(sb));
+    RELEASE_ASSERT(added, "two CRAFT state records for volume {}", boost::uuids::to_string(id));
 }
 
 shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {

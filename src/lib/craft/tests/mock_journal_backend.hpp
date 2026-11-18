@@ -121,6 +121,8 @@ public:
         saved = s;
         co_return ok();
     }
+
+    void destroy() override { saved.reset(); }
 };
 
 template < typename Mock >

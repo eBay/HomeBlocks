@@ -2572,6 +2572,60 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
     return s;
 }
 
+namespace {
+// The image goes in the partition's own meta blk record, after a craft_state_sb_t header. The mutex orders a persist
+// against destroy(), which the volume's destroy calls while a persist round may still be running.
+class HomeStoreCraftStateStore : public CraftStateStore {
+public:
+    HomeStoreCraftStateStore(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb) :
+            vol_id_{vol_id}, sb_{std::move(sb)} {}
+
+    result< std::optional< CraftDurableState > > load() override {
+        std::lock_guard lk{mu_};
+        if (sb_.is_empty()) return std::nullopt;
+        auto const buf = sb_.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
+        auto const* const hdr = sb_.get();
+        std::optional< CraftDurableState > d;
+        if (buf->size() >= sizeof(craft_state_sb_t) && hdr->magic == craft_state_sb_t::k_magic &&
+            hdr->version == craft_state_sb_t::k_version && hdr->vol_id == vol_id_ &&
+            hdr->image_len <= buf->size() - sizeof(craft_state_sb_t)) {
+            d = decode_durable_state(buf->cbytes() + sizeof(craft_state_sb_t), hdr->image_len);
+        }
+        if (!d) return std::unexpected(std::make_error_condition(std::errc::illegal_byte_sequence));
+        return d;
+    }
+
+    async_status persist(CraftDurableState const& s) override {
+        auto const image = encode_durable_state(s);
+        std::lock_guard lk{mu_};
+        if (destroyed_) co_return std::unexpected(std::make_error_condition(std::errc::operation_canceled));
+        // A new buffer each time, sized to this image; the record keeps its meta blk.
+        sb_.create(static_cast< uint32_t >(sizeof(craft_state_sb_t) + image.size()));
+        sb_->vol_id = vol_id_;
+        sb_->image_len = static_cast< uint32_t >(image.size());
+        std::memcpy(sb_.raw_buf()->bytes() + sizeof(craft_state_sb_t), image.data(), image.size());
+        sb_.write();
+        co_return ok();
+    }
+
+    void destroy() override {
+        std::lock_guard lk{mu_};
+        destroyed_ = true;
+        sb_.destroy();
+    }
+
+private:
+    std::mutex mu_;
+    volume_id_t const vol_id_;
+    homestore::superblk< craft_state_sb_t > sb_;
+    bool destroyed_{false};
+};
+} // namespace
+
+unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb) {
+    return std::make_unique< HomeStoreCraftStateStore >(vol_id, std::move(sb));
+}
+
 async_status CraftReplDev::persist_state() {
     if (!state_store_) co_return ok();
     shared< sisl::async::shared_awaitable< bool > > round;

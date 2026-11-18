@@ -226,7 +226,7 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
     // First write of the superblock: from here on the volume exists, and a replayed CreateVolume finds it.
     state_change(volume_state::ONLINE);
 
-    attach_craft_dev(std::move(journal));
+    craft_dev_ = make_craft_dev(std::move(journal)); // a new partition: nothing to recover
     LOGI("Created CRAFT volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {} journal: {}/{}",
          vol_info_->name, id_str(), ordinal(), vol_info_->size_bytes, pdev_id, chunk_ids.size(), logdev_id,
          sb_->journal_store_id);
@@ -234,31 +234,55 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
 }
 
 // Reopens the volume's journal at load, ahead of the log store service start: HomeStore purges every logdev nobody
-// reopened. The store itself opens during the log replay, and the CraftReplDev is attached then.
+// reopened. The device recovers from the journal, so it waits for the journal's log replay, which HomeStore reports
+// with the log device locked: the callback only keeps the store, and reattach_craft_dev() makes the device.
 void volume::reopen_craft_journal() {
     auto& logstores = homestore::logstore_service();
     logstores.open_logdev(sb_->journal_logdev_id, craft_journal_flush_mode);
     journal_open_ = true;
-    detail::detach([](sisl::async::task< shared< homestore::home_log_store > > open,
-                      volume_handle vol) -> sisl::async::task< void > {
-        vol->attach_craft_dev(co_await std::move(open));
-        LOGI("CRAFT volume: {} uuid: {} reattached to its journal", vol->vol_info_->name, vol->id_str());
-    }(logstores.open_log_store(sb_->journal_logdev_id, sb_->journal_store_id, false /* append_mode */, nullptr,
-                                         nullptr),
-                                         shared_from_this()));
+    // The task only waits for the store to open, before its replay: not needed.
+    (void)logstores.open_log_store(
+        sb_->journal_logdev_id, sb_->journal_store_id, false /* append_mode */, nullptr /* log_found_cb */,
+        [weak = weak_from_this()](shared< homestore::home_log_store > journal, homestore::logstore_seq_num_t) {
+            if (auto vol = weak.lock()) { vol->craft_journal_ = std::move(journal); }
+        });
 }
 
-void volume::attach_craft_dev(shared< homestore::home_log_store > journal) {
+sisl::async::task< void > volume::reattach_craft_dev() {
+    // Torn down at load (its destroy may be running), its journal never reopened, or its device made at its create
+    // (e.g. a CreateVolume the restart replayed).
+    if (is_destroying() || !journal_open_ || craft_dev_) co_return;
+    if (!craft_journal_) {
+        LOGE("CRAFT volume: {} uuid: {}: its journal's log replay never reported it, not reattached", vol_info_->name,
+             id_str());
+        co_return;
+    }
+    // Counted in flight until the device is published: the volume's destroy, which removes the journal and the state
+    // record the recovery reads, waits for it, or is seen here (as by a CRAFT op, see craft_api.cpp).
+    vol_io_guard const guard{shared_from_this()};
+    if (is_destroying()) {
+        LOGI("CRAFT volume: {} uuid: {} is being destroyed, not reattached", vol_info_->name, id_str());
+        co_return;
+    }
+    auto dev = make_craft_dev(std::move(craft_journal_));
+    // Nothing reaches the device before it recovered. A recovery that fails faults the partition (logged), which then
+    // refuses client I/O and peer fetches.
+    (void)co_await dev->recover();
+    craft_dev_ = std::move(dev);
+    LOGI("CRAFT volume: {} uuid: {} reattached to its journal", vol_info_->name, id_str());
+}
+
+shared< CraftReplDev > volume::make_craft_dev(shared< homestore::home_log_store > journal) {
     // The device keeps the index table it is given; without one it could neither apply commits nor serve reads.
     RELEASE_ASSERT(indx_tbl_ != nullptr, "CRAFT volume: {} uuid: {} has no index table to attach its device to",
                    vol_info_->name, id_str());
     auto const lba_size = static_cast< uint32_t >(vol_info_->page_size);
     auto dev = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
-                                    lba_size, indx_tbl_);
+                                    lba_size, indx_tbl_, make_homestore_state_store(id(), std::move(craft_state_sb_)));
     dev->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
     dev->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
     dev->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
-    craft_dev_ = std::move(dev); // published only once configured
+    return dev;
 }
 
 // Runs once, by the removal that claimed it (try_start_destroy).
@@ -267,8 +291,14 @@ sisl::async::task< void > volume::destroy() {
 
     // The CRAFT device goes before the index and journal it works on: no CRAFT op runs anymore (each one counts itself
     // in flight on the volume, and the destroy starts only when none is), no committed RAFT entry applies anymore
-    // (stop_apply() waits out the one in progress), and its watchdog stops with it.
-    if (craft_dev_) (void)co_await craft_dev_->stop_apply();
+    // (stop_apply() waits out the one in progress), and its watchdog stops with it. Its durable state record goes first
+    // of all on disk: removed after the superblock, a crash in between would leave it behind for good.
+    if (craft_dev_) {
+        (void)co_await craft_dev_->stop_apply();
+        craft_dev_->destroy_state();
+    } else if (!craft_state_sb_.is_empty()) {
+        craft_state_sb_.destroy(); // never reattached (e.g. a destroy resumed after a crash): the record loaded at boot
+    }
     craft_dev_.reset();
 
     // 1. destroy the repl dev. A CRAFT volume's RAFT group is destroyed through RAFT, by whoever removes the partition;

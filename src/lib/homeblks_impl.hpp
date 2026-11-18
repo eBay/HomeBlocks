@@ -104,6 +104,10 @@ private:
     mutable std::shared_mutex index_lock_;
     std::unordered_map< std::string, std::pair< shared< VolumeIndexTable >, uint64_t > > idx_tbl_map_;
 
+    // CRAFT durable state records read at boot, by volume id, until their volumes take them. Only on_init_complete()
+    // uses it, reading the records and then the volumes on one thread.
+    std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > craft_state_sbs_;
+
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
     std::mutex sb_lock_; // this lock is only used when FC is triggered;
@@ -188,12 +192,22 @@ public:
     // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
     // leaves one), other than those of a create in flight here and those being destroyed.
     int64_t craft_groups_without_replica() const;
+#ifdef _PRERELEASE
+    // Reads every CRAFT state record in the meta service again, as a boot does, and hands them over by volume.
+    std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > read_craft_state_records() {
+        homestore::hs()->meta_service().read_sub_sb(craft_state_meta_name);
+        return std::exchange(craft_state_sbs_, {});
+    }
+#endif
     // CRAFT: HomeStore asks for a new RAFT group's listener on the thread that instantiated the group.
     static void on_craft_group_made(volume_id_t const& id) {
         if (forming_ && forming_->id == id) { forming_->made = true; }
     }
 
     void start_reaper_thread();
+    // CRAFT: gives every CRAFT volume loaded at boot its device, recovered, once HomeStore has started (and replayed
+    // their journals). Blocks until all are done: init_homeblocks returns with the partitions recovered.
+    void reattach_craft_volumes();
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;
@@ -250,6 +264,7 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 
     void vol_gc();
 
