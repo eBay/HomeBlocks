@@ -628,9 +628,23 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
         LOGE("login_poll: quorum poll failed: {}", polled.error().message());
         co_return std::unexpected(polled.error());
     }
+    // Rechecked after the await, as any of these can change during it.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_poll: partition faulted during the poll -- abandoning term={}", term);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     if (!raft_proposer_->is_leader()) {
         LOGW("login_poll: lost leadership during the poll -- abandoning term={}", term);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    }
+    {
+        // A login committed meanwhile (say, an earlier attempt's InternalLogin whose proposal timed out) leaves this
+        // round's term stale, though no member may have applied it yet.
+        std::lock_guard lk{state_mu_};
+        if (login_fence_term_ > term) {
+            LOGW("login_poll: a login at term {} committed during the poll, past {}", login_fence_term_, term);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
     }
 
     LoginPoll result{.rs_commit_lsn = own->lsns.last_append_lsn};
@@ -1024,9 +1038,14 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     touch_watchdog();
     maybe_trigger_periodic_sync();
 
-    // Snapshot after the piggyback commit() above, so the ack reflects whatever progress it just made.
+    // Snapshot after the piggyback commit() above, so the ack reflects whatever progress it just made. A login poll or
+    // a login can land while commit() awaits; the write isn't acked then either, though its slot stays published.
     {
         std::lock_guard lock{state_mu_};
+        if (!session_current_locked(hdr.term) || write_quiesced_locked(hdr.term)) {
+            LOGW("write kept but not acked: session fenced or quiesced before the ack dlsn={}", dlsn);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
         snapshot = {state_.commit_lsn, state_.last_append_lsn};
     }
 

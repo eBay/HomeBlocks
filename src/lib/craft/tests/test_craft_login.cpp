@@ -122,6 +122,28 @@ protected:
 
     auto do_login_poll(uint64_t term) { return homeblocks::detail::sync_get(dev_->login_poll(term)); }
 
+    // Commit an entry on this member as RAFT would, with no proposal of its own.
+    void commit_entry(CraftEntryType type, std::vector< uint8_t > const& key) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = type;
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    }
+    void commit_login(uint64_t term) {
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        commit_entry(CraftEntryType::InternalLogin, key);
+    }
+    // Faults the partition: a verdict for a slot it has already committed.
+    void fault_partition() {
+        dev_->seed_lsns(5, {});
+        dev_->seed_commit_lsn(5);
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
+        serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {3});
+        commit_entry(CraftEntryType::SyncRSCommitLSN, key);
+    }
+
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftLsnPoller poller_;
     MockCraftRaftProposer proposer_;
@@ -257,17 +279,8 @@ TEST_F(CraftLoginTest, PollUnwiredFailsNotSupported) {
     EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
 }
 
-// A faulted leader (here, by a verdict for a slot it already committed) can't run a login.
 TEST_F(CraftLoginTest, PollOnFaultedLeaderFailsInternalError) {
-    dev_->seed_lsns(5, {});
-    dev_->seed_commit_lsn(5);
-    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
-    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
-    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
-    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {3});
-    cintrusive< homestore::repl_req_ctx > ctx{};
-    dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
-                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    fault_partition();
     ASSERT_TRUE(dev_->is_faulted());
 
     auto r = do_login_poll(/*term=*/0);
@@ -275,6 +288,29 @@ TEST_F(CraftLoginTest, PollOnFaultedLeaderFailsInternalError) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
     EXPECT_EQ(poller_.poll_calls, 0);
+}
+
+// ...and one that faults while the poll is out doesn't report its result.
+TEST_F(CraftLoginTest, PollFaultedDuringThePollFailsInternalError) {
+    poller_.replies = {reply(1, 7), reply(2, 7)};
+    poller_.on_poll = [this] { fault_partition(); };
+
+    auto r = do_login_poll(/*term=*/0);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+// A login committed while the poll is out (an earlier attempt's InternalLogin whose proposal timed out, say) makes
+// the round's term stale, though no member has applied it yet.
+TEST_F(CraftLoginTest, PollFailsStaleTermWhenALoginCommitsDuringThePoll) {
+    poller_.replies = {reply(1, 7), reply(2, 7)};
+    poller_.on_poll = [this] { commit_login(/*term=*/1); };
+
+    auto r = do_login_poll(/*term=*/0);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
 }
 
 // ── login_poll: the leader's own quiesce ──────────────────────────────────────

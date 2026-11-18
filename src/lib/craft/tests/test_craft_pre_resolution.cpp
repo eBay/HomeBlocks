@@ -1680,6 +1680,45 @@ TEST_F(CraftAppendTest, LoginCommittedDuringFetchStopsOldSessionRound) {
     fetcher_.fetch_gate.complete(true);
 }
 
+// ── a fence landing between a write's post-flight check and its ack (SDSTOR-22889) ──
+//
+// In production the window is the piggybacked commit(); here it's the periodic round write(3) triggers, whose fetch
+// raises the fence. Slot 1 is a hole, so the round fetches. Either way the slot stays published; only the ack goes.
+
+// A login poll quiesces the write's term.
+TEST_F(CraftAppendTest, WriteQuiescedBeforeItsAckIsNotAcked) {
+    dev_->set_sync_lsn_interval(4);
+    ASSERT_TRUE(do_write(0, 0).has_value());
+    ASSERT_TRUE(do_write(2, 0).has_value());
+    fetcher_.on_fetch = [this] {
+        ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/true)).has_value());
+    };
+
+    auto w = do_write(3, 0, /*commit_lsn=*/2);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_FALSE(dev_->is_missing(3));
+    EXPECT_TRUE(journal_->has_slot(3));
+    fetcher_.on_fetch = nullptr;
+}
+
+// A login commits, ending the write's session.
+TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
+    dev_->set_sync_lsn_interval(4);
+    ASSERT_TRUE(do_write(0, 0).has_value());
+    ASSERT_TRUE(do_write(2, 0).has_value());
+    fetcher_.on_fetch = [this] { commit_login(5); };
+
+    auto w = do_write(3, 0, /*commit_lsn=*/2);
+
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_FALSE(dev_->is_missing(3));
+    EXPECT_TRUE(journal_->has_slot(3));
+    fetcher_.on_fetch = nullptr;
+}
+
 // ── fence matrix (SDSTOR-26655, SDSTOR-22889) ─────────────────────────────────
 //
 // What each entry point does while a fence is up, and once it has settled. Each cell raises one fence and calls one
