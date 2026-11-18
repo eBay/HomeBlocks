@@ -124,8 +124,11 @@ public:
     int reclaim_calls{0};
     bool reclaim_unsupported{false};
     bool fail_reclaim{false};
+    bool hold_reclaim{false}; // the next reclaim waits at reclaim_gate
+    sisl::async::value_awaitable< bool > reclaim_gate;
     async_status reclaim_upto(int64_t upto) override {
         ++reclaim_calls;
+        if (std::exchange(hold_reclaim, false)) co_await reclaim_gate;
         if (reclaim_unsupported)
             co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
         if (fail_reclaim) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -2130,6 +2133,62 @@ TEST_F(CraftRaftEntriesTest, ReclaimWaitsForTheFrontierToBePersisted) {
     store->fail_persist = false;
     ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
     EXPECT_EQ(dev_->reclaimed_upto(), 4);
+}
+
+// ── stop (destroy, shutdown) ──
+
+// A shutdown's stop waits out the apply in progress and leaves the queued entries unapplied, also those committed
+// after it: HomeStore's last checkpoint saves them as pending, for the restart to apply.
+TEST_F(CraftRaftEntriesTest, StopForAShutdownKeepsTheQueuedEntries) {
+    auto* store = with_store();
+    store->hold = true; // the first login's write-ahead persist waits at the gate
+    commit(1, make_header(CraftEntryType::InternalLogin), make_internal_login_key(1, 1));
+    commit(2, make_header(CraftEntryType::InternalLogin), make_internal_login_key(2, 2));
+    bool stopped = false;
+    homeblocks::detail::detach([](CraftReplDev& dev, bool& stopped) -> sisl::async::task< void > {
+        (void)co_await dev.stop(true /* keep_queued */);
+        stopped = true;
+    }(*dev_, stopped));
+    EXPECT_FALSE(stopped) << "the apply in progress wasn't waited out";
+    store->gate.complete(true);
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(dev_->term(), 1u) << "a queued entry applied";
+
+    commit(3, make_header(CraftEntryType::InternalLogin), make_internal_login_key(3, 3));
+    EXPECT_EQ(dev_->term(), 1u) << "an entry committed after the stop applied";
+    ASSERT_TRUE(homeblocks::detail::sync_get(persist()).has_value());
+    std::vector< int64_t > pending;
+    for (auto const& e : store->saved->pending)
+        pending.push_back(e.raft_idx);
+    EXPECT_EQ(pending, (std::vector< int64_t >{2, 3}));
+
+    (void)homeblocks::detail::sync_get(dev_->stop_apply()); // empties the queue for the teardown's invariant check
+}
+
+// A stop waits out the journal reclaim in progress, and no reclaim runs after it.
+TEST_F(CraftRaftEntriesTest, StopEndsTheJournalReclaim) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    journal_->hold_reclaim = true;
+    ASSERT_TRUE(keep_alive_with(*dev_, 6).has_value()); // its reclaim to 6 waits at the gate
+    ASSERT_EQ(journal_->reclaim_calls, 1);
+
+    bool stopped = false;
+    homeblocks::detail::detach([](CraftReplDev& dev, bool& stopped) -> sisl::async::task< void > {
+        (void)co_await dev.stop(false /* keep_queued */);
+        stopped = true;
+    }(*dev_, stopped));
+    EXPECT_FALSE(stopped) << "the reclaim in progress wasn't waited out";
+    journal_->reclaim_gate.complete(true);
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(dev_->reclaimed_upto(), 6);
+
+    ASSERT_TRUE(keep_alive_with(*dev_, 10).has_value());
+    EXPECT_EQ(journal_->reclaim_calls, 1) << "a reclaim ran after the stop";
 }
 
 // A backend that can't reclaim is asked once; a failed reclaim is tried again on the next trigger.

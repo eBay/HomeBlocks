@@ -2309,6 +2309,30 @@ async_status CraftReplDev::stop_apply() {
     co_return ok();
 }
 
+async_status CraftReplDev::stop(bool keep_queued) {
+    if (keep_queued) {
+        bool wait;
+        {
+            std::lock_guard lk{apply_mu_};
+            apply_paused_ = true; // the drainer ends after the apply in progress; what commits now stays queued
+            wait = apply_running_;
+            if (wait) apply_idle_wanted_ = true;
+        }
+        if (wait) co_await apply_idle_;
+    } else {
+        (void)co_await stop_apply();
+    }
+    shared< sisl::async::value_awaitable< bool > > reclaimed;
+    {
+        std::lock_guard lk{state_mu_};
+        reclaim_stopped_ = true;
+        if (reclaim_running_) reclaimed = reclaim_idle_ = std::make_shared< sisl::async::value_awaitable< bool > >();
+    }
+    if (reclaimed) co_await *reclaimed;
+    watchdog_token_.cancel(/* wait = */ true);
+    co_return ok();
+}
+
 #ifdef _PRERELEASE
 void CraftReplDev::pause_apply() {
     std::lock_guard lk{apply_mu_};
@@ -2751,7 +2775,8 @@ int64_t CraftReplDev::reclaim_floor_locked() const {
 void CraftReplDev::request_reclaim() {
     {
         std::lock_guard lk{state_mu_};
-        if (reclaim_running_ || reclaim_unsupported_ || reclaim_floor_locked() <= reclaimed_upto_) return;
+        if (reclaim_running_ || reclaim_unsupported_ || reclaim_stopped_ || reclaim_floor_locked() <= reclaimed_upto_)
+            return;
         reclaim_running_ = true;
     }
     detail::detach(run_reclaim());
@@ -2760,14 +2785,17 @@ void CraftReplDev::request_reclaim() {
 // The one runner: reclaims to the current floor, and again while the floor keeps rising meanwhile.
 async_status CraftReplDev::run_reclaim() {
     auto self = shared_from_this();
+    shared< sisl::async::value_awaitable< bool > > idle; // a stop() waiting for this runner to end
+    status ended = ok();
     for (;;) {
         int64_t floor;
         {
             std::lock_guard lk{state_mu_};
             floor = reclaim_floor_locked();
-            if (floor <= reclaimed_upto_) {
+            if (reclaim_stopped_ || floor <= reclaimed_upto_) {
                 reclaim_running_ = false;
-                co_return ok();
+                idle = std::exchange(reclaim_idle_, nullptr);
+                break;
             }
         }
         // An escaping exception would end the runner with reclaim_running_ still set: no reclaim would run again.
@@ -2786,11 +2814,15 @@ async_status CraftReplDev::run_reclaim() {
                 LOGE("journal reclaim to {} failed: {} -- tried again on the next trigger", floor, r.error().message());
             }
             reclaim_running_ = false;
-            co_return r;
+            idle = std::exchange(reclaim_idle_, nullptr);
+            ended = r;
+            break;
         }
         reclaimed_upto_ = floor;
         LOGD("journal reclaimed to {}", floor);
     }
+    if (idle) idle->complete(true); // outside the lock: resumes stop()
+    co_return ended;
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────

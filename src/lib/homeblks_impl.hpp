@@ -224,6 +224,8 @@ public:
     sisl::async::task< void > craft_reattaches_done();
     // CRAFT, end of init: waits for every reattach, then gives up the devices whose journal never replayed.
     void finish_craft_reattach();
+    // CRAFT, at shutdown: stops every CRAFT device (CraftReplDev::stop), keeping their queued entries.
+    void stop_craft_devices();
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;

@@ -557,9 +557,14 @@ public:
     homestore::repl_dev_listener& raft_listener() { return raft_listener_; }
 
     // Stops applying committed RAFT entries: waits out the one being applied, and fails the queued ones and any that
-    // commit later with operation_canceled, unapplied. volume::destroy() calls it (once) before tearing down the index
-    // and journal the applies use.
+    // commit later with operation_canceled, unapplied.
     async_status stop_apply();
+
+    // Stops everything the device runs on its own, before what it works on goes away: the applies (waiting out the one
+    // in progress), the journal reclaim (waiting out a running one) and the watchdog. keep_queued, for a shutdown: the
+    // queued entries, and any that commit later, stay queued unapplied, for HomeStore's last checkpoint to save with
+    // the partition's state. Otherwise, for a destroy, they fail as in stop_apply(). Called once.
+    async_status stop(bool keep_queued);
 
     // Restart recovery: restores the durable state (restore_state()), rebuilds the overlay, then queues again the
     // entries the image holds as committed but not applied. Client I/O is rejected (OFFLINE) until it completes; a
@@ -825,7 +830,7 @@ private:
     std::deque< PendingApply > apply_queue_; // guarded by apply_mu_
     bool apply_running_{false};              // guarded by apply_mu_: a drainer is active
     bool apply_stopped_{false};              // guarded by apply_mu_
-    bool apply_paused_{false};               // guarded by apply_mu_; set only by the test seam pause_apply()
+    bool apply_paused_{false};               // guarded by apply_mu_; set by stop(keep_queued) and pause_apply()
     bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
     sisl::async::value_awaitable< bool > apply_idle_;
     // RAFT entries at or below this were applied before the restart, or are queued again from the restored image: the
@@ -1155,6 +1160,9 @@ private:
     int64_t persisted_durable_commit_{-1}; // durable_commit_lsn as last persisted: the floor's input
     bool reclaim_running_{false};          // a run_reclaim() is active
     bool reclaim_unsupported_{false};      // the backend said not_supported: stop asking
+    bool reclaim_stopped_{false};          // stop(): no reclaim runs anymore
+    // Completed when the running reclaim ends, for a stop() waiting for it.
+    shared< sisl::async::value_awaitable< bool > > reclaim_idle_;
 };
 
 } // namespace homeblocks

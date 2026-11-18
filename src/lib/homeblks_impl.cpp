@@ -167,6 +167,8 @@ void HomeBlocksImpl::shutdown() {
         shutdown_timer_hdl_ = iomgr::null_timer_handle;
     }
 
+    stop_craft_devices();
+
     // set the shutdown flag so that no new requests are accepted;
     sb_->set_flag(SB_FLAGS_GRACEFUL_SHUTDOWN);
     sb_.write();
@@ -642,6 +644,21 @@ sisl::async::task< void > HomeBlocksImpl::craft_reattaches_done() {
         reattached = craft_reattached_;
     }
     if (reattached) co_await *reattached;
+}
+
+// Before HomeStore shuts down: nothing a CRAFT device runs on its own may touch HomeStore after it. The entries still
+// queued stay queued, for HomeStore's last checkpoint to save with each partition's state.
+void HomeBlocksImpl::stop_craft_devices() {
+    std::vector< volume_handle > vols;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        for (auto const& [id, vol] : vol_map_) {
+            if (vol->is_craft()) { vols.push_back(vol); }
+        }
+    }
+    for (auto const& vol : vols) {
+        if (auto* const dev = vol->craft_dev()) { (void)detail::sync_get(dev->stop(true /* keep_queued */)); }
+    }
 }
 
 void HomeBlocksImpl::finish_craft_reattach() {

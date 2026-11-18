@@ -338,16 +338,17 @@ sisl::async::task< void > volume::destroy() {
     LOGI("Start destroying volume: {}, uuid: {}", vol_info_->name, boost::uuids::to_string(id()));
 
     // The CRAFT device goes before the index and journal it works on: no CRAFT op runs anymore (each one counts itself
-    // in flight on the volume, and the destroy starts only when none is), no committed RAFT entry applies anymore
-    // (stop_apply() waits out the one in progress), and its watchdog stops with it. Its durable state record goes first
-    // of all on disk: removed after the superblock, a crash in between would leave it behind for good.
+    // in flight on the volume, and the destroy starts only when none is), no committed RAFT entry applies anymore, and
+    // neither its journal reclaim nor its watchdog runs (stop() waits out what is in progress). Its durable state
+    // record goes first of all on disk: removed after the superblock, a crash in between would leave it behind for
+    // good.
     {
         std::lock_guard lk{craft_hold_mu_};
         craft_held_.clear(); // held for a device that won't come
         craft_dev_expected_ = false;
     }
     if (craft_dev_) {
-        (void)co_await craft_dev_->stop_apply();
+        (void)co_await craft_dev_->stop(false /* keep_queued */);
         craft_dev_->destroy_state();
     } else if (!craft_state_sb_.is_empty()) {
         craft_state_sb_.destroy(); // never reattached (e.g. a destroy resumed after a crash): the record loaded at boot
