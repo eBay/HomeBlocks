@@ -86,10 +86,12 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
         start_volume_removal(id);
     } else if (vol_ptr->is_craft()) {
-        // Only now that its index table is installed: the CraftReplDev made once HomeStore has started keeps it
-        // (reattach_craft_volumes). A CRAFT volume torn down above leaves its journal unopened, and HomeStore purges
-        // it.
-        vol_ptr->reopen_craft_journal();
+        // Only now that its index table is installed: the CraftReplDev made once the journal replays keeps it. A CRAFT
+        // volume torn down above leaves its journal unopened, and HomeStore purges it.
+        vol_ptr->reopen_craft_journal(
+            [this, weak = std::weak_ptr< volume >(vol_ptr)](shared< homestore::home_log_store > journal) {
+                if (auto vol = weak.lock()) { on_craft_journal_replayed(std::move(vol), std::move(journal)); }
+            });
     }
 }
 

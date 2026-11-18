@@ -16,8 +16,10 @@
 #include <algorithm>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/nil_generator.hpp>
+#include <thread>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/drive.hpp>
+#include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/replication_service.hpp>
@@ -38,7 +40,7 @@ result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
     // TODO: surface operational init failures (on_svc_id RPC, device open, format) as result<> errors rather than
     // aborting inside init_homestore(); precondition bugs (e.g. no devices) stay asserts.
     inst->init_homestore();
-    inst->reattach_craft_volumes();
+    inst->finish_craft_reattach();
     inst->start_reaper_thread();
     HomeBlocksImpl::s_instance_ = inst;
     return inst;
@@ -488,7 +490,8 @@ void HomeBlocksImpl::on_init_complete() {
     // Add anything that needs to be done here.
     using namespace homestore;
 
-    // While HomeStore starts, ahead of its log replay: a CreateVolume the replay applies makes a CRAFT device then.
+    // While HomeStore starts: the checkpoint that ends its start waits, through this consumer, for the CRAFT partitions
+    // to be reattached, so it can't cover the entries they hold meanwhile.
     init_cp();
 
     // CRAFT state records, ahead of the volumes that take them
@@ -561,6 +564,9 @@ void HomeBlocksImpl::init_cp() {
 // ponytail: one meta blk write per CRAFT volume per checkpoint, in turn (the meta service serializes them anyway); skip
 // the unchanged ones if checkpoints get slow with many partitions.
 sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
+    // A volume being reattached holds the entries committed meanwhile, which this checkpoint may cover: they reach its
+    // device, whose state is saved below with them, first.
+    co_await craft_reattaches_done();
     std::vector< volume_handle > vols;
     {
         auto lg = std::shared_lock(vol_lock_);
@@ -591,7 +597,55 @@ uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
     }
 }
 
-void HomeBlocksImpl::reattach_craft_volumes() {
+// Counted from the replay on, so a checkpoint that ends HomeStore's start already waits for it. Every journal reopened
+// at load replays during HomeStore's start: by the time init waits, every reattach is counted.
+void HomeBlocksImpl::on_craft_journal_replayed(volume_handle vol, shared< homestore::home_log_store > journal) {
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        if (craft_reattaching_++ == 0) craft_reattached_ = std::make_shared< sisl::async::shared_awaitable< bool > >();
+    }
+    // A worker, not the replay's thread: HomeStore holds the log device locked, and its start goes on meanwhile.
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, vol = std::move(vol), journal]() mutable {
+        detail::detach(reattach_craft_volume(std::move(vol), std::move(journal)));
+    });
+}
+
+sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vol,
+                                                                shared< homestore::home_log_store > journal) {
+#ifdef _PRERELEASE
+    // Holds the reattach, for a test to commit entries meanwhile. It resumes from a message on a worker, as it started:
+    // the flip's timer fires on a reactor where it would otherwise run inline, so a thread sends it.
+    if (auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
+        iomgr_flip::instance()->delay_flip("craft_reattach_delay", [held]() {
+            std::thread([held]() {
+                iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
+            }).detach();
+        })) {
+        co_await *held;
+    }
+#endif
+    if (auto const r = co_await vol->reattach_craft_dev(std::move(journal)); !r) {
+        COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
+    }
+    shared< sisl::async::shared_awaitable< bool > > done;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        if (--craft_reattaching_ == 0) done = std::exchange(craft_reattached_, nullptr);
+    }
+    if (done) done->complete(true); // outside the lock: resumes the waiters
+}
+
+sisl::async::task< void > HomeBlocksImpl::craft_reattaches_done() {
+    shared< sisl::async::shared_awaitable< bool > > reattached;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        reattached = craft_reattached_;
+    }
+    if (reattached) co_await *reattached;
+}
+
+void HomeBlocksImpl::finish_craft_reattach() {
+    detail::sync_get(craft_reattaches_done());
     std::vector< volume_handle > vols;
     {
         auto lg = std::shared_lock(vol_lock_);
@@ -600,7 +654,7 @@ void HomeBlocksImpl::reattach_craft_volumes() {
         }
     }
     for (auto const& vol : vols) {
-        detail::sync_get(vol->reattach_craft_dev());
+        vol->abandon_craft_hold();
     }
 }
 

@@ -124,13 +124,14 @@ public:
     std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
 
 private:
-    // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).
-    volume_handle craft_volume(int64_t lsn) const;
+    // The volume whose published CraftReplDev this group's entries go to, or null.
+    volume_handle craft_volume() const;
 
     HomeBlocksImpl* hb_;
     homestore::group_id_t group_id_;
     std::atomic< bool > replaying_;
     std::atomic_flag snapshot_refusal_logged_{};
+    std::atomic_flag entries_dropped_logged_{};
     std::mutex snapshot_mu_;
     std::shared_ptr< homestore::snapshot_context > last_snapshot_; // guarded by snapshot_mu_
 };

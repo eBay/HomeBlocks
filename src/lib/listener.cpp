@@ -57,9 +57,9 @@ static bool is_create_volume(sisl::blob const& header) {
         reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type == CraftEntryType::CreateVolume;
 }
 
-volume_handle CraftGroupListener::craft_volume(int64_t lsn) const {
+// Only a published device has anything to roll back or fail: committed entries are all it is ever handed.
+volume_handle CraftGroupListener::craft_volume() const {
     if (auto vol = hb_->get_volume(group_id_); vol && (*vol)->craft_dev()) { return *vol; }
-    LOGW("group={} lsn={}: no CRAFT volume on this node (yet), entry dropped", boost::uuids::to_string(group_id_), lsn);
     return nullptr;
 }
 
@@ -68,8 +68,13 @@ void CraftGroupListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::
                                    cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
         hb_->on_create_volume_commit(lsn, key, ctx, replaying_.load());
-    } else if (auto vol = craft_volume(lsn)) {
-        vol->craft_dev()->raft_listener().on_commit(lsn, header, key, blkids, ctx);
+    } else if (auto vol = hb_->get_volume(group_id_);
+               !vol || !(*vol)->deliver_craft_entry(lsn, header, key, blkids, ctx)) {
+        // No replica here, and none coming (its local create failed, or it is being destroyed): reported once.
+        if (!entries_dropped_logged_.test_and_set()) {
+            LOGW("group={} lsn={}: no CRAFT replica on this node, the group's committed entries are dropped",
+                 boost::uuids::to_string(group_id_), lsn);
+        }
     }
 }
 
@@ -77,7 +82,7 @@ void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl
                                      cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
         create_volume_ctx::complete(ctx, std::unexpected(std::errc::operation_canceled));
-    } else if (auto vol = craft_volume(lsn)) {
+    } else if (auto vol = craft_volume()) {
         vol->craft_dev()->raft_listener().on_rollback(lsn, header, key, ctx);
     }
 }
@@ -152,7 +157,7 @@ void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob 
                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
         create_volume_ctx::complete(ctx, std::unexpected(error));
-    } else if (auto vol = craft_volume(-1)) {
+    } else if (auto vol = craft_volume()) {
         vol->craft_dev()->raft_listener().on_error(error, header, key, ctx);
     }
 }

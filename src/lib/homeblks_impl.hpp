@@ -55,6 +55,8 @@ public:
                        "replaces this member");
         REGISTER_COUNTER(craft_leaderships_handed_off,
                          "RAFT leaderships this node handed to another member, having no replica of the volume");
+        REGISTER_COUNTER(craft_recoveries_failed,
+                         "CRAFT partitions whose recovery at restart failed: faulted, they refuse I/O until replaced");
         register_me_to_farm();
     }
     ~HomeBlocksMetrics() { deregister_me_from_farm(); }
@@ -107,6 +109,11 @@ private:
     // CRAFT durable state records read at boot, by volume id, until their volumes take them. Only on_init_complete()
     // uses it, reading the records and then the volumes on one thread.
     std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > craft_state_sbs_;
+
+    // CRAFT reattaches started and not done yet, and what their waiters await: completed when the count drops to 0.
+    std::mutex craft_reattach_mu_;
+    uint32_t craft_reattaching_{0};                                             // guarded by craft_reattach_mu_
+    shared< sisl::async::shared_awaitable< bool > > craft_reattached_{nullptr}; // guarded by craft_reattach_mu_
 
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
@@ -208,9 +215,15 @@ public:
     }
 
     void start_reaper_thread();
-    // CRAFT: gives every CRAFT volume loaded at boot its device, recovered, once HomeStore has started (and replayed
-    // their journals). Blocks until all are done: init_homeblocks returns with the partitions recovered.
-    void reattach_craft_volumes();
+    // CRAFT: a volume loaded at boot has its journal replayed: its device is made and recovered on a worker
+    // (reattach_craft_volume), counted until published. HomeStore calls this from the replay, with the log device
+    // locked.
+    void on_craft_journal_replayed(volume_handle vol, shared< homestore::home_log_store > journal);
+    // CRAFT: once no reattach is pending. A checkpoint's flush waits for this, so it never covers entries a volume
+    // holds for its device.
+    sisl::async::task< void > craft_reattaches_done();
+    // CRAFT, end of init: waits for every reattach, then gives up the devices whose journal never replayed.
+    void finish_craft_reattach();
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;
@@ -274,6 +287,8 @@ private:
     // Coroutine driving the actual volume teardown (co_awaits volume::destroy); launched via detach on a
     // worker reactor by remove_volume so the reactor yields during the destroy's CP flush instead of parking.
     sisl::async::task< void > do_remove_volume(volume_id_t id);
+    // CRAFT: one volume's reattach (volume::reattach_craft_dev), counted in craft_reattaching_.
+    sisl::async::task< void > reattach_craft_volume(volume_handle vol, shared< homestore::home_log_store > journal);
     // Starts a volume's teardown (do_remove_volume) on a worker. False if the system is restricted or shutting down.
     bool start_volume_removal(volume_id_t const& id);
 

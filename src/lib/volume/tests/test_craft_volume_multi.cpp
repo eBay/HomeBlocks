@@ -364,6 +364,52 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
     ASSERT_TRUE(sync());
 }
 
+#ifdef _PRERELEASE
+// A restarting member holds what its group commits until its device has recovered, then applies it in log order: here
+// a login committed while it was down, which it gets when it rejoins, during a reattach held for 10 seconds.
+TEST_F(CraftVolumeMultiTest, EntriesCommittedBeforeTheReattachAreHeld) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(6);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(6)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
+        CraftEntryHeader hdr{CraftEntryType::InternalLogin};
+        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto const st = homeblocks::detail::sync_get(
+            proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
+                              sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+        ASSERT_TRUE(st) << st.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        g_helper->set_delay_flip("craft_reattach_delay", 10 * 1000 * 1000 /* usec */, 1000 /* every volume */);
+        g_helper->start();
+        g_helper->remove_flip("craft_reattach_delay");
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        ASSERT_NE((*vol)->craft_dev(), nullptr) << "init returned before the reattach";
+        EXPECT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        EXPECT_EQ((*vol)->craft_dev()->client_token(), 42u);
+    }
+    ASSERT_TRUE(sync());
+}
+#endif
+
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
 // settings directory each (they rewrite their settings files at startup).
 static std::vector< pid_t > start_members(std::vector< std::string > const& args, std::string const& shm_name) {

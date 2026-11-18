@@ -244,14 +244,23 @@ public:
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
     // CRAFT recovery, at load: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and
-    // keeps its store once HomeStore's log replay has replayed it.
-    void reopen_craft_journal();
+    // hands its store to `replayed` once HomeStore's log replay has replayed it. HomeStore calls that with the log
+    // device locked: it only passes the store on. From here on the volume expects its device: the committed entries
+    // that reach it meanwhile are held for it.
+    void reopen_craft_journal(std::function< void(shared< homestore::home_log_store >) > replayed);
     // CRAFT recovery, at load: the volume's durable state record (none if it never persisted one).
     void adopt_craft_state(superblk< craft_state_sb_t > sb) { craft_state_sb_ = std::move(sb); }
-    // CRAFT recovery, once HomeStore has started: makes the CraftReplDev on the journal reopen_craft_journal() kept,
-    // the state record and the index table installed at load, recovers it, then publishes it. init_homeblocks waits for
-    // it.
-    sisl::async::task< void > reattach_craft_dev();
+    // CRAFT recovery: makes the CraftReplDev on the replayed journal, the state record and the index table installed at
+    // load, recovers it, hands it the entries held meanwhile in log order, then publishes it. Returns recover()'s
+    // outcome; on a failure the device is published faulted.
+    async_status reattach_craft_dev(shared< homestore::home_log_store > journal);
+    // CRAFT recovery: the device expected since the load won't come (its journal never replayed): drops what is held.
+    void abandon_craft_hold();
+    // CRAFT: an entry the volume's RAFT group committed, for its CraftReplDev: handed to it, or held until it is
+    // published while one is expected. False if this volume won't have one (being destroyed, or never reattached).
+    bool deliver_craft_entry(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                             std::vector< homestore::multi_blk_id > const& blkids,
+                             cintrusive< homestore::repl_req_ctx >& ctx);
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -338,8 +347,17 @@ private:
     bool journal_open_{false};                  // CRAFT: this boot created or reopened the volume's journal
     // CRAFT: the durable state record until the CraftReplDev's store takes it (empty if there is none yet).
     superblk< craft_state_sb_t > craft_state_sb_{craft_state_meta_name};
-    // CRAFT: the journal the log replay reopened, until reattach_craft_dev() makes the device on it.
-    shared< homestore::home_log_store > craft_journal_;
+    // CRAFT: the committed entries held for the device expected since the load, in log order. Publishing the device,
+    // or giving it up, clears them. Guarded by craft_hold_mu_, which also orders craft_dev_'s changes against them.
+    struct held_craft_entry {
+        int64_t lsn;
+        std::vector< uint8_t > header;
+        std::vector< uint8_t > key;
+        cintrusive< homestore::repl_req_ctx > ctx;
+    };
+    std::mutex craft_hold_mu_;
+    std::vector< held_craft_entry > craft_held_;
+    bool craft_dev_expected_{false};
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and
