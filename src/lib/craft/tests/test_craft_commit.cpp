@@ -33,6 +33,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
+#include "craft/craft_raft_entries.hpp"
 #include "craft/craft_repl_dev.hpp"
 #include "home_blks_config.hpp"
 #include "coro_helpers.hpp"
@@ -227,6 +228,28 @@ protected:
             }));
     }
 
+    // From here on commit() itself, and so the SyncRSCommitLSN apply, writes to index_.
+    void use_fake_index() {
+        dev_->set_index_fns_for_test(
+            [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+                return index_.write_to_index(s, e, info);
+            },
+            [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+                return index_.delete_lba_range(s, e, freed);
+            });
+    }
+
+    // Delivers a committed SyncRSCommitLSN as HomeStore does on a follower: no proposal of this member's to complete.
+    void commit_sync(int64_t rs_commit_lsn) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
+        intrusive< homestore::repl_req_ctx > const no_ctx;
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, no_ctx);
+    }
+
     // Real write() call -- the only way to populate the overlay (write()'s post-flight block does
     // it unconditionally, regardless of indx_tbl_). Backed by a shared static buffer since write()
     // computes a per-LBA CRC over it.
@@ -344,6 +367,27 @@ TEST_F(CraftCommitTest, EmptyVerdictRetiresOverlayEvenWhenThisReplicaHadTheData)
     EXPECT_EQ(dev_->commit_lsn(), 0);
     EXPECT_FALSE(index_.entries.count(5));   // never applied -- Empty beats data
     EXPECT_EQ(dev_->overlay_lsn_for(5), -1); // retired -- must not still be served on reads
+}
+
+// A SyncRSCommitLSN's advance applies each slot it passes to the index and retires its overlay entry. Moving commit_lsn
+// alone left the slots unapplied, and a read, which serves overlay entries only above commit_lsn, returned the index's
+// older value: here the old data instead of the new write, and the old data instead of the unmap's zeros.
+TEST_F(CraftCommitTest, SyncAdvanceAppliesSlotsToTheIndex) {
+    use_fake_index();
+    seed_index_entry(/*lba=*/0, /*blk_num=*/500, std::vector< uint8_t >(k_page_size, 0x11));
+    seed_index_entry(/*lba=*/1, /*blk_num=*/501, std::vector< uint8_t >(k_page_size, 0x22));
+    ASSERT_TRUE(do_write_data(0, /*dlsn=*/0, /*lba=*/0, /*nlbas=*/1).has_value()); // 0xAB
+    ASSERT_TRUE(do_write_zeros(0, /*dlsn=*/1, /*lba=*/1, /*nlbas=*/1).has_value());
+
+    commit_sync(/*rs_commit_lsn=*/1);
+
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1);
+    EXPECT_EQ(dev_->overlay_lsn_for(1), -1);
+    auto r = do_read(/*read_lsn=*/1, /*lba=*/0, /*nlbas=*/2);
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(dest_buf_[0], 0xAB) << "lba 0: the write's data, not the older index value";
+    EXPECT_EQ(dest_buf_[k_page_size], 0x00) << "lba 1: the unmap's zeros, not the older index value";
 }
 
 // all_zeros apply removes the index entry and reclaims its block.

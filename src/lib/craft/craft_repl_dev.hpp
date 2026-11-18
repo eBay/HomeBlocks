@@ -494,6 +494,12 @@ public:
     // logic (in-order apply, stall at a gap, Empty-slot skip, overlay retirement) against a fake
     // index instead of a real VolumeIndexTable.
     async_result< int64_t > commit_with(int64_t upto_lsn, write_index_fn_t write_fn, delete_index_fn_t delete_fn);
+    // Test seam for commit() itself: from now on commit(), and so each of its callers (the SyncRSCommitLSN apply
+    // included), applies slots through these instead of indx_tbl_.
+    void set_index_fns_for_test(write_index_fn_t write_fn, delete_index_fn_t delete_fn) {
+        test_write_fn_ = std::move(write_fn);
+        test_delete_fn_ = std::move(delete_fn);
+    }
 
     // Test seam for read(): runs the same read algorithm, but the index read operation is injected
     // rather than routed through indx_tbl_, so tests can exercise read()'s logic (index/overlay merge,
@@ -705,7 +711,8 @@ private:
     result< std::vector< int64_t > > install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
                                                                 std::vector< int64_t > const& empty_slots);
     // Its I/O, run by the apply queue: frees the voided slots' blocks, catches up the slots still missing at or below
-    // rs_commit_lsn from a peer, and advances commit_lsn.
+    // rs_commit_lsn from a peer, and advances commit_lsn through commit(), which applies each slot it passes to the
+    // index.
     async_status finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                            std::vector< int64_t > to_free);
     // Both halves back to back, for tests that apply a Sync without the queue.
@@ -720,8 +727,9 @@ private:
     // achieved commit_lsn. At most one run is ever active at a time (commit_running_); a concurrent
     // caller is a safe no-op since the in-flight run covers the same ground and every subsequent
     // write()/keep_alive() retries the advance. Callers: write()'s post-flight piggyback (best-effort,
-    // every outcome including real errors is ignored) and keep_alive() (propagates real errors, since
-    // advancing the frontier is its entire purpose -- a stall is still not an error there either).
+    // every outcome including real errors is ignored), keep_alive() (propagates real errors, since
+    // advancing the frontier is its entire purpose -- a stall is still not an error there either), and
+    // the SyncRSCommitLSN apply (finish_sync_rs_commit_lsn; logs an error).
     async_result< int64_t > commit(int64_t upto_lsn);
 
     // Core apply-one-slot algorithm behind commit(), parameterized by the index write/delete
@@ -740,8 +748,8 @@ private:
     // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
     // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
     // same commit_lsn_snapshot. Safe without state_mu_ held. Shared by every commit_lsn-advance path:
-    // commit_impl() (covers write()'s piggyback and keep_alive()) and apply_sync_rs_commit_lsn()'s own
-    // walk-forward loop.
+    // commit_impl() (covers write()'s piggyback, keep_alive() and the SyncRSCommitLSN apply) and
+    // finish_sync_rs_commit_lsn()'s walk-forward loop, which runs only without an index.
     void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
 
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
@@ -954,6 +962,8 @@ private:
     iomgr::timer_token watchdog_token_;
 #ifdef _PRERELEASE
     std::atomic< int > watchdog_fire_count_{0}; // test-only; never present in production binaries
+    write_index_fn_t test_write_fn_;            // set_index_fns_for_test(); test-only
+    delete_index_fn_t test_delete_fn_;
 #endif
     checkpoint_trigger_fn_t checkpoint_trigger_{}; // empty until production wiring; unit tests inject a mock
     int64_t checkpoint_lsn_interval_{128};         // commit_lsn delta between checkpoint triggers; see
@@ -962,7 +972,7 @@ private:
                                       // FIXME(S8/SDSTOR-22745): defaults to -1 in lockstep with state_.commit_lsn
                                       // When S8 wires recovering commit_lsn from the journal/superblock on restart,
                                       // seed this to the recovered commit_lsn too (not -1), or the first post-
-                                      // restart apply_sync_rs_commit_lsn will unconditionally fire a checkpoint
+                                      // restart commit_lsn advance will unconditionally fire a checkpoint
                                       // regardless of how recently one actually happened before the crash.
 };
 

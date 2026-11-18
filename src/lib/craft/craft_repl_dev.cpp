@@ -969,8 +969,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
 
 // ─── proactive checkpoint trigger (SDSTOR-22888) ─────────────────────────────
 //
-// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback and
-// keep_alive() -- and apply_sync_rs_commit_lsn()'s own walk-forward loop) so a checkpoint fires
+// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback, keep_alive()
+// and the SyncRSCommitLSN apply -- and finish_sync_rs_commit_lsn()'s index-less walk) so a checkpoint fires
 // regardless of which path is driving commit_lsn forward. Split into a locked check and an unlocked
 // fire because the fire awaits (via detail::detach) and must not run with state_mu_ held.
 
@@ -1156,6 +1156,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
 }
 
 async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
+#ifdef _PRERELEASE
+    if (test_write_fn_) co_return co_await commit_impl(upto_lsn, test_write_fn_, test_delete_fn_);
+#endif
     if (!indx_tbl_) {
         // No index configured (write-path-only tests): nothing to apply, no-op safely.
         std::lock_guard lk{state_mu_};
@@ -2740,6 +2743,25 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
     // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
+    //
+    // With an index, the advance goes through commit(), which applies each slot it passes to the index (same rule:
+    // skip Empty, stop at Missing) and retires its overlay entry. Moving commit_lsn without that left those slots
+    // unapplied: commit() never revisits a slot below commit_lsn, and a read serves overlay entries only above it, so
+    // a read of such an LBA returned the older index value. A commit() already running is left to finish; until the
+    // next write, keep_alive or Sync carries the advance further, reads still find the slots in the overlay.
+    bool has_index = indx_tbl_ != nullptr;
+#ifdef _PRERELEASE
+    has_index = has_index || static_cast< bool >(test_write_fn_);
+#endif
+    if (has_index) {
+        if (auto r = co_await commit(rs_commit_lsn); !r) {
+            LOGE("apply_sync_rs_commit_lsn: commit({}) failed: {}", rs_commit_lsn, r.error().message());
+        } else {
+            LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
+        }
+        co_return ok();
+    }
+    // No index (the write-path-only unit tests): nothing to apply, the frontier alone moves.
     int64_t commit_lsn_snapshot;
     bool should_checkpoint;
     {
