@@ -243,6 +243,11 @@ public:
     // engine object, NOT a craft::craft_replica: that interface is the CLIENT's view of a member and belongs on
     // the far side of the wire.
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
+    // The same, safe to read while a destroy may reset it; held, the device outlives that reset.
+    shared< CraftReplDev > craft_dev_ref() const {
+        std::lock_guard lk{craft_hold_mu_};
+        return craft_dev_;
+    }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
     // CRAFT recovery, at load: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and
     // hands its store to `replayed` once HomeStore's log replay has replayed it. HomeStore calls that with the log
@@ -356,7 +361,7 @@ private:
         std::vector< uint8_t > key;
         cintrusive< homestore::repl_req_ctx > ctx;
     };
-    std::mutex craft_hold_mu_;
+    mutable std::mutex craft_hold_mu_;
     std::vector< held_craft_entry > craft_held_;
     bool craft_dev_expected_{false};
 };

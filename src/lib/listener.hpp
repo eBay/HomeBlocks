@@ -124,8 +124,8 @@ public:
     std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
 
 private:
-    // The volume whose published CraftReplDev this group's entries go to, or null.
-    volume_handle craft_volume() const;
+    // The published CraftReplDev this group's entries go to, or null; held, it outlives a destroy's reset.
+    shared< CraftReplDev > craft_device() const;
 
     HomeBlocksImpl* hb_;
     homestore::group_id_t group_id_;

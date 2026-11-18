@@ -58,8 +58,8 @@ static bool is_create_volume(sisl::blob const& header) {
 }
 
 // Only a published device has anything to roll back or fail: committed entries are all it is ever handed.
-volume_handle CraftGroupListener::craft_volume() const {
-    if (auto vol = hb_->get_volume(group_id_); vol && (*vol)->craft_dev()) { return *vol; }
+shared< CraftReplDev > CraftGroupListener::craft_device() const {
+    if (auto vol = hb_->get_volume(group_id_)) { return (*vol)->craft_dev_ref(); }
     return nullptr;
 }
 
@@ -82,8 +82,8 @@ void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl
                                      cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
         create_volume_ctx::complete(ctx, std::unexpected(std::errc::operation_canceled));
-    } else if (auto vol = craft_volume()) {
-        vol->craft_dev()->raft_listener().on_rollback(lsn, header, key, ctx);
+    } else if (auto const dev = craft_device()) {
+        dev->raft_listener().on_rollback(lsn, header, key, ctx);
     }
 }
 
@@ -157,8 +157,8 @@ void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob 
                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     if (is_create_volume(header)) {
         create_volume_ctx::complete(ctx, std::unexpected(error));
-    } else if (auto vol = craft_volume()) {
-        vol->craft_dev()->raft_listener().on_error(error, header, key, ctx);
+    } else if (auto const dev = craft_device()) {
+        dev->raft_listener().on_error(error, header, key, ctx);
     }
 }
 

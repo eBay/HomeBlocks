@@ -576,8 +576,9 @@ sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
     for (auto const& vol : craft_volumes()) {
         // Counted in flight while saved: its destroy, which removes the state record, waits for it or is seen here.
         vol_io_guard const guard{vol};
-        auto* const dev = vol->craft_dev();
-        if (vol->is_destroying() || !dev) { continue; } // no device yet: nothing to save
+        if (vol->is_destroying()) { continue; }
+        auto const dev = vol->craft_dev_ref();
+        if (!dev) { continue; } // no device yet: nothing to save
         auto const saved = co_await dev->save_state();
         // The replication service records the checkpoint whatever this flush returns: stop rather than let it cover
         // entries whose state isn't durable.
@@ -654,9 +655,7 @@ std::vector< volume_handle > HomeBlocksImpl::craft_volumes() const {
 
 void HomeBlocksImpl::expire_overdue_craft_proposals() {
     for (auto const& vol : craft_volumes()) {
-        vol_io_guard const guard{vol}; // its destroy, which stops the device, waits for it or is seen here
-        auto* const dev = vol->craft_dev();
-        if (dev && !vol->is_destroying()) { dev->expire_overdue_proposals(); }
+        if (auto const dev = vol->craft_dev_ref()) { dev->expire_overdue_proposals(); }
     }
 }
 
@@ -664,7 +663,7 @@ void HomeBlocksImpl::expire_overdue_craft_proposals() {
 // queued stay queued, for HomeStore's last checkpoint to save with each partition's state.
 void HomeBlocksImpl::stop_craft_devices() {
     for (auto const& vol : craft_volumes()) {
-        if (auto* const dev = vol->craft_dev()) { (void)detail::sync_get(dev->stop(true /* keep_queued */)); }
+        if (auto const dev = vol->craft_dev_ref()) { (void)detail::sync_get(dev->stop(true /* keep_queued */)); }
     }
 }
 
