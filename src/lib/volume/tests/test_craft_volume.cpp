@@ -96,6 +96,19 @@ public:
         return pred();
     }
 
+    // Removes a volume a test is done with, so that the suite's small index chunks last: its group is destroyed
+    // through its leader, this node once its one-member group has elected it (again, after a restart).
+    static void remove(volume_id_t const& id) {
+        ASSERT_TRUE(wait_until(
+            [&id] {
+                auto const rd = group(id);
+                return rd != nullptr && rd->is_leader();
+            },
+            std::chrono::seconds(60)));
+        ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+        ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
+    }
+
     // An InternalLogin the volume's group committed at raft_lsn, handed to its device as HomeStore does. Straight to
     // the device: this node has no RAFT proposer yet.
     static void commit_login(volume_handle const& vol, uint64_t client_token, uint64_t term, int64_t raft_lsn) {
@@ -105,6 +118,44 @@ public:
         vol->craft_dev()->raft_listener().on_commit(
             raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
             sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}, {}, ctx);
+    }
+
+    // A SyncRSCommitLSN the volume's group committed at raft_lsn, without Empty verdicts, handed to its device as
+    // HomeStore does.
+    static void commit_sync(volume_handle const& vol, int64_t rs_commit_lsn, uint64_t client_token, int64_t raft_lsn) {
+        CraftEntryHeader header{CraftEntryType::SyncRSCommitLSN};
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, {});
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        vol->craft_dev()->raft_listener().on_commit(
+            raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
+            sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    }
+
+    static constexpr uint64_t k_page = 4096;
+
+    // Writes slot dlsn: one page at page dlsn, every byte 'a' + dlsn.
+    static status write_slot(volume_handle const& vol, craft::client_hdr const& hdr, int64_t dlsn) {
+        sisl::io_blob_safe data(k_page, 512);
+        std::memset(data.bytes(), 'a' + dlsn, k_page);
+        auto const w = homeblocks::detail::sync_get(
+            homeblocks::async_write(vol, hdr, dlsn, dlsn * k_page, k_page,
+                                    sisl::sg_list{.size = k_page, .iovs = {iovec{data.bytes(), k_page}}}));
+        if (!w) return std::unexpected(w.error());
+        return ok();
+    }
+
+    // Whether page dlsn reads back as write_slot() wrote it, at horizon read_lsn.
+    static bool reads_back(volume_handle const& vol, craft::client_hdr const& hdr, int64_t read_lsn, int64_t dlsn) {
+        sisl::io_blob_safe dest(k_page, 512);
+        auto const r = homeblocks::detail::sync_get(
+            homeblocks::async_read(vol, hdr, read_lsn, dlsn * k_page, k_page,
+                                   sisl::sg_list{.size = k_page, .iovs = {iovec{dest.bytes(), k_page}}}));
+        if (!r) {
+            LOGERROR("read of slot {} failed: {}", dlsn, r.error().message());
+            return false;
+        }
+        return std::all_of(dest.cbytes(), dest.cbytes() + k_page, [dlsn](uint8_t b) { return b == 'a' + dlsn; });
     }
 
     // The volumes with a CRAFT state record in the meta service, read as a boot reads them.
@@ -316,6 +367,7 @@ TEST_F(CraftVolumeTest, InitWaitsForTheReattach) {
     auto vol = hb()->get_volume(id);
     ASSERT_TRUE(vol);
     EXPECT_NE((*vol)->craft_dev(), nullptr);
+    remove(id);
 }
 #endif
 
@@ -338,6 +390,61 @@ TEST_F(CraftVolumeTest, SessionSurvivesRestarts) {
         EXPECT_EQ((*again)->craft_dev()->term(), 7u) << "restart " << i;
         EXPECT_EQ((*again)->craft_dev()->client_token(), 42u) << "restart " << i;
     }
+    remove(id);
+}
+
+// Writes a member acknowledged but nothing committed to the index yet live only in its journal: a restart rebuilds them
+// from it, and they read back.
+TEST_F(CraftVolumeTest, UnappliedJournalWritesSurviveARestart) {
+    auto info = craft_vol_info("craft_vol_journal_writes");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 3; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_NE((*again)->craft_dev(), nullptr);
+    EXPECT_EQ((*again)->craft_dev()->last_append_lsn(), 2);
+    EXPECT_EQ((*again)->craft_dev()->commit_lsn(), -1);
+    for (int64_t dlsn = 0; dlsn < 3; ++dlsn) {
+        EXPECT_TRUE(reads_back(*again, hdr, 2 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
+    remove(id);
+}
+
+// Slots a SyncRSCommitLSN committed to the index read back after a restart, as do those it left in the journal.
+TEST_F(CraftVolumeTest, CommittedSlotsSurviveARestart) {
+    auto info = craft_vol_info("craft_vol_committed_slots");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    commit_sync(*vol, 2 /* rs_commit_lsn */, 42 /* client_token */, 1001 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->commit_lsn() == 2; }));
+
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_NE((*again)->craft_dev(), nullptr);
+    EXPECT_EQ((*again)->craft_dev()->last_append_lsn(), 3);
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        EXPECT_TRUE(reads_back(*again, hdr, 3 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
+    remove(id);
 }
 
 // A RAFT entry a checkpoint covers is never replayed after a restart. One that hasn't applied yet survives in the
@@ -359,6 +466,7 @@ TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
     ASSERT_NE((*again)->craft_dev(), nullptr);
     ASSERT_TRUE(wait_until([&again] { return (*again)->craft_dev()->term() == 7; }));
     EXPECT_EQ((*again)->craft_dev()->client_token(), 42u);
+    remove(id);
 }
 
 // The group is destroyed (here directly; by the partition's removal or a create rollback in practice): each member's
