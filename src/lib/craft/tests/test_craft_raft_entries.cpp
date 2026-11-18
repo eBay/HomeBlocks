@@ -1639,16 +1639,19 @@ TEST(CraftDurableStateCodec, RejectsMalformedImages) {
     bad_version[8] ^= 0xff;
     EXPECT_FALSE(decode_durable_state(bad_version.data(), bad_version.size()).has_value());
 
-    // Verdicts must be strictly ascending and above durable_commit_lsn (1).
+    // Verdicts must be strictly ascending and not negative; at or below the frontier (1) is fine.
     size_t const first = good.size() - 2 * sizeof(int64_t);
-    int64_t const nine = 9, four = 4, one = 1;
+    int64_t const nine = 9, four = 4, one = 1, negative = -1;
     auto unsorted = good;
     std::memcpy(unsorted.data() + first, &nine, sizeof(nine));
     std::memcpy(unsorted.data() + first + sizeof(int64_t), &four, sizeof(four));
     EXPECT_FALSE(decode_durable_state(unsorted.data(), unsorted.size()).has_value());
+    auto below_zero = good;
+    std::memcpy(below_zero.data() + first, &negative, sizeof(negative));
+    EXPECT_FALSE(decode_durable_state(below_zero.data(), below_zero.size()).has_value());
     auto at_frontier = good;
     std::memcpy(at_frontier.data() + first, &one, sizeof(one));
-    EXPECT_FALSE(decode_durable_state(at_frontier.data(), at_frontier.size()).has_value());
+    EXPECT_TRUE(decode_durable_state(at_frontier.data(), at_frontier.size()).has_value());
 }
 
 // ── write-ahead persistence ──
@@ -1772,7 +1775,7 @@ TEST_F(CraftRaftEntriesTest, PersistFailureFailsItsCallers) {
 
 // ── durable commit frontier ──
 
-// A checkpoint that flushed makes commit_lsn the durable frontier, and drops the verdicts at or below it.
+// A checkpoint that flushed makes commit_lsn the durable frontier, and keeps the verdicts at or below it.
 TEST_F(CraftRaftEntriesTest, FlushedCheckpointRecordsTheDurableCommit) {
     auto* store = with_store();
     dev_->set_checkpoint_trigger(std::ref(trigger_));
@@ -1783,7 +1786,7 @@ TEST_F(CraftRaftEntriesTest, FlushedCheckpointRecordsTheDurableCommit) {
     EXPECT_EQ(trigger_.call_count, 1);
     ASSERT_TRUE(store->saved.has_value());
     EXPECT_EQ(store->saved->durable_commit_lsn, 12);
-    EXPECT_TRUE(store->saved->empty_lsns.empty());
+    EXPECT_EQ(store->saved->empty_lsns, (std::set< int64_t >{11, 12}));
 }
 
 // A checkpoint request that coalesced with a flush already running proves nothing about the slots applied since that
@@ -1898,6 +1901,21 @@ TEST_F(CraftRaftEntriesTest, RestartFaultsWhenItCantCommitALiveSlotsBlocks) {
     journal_->fail_commit = true;
     dev_->trigger_on_restart();
     EXPECT_TRUE(dev_->is_faulted());
+}
+
+// The verdicts at or below the durable frontier survive a restart too: a late write to a voided slot is still refused,
+// not acked as already written.
+TEST_F(CraftRaftEntriesTest, RestartKeepsTheVerdictsAtOrBelowTheFrontier) {
+    auto image = sample_state(); // frontier 1
+    image.empty_lsns = {0, 4};
+    restart(image, page_slots({1, 2, 3}));
+    ASSERT_FALSE(dev_->is_faulted());
+    EXPECT_TRUE(dev_->is_empty_slot(0));
+    auto const w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 3, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}));
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
 }
 
 // The Sync watermark can be above the journal tail: the slots up to it were never received here.

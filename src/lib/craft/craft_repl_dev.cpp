@@ -1060,9 +1060,9 @@ async_status CraftReplDev::advance_durable_commit(int64_t lsn) {
     {
         std::lock_guard lk{state_mu_};
         if (lsn <= durable_.durable_commit_lsn) co_return ok();
+        // The verdicts at or below it stay: a client that lost a resolution reply asks again, and a late write to a
+        // voided slot must still be refused, not acked as already written.
         durable_.durable_commit_lsn = lsn;
-        auto& empties = durable_.empty_lsns;
-        empties.erase(empties.begin(), empties.upper_bound(lsn));
     }
     if (auto r = co_await persist_state(); !r) {
         // Recorded in memory; the next persist writes it. The superseded blocks wait for a frontier that is durable.
@@ -2400,9 +2400,7 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
         found.push_back(fmt::format("durable commit frontier {} above commit_lsn {}", durable_.durable_commit_lsn,
                                     state_.commit_lsn));
     for (int64_t lsn : durable_.empty_lsns)
-        if (lsn <= durable_.durable_commit_lsn || !empty_lsns_.contains(lsn))
-            found.push_back(fmt::format("durable verdict {} is at or below its frontier {}, or not in effect", lsn,
-                                        durable_.durable_commit_lsn));
+        if (!empty_lsns_.contains(lsn)) found.push_back(fmt::format("durable verdict {} is not in effect", lsn));
     for (int64_t lsn : empty_lsns_)
         if (missing_lsns_.contains(lsn)) found.push_back(fmt::format("lsn {} is both missing and Empty", lsn));
 
@@ -2604,11 +2602,11 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
                         .last_applied_raft_idx = h.last_applied_raft_idx,
                         .durable_commit_lsn = h.durable_commit_lsn,
                         .sync_watermark = h.sync_watermark};
-    int64_t prev = s.durable_commit_lsn;
+    int64_t prev = -1;
     for (uint32_t i = 0; i < h.n_empty; ++i) {
         int64_t lsn;
         std::memcpy(&lsn, buf + sizeof(h) + i * sizeof(int64_t), sizeof(lsn));
-        if (lsn <= prev) return std::nullopt; // strictly ascending, and above the frontier
+        if (lsn <= prev) return std::nullopt; // strictly ascending, and not negative
         s.empty_lsns.insert(s.empty_lsns.end(), lsn);
         prev = lsn;
     }
@@ -3189,13 +3187,12 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
     }
     state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
 
-    // The image takes the verdicts (above its frontier) and the watermark now, with the state change: every block a
-    // verdict voids, here or by a write or fill it beats, is freed only once an image holding the verdict is durable
-    // (free_voided()). Without a store the verdicts aren't kept: nothing would ever prune them.
-    if (state_store_) {
-        for (int64_t lsn : empty_slots)
-            if (lsn > durable_.durable_commit_lsn) durable_.empty_lsns.insert(lsn);
-    }
+    // The image takes the verdicts and the watermark now, with the state change: every block a verdict voids, here or
+    // by a write or fill it beats, is freed only once an image holding the verdict is durable (free_voided()). It keeps
+    // them as long as empty_lsns_ does. Without a store nothing is persisted.
+    // ponytail: every verdict for the partition's lifetime, in memory and in the image; prune below the client's
+    // acknowledged commit if Empty verdicts ever pile up.
+    if (state_store_) durable_.empty_lsns.insert(empty_slots.begin(), empty_slots.end());
     durable_.sync_watermark = std::max(durable_.sync_watermark, rs_commit_lsn);
 
     // The voided slots stop being readable now, not once their blocks are freed: commit never retires their overlay

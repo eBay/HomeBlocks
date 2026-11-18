@@ -309,7 +309,7 @@ struct CraftDurableState {
     int64_t last_applied_raft_idx{-1}; // RAFT entries at or below were applied: a replay of one is skipped
     int64_t durable_commit_lsn{-1};    // commit frontier covered by a completed checkpoint
     int64_t sync_watermark{-1};        // highest SyncRSCommitLSN rs_commit_lsn applied; last_append_lsn >= this
-    std::set< int64_t > empty_lsns{};  // Empty verdicts above durable_commit_lsn (at or below it they no longer matter)
+    std::set< int64_t > empty_lsns{};  // every Empty verdict, as empty_lsns_ (a late write or a resolution retry asks)
     // The RAFT entries committed but not yet applied when the image was taken, in log order. The RAFT log replay after
     // a restart starts above the last checkpoint, which may cover them: a restart applies those above
     // last_applied_raft_idx again from here. Taken by every persist; the in-memory image leaves it empty.
