@@ -167,6 +167,10 @@ void HomeBlocksImpl::shutdown() {
         shutdown_timer_hdl_ = iomgr::null_timer_handle;
     }
 
+    if (craft_sweep_timer_hdl_ != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(craft_sweep_timer_hdl_, true /* wait: a sweep in progress finishes */);
+        craft_sweep_timer_hdl_ = iomgr::null_timer_handle;
+    }
     stop_craft_devices();
 
     // set the shutdown flag so that no new requests are accepted;
@@ -569,14 +573,7 @@ sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
     // A volume being reattached holds the entries committed meanwhile, which this checkpoint may cover: they reach its
     // device, whose state is saved below with them, first.
     co_await craft_reattaches_done();
-    std::vector< volume_handle > vols;
-    {
-        auto lg = std::shared_lock(vol_lock_);
-        for (auto const& [id, vol] : vol_map_) {
-            if (vol->is_craft()) { vols.push_back(vol); }
-        }
-    }
-    for (auto const& vol : vols) {
+    for (auto const& vol : craft_volumes()) {
         // Counted in flight while saved: its destroy, which removes the state record, waits for it or is seen here.
         vol_io_guard const guard{vol};
         auto* const dev = vol->craft_dev();
@@ -626,7 +623,7 @@ sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vo
         co_await *held;
     }
 #endif
-    if (auto const r = co_await vol->reattach_craft_dev(std::move(journal)); !r) {
+    if (auto const r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid()); !r) {
         COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
     }
     shared< sisl::async::shared_awaitable< bool > > done;
@@ -646,31 +643,34 @@ sisl::async::task< void > HomeBlocksImpl::craft_reattaches_done() {
     if (reattached) co_await *reattached;
 }
 
+std::vector< volume_handle > HomeBlocksImpl::craft_volumes() const {
+    std::vector< volume_handle > vols;
+    auto lg = std::shared_lock(vol_lock_);
+    for (auto const& [id, vol] : vol_map_) {
+        if (vol->is_craft()) { vols.push_back(vol); }
+    }
+    return vols;
+}
+
+void HomeBlocksImpl::expire_overdue_craft_proposals() {
+    for (auto const& vol : craft_volumes()) {
+        vol_io_guard const guard{vol}; // its destroy, which stops the device, waits for it or is seen here
+        auto* const dev = vol->craft_dev();
+        if (dev && !vol->is_destroying()) { dev->expire_overdue_proposals(); }
+    }
+}
+
 // Before HomeStore shuts down: nothing a CRAFT device runs on its own may touch HomeStore after it. The entries still
 // queued stay queued, for HomeStore's last checkpoint to save with each partition's state.
 void HomeBlocksImpl::stop_craft_devices() {
-    std::vector< volume_handle > vols;
-    {
-        auto lg = std::shared_lock(vol_lock_);
-        for (auto const& [id, vol] : vol_map_) {
-            if (vol->is_craft()) { vols.push_back(vol); }
-        }
-    }
-    for (auto const& vol : vols) {
+    for (auto const& vol : craft_volumes()) {
         if (auto* const dev = vol->craft_dev()) { (void)detail::sync_get(dev->stop(true /* keep_queued */)); }
     }
 }
 
 void HomeBlocksImpl::finish_craft_reattach() {
     detail::sync_get(craft_reattaches_done());
-    std::vector< volume_handle > vols;
-    {
-        auto lg = std::shared_lock(vol_lock_);
-        for (auto const& [id, vol] : vol_map_) {
-            if (vol->is_craft()) { vols.push_back(vol); }
-        }
-    }
-    for (auto const& vol : vols) {
+    for (auto const& vol : craft_volumes()) {
         vol->abandon_craft_hold();
     }
 }
@@ -681,6 +681,14 @@ void HomeBlocksImpl::start_reaper_thread() {
     vol_gc_timer_hdl_ = iomanager.schedule_global_timer(
         nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
         [this](void*) { this->vol_gc(); }, true /* wait_to_schedule */);
+    if (is_craft()) {
+        // One timer for every partition, armed off the reactors: a recurring timer per proposer is armed and canceled
+        // on every worker, a blocking round that hangs when two workers do it at once.
+        craft_sweep_timer_hdl_ = iomanager.schedule_global_timer(
+            1'000'000'000 /* 1s: a proposal times out up to this late */, true /* recurring */, nullptr /* cookie */,
+            iomgr::reactor_regex::all_user, [this](void*) { expire_overdue_craft_proposals(); },
+            true /* wait_to_schedule */);
+    }
 }
 
 void HomeBlocksImpl::vol_gc() {

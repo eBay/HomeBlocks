@@ -166,7 +166,7 @@ bool volume::init(bool is_recovery) {
     return true;
 }
 
-bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
+bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx, peer_id_t const& my_id) {
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("craft_create_volume_init_error")) {
         LOGI("vol={}: flip craft_create_volume_init_error set, local create fails", id_str());
@@ -226,7 +226,7 @@ bool volume::init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx) {
     // First write of the superblock: from here on the volume exists, and a replayed CreateVolume finds it.
     state_change(volume_state::ONLINE);
 
-    craft_dev_ = make_craft_dev(std::move(journal)); // a new partition: nothing to recover
+    craft_dev_ = make_craft_dev(std::move(journal), my_id); // a new partition: nothing to recover
     LOGI("Created CRAFT volume: {} uuid: {} ordinal: {} size: {} pdev: {} num_chunks: {} journal: {}/{}",
          vol_info_->name, id_str(), ordinal(), vol_info_->size_bytes, pdev_id, chunk_ids.size(), logdev_id,
          sb_->journal_store_id);
@@ -251,7 +251,7 @@ void volume::reopen_craft_journal(std::function< void(shared< homestore::home_lo
         });
 }
 
-async_status volume::reattach_craft_dev(shared< homestore::home_log_store > journal) {
+async_status volume::reattach_craft_dev(shared< homestore::home_log_store > journal, peer_id_t my_id) {
     // Counted in flight until the device is published: the volume's destroy, which removes the journal and the state
     // record the recovery reads, waits for it, or is seen here (as by a CRAFT op, see craft_api.cpp).
     vol_io_guard const guard{shared_from_this()};
@@ -259,7 +259,7 @@ async_status volume::reattach_craft_dev(shared< homestore::home_log_store > jour
         LOGI("CRAFT volume: {} uuid: {} is being destroyed, not reattached", vol_info_->name, id_str());
         co_return ok();
     }
-    auto dev = make_craft_dev(std::move(journal));
+    auto dev = make_craft_dev(std::move(journal), my_id);
     // Nothing reaches the device before it recovered. A recovery that fails faults the partition (logged), which then
     // refuses client I/O and peer fetches.
     auto const recovered = co_await dev->recover();
@@ -320,13 +320,17 @@ bool volume::deliver_craft_entry(int64_t lsn, sisl::blob const& header, sisl::bl
     return true;
 }
 
-shared< CraftReplDev > volume::make_craft_dev(shared< homestore::home_log_store > journal) {
+shared< CraftReplDev > volume::make_craft_dev(shared< homestore::home_log_store > journal, peer_id_t const& my_id) {
     // The device keeps the index table it is given; without one it could neither apply commits nor serve reads.
     RELEASE_ASSERT(indx_tbl_ != nullptr, "CRAFT volume: {} uuid: {} has no index table to attach its device to",
                    vol_info_->name, id_str());
+    // Nor propose anything without its group: every CRAFT volume made here has one.
+    RELEASE_ASSERT(rd_ != nullptr, "CRAFT volume: {} uuid: {} has no RAFT group to attach its device to",
+                   vol_info_->name, id_str());
     auto const lba_size = static_cast< uint32_t >(vol_info_->page_size);
     auto dev = CraftReplDev::create(id(), make_homestore_journal_backend(std::move(journal), ordinal(), lba_size),
-                                    lba_size, indx_tbl_, make_homestore_state_store(id(), std::move(craft_state_sb_)));
+                                    lba_size, indx_tbl_, make_homestore_state_store(id(), std::move(craft_state_sb_)),
+                                    make_homestore_raft_proposer(rd_, my_id));
     dev->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
     dev->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
     dev->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));

@@ -39,6 +39,7 @@
 #include "test_common.hpp"
 #include "craft/craft_raft_entries.hpp"
 #include "craft/craft_repl_dev.hpp"
+#include "home_blks_config.hpp"
 #include <volume/volume.hpp>
 
 extern char** environ;
@@ -361,6 +362,85 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
         EXPECT_TRUE(hb()->get_volume(id));
         EXPECT_LT(group(id)->get_last_commit_lsn(), g_barrier->published());
     }
+    ASSERT_TRUE(sync());
+}
+
+// Every member's device proposes through its own RAFT group: a follower refuses a resolution as not the leader, and the
+// leader takes it on (refusing it only for its invalid upper bound).
+TEST_F(CraftVolumeMultiTest, OnlyTheLeaderRunsAResolution) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(7);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(7)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(wait_until([&id] {
+        auto rd = group(id);
+        return rd && !rd->get_leader_id().is_nil();
+    }));
+    ASSERT_TRUE(sync());
+
+    auto vol = hb()->get_volume(id);
+    ASSERT_TRUE(vol);
+    auto const r = homeblocks::detail::sync_get(
+        homeblocks::request_resolution(*vol, craft::client_hdr{0 /* term */, -1, -1}, -1 /* upto */));
+    ASSERT_FALSE(r);
+    if (group(id)->is_leader()) {
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::invalid_argument)) << r.error().message();
+    } else {
+        EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+}
+
+// A leader cut off from its group doesn't wait out the outage: its proposal times out, outcome unknown.
+TEST_F(CraftVolumeMultiTest, ProposalWithoutQuorumTimesOut) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(8);
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(8)));
+        ASSERT_TRUE(vol) << vol.error().message();
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
+        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto const st = homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(rd, member_id(0))
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)},
+                          sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+        ASSERT_TRUE(st) << st.error().message();
+        ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
+        sisl::io_blob_safe data(page, 512);
+        std::memset(data.bytes(), 'a', page);
+        auto const w = homeblocks::detail::sync_get(homeblocks::async_write(
+            *vol, hdr, 0 /* dlsn */, 0, page, sisl::sg_list{.size = page, .iovs = {iovec{data.bytes(), page}}}));
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const timeout_ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_raft_propose_timeout_ms = 1000; });
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        auto const r = homeblocks::detail::sync_get(homeblocks::request_resolution(*vol, hdr, 0 /* upto */));
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [timeout_ms](auto& s) { s.craft_raft_propose_timeout_ms = timeout_ms; });
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->start(); }
     ASSERT_TRUE(sync());
 }
 

@@ -109,8 +109,8 @@ public:
         ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     }
 
-    // An InternalLogin the volume's group committed at raft_lsn, handed to its device as HomeStore does. Straight to
-    // the device: this node has no RAFT proposer yet.
+    // An InternalLogin the volume's group committed at raft_lsn, handed to its device as HomeStore does, without a RAFT
+    // round.
     static void commit_login(volume_handle const& vol, uint64_t client_token, uint64_t term, int64_t raft_lsn) {
         CraftEntryHeader header{CraftEntryType::InternalLogin};
         InternalLoginPayload key{client_token, term};
@@ -118,6 +118,17 @@ public:
         vol->craft_dev()->raft_listener().on_commit(
             raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
             sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}, {}, ctx);
+    }
+
+    // An InternalLogin through the volume's group, as a login commits it: at a RAFT index the device's entries after a
+    // restart follow, unlike commit_login()'s.
+    static status propose_login(volume_id_t const& id, uint64_t client_token, uint64_t term) {
+        CraftEntryHeader header{CraftEntryType::InternalLogin};
+        InternalLoginPayload key{client_token, term};
+        return homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(group(id), peer_id_t{})
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
+                          sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}));
     }
 
     // A SyncRSCommitLSN the volume's group committed at raft_lsn, without Empty verdicts, handed to its device as
@@ -444,6 +455,49 @@ TEST_F(CraftVolumeTest, CommittedSlotsSurviveARestart) {
     for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
         EXPECT_TRUE(reads_back(*again, hdr, 3 /* read_lsn */, dlsn)) << "slot " << dlsn;
     }
+    remove(id);
+}
+
+// The device proposes through its own RAFT group, and again after a restart: a resolution the client asks for commits a
+// SyncRSCommitLSN, which the partition has applied, its slots committed to the index, when the resolution returns.
+TEST_F(CraftVolumeTest, RequestResolutionCommitsThroughTheGroup) {
+    auto info = craft_vol_info("craft_vol_resolution");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 3; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+
+    auto const res = homeblocks::detail::sync_get(homeblocks::request_resolution(*vol, hdr, 2 /* upto */));
+    ASSERT_TRUE(res) << res.error().message();
+    EXPECT_EQ(res->resolved_upto, 2);
+    EXPECT_TRUE(res->empty_slots.empty());
+    EXPECT_EQ((*vol)->craft_dev()->commit_lsn(), 2);
+    for (int64_t dlsn = 0; dlsn < 3; ++dlsn) {
+        EXPECT_TRUE(reads_back(*vol, hdr, 2 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
+
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_TRUE(wait_until(
+        [&id] {
+            auto const rd = group(id);
+            return rd != nullptr && rd->is_leader();
+        },
+        std::chrono::seconds(60)));
+    auto const w = write_slot(*again, hdr, 3);
+    ASSERT_TRUE(w) << w.error().message();
+    auto const res2 = homeblocks::detail::sync_get(homeblocks::request_resolution(*again, hdr, 3 /* upto */));
+    ASSERT_TRUE(res2) << res2.error().message();
+    EXPECT_EQ(res2->resolved_upto, 3);
+    EXPECT_EQ((*again)->craft_dev()->commit_lsn(), 3);
     remove(id);
 }
 

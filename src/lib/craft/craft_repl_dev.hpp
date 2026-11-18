@@ -202,9 +202,9 @@ public:
 //
 // Abstraction over this partition's RAFT group (a HomeStore repl_dev in production): leadership,
 // membership, and proposing the CRAFT control-plane entries. Injected into CraftReplDev so unit tests
-// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. Production
-// passes make_homestore_raft_proposer()'s result; wiring it to a volume's repl_dev is S8's job. Default
-// (null) leaves every leader-only path failing closed.
+// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. A CRAFT volume's
+// device gets make_homestore_raft_proposer()'s, over the volume's repl_dev. Default (null) leaves every
+// leader-only path failing closed.
 
 class CraftRaftProposer {
 public:
@@ -217,6 +217,12 @@ public:
     // Proposes a key-only RAFT entry (no data payload). Completes once the entry has committed and been
     // dispatched to this member's CraftRaftListener::on_commit, or with an error if replication fails.
     virtual async_status propose(sisl::blob header, sisl::blob key) = 0;
+    // Completes the proposals past their deadline (craft_raft_propose_timeout_ms) with timed_out: their entries may
+    // still commit. HomeBlocks calls it every second for each partition's device, on one of its own timer's reactors.
+    virtual void expire_overdue() {}
+    // Stops for good: the proposals still pending complete with timed_out (they may still commit), later ones fail
+    // with operation_canceled.
+    virtual void stop() {}
     virtual ~CraftRaftProposer() = default;
 };
 
@@ -225,22 +231,26 @@ public:
 // replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
 
-// The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by the proposer's recurring
-// timer. Not an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its
-// own delay and nothing re-arms after a fire, so concurrent deadlines postpone or drop each other.
+// The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by its expire_overdue(). Not
+// an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its own delay
+// and nothing re-arms after a fire, so concurrent deadlines postpone or drop each other.
 class ProposalDeadlines {
 public:
     using clock = std::chrono::steady_clock;
 
-    void add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline);
+    // False once closed: the proposal isn't tracked.
+    bool add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline);
     // Completes every pending proposal whose deadline is at or before `now` with timed_out (its outcome is unknown:
     // the entry may still commit), and forgets the ones that already completed.
     void sweep(clock::time_point now);
+    // Tracks nothing more, and hands back every proposal still tracked.
+    std::vector< intrusive< homestore::repl_req_ctx > > close();
     size_t pending() const;
 
 private:
     mutable std::mutex mu_;
     std::vector< std::pair< intrusive< homestore::repl_req_ctx >, clock::time_point > > pending_;
+    bool closed_{false};
 };
 
 #ifdef _PRERELEASE
@@ -380,15 +390,19 @@ private:
     // state_store holds the partition's durable state (CraftDurableState). Given at construction, so it is in place
     // before anything is applied or recovered; without one nothing is persisted and a restart restores nothing (the
     // light unit tests).
+    // raft_proposer proposes the partition's entries through its RAFT group; the device owns it. Without one nothing
+    // is proposed: append() and request_resolution() refuse with not_supported.
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
-                          shared< VolumeIndexTable > indx_tbl, unique< CraftStateStore > state_store);
+                          shared< VolumeIndexTable > indx_tbl, unique< CraftStateStore > state_store,
+                          unique< CraftRaftProposer > raft_proposer);
 
 public:
     static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
                                          shared< VolumeIndexTable > indx_tbl,
-                                         unique< CraftStateStore > state_store = nullptr) {
-        return shared< CraftReplDev >(
-            new CraftReplDev(vol_id, std::move(journal), lba_size, std::move(indx_tbl), std::move(state_store)));
+                                         unique< CraftStateStore > state_store = nullptr,
+                                         unique< CraftRaftProposer > raft_proposer = nullptr) {
+        return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal), lba_size, std::move(indx_tbl),
+                                                       std::move(state_store), std::move(raft_proposer)));
     }
     // Cancels the watchdog's recurring timer (iomgr::timer_token::cancel(wait=true)), blocking until
     // any in-flight tick has finished, so on_watchdog_tick() (which captures `this`) can never fire
@@ -534,8 +548,12 @@ public:
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
-    // Wires this partition's RAFT group (leadership, membership, proposing). Wired by S8; tests inject a mock.
+    // Test seam: a proposer the device doesn't own (a mock the test keeps), in place of create()'s.
     void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
+    // See CraftRaftProposer::expire_overdue().
+    void expire_overdue_proposals() {
+        if (raft_proposer_) raft_proposer_->expire_overdue();
+    }
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
@@ -561,9 +579,10 @@ public:
     async_status stop_apply();
 
     // Stops everything the device runs on its own, before what it works on goes away: the applies (waiting out the one
-    // in progress), the journal reclaim (waiting out a running one) and the watchdog. keep_queued, for a shutdown: the
-    // queued entries, and any that commit later, stay queued unapplied, for HomeStore's last checkpoint to save with
-    // the partition's state. Otherwise, for a destroy, they fail as in stop_apply(). Called once.
+    // in progress), the journal reclaim (waiting out a running one), the watchdog and the proposer
+    // (CraftRaftProposer::stop()). keep_queued, for a shutdown: the queued entries, and any that commit later, stay
+    // queued unapplied, for HomeStore's last checkpoint to save with the partition's state. Otherwise, for a destroy,
+    // they fail as in stop_apply(). Called once.
     async_status stop(bool keep_queued);
 
     // Restart recovery: restores the durable state (restore_state()), rebuilds the overlay, then queues again the
@@ -1052,13 +1071,16 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    // TODO(S8): raw pointers the device doesn't own, yet background work (append, pre-resolution, the watchdog,
-    // apply catch-up) uses them after awaits while holding only the device. Whoever wires them must make them
-    // outlive every round, e.g. by giving the device ownership (shared_ptr setters).
-    CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
-    CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
-    std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
+    // TODO(S9): a raw pointer the device doesn't own, yet background work (pre-resolution, the watchdog, apply
+    // catch-up) uses it after awaits while holding only the device. Whoever wires it must make it outlive every
+    // round, e.g. by giving the device ownership, as for the proposer.
+    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};    // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    // The proposer every round uses: the one create() was given, which the device owns, or a test's
+    // (set_raft_proposer). Null: nothing is proposed.
+    unique< CraftRaftProposer > owned_raft_proposer_;
+    CraftRaftProposer* raft_proposer_{nullptr};
+    std::atomic< bool > sync_in_flight_{false};           // single-flight gate for append()
     std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
     int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
     int64_t applied_sync_lsn_{-1};       // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)

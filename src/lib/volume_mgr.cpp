@@ -482,8 +482,9 @@ status HomeBlocksImpl::create_craft_volume_local(volume_info&& info) {
     }
 
     auto const ordinal = info.ordinal;
-    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
-                                         dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr);
+    auto vol =
+        volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                  dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr, our_uuid());
     if (!vol) {
         if (orphan_idx) {
             // The table stays behind, holding its ordinal, for the next create of this volume to take over.

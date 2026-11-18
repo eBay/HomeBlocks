@@ -133,6 +133,7 @@ private:
     std::promise< void > shutdown_promise_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
+    iomgr::timer_handle_t craft_sweep_timer_hdl_{iomgr::null_timer_handle}; // CRAFT: expire_overdue_craft_proposals()
 
     HomeBlocksMetrics metrics_;
 
@@ -226,6 +227,9 @@ public:
     void finish_craft_reattach();
     // CRAFT, at shutdown: stops every CRAFT device (CraftReplDev::stop), keeping their queued entries.
     void stop_craft_devices();
+    // CRAFT, every second from start_reaper_thread()'s timer: completes each device's proposals past their deadline.
+    void expire_overdue_craft_proposals();
+    std::vector< volume_handle > craft_volumes() const;
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;

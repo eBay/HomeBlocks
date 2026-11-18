@@ -1261,6 +1261,22 @@ TEST_F(CraftRaftEntriesTest, CommitAfterDeadlineIsAppliedButOutcomeStaysTimedOut
     EXPECT_EQ(dev_->last_append_lsn(), 3); // applied all the same
 }
 
+// Closed, as the proposer's stop() does it: hands back every proposal still tracked, with or without a deadline, and
+// tracks no more.
+TEST_F(CraftRaftEntriesTest, ClosedDeadlinesHandBackThePendingAndTrackNoMore) {
+    ProposalDeadlines deadlines;
+    auto const a = make_test_proposal_ctx();
+    auto const b = make_test_proposal_ctx();
+    EXPECT_TRUE(deadlines.add(a, ProposalDeadlines::clock::now() + std::chrono::seconds{10}));
+    EXPECT_TRUE(deadlines.add(b, ProposalDeadlines::clock::time_point::max()));
+
+    auto const pending = deadlines.close();
+    EXPECT_EQ(pending, (std::vector< intrusive< homestore::repl_req_ctx > >{a, b}));
+    EXPECT_EQ(deadlines.pending(), 0u);
+    EXPECT_FALSE(deadlines.add(make_test_proposal_ctx(), ProposalDeadlines::clock::now()));
+    EXPECT_EQ(deadlines.pending(), 0u);
+}
+
 // A proposal that commits before its deadline is released by the next sweep, not held until its deadline.
 TEST_F(CraftRaftEntriesTest, SweepDropsCommittedProposalWithoutExpiringIt) {
     auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);

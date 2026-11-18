@@ -223,11 +223,12 @@ public:
     // chunks, the volume's own journal, the index table and the superblock, then the CraftReplDev on top. Applied on
     // CreateVolume commit. `orphan_idx` is the index table of a create that crashed before its superblock, reused
     // instead of creating a second table for the same volume.
+    // `my_id` is this member's id in the group, which proposes through it.
     static volume_handle make_craft_volume(volume_info&& info, shared< VolumeChunkSelector > volume_chunk_sel,
                                            shared< VolumeChunkSelector > index_chunk_sel, bool dynamic_chunk_alloc,
-                                           VolIdxTablePtr orphan_idx) {
+                                           VolIdxTablePtr orphan_idx, peer_id_t const& my_id) {
         auto vol = std::make_shared< volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
-        return vol->init_craft(dynamic_chunk_alloc, std::move(orphan_idx)) ? vol : nullptr;
+        return vol->init_craft(dynamic_chunk_alloc, std::move(orphan_idx), my_id) ? vol : nullptr;
     }
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
@@ -252,8 +253,8 @@ public:
     void adopt_craft_state(superblk< craft_state_sb_t > sb) { craft_state_sb_ = std::move(sb); }
     // CRAFT recovery: makes the CraftReplDev on the replayed journal, the state record and the index table installed at
     // load, recovers it, hands it the entries held meanwhile in log order, then publishes it. Returns recover()'s
-    // outcome; on a failure the device is published faulted.
-    async_status reattach_craft_dev(shared< homestore::home_log_store > journal);
+    // outcome; on a failure the device is published faulted. `my_id`: as in make_craft_volume().
+    async_status reattach_craft_dev(shared< homestore::home_log_store > journal, peer_id_t my_id);
     // CRAFT recovery: the device expected since the load won't come (its journal never replayed): drops what is held.
     void abandon_craft_hold();
     // CRAFT: an entry the volume's RAFT group committed, for its CraftReplDev: handed to it, or held until it is
@@ -319,8 +320,8 @@ private:
     // destroyed automatically; if success, the repl dev will be stored in the volume object;
     //
     bool init(bool is_recovery);
-    bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
-    shared< CraftReplDev > make_craft_dev(shared< homestore::home_log_store > journal);
+    bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx, peer_id_t const& my_id);
+    shared< CraftReplDev > make_craft_dev(shared< homestore::home_log_store > journal, peer_id_t const& my_id);
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 
