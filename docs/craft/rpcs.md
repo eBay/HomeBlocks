@@ -216,8 +216,8 @@ carries the reconfig promotion gate.
 
 The request's `term` is the current session term T. A login poll fences writes whose term is ≤ T: the
 request's term, not the peer's own, which may lag behind an `InternalLogin` it hasn't applied yet. The
-response's `term` is the peer's own session term; a responder already past T makes the leader abort the
-login with `STALE_TERM`. The leader counts itself locally rather than polling itself, but it quiesces its own
+response's `term` is the peer's own session term, counting an `InternalLogin` it has committed but not yet
+applied; a responder already past T makes the leader abort the login with `STALE_TERM`. The leader counts itself locally rather than polling itself, but it quiesces its own
 prior-session writes the same way before reading its own LSNs: otherwise an old write acked by the leader and
 a member the poll missed could land above the watermark, and `InternalLogin` would truncate it. The leader
 identifies each responder by the connection it sent the request on, so the response carries no peer id.

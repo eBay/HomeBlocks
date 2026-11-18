@@ -601,7 +601,9 @@ async_result< RsCommitLsnReply > CraftReplDev::get_rs_commit_lsn(uint64_t term, 
             LOGI("login poll: quiescing writes at term <= {} (session term {})", term, state_.term);
             quiesce_term_ = term;
         }
-        reply = {.lsns = {state_.commit_lsn, state_.last_append_lsn}, .term = state_.term};
+        // The term counts a login committed but not yet applied: a leader that hasn't learned of that commit mustn't
+        // pass a poll at the replaced session's term.
+        reply = {.lsns = {state_.commit_lsn, state_.last_append_lsn}, .term = std::max(state_.term, login_fence_term_)};
     }
     co_return reply;
 }

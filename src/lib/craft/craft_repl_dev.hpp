@@ -100,7 +100,8 @@ struct QuorumSlotResponse {
     std::vector< JournalSlot > slots{};
 };
 
-// A member's answer to GetRSCommitLSN: its watermarks and its own session term.
+// A member's answer to GetRSCommitLSN: its watermarks and its session term, counting a login it has committed but not
+// yet applied.
 struct RsCommitLsnReply {
     craft::lsn_pair lsns{};
     uint64_t term{0};
@@ -188,8 +189,9 @@ public:
                                                                                 uint32_t timeout_ms) = 0;
     // Broadcasts GetRSCommitLSN(term, is_login) to every OTHER replica-set member and returns each
     // responder's {commit_lsn, last_append_lsn} and session term, tagged with its member; a non-responding member is
-    // absent from the result. Waits for every member up to timeout_ms, not just the first quorum. Used by the
-    // watchdog trigger (is_login=false, never quiesces) and by login_poll() (is_login=true).
+    // absent from the result. A login poll (is_login) waits for every member up to timeout_ms, not just the first
+    // majority, since login's watermark is the max over every reply; a watchdog poll may return once a majority has
+    // replied. Used by the watchdog trigger (is_login=false, never quiesces) and by login_poll() (is_login=true).
     virtual async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t term, bool is_login,
                                                                               uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
@@ -367,10 +369,11 @@ public:
 
     // ── internal / peer API (server-to-server; NEVER reachable over the client wire) ──
 
-    // Callee side of the GetRSCommitLSN broadcast: this member's watermarks and its own session term. A login poll
-    // (is_login) first quiesces writes whose term is at or below `term` (the poll's, not this member's, which may lag
-    // behind a login it hasn't applied): they get STALE_TERM from then on, so the reported last_append_lsn counts every
-    // write this member can still ack. The fence only rises. Watchdog polls pass is_login=false and never quiesce.
+    // Callee side of the GetRSCommitLSN broadcast: this member's watermarks and its session term (a login committed but
+    // not yet applied counts). A login poll (is_login) first quiesces writes whose term is at or below `term` (the
+    // poll's, not this member's, which may lag behind a login it hasn't applied): they get STALE_TERM from then on, so
+    // the reported last_append_lsn counts every write this member can still ack. The fence only rises. Watchdog polls
+    // pass is_login=false and never quiesce.
     async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn and

@@ -242,8 +242,9 @@ Peer-to-peer; not a client-facing free function. The leader polls every other me
 `get_rs_commit_lsn` before proposing a `SyncRSCommitLSN`; at login it takes `rs_commit_lsn` as the max
 `last_append_lsn` over itself and every responder. `term` is the current session term T. With
 `is_login=true` the replica quiesces first, rejecting writes whose term is ≤ T; it fences the request's
-term rather than its own, which may lag. The reply's `term` is the replica's own session term, so the
-leader can abort with `STALE_TERM` if a responder is already past T.
+term rather than its own, which may lag. The reply's `term` is the replica's own session term, counting an
+`InternalLogin` it has committed but not yet applied, so the leader can abort with `STALE_TERM` if a responder
+is already past T.
 
 ### `truncate`
 

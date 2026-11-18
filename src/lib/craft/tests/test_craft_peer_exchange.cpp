@@ -118,8 +118,8 @@ protected:
         return homeblocks::detail::sync_get(
             dev_->write(craft::client_hdr{term, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
     }
-    // Applies an InternalLogin at term, as RAFT would on this member.
-    void apply_login(uint64_t term) {
+    // Commits an InternalLogin at term, as RAFT would on this member; it applies unless the apply queue is paused.
+    void commit_login(uint64_t term) {
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
         reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
@@ -160,6 +160,21 @@ TEST_F(CraftPeerExchangeTest, GetRsCommitLsnReportsOwnTerm) {
     auto r = do_quiesce(/*term=*/5);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->term, 3u);
+}
+
+// ...counting a login it has committed but not yet applied: else a leader that hasn't learned of that commit could
+// poll at the replaced session's term and pass.
+TEST_F(CraftPeerExchangeTest, GetRsCommitLsnReportsACommittedLogin) {
+    dev_->seed_term(3);
+    dev_->pause_apply();
+    commit_login(/*term=*/5);
+    ASSERT_EQ(dev_->term(), 3u); // committed, not applied
+
+    auto r = do_quiesce(/*term=*/3);
+    dev_->resume_apply();
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->term, 5u);
 }
 
 // ── login quiesce (SDSTOR-22889) ──────────────────────────────────────────────
@@ -220,7 +235,7 @@ TEST_F(CraftPeerExchangeTest, QuiesceFenceOnlyRises) {
 TEST_F(CraftPeerExchangeTest, QuiesceFencesThePollTermNotTheReplicaTerm) {
     dev_->seed_term(3);
     ASSERT_TRUE(do_quiesce(/*term=*/5).has_value());
-    apply_login(/*term=*/5);
+    commit_login(/*term=*/5);
     ASSERT_EQ(dev_->term(), 5u);
 
     auto w = do_write(/*dlsn=*/0, /*term=*/5);
