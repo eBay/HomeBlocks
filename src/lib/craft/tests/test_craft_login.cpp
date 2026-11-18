@@ -301,13 +301,18 @@ TEST_F(CraftLoginTest, PollFaultedDuringThePollFailsInternalError) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
-// A login committed while the poll is out (an earlier attempt's InternalLogin whose proposal timed out, say) makes
-// the round's term stale, though no member has applied it yet.
+// A login committed while the poll is out (say, an earlier attempt's InternalLogin whose proposal timed out) makes
+// the round's term stale, even while it still waits to apply.
 TEST_F(CraftLoginTest, PollFailsStaleTermWhenALoginCommitsDuringThePoll) {
     poller_.replies = {reply(1, 7), reply(2, 7)};
-    poller_.on_poll = [this] { commit_login(/*term=*/1); };
+    poller_.on_poll = [this] {
+        dev_->pause_apply();
+        commit_login(/*term=*/1);
+    };
 
     auto r = do_login_poll(/*term=*/0);
+    EXPECT_EQ(dev_->term(), 0u); // committed, not yet applied
+    dev_->resume_apply();
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), stale_term());
