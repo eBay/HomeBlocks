@@ -1680,27 +1680,31 @@ TEST_F(CraftAppendTest, LoginCommittedDuringFetchStopsOldSessionRound) {
     fetcher_.fetch_gate.complete(true);
 }
 
-// ── fence matrix (SDSTOR-26655) ───────────────────────────────────────────────
+// ── fence matrix (SDSTOR-26655, SDSTOR-22889) ─────────────────────────────────
 //
-// What each entry point makes of an entry that has committed but not yet applied. Each cell commits one entry with
-// the apply queue paused and calls one entry point, then resumes the queue and calls it again. A new entry type or
-// entry point adds its cells here, so moving an effect between commit and apply fails a cell.
+// What each entry point does while a fence is up, and once it has settled. Each cell raises one fence and calls one
+// entry point, then settles the fence and calls it again. A new fence or entry point adds its cells here, so a change
+// to what a fence covers, or when, fails a cell.
 //
-// Start: slots 0..2 appended, session term 0.
-//   Sync   SyncRSCommitLSN(rs=5, Empty={4})
-//   Login  InternalLogin(term=5)
+// Start: slots 0..2 appended, session term 0. The fences:
+//   queued_sync   SyncRSCommitLSN(rs=5, Empty={4}), committed with the apply queue paused; settles when it applies
+//   queued_login  InternalLogin(term=5), committed with the apply queue paused; settles when it applies
+//   quiesce       a login poll (GetRSCommitLSN, is_login) at term 0; settles when the login's InternalLogin applies
+//   plain_poll    a watchdog poll (GetRSCommitLSN, not is_login), which fences nothing
 // Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
 // (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
 
-enum class Queued { sync, login };
+constexpr uint64_t k_new_term{5}; // the login's term
+
+enum class Fence { queued_sync, queued_login, quiesce, plain_poll };
 enum class Call { write, write_voided_slot, write_new_term, read, keep_alive, resolve, append, pre_resolve };
 
 struct FenceCell {
     char const* name;
-    Queued entry;
+    Fence fence;
     Call call;
-    std::error_condition while_queued; // {} = accepted
-    std::error_condition once_applied;
+    std::error_condition while_fenced; // {} = accepted
+    std::error_condition once_settled;
 };
 void PrintTo(FenceCell const& cell, std::ostream* os) { *os << cell.name; }
 
@@ -1710,24 +1714,68 @@ std::vector< FenceCell > fence_cells() {
     auto const no_index = std::make_error_condition(std::errc::not_supported); // read() got past its term check
     return {
         // A Sync doesn't fence the session; its verdicts fence the slots they void.
-        {"Sync_Write", Queued::sync, Call::write, {}, {}},
-        {"Sync_WriteVoidedSlot", Queued::sync, Call::write_voided_slot, empty_slot, empty_slot},
+        {"Sync_Write", Fence::queued_sync, Call::write, {}, {}},
+        {"Sync_WriteVoidedSlot", Fence::queued_sync, Call::write_voided_slot, empty_slot, empty_slot},
         // A login fences the old session's writes and leader rounds at commit. Reads and keep_alive aren't fenced
         // (quiesce blocks writes only): like the new term's writes, they change over when the login applies.
-        {"Login_Write", Queued::login, Call::write, stale, stale},
-        {"Login_WriteNewTerm", Queued::login, Call::write_new_term, stale, {}},
-        {"Login_Read", Queued::login, Call::read, no_index, stale},
-        {"Login_KeepAlive", Queued::login, Call::keep_alive, {}, stale},
-        {"Login_Resolve", Queued::login, Call::resolve, stale, stale},
-        {"Login_Append", Queued::login, Call::append, stale, stale},
-        {"Login_PreResolve", Queued::login, Call::pre_resolve, stale, stale},
+        {"Login_Write", Fence::queued_login, Call::write, stale, stale},
+        {"Login_WriteNewTerm", Fence::queued_login, Call::write_new_term, stale, {}},
+        {"Login_Read", Fence::queued_login, Call::read, no_index, stale},
+        {"Login_KeepAlive", Fence::queued_login, Call::keep_alive, {}, stale},
+        {"Login_Resolve", Fence::queued_login, Call::resolve, stale, stale},
+        {"Login_Append", Fence::queued_login, Call::append, stale, stale},
+        {"Login_PreResolve", Fence::queued_login, Call::pre_resolve, stale, stale},
+        // A quiesce fences the old session's writes only. The rest of its IO, and its leader rounds, go on until the
+        // login applies.
+        {"Quiesce_Write", Fence::quiesce, Call::write, stale, stale},
+        {"Quiesce_WriteNewTerm", Fence::quiesce, Call::write_new_term, stale, {}},
+        {"Quiesce_Read", Fence::quiesce, Call::read, no_index, stale},
+        {"Quiesce_KeepAlive", Fence::quiesce, Call::keep_alive, {}, stale},
+        {"Quiesce_Resolve", Fence::quiesce, Call::resolve, {}, stale},
+        {"Quiesce_Append", Fence::quiesce, Call::append, {}, stale},
+        {"Quiesce_PreResolve", Fence::quiesce, Call::pre_resolve, {}, stale},
+        // A watchdog poll never quiesces.
+        {"Poll_Write", Fence::plain_poll, Call::write, {}, {}},
     };
 }
 
 class CraftFenceMatrixTest : public CraftAppendTest, public ::testing::WithParamInterface< FenceCell > {
 protected:
+    void raise_fence() {
+        switch (GetParam().fence) {
+        case Fence::queued_sync:
+            dev_->pause_apply();
+            commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{4});
+            break;
+        case Fence::queued_login:
+            dev_->pause_apply();
+            commit_login(k_new_term);
+            break;
+        case Fence::quiesce:
+        case Fence::plain_poll:
+            ASSERT_TRUE(homeblocks::detail::sync_get(
+                            dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/GetParam().fence == Fence::quiesce))
+                            .has_value());
+            break;
+        }
+    }
+
+    void settle_fence() {
+        switch (GetParam().fence) {
+        case Fence::queued_sync:
+        case Fence::queued_login:
+            dev_->resume_apply();
+            break;
+        case Fence::quiesce:
+            commit_login(k_new_term);
+            break;
+        case Fence::plain_poll:
+            break;
+        }
+    }
+
     // The cell's entry point, called by the old session (term 0) unless it says otherwise. Phase 0 runs while the
-    // entry is queued, phase 1 once it has applied; each phase writes its own dlsn.
+    // fence is up, phase 1 once it has settled; each phase writes its own dlsn.
     std::error_condition call(int phase) {
         auto const outcome = [](auto const& r) { return r ? std::error_condition{} : r.error(); };
         craft::client_hdr const old_session{0, -1, -1};
@@ -1737,7 +1785,7 @@ protected:
         case Call::write_voided_slot:
             return outcome(do_write(/*dlsn=*/4, /*term=*/0));
         case Call::write_new_term:
-            return outcome(do_write(/*dlsn=*/8 + phase, /*term=*/5));
+            return outcome(do_write(/*dlsn=*/8 + phase, k_new_term));
         case Call::read: {
             static std::array< uint8_t, k_page_size > buf{};
             sisl::sg_list dest;
@@ -1759,21 +1807,19 @@ protected:
     }
 };
 
-TEST_P(CraftFenceMatrixTest, CommitTimeThenApplyTime) {
+TEST_P(CraftFenceMatrixTest, WhileFencedThenOnceSettled) {
     auto const& cell = GetParam();
     dev_->seed_lsns(2, {});
-    dev_->pause_apply();
-    if (cell.entry == Queued::sync) {
-        commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{4});
-    } else {
-        commit_login(/*term=*/5);
-    }
+    raise_fence();
+    ASSERT_FALSE(HasFatalFailure());
 
-    auto const queued = call(0);
-    EXPECT_EQ(queued, cell.while_queued) << "while queued, got: " << queued.message();
-    dev_->resume_apply();
-    auto const applied = call(1);
-    EXPECT_EQ(applied, cell.once_applied) << "once applied, got: " << applied.message();
+    auto const fenced = call(0);
+    EXPECT_EQ(fenced, cell.while_fenced) << "while fenced, got \"" << fenced.message() << "\", want \""
+                                         << cell.while_fenced.message() << "\"";
+    settle_fence();
+    auto const settled = call(1);
+    EXPECT_EQ(settled, cell.once_settled)
+        << "once settled, got \"" << settled.message() << "\", want \"" << cell.once_settled.message() << "\"";
 }
 
 INSTANTIATE_TEST_SUITE_P(Cells, CraftFenceMatrixTest, ::testing::ValuesIn(fence_cells()),
