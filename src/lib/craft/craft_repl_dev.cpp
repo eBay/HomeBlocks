@@ -64,12 +64,16 @@ std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& r
 // the voter list is empty or excludes this member. Replies a correct transport never sends are logged under `round`.
 class VoterTally {
 public:
-    // drop: this member's own reply. use: evidence but not a vote (a learner's, an untagged one, or a repeat, which
-    // merges with the member's first reply since "absent" is only a snapshot). count: a distinct voter.
+    // drop: this member's own reply. use: evidence but not a vote (a learner's, an untagged one, one outside
+    // `eligible`, or a repeat, which merges with the member's first reply since "absent" is only a snapshot).
+    // count: a distinct voter.
     enum class Reply { drop, use, count };
 
-    VoterTally(char const* round, craft::peer_id_t self, std::vector< craft::peer_id_t > voters) :
-            round_{round}, self_{self}, voters_{std::move(voters)} {
+    // eligible, if set, narrows the votes further: a voter outside it is evidence, not a vote (login counts only the
+    // members its poll quiesced).
+    VoterTally(char const* round, craft::peer_id_t self, std::vector< craft::peer_id_t > voters,
+               std::optional< std::vector< craft::peer_id_t > > eligible = std::nullopt) :
+            round_{round}, self_{self}, voters_{std::move(voters)}, eligible_{std::move(eligible)} {
         if (!is_voter(self_))
             LOGW("{}: this member ({}) isn't among the {} voter(s) -- failing closed", round_,
                  boost::uuids::to_string(self_), voters_.size());
@@ -89,6 +93,11 @@ public:
             return Reply::use;
         }
         if (!is_voter(member)) return Reply::use; // a learner
+        if (eligible_ && std::ranges::find(*eligible_, member) == eligible_->end()) {
+            LOGI("{}: {} isn't eligible to vote here (the login poll didn't quiesce it) -- used as evidence only",
+                 round_, boost::uuids::to_string(member));
+            return Reply::use;
+        }
         ++counted_;
         return Reply::count;
     }
@@ -106,6 +115,7 @@ private:
     char const* round_;
     craft::peer_id_t self_;
     std::vector< craft::peer_id_t > voters_;
+    std::optional< std::vector< craft::peer_id_t > > eligible_;
     std::set< craft::peer_id_t > seen_;
     size_t counted_{0};
 };
@@ -680,6 +690,18 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
     LOGI("login_poll: term={} rs_commit_lsn={} from {} quiesced member(s)", term, result.rs_commit_lsn,
          result.quiesced.size());
     co_return result;
+}
+
+async_result< std::vector< int64_t > > CraftReplDev::login_resolve(int64_t rs_commit_lsn, uint64_t term,
+                                                                   std::vector< craft::peer_id_t > quiesced) {
+    auto pre = co_await pre_resolve_slots(rs_commit_lsn, term, std::move(quiesced));
+    if (!pre) co_return std::unexpected(pre.error());
+    if (!pre->unresolved.empty()) {
+        LOGW("login_resolve: {} slot(s) <= {} unresolved (first {}) -- login fails, nothing proposed",
+             pre->unresolved.size(), rs_commit_lsn, *std::ranges::min_element(pre->unresolved));
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    co_return std::move(pre->empty_slots);
 }
 
 // ─── truncate (S4) ────────────────────────────────────────────────────────────
@@ -2395,8 +2417,13 @@ async_status CraftReplDev::run_recovery() {
 // too; a slot with a write already in flight is left unresolved (H1). A slot at or below an applied
 // SyncRSCommitLSN is never voted Empty: that entry already settled it as present (C2b).
 
-async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term) {
+async_result< CraftReplDev::PreResolution >
+CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
+                                std::optional< std::vector< craft::peer_id_t > > counted_lackers) {
     auto self = shared_from_this();
+    // At login no usable reply means no quorum, not an unwired fetcher.
+    auto const no_evidence = counted_lackers ? craft::make_error_condition(craft::craft_error::NO_QUORUM)
+                                             : std::make_error_condition(std::errc::not_supported);
     std::vector< int64_t > candidates;
     {
         std::lock_guard lk{state_mu_};
@@ -2470,7 +2497,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     if (responses->empty()) {
         LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
              candidates.size());
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+        co_return std::unexpected(no_evidence);
     }
 
     // Empty beats data even across members, regardless of response order: seeing Empty for an lsn purges
@@ -2481,9 +2508,10 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     data_by_lsn.reserve(candidates.size());
     std::unordered_set< int64_t > empty_by_quorum;
     empty_by_quorum.reserve(candidates.size());
-    // Only distinct voters other than this leader count toward quorum-lacks evidence; a learner's reply or a
-    // member's repeat still contributes its slots (VoterTally).
-    VoterTally tally{"pre_resolve_slots", raft_proposer_->my_id(), raft_proposer_->voters()};
+    // Only distinct voters other than this leader, and at login only quiesced ones, count toward quorum-lacks evidence;
+    // any other reply still contributes its slots (VoterTally).
+    VoterTally tally{"pre_resolve_slots", raft_proposer_->my_id(), raft_proposer_->voters(),
+                     std::move(counted_lackers)};
     int valid_member_count = 0; // usable replies, counted or not
     for (auto& reply : *responses) {
         if (auto bad_lsn = validate_fetch_response(candidates, reply.slots); bad_lsn) {
@@ -2511,7 +2539,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         // falling through to mint an Empty verdict for every candidate with nothing behind it.
         LOGE("pre_resolve_slots: none of {} reply(ies) is usable -- no trustworthy evidence for {} candidate(s)",
              responses->size(), candidates.size());
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+        co_return std::unexpected(no_evidence);
     }
 
     // Every candidate is a slot this leader lacks, so it counts itself among the members lacking it.
