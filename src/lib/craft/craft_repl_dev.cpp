@@ -625,6 +625,11 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
     // watermark, and the login's truncation would drop an acked write.
     auto own = co_await get_rs_commit_lsn(term, /*is_login=*/true);
     if (!own) co_return std::unexpected(own.error());
+    // Already past this round's term here: the poll can only fail STALE_TERM, so don't wait for every member.
+    if (own->term > term) {
+        LOGW("login_poll: this member is already at term {}, past {} -- a newer login exists", own->term, term);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
     auto polled = co_await peer_fetcher_->poll_quorum_lsns(term, /*is_login=*/true, peer_fetch_timeout_ms_);
     if (!polled) {
         LOGE("login_poll: quorum poll failed: {}", polled.error().message());

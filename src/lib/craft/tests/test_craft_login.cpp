@@ -256,6 +256,7 @@ TEST_F(CraftLoginTest, PollFailsStaleTermWhenTheLeaderIsPastTheTerm) {
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), stale_term());
+    EXPECT_EQ(poller_.poll_calls, 0); // known before polling: no member is quiesced, nothing waited for
 }
 
 TEST_F(CraftLoginTest, PollFailurePropagates) {

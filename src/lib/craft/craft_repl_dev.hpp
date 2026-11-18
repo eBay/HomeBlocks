@@ -672,8 +672,10 @@ private:
     // Fails STALE_TERM if any member is already past `term`, and NO_QUORUM unless this member and the counted voters
     // are a majority.
     struct LoginPoll {
-        int64_t rs_commit_lsn{-1};                  // max last_append_lsn over this member and every responder
-        std::vector< craft::peer_id_t > quiesced{}; // the members that replied, so are quiesced (not this one)
+        int64_t rs_commit_lsn{-1}; // max last_append_lsn over this member and every responder
+        // The members that replied, so are quiesced (not this one), learners included: quorum coverage counts voters
+        // (VoterTally), not quiesced.size().
+        std::vector< craft::peer_id_t > quiesced{};
     };
     async_result< LoginPoll > login_poll(uint64_t term);
 
