@@ -299,6 +299,9 @@ struct CraftPendingEntry {
     int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
     uint64_t client_token{0};
     uint64_t term{0}; // InternalLogin
+    // SyncRSCommitLSN still queued: the slots held here that its verdicts voided, which its apply frees. Empty for the
+    // entry being applied: its frees may have happened.
+    std::vector< int64_t > to_free{};
 
     bool operator==(CraftPendingEntry const&) const = default;
 };
@@ -850,7 +853,8 @@ private:
                                      .type = type,
                                      .rs_commit_lsn = rs_commit_lsn,
                                      .client_token = client_token,
-                                     .term = term};
+                                     .term = term,
+                                     .to_free = to_free};
         }
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from

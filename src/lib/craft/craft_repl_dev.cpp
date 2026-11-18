@@ -2282,6 +2282,7 @@ std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
             auto entry = std::move(apply_queue_.front());
             apply_queue_.pop_front();
             applying_ = entry.as_pending();
+            applying_->to_free.clear(); // its frees may happen before its apply is recorded: a restart leaks them
             return entry;
         }
         applying_.reset();
@@ -2517,6 +2518,18 @@ async_status CraftReplDev::recover() {
     } else {
         r = co_await rebuild_overlay();
     }
+    // A Sync still queued frees, when it applies, the slots its verdicts voided: their blocks stay the allocator's
+    // until then (rebuild_overlay() skips Empty slots).
+    if (r) {
+        for (auto const& p : *pending) {
+            for (int64_t lsn : p.to_free) {
+                auto const slot = co_await journal_->read_slot(lsn);
+                if (!slot || slot->all_zeros) continue; // nothing held: nothing to free either
+                if (r = journal_->commit_data(slot->blkid, /* recovering = */ true); !r) break;
+            }
+            if (!r) break;
+        }
+    }
     if (!r) {
         LOGE("restart recovery failed: {} -- partition permanently faulted, will "
              "not accept client I/O (see faulted_'s doc comment)",
@@ -2530,10 +2543,10 @@ async_status CraftReplDev::recover() {
 }
 
 // An entry queued again here applies without its commit-time state change: the image already holds a Sync's verdicts
-// above the frontier and its watermark (restore_state()), the journal walk rebuilt the rest, and making the change
-// again could find a verdict the restored frontier has passed. A Sync's frees are left out too: they may have happened
-// before the restart, and freeing twice is worse than leaking. An InternalLogin raises the login fence again, as at
-// commit.
+// and its watermark (restore_state()), the journal walk rebuilt the rest, and making the change again could find a
+// verdict the restored frontier has passed. A Sync still queued at the restart frees the slots its verdicts voided, as
+// it would have (recover() kept their blocks allocated); the one being applied comes without them, as its frees may
+// have happened: freeing twice is worse than leaking. An InternalLogin raises the login fence again, as at commit.
 void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
     bool start = false;
     {
@@ -2548,6 +2561,7 @@ void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
                                                 .type = p.type,
                                                 .rs_commit_lsn = p.rs_commit_lsn,
                                                 .client_token = p.client_token,
+                                                .to_free = p.to_free,
                                                 .term = p.term});
             restored_raft_idx_ = p.raft_idx; // the log replay delivers it too
         }
@@ -2560,7 +2574,7 @@ void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
 
 namespace {
 constexpr uint64_t k_durable_magic = 0x31425354'46415243ull; // "CRAFTSB1" little-endian
-constexpr uint32_t k_durable_version = 1;
+constexpr uint32_t k_durable_version = 2;
 #pragma pack(push, 1)
 struct DurableHeader {
     uint64_t magic;
@@ -2573,22 +2587,25 @@ struct DurableHeader {
     int64_t durable_commit_lsn;
     int64_t sync_watermark;
 };
-struct PendingRecord {
+struct PendingRecord { // followed by n_free int64_t: CraftPendingEntry::to_free
     int64_t raft_idx;
     uint8_t type;
     int64_t rs_commit_lsn;
     uint64_t client_token;
     uint64_t term;
+    uint32_t n_free;
 };
 #pragma pack(pop)
 } // namespace
 
 std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
-    // Verdicts above the frontier are pruned as it advances, and the pending entries are the apply queue's: neither
-    // gets near 2^32.
+    // Empty verdicts are rare, and the pending entries are the apply queue's: neither gets near 2^32.
     RELEASE_ASSERT(s.empty_lsns.size() <= std::numeric_limits< uint32_t >::max() &&
                        s.pending.size() <= std::numeric_limits< uint32_t >::max(),
                    "{} Empty verdicts or {} pending entries overflow the image", s.empty_lsns.size(), s.pending.size());
+    size_t frees = 0;
+    for (auto const& p : s.pending)
+        frees += p.to_free.size();
     DurableHeader const h{k_durable_magic,
                           k_durable_version,
                           static_cast< uint32_t >(s.empty_lsns.size()),
@@ -2599,7 +2616,7 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
                           s.durable_commit_lsn,
                           s.sync_watermark};
     std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t) +
-                               s.pending.size() * sizeof(PendingRecord));
+                               s.pending.size() * sizeof(PendingRecord) + frees * sizeof(int64_t));
     std::memcpy(out.data(), &h, sizeof(h));
     size_t off = sizeof(h);
     for (int64_t lsn : s.empty_lsns) {
@@ -2607,9 +2624,18 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
         off += sizeof(lsn);
     }
     for (auto const& p : s.pending) {
-        PendingRecord const r{p.raft_idx, static_cast< uint8_t >(p.type), p.rs_commit_lsn, p.client_token, p.term};
+        PendingRecord const r{.raft_idx = p.raft_idx,
+                              .type = static_cast< uint8_t >(p.type),
+                              .rs_commit_lsn = p.rs_commit_lsn,
+                              .client_token = p.client_token,
+                              .term = p.term,
+                              .n_free = static_cast< uint32_t >(p.to_free.size())};
         std::memcpy(out.data() + off, &r, sizeof(r));
         off += sizeof(r);
+        for (int64_t lsn : p.to_free) {
+            std::memcpy(out.data() + off, &lsn, sizeof(lsn));
+            off += sizeof(lsn);
+        }
     }
     return out;
 }
@@ -2619,10 +2645,8 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
     DurableHeader h;
     std::memcpy(&h, buf, sizeof(h));
     if (h.magic != k_durable_magic || h.version != k_durable_version) return std::nullopt;
-    if (len !=
-        sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t) +
-            static_cast< size_t >(h.n_pending) * sizeof(PendingRecord))
-        return std::nullopt;
+    // The pending records are of variable size: checked one by one below, and that they end the image exactly.
+    if ((len - sizeof(h)) / sizeof(int64_t) < h.n_empty) return std::nullopt;
     CraftDurableState s{.term = h.term,
                         .client_token = h.client_token,
                         .last_applied_raft_idx = h.last_applied_raft_idx,
@@ -2636,21 +2660,29 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
         s.empty_lsns.insert(s.empty_lsns.end(), lsn);
         prev = lsn;
     }
-    uint8_t const* const records = buf + sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t);
+    size_t off = sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t);
     int64_t prev_idx = -1;
     for (uint32_t i = 0; i < h.n_pending; ++i) {
         PendingRecord r;
-        std::memcpy(&r, records + i * sizeof(PendingRecord), sizeof(r));
+        if (len - off < sizeof(r)) return std::nullopt;
+        std::memcpy(&r, buf + off, sizeof(r));
+        off += sizeof(r);
         auto const type = static_cast< CraftEntryType >(r.type);
         if (r.raft_idx <= prev_idx) return std::nullopt; // strictly ascending
         if (type != CraftEntryType::SyncRSCommitLSN && type != CraftEntryType::InternalLogin) return std::nullopt;
-        s.pending.push_back(CraftPendingEntry{.raft_idx = r.raft_idx,
-                                              .type = type,
-                                              .rs_commit_lsn = r.rs_commit_lsn,
-                                              .client_token = r.client_token,
-                                              .term = r.term});
+        if ((len - off) / sizeof(int64_t) < r.n_free) return std::nullopt;
+        CraftPendingEntry p{.raft_idx = r.raft_idx,
+                            .type = type,
+                            .rs_commit_lsn = r.rs_commit_lsn,
+                            .client_token = r.client_token,
+                            .term = r.term};
+        p.to_free.resize(r.n_free);
+        std::memcpy(p.to_free.data(), buf + off, r.n_free * sizeof(int64_t));
+        off += r.n_free * sizeof(int64_t);
+        s.pending.push_back(std::move(p));
         prev_idx = r.raft_idx;
     }
+    if (off != len) return std::nullopt;
     return s;
 }
 

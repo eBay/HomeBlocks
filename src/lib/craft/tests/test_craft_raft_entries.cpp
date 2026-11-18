@@ -119,6 +119,7 @@ public:
     bool fail_commit{false};
     status commit_data(homestore::multi_blk_id const& blkid, bool recovering) override {
         if (fail_commit) return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (!blkid.is_valid()) return ok(); // as the HomeStore backend: nothing allocated
         commits.emplace_back(blkid.to_single_blkid().blk_num(), recovering);
         return ok();
     }
@@ -2091,9 +2092,11 @@ TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterARestart) {
 
 // ── entries committed but not applied (pending) ──
 
-CraftPendingEntry pending_sync(int64_t raft_idx, int64_t rs_commit_lsn) {
-    return CraftPendingEntry{
-        .raft_idx = raft_idx, .type = CraftEntryType::SyncRSCommitLSN, .rs_commit_lsn = rs_commit_lsn};
+CraftPendingEntry pending_sync(int64_t raft_idx, int64_t rs_commit_lsn, std::vector< int64_t > to_free = {}) {
+    return CraftPendingEntry{.raft_idx = raft_idx,
+                             .type = CraftEntryType::SyncRSCommitLSN,
+                             .rs_commit_lsn = rs_commit_lsn,
+                             .to_free = std::move(to_free)};
 }
 
 CraftPendingEntry pending_login(int64_t raft_idx, uint64_t client_token, uint64_t term) {
@@ -2103,7 +2106,7 @@ CraftPendingEntry pending_login(int64_t raft_idx, uint64_t client_token, uint64_
 
 TEST(CraftDurableStateCodec, RoundTripsPendingEntries) {
     auto s = sample_state();
-    s.pending = {pending_sync(10, 7), pending_login(11, 55, 6)};
+    s.pending = {pending_sync(10, 7, {5, 6}), pending_login(11, 55, 6)};
     auto const bytes = encode_durable_state(s);
     auto const d = decode_durable_state(bytes.data(), bytes.size());
     ASSERT_TRUE(d.has_value());
@@ -2112,9 +2115,10 @@ TEST(CraftDurableStateCodec, RoundTripsPendingEntries) {
 
 TEST(CraftDurableStateCodec, RejectsMalformedPendingEntries) {
     auto s = sample_state();
-    s.pending = {pending_sync(10, 7), pending_login(11, 55, 6)};
+    s.pending = {pending_sync(10, 7, {5}), pending_login(11, 55, 6)};
     auto const good = encode_durable_state(s);
-    size_t const record = 33; // packed: raft_idx, type, rs_commit_lsn, client_token, term
+    size_t const record =
+        37; // packed: raft_idx, type, rs_commit_lsn, client_token, term, n_free (the login frees none)
     size_t const second = good.size() - record;
 
     EXPECT_FALSE(decode_durable_state(good.data(), good.size() - 1).has_value()); // cut short
@@ -2125,6 +2129,10 @@ TEST(CraftDurableStateCodec, RejectsMalformedPendingEntries) {
     auto create_volume = good;
     create_volume[second + sizeof(int64_t)] = static_cast< uint8_t >(CraftEntryType::CreateVolume); // not queued
     EXPECT_FALSE(decode_durable_state(create_volume.data(), create_volume.size()).has_value());
+    auto overrun = good;
+    uint32_t const one = 1;
+    std::memcpy(overrun.data() + good.size() - sizeof(uint32_t), &one, sizeof(one)); // a free past the end
+    EXPECT_FALSE(decode_durable_state(overrun.data(), overrun.size()).has_value());
 }
 
 // Every image holds the entries committed but not yet applied, in log order; once applied they leave it.
@@ -2145,19 +2153,38 @@ TEST_F(CraftRaftEntriesTest, ImageHoldsTheEntriesNotYetApplied) {
     EXPECT_EQ(store->saved->last_applied_raft_idx, 6);
 }
 
-// The entry being applied is pending until its apply completes.
+// The entry being applied is pending until its apply completes, without the slots it frees: its frees may have
+// happened, and a restart leaks them rather than free twice.
 TEST_F(CraftRaftEntriesTest, ImageHoldsTheEntryBeingApplied) {
     auto* store = with_store();
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
+    journal_->slots[0] = page_slot(0);
     fetcher_.hold_fetch = true; // the Sync's catch-up waits for the gate
-    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {}));
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {0}));
     ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
     EXPECT_EQ(store->saved->pending, (std::vector< CraftPendingEntry >{pending_sync(5, 2)}));
 
     fetcher_.fetch_gate.complete(true);
     EXPECT_TRUE(store->saved->pending.empty());
     EXPECT_EQ(store->saved->last_applied_raft_idx, 5);
+    EXPECT_EQ(journal_->free_data_calls, 1) << "slot 0, voided";
+}
+
+// A Sync still queued keeps in the image the slots its verdicts voided: its apply frees them, after a restart too.
+TEST_F(CraftRaftEntriesTest, ImageHoldsTheFreesOfAQueuedSync) {
+    auto* store = with_store();
+    dev_->seed_lsns(3, {});
+    journal_->slots[2] = page_slot(2);
+    dev_->pause_apply();
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(3, 0, {2}));
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
+    EXPECT_EQ(store->saved->pending, (std::vector< CraftPendingEntry >{pending_sync(5, 3, {2})}));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+
+    dev_->resume_apply();
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    EXPECT_TRUE(store->saved->pending.empty());
 }
 
 // A restart applies again the image's pending entries above its last applied index, in log order, and the log replay
@@ -2180,7 +2207,8 @@ TEST_F(CraftRaftEntriesTest, RestartAppliesThePendingEntriesAgain) {
 }
 
 // A pending Sync applies again without its commit-time state change, which the image already holds: no verdict check
-// against the restored frontier (its verdicts here are at or below it), and no frees (they may have happened before).
+// against the restored frontier (its verdicts here are at or below it). One recorded as being applied frees nothing:
+// its frees may have happened before.
 TEST_F(CraftRaftEntriesTest, RestartAppliesAPendingSyncWithoutItsVerdictsOrFrees) {
     auto image = sample_state();
     image.durable_commit_lsn = 3; // the Sync voided slot 3 before the restart; the frontier has passed it
@@ -2190,6 +2218,22 @@ TEST_F(CraftRaftEntriesTest, RestartAppliesAPendingSyncWithoutItsVerdictsOrFrees
     restart(image, page_slots({0, 1, 2, 3}));
     EXPECT_FALSE(dev_->is_faulted());
     EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 10);
+}
+
+// A Sync still queued at the restart frees the slots its verdicts voided when it applies again; the recovery keeps
+// their blocks allocated until then.
+TEST_F(CraftRaftEntriesTest, RestartFreesTheVoidedSlotsOfAQueuedSync) {
+    auto image = sample_state(); // frontier 1, watermark 6
+    image.empty_lsns = {2, 4};
+    image.pending = {pending_sync(10, 3, {2})};
+    auto slots = page_slots({0, 1, 2, 3});
+    slots[2].blkid = homestore::multi_blk_id{102, 1, 0};
+    restart(image, std::move(slots));
+    ASSERT_FALSE(dev_->is_faulted());
+    EXPECT_EQ(journal_->commits, (std::vector< std::pair< homestore::blk_num_t, bool > >{{102, true}}))
+        << "kept until freed";
+    EXPECT_EQ(journal_->free_data_calls, 1);
     EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 10);
 }
 
