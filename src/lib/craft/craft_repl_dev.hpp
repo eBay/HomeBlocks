@@ -592,10 +592,10 @@ public:
     async_status stop_apply();
 
     // Stops everything the device runs on its own, before what it works on goes away: the applies (waiting out the one
-    // in progress), the journal reclaim (waiting out a running one), the watchdog and the proposer
-    // (CraftRaftProposer::stop()). keep_queued, for a shutdown: the queued entries, and any that commit later, stay
-    // queued unapplied, for HomeStore's last checkpoint to save with the partition's state. Otherwise, for a destroy,
-    // they fail as in stop_apply(). Called once.
+    // in progress), the journal reclaim (waiting out a running one), the checkpoint triggers (waiting out those in
+    // flight), the watchdog and the proposer (CraftRaftProposer::stop()). keep_queued, for a shutdown: the queued
+    // entries, and any that commit later, stay queued unapplied, for HomeStore's last checkpoint to save with the
+    // partition's state. Otherwise, for a destroy, they fail as in stop_apply(). Called once.
     async_status stop(bool keep_queued);
 
     // Restart recovery: restores the durable state (restore_state()), rebuilds the overlay, then queues again the
@@ -1202,6 +1202,12 @@ private:
     bool reclaim_running_{false};          // a run_reclaim() is active
     bool reclaim_unsupported_{false};      // the backend said not_supported: stop asking
     bool reclaim_stopped_{false};          // stop(): no reclaim runs anymore
+    // fire_checkpoint_trigger()'s detached rounds still running: after its flush, one persists the frontier and frees
+    // blocks, so stop() waits for them. Guarded by state_mu_.
+    int checkpoints_running_{0};
+    bool checkpoints_stopped_{false}; // stop(): none starts anymore
+    shared< sisl::async::value_awaitable< bool > > checkpoints_idle_;
+    void checkpoint_done();
     // Completed when the running reclaim ends, for a stop() waiting for it.
     shared< sisl::async::value_awaitable< bool > > reclaim_idle_;
 };

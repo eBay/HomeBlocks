@@ -1039,9 +1039,18 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
     // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
     // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
+    {
+        std::lock_guard lk{state_mu_};
+        if (checkpoints_stopped_) return; // stop(): nothing here touches HomeStore anymore
+        ++checkpoints_running_;
+    }
     // Parameters, not captures: a coroutine lambda's captures live in the temporary closure, which is gone by
     // the time the coroutine resumes.
     detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot) -> async_status {
+        struct done_t {
+            CraftReplDev* dev;
+            ~done_t() { dev->checkpoint_done(); }
+        } const done{self.get()}; // on every way out
         auto cp = co_await self->checkpoint_trigger_(false);
         if (!cp) {
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
@@ -1052,6 +1061,15 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
         if (!*cp) co_return ok();
         co_return co_await self->advance_durable_commit(commit_lsn_snapshot);
     }(shared_from_this(), commit_lsn_snapshot));
+}
+
+void CraftReplDev::checkpoint_done() {
+    shared< sisl::async::value_awaitable< bool > > idle;
+    {
+        std::lock_guard lk{state_mu_};
+        if (--checkpoints_running_ == 0) idle = std::exchange(checkpoints_idle_, nullptr);
+    }
+    if (idle) idle->complete(true); // outside the lock: resumes stop()
 }
 
 // ─── durable commit frontier and block frees (S8) ────────────────────────────
@@ -2362,6 +2380,14 @@ async_status CraftReplDev::stop(bool keep_queued) {
         if (reclaim_running_) reclaimed = reclaim_idle_ = std::make_shared< sisl::async::value_awaitable< bool > >();
     }
     if (reclaimed) co_await *reclaimed;
+    shared< sisl::async::value_awaitable< bool > > checkpointed;
+    {
+        std::lock_guard lk{state_mu_};
+        checkpoints_stopped_ = true;
+        if (checkpoints_running_ > 0)
+            checkpointed = checkpoints_idle_ = std::make_shared< sisl::async::value_awaitable< bool > >();
+    }
+    if (checkpointed) co_await *checkpointed;
     watchdog_token_.cancel(/* wait = */ true);
     if (raft_proposer_) raft_proposer_->stop(); // the pending proposals of its rounds end
     co_return ok();

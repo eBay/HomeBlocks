@@ -199,10 +199,13 @@ struct MockCraftCheckpointTrigger {
     bool last_force{false};
     bool fail_next{false};
     bool flushed{true}; // false: the request coalesced with a flush already running
+    bool hold{false};   // the next trigger waits at gate
+    sisl::async::value_awaitable< bool > gate;
 
     async_result< bool > operator()(bool force) {
         ++call_count;
         last_force = force;
+        if (std::exchange(hold, false)) co_await gate;
         if (fail_next) {
             fail_next = false;
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -1787,6 +1790,34 @@ TEST_F(CraftRaftEntriesTest, FlushedCheckpointRecordsTheDurableCommit) {
     ASSERT_TRUE(store->saved.has_value());
     EXPECT_EQ(store->saved->durable_commit_lsn, 12);
     EXPECT_EQ(store->saved->empty_lsns, (std::set< int64_t >{11, 12}));
+}
+
+// stop() waits out a checkpoint trigger in flight: once its flush completes it still persists the frontier and frees
+// blocks, which a destroy or a shutdown must not pull out from under it. None starts after stop().
+TEST_F(CraftRaftEntriesTest, StopWaitsForTheCheckpointInFlight) {
+    auto* store = with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(5);
+    dev_->seed_lsns(10, {});
+    trigger_.hold = true;
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/12, /*client_token=*/0, /*empty_slots=*/{11, 12}).has_value());
+    ASSERT_EQ(trigger_.call_count, 1);
+
+    bool stopped = false;
+    homeblocks::detail::detach([](CraftReplDev* dev, bool* stopped) -> async_status {
+        (void)co_await dev->stop(/*keep_queued=*/true);
+        *stopped = true;
+        co_return ok();
+    }(dev_.get(), &stopped));
+    EXPECT_FALSE(stopped) << "the checkpoint is still in flight";
+    trigger_.gate.complete(true);
+    EXPECT_TRUE(stopped);
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->durable_commit_lsn, 12) << "it finished before stop() returned";
+
+    dev_->seed_lsns(20, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/20, /*client_token=*/0).has_value());
+    EXPECT_EQ(trigger_.call_count, 1) << "none starts after stop()";
 }
 
 // A checkpoint request that coalesced with a flush already running proves nothing about the slots applied since that
