@@ -94,6 +94,35 @@ inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8
             empties.value_or(std::vector< int64_t >{})};
 }
 
+// In-memory CraftStateStore. Keeps the last image persisted and hands it back through the real codec on load(), so
+// restart tests exercise encode/decode too. hold suspends the next persist() until gate is completed.
+class MockCraftStateStore : public CraftStateStore {
+public:
+    std::optional< CraftDurableState > saved;
+    int persist_calls{0};
+    bool fail_persist{false};
+    bool fail_load{false};
+    bool hold{false};
+    sisl::async::value_awaitable< bool > gate;
+
+    result< std::optional< CraftDurableState > > load() override {
+        if (fail_load) return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (!saved) return std::optional< CraftDurableState >{};
+        auto const bytes = encode_durable_state(*saved);
+        auto d = decode_durable_state(bytes.data(), bytes.size());
+        if (!d) return std::unexpected(std::make_error_condition(std::errc::illegal_byte_sequence));
+        return d;
+    }
+
+    async_status persist(CraftDurableState const& s) override {
+        ++persist_calls;
+        if (std::exchange(hold, false)) co_await gate;
+        if (fail_persist) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        saved = s;
+        co_return ok();
+    }
+};
+
 template < typename Mock >
 async_status mock_free_slot(Mock& mock, int64_t lsn) {
     auto it = mock.slots.find(lsn);

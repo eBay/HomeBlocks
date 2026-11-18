@@ -405,6 +405,10 @@ public:
         co_return ok();
     }
 
+    // The log store's highest seq_num not rolled back: -1 for a store never written to (a new store starts at seq_num
+    // 0). A reopened store has its tail once its log replay is done, which is before the device is attached to it.
+    async_result< int64_t > tail_lsn() override { co_return static_cast< int64_t >(logstore_->tail_lsn()); }
+
 private:
     shared< homestore::home_log_store > logstore_;
     uint64_t vol_ordinal_;
@@ -418,13 +422,14 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 
 // Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
-    return [](bool force) -> async_status {
-        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return ok();
+    return [](bool force) -> async_result< bool > {
+        // true: this call switched over a new checkpoint and its flush completed.
+        if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return true;
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
         // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
         // (this trigger's only current caller, fire_checkpoint_trigger, coalesces with any in-flight
         // flush on purpose). Only a force=true false return is a real failure worth surfacing.
-        if (!force) co_return ok();
+        if (!force) co_return false;
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     };
 }
@@ -559,14 +564,15 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
 // ─── constructor ──────────────────────────────────────────────────────────────
 
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
-                           shared< VolumeIndexTable > indx_tbl) :
+                           shared< VolumeIndexTable > indx_tbl, unique< CraftStateStore > state_store) :
         vol_id_{vol_id},
         journal_{std::move(journal)},
         lba_size_{lba_size},
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
         sync_lsn_interval_{static_cast< int64_t >(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval))},
-        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
+        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL},
+        state_store_{std::move(state_store)} {}
 
 CraftReplDev::~CraftReplDev() {
     // iomgr::timer_token::cancel(wait=true) is a no-op if the watchdog was never armed (watchdog disabled
@@ -943,8 +949,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     if (stale_post_flight) { co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM)); }
     if (voided_post_flight) {
         // Apply didn't free this slot (it was still missing then), so free its blocks here.
-        if (auto fr = co_await journal_->free_slot(dlsn); !fr)
-            LOGE("free_slot failed for voided write dlsn={}: {}", dlsn, fr.error().message());
+        co_await free_voided(dlsn);
         co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
     }
 
@@ -997,10 +1002,87 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     // Parameters, not captures: a coroutine lambda's captures live in the temporary closure, which is gone by
     // the time the coroutine resumes.
     detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot) -> async_status {
-        if (auto cp = co_await self->checkpoint_trigger_(false); !cp)
+        auto cp = co_await self->checkpoint_trigger_(false);
+        if (!cp) {
             LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
-        co_return ok();
+            co_return ok();
+        }
+        // Coalesced into a flush that was already running: that flush may predate some of the slots applied up to
+        // commit_lsn_snapshot, so it proves nothing about them. A later trigger will.
+        if (!*cp) co_return ok();
+        co_return co_await self->advance_durable_commit(commit_lsn_snapshot);
     }(shared_from_this(), commit_lsn_snapshot));
+}
+
+// ─── durable commit frontier and block frees (S8) ────────────────────────────
+
+async_status CraftReplDev::advance_durable_commit(int64_t lsn) {
+    {
+        std::lock_guard lk{state_mu_};
+        if (lsn <= durable_.durable_commit_lsn) co_return ok();
+        durable_.durable_commit_lsn = lsn;
+        auto& empties = durable_.empty_lsns;
+        empties.erase(empties.begin(), empties.upper_bound(lsn));
+    }
+    if (auto r = co_await persist_state(); !r) {
+        // Recorded in memory; the next persist writes it. The superseded blocks wait for a frontier that is durable.
+        LOGE("persisting the durable commit_lsn={} failed: {}", lsn, r.error().message());
+        co_return ok();
+    }
+    // A restart never applies a slot <= lsn again, so the blocks those slots superseded can go.
+    std::vector< homestore::blk_id > releasable;
+    {
+        std::lock_guard lk{state_mu_};
+        auto const keep = std::stable_partition(deferred_frees_.begin(), deferred_frees_.end(),
+                                                [lsn](auto const& e) { return e.first > lsn; });
+        for (auto it = keep; it != deferred_frees_.end(); ++it)
+            releasable.push_back(it->second);
+        deferred_frees_.erase(keep, deferred_frees_.end());
+    }
+    co_return co_await free_blocks(lsn, std::move(releasable));
+}
+
+// A block an index write replaces belongs to an OLDER slot. With a state store, freeing it at once is unsafe: until a
+// checkpoint covering the replacing slot completes, a restart applies the older slot again from the journal and points
+// the index at a block that may belong to someone else by then. So the free waits for the durable commit frontier
+// (advance_durable_commit()). A crash before that leaks the waiting blocks, bounded by the window since the last
+// durable checkpoint -- never corruption. Without a store nothing is restored after a restart, so they go at once.
+async_status CraftReplDev::release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks) {
+    if (blocks.empty()) co_return ok();
+    if (state_store_) {
+        std::lock_guard lk{state_mu_};
+        for (auto const& b : blocks)
+            deferred_frees_.emplace_back(replacing_lsn, b);
+        co_return ok();
+    }
+    co_return co_await free_blocks(replacing_lsn, std::move(blocks));
+}
+
+async_status CraftReplDev::free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks) {
+    for (auto const& blk : blocks) {
+        if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{blk}); !fr)
+            LOGE("free_data failed reclaiming blk={} lsn={}: {}", blk.to_string(), lsn, fr.error().message());
+    }
+    co_return ok();
+}
+
+// Every block an Empty verdict voids is freed only once the verdict is durable, wherever the free happens (a Sync's
+// apply, a voided write or fill). Otherwise a restart replaying the Sync with no memory of the verdict finds the slot's
+// journal record and frees the same blocks a second time. If the verdict can't be made durable, the blocks leak.
+async_status CraftReplDev::free_voided(int64_t lsn, std::optional< homestore::multi_blk_id > fill) {
+    if (auto r = co_await persist_state(); !r) {
+        LOGE("verdict voiding lsn={} not durable: {} -- leaking its blocks rather than risk freeing them twice", lsn,
+             r.error().message());
+        co_return ok();
+    }
+    status fr;
+    if (fill) {
+        fr = co_await journal_->free_data(*fill);
+    } else {
+        fr = co_await journal_->free_slot(lsn);
+    }
+    if (!fr) LOGE("freeing the blocks of voided lsn={} failed: {} -- they may leak", lsn, fr.error().message());
+    co_return ok();
 }
 
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
@@ -1013,13 +1095,14 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 
 async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t write_fn,
                                                   delete_index_fn_t delete_fn) {
-    int64_t commit_lsn, last_append_lsn;
+    int64_t commit_lsn, last_append_lsn, replay_upto;
     {
         std::lock_guard lk{state_mu_};
         if (commit_running_) co_return state_.commit_lsn; // another run is already advancing
         commit_running_ = true;
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
+        replay_upto = replay_upto_;
     }
     // Tracks the highest lsn successfully applied so far, updated per-iteration below WITHOUT
     // state_mu_. Written to the shared state_.commit_lsn exactly once, in
@@ -1060,6 +1143,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             if (!is_missing && !is_empty) indexing_lsn_ = lsn;
         }
         if (is_missing) break; // stall at the first hole -- not an error
+        // A slot journalled before the restart may be applied again over an index that already holds a newer slot's
+        // block for the same LBA: never free what applying it replaces (see replay_upto_).
+        bool const replaying = lsn <= replay_upto;
 
         if (!is_empty) {
             auto slot_r = co_await journal_->read_slot(lsn);
@@ -1082,13 +1168,9 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             if (slot.all_zeros) {
                 std::vector< homestore::blk_id > freed;
                 if (auto r = delete_fn(start_lba, end_lba, freed); !r) co_return std::unexpected(r.error());
-                // Reclaim inline, same as write()'s own free_data call sites -- free errors are
-                // logged but non-fatal (the block is merely leaked, not corrupted).
-                for (auto const& blk : freed) {
-                    if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{blk}); !fr)
-                        LOGE("free_data failed reclaiming blk={} lsn={}: {}", blk.to_string(), lsn,
-                             fr.error().message());
-                }
+                // Reclaim what the delete unmapped (release_superseded() says when); a failed free merely leaks.
+                if (replaying) freed.clear();
+                co_await release_superseded(lsn, std::move(freed));
             } else {
                 // Decompose the slot's blkid into per-LBA single-block BlockInfo entries -- same shape
                 // as write()'s own overlay-population decomposition and volume.cpp's non-CRAFT path.
@@ -1114,16 +1196,16 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                     }
                 }
                 if (auto r = write_fn(start_lba, end_lba, blocks_info); !r) co_return std::unexpected(r.error());
-                // Reclaim any superseded old blkid inline, same as write()'s own free_data call sites.
+                // Reclaim any superseded old blkid (release_superseded() says when).
                 // old_blkid == new_blkid means this slot was already applied (crash-replay of an
                 // idempotent commit before commit_lsn was durably persisted): the index already holds
                 // this exact blkid, so freeing it here would free a block the index still references.
+                std::vector< homestore::blk_id > superseded;
                 for (auto const& [_, info] : blocks_info) {
-                    if (!info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
-                    if (auto fr = co_await journal_->free_data(homestore::multi_blk_id{info.old_blkid}); !fr)
-                        LOGE("free_data failed reclaiming blk={} lsn={}: {}", info.old_blkid.to_string(), lsn,
-                             fr.error().message());
+                    if (replaying || !info.old_blkid.is_valid() || info.old_blkid == info.new_blkid) continue;
+                    superseded.push_back(info.old_blkid);
                 }
+                co_await release_superseded(lsn, std::move(superseded));
             }
 
             retire_overlay_range(start_lba, end_lba, lsn);
@@ -2001,7 +2083,16 @@ async_status CraftReplDev::rebuild_overlay() {
         if (is_missing || is_empty) continue;
 
         auto slot_r = co_await journal_->read_slot(lsn);
-        if (!slot_r) co_return std::unexpected(slot_r.error());
+        if (!slot_r) {
+            // Never journalled here (the restored range reaches up to the Sync watermark): missing, catch-up fills it.
+            // Any other read error is a fault.
+            auto const e = slot_r.error();
+            if (e != std::errc::result_out_of_range && e != std::errc::no_such_file_or_directory)
+                co_return std::unexpected(e);
+            std::lock_guard lk{state_mu_};
+            missing_lsns_.insert(lsn);
+            continue;
+        }
         // A malformed record is skipped, not fatal: the replayed journal isn't being mutated.
         populate_overlay_from_slot(lsn, *slot_r, slot_r->blkid);
     }
@@ -2067,10 +2158,15 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots) {
     std::optional< std::error_condition > rejected;
     bool start = false;
+    std::optional< int64_t > applied_before_restart;
     {
         std::lock_guard lk{apply_mu_};
         if (apply_stopped_) {
             rejected = std::make_error_condition(std::errc::operation_canceled);
+        } else if (entry.lsn <= restored_raft_idx_) {
+            // Applied before the restart, and its effects restored from the image: applying it again could e.g. free
+            // the blocks of a slot it voided a second time.
+            applied_before_restart = restored_raft_idx_;
         } else {
             // Fences take effect at commit; only I/O waits for the queue.
             if (entry.type == CraftEntryType::SyncRSCommitLSN) {
@@ -2095,6 +2191,12 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
     if (rejected) {
         LOGW("apply lsn={} not applied: {}", entry.lsn, rejected->message());
         complete_proposal(entry.ctx, std::unexpected(*rejected));
+        return;
+    }
+    if (applied_before_restart) {
+        LOGD("apply lsn={} skipped: applied before the restart (up to raft lsn={})", entry.lsn,
+             *applied_before_restart);
+        complete_proposal(entry.ctx, ok());
         return;
     }
     // Starts inline: with nothing awaited, the entry has applied by the time on_commit() returns.
@@ -2137,8 +2239,21 @@ async_status CraftReplDev::drain_apply() {
             faulted_.store(true, std::memory_order_release);
             outcome = std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
-        if (!outcome) LOGW("apply lsn={} failed: {}", entry->lsn, outcome.error().message());
+        bool const applied = static_cast< bool >(outcome);
+        if (!applied) LOGW("apply lsn={} failed: {}", entry->lsn, outcome.error().message());
         complete_proposal(entry->ctx, std::move(outcome));
+
+        // Then the image records the entry as applied -- after the durable effects its apply wrote ahead -- so the log
+        // replay after a restart skips it. Not once an apply has failed in this process: a restart then applies the
+        // failed entry again instead of skipping it for good (later entries again too; that's what a failed persist
+        // here leads to as well).
+        {
+            std::lock_guard lk{state_mu_};
+            if (!applied) apply_failed_ = true;
+            if (!apply_failed_) durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, entry->lsn);
+        }
+        if (auto r = co_await persist_state(); !r)
+            LOGE("persisting the last applied raft lsn={} failed: {}", entry->lsn, r.error().message());
     }
     co_return ok();
 }
@@ -2148,8 +2263,7 @@ async_status CraftReplDev::apply_one(PendingApply const& entry) {
     case CraftEntryType::SyncRSCommitLSN: // its state change was made at commit
         co_return co_await finish_sync_rs_commit_lsn(entry.rs_commit_lsn, entry.client_token, entry.to_free);
     case CraftEntryType::InternalLogin:
-        apply_internal_login(entry.client_token, entry.term);
-        co_return ok();
+        co_return co_await apply_internal_login(entry.client_token, entry.term);
     default: // on_commit() queues only the types above
         co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
     }
@@ -2199,6 +2313,13 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
     std::lock_guard sl{state_mu_};
     if (login_fence_term_ < state_.term)
         found.push_back(fmt::format("login fence term {} below the session term {}", login_fence_term_, state_.term));
+    if (durable_.durable_commit_lsn > state_.commit_lsn)
+        found.push_back(fmt::format("durable commit frontier {} above commit_lsn {}", durable_.durable_commit_lsn,
+                                    state_.commit_lsn));
+    for (int64_t lsn : durable_.empty_lsns)
+        if (lsn <= durable_.durable_commit_lsn || !empty_lsns_.contains(lsn))
+            found.push_back(fmt::format("durable verdict {} is at or below its frontier {}, or not in effect", lsn,
+                                        durable_.durable_commit_lsn));
     for (int64_t lsn : empty_lsns_)
         if (missing_lsns_.contains(lsn)) found.push_back(fmt::format("lsn {} is both missing and Empty", lsn));
 
@@ -2259,17 +2380,14 @@ void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const&
 // correctness for that case currently rests entirely on HomeStore's calling convention (observed today:
 // fired at most once per instance per restart cycle), not on anything this class enforces itself.
 //
-// Currently a no-op in practice: CraftPartitionState itself (state_) has no superblock-recovery path
-// yet, so commit_lsn/last_append_lsn are still at their default -1/-1 when this fires, making
-// rebuild_overlay()'s walk range empty and run_recovery() clear recovering_ almost immediately. This
-// gate is still the correct wiring for once real superblock recovery populates state_ before this
-// fires.
+// With a state store, run_recovery() first restores state_ from the durable image and the journal, then rebuilds the
+// overlay over (commit_lsn, last_append_lsn]. Without one, state_ stays at its defaults and the walk is empty.
 void CraftReplDev::CraftRaftListener::on_restart() {
     owner_->recovering_.store(true, std::memory_order_release);
     detail::detach(owner_->run_recovery());
 }
 
-// Awaits rebuild_overlay() to completion. On success, clears recovering_ -- the volume resumes
+// Awaits restore_state(), then rebuild_overlay(), to completion. On success, clears recovering_ -- the volume resumes
 // accepting client I/O against a now-complete overlay. On FAILURE (e.g. a corrupt journal record),
 // does the opposite of what a naive "always clear, log and move on" version would: leaves recovering_
 // set and additionally sets faulted_ (checked first, ahead of recovering_, by every client-
@@ -2281,9 +2399,12 @@ void CraftReplDev::CraftRaftListener::on_restart() {
 // data is not. There is deliberately no self-healing path out of this state here -- an operator
 // decision (or a future re-sync-from-peer mechanism) is required.
 async_status CraftReplDev::run_recovery() {
-    auto r = co_await rebuild_overlay();
+    // An image or journal tail that can't be read faults the partition just as a failed rebuild does: restarting it
+    // empty would forget its session and verdicts.
+    auto r = co_await restore_state();
+    if (r) r = co_await rebuild_overlay();
     if (!r) {
-        LOGE("rebuild_overlay failed during restart recovery: {} -- partition permanently faulted, will "
+        LOGE("restart recovery failed: {} -- partition permanently faulted, will "
              "not accept client I/O (see faulted_'s doc comment)",
              r.error().message());
         faulted_.store(true, std::memory_order_release);
@@ -2291,6 +2412,161 @@ async_status CraftReplDev::run_recovery() {
     }
     recovering_.store(false, std::memory_order_release);
     co_return r;
+}
+
+// ─── durable partition state (S8 / SDSTOR-22745) ─────────────────────────────
+
+namespace {
+constexpr uint64_t k_durable_magic = 0x31425354'46415243ull; // "CRAFTSB1" little-endian
+constexpr uint32_t k_durable_version = 1;
+#pragma pack(push, 1)
+struct DurableHeader {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t n_empty;
+    uint64_t term;
+    uint64_t client_token;
+    int64_t last_applied_raft_idx;
+    int64_t durable_commit_lsn;
+    int64_t sync_watermark;
+};
+#pragma pack(pop)
+} // namespace
+
+std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
+    // Verdicts above the frontier are pruned as it advances, so this is a backlog of unresolved slots, never near 2^32.
+    RELEASE_ASSERT(s.empty_lsns.size() <= std::numeric_limits< uint32_t >::max(),
+                   "{} Empty verdicts overflow the image", s.empty_lsns.size());
+    DurableHeader const h{k_durable_magic,
+                          k_durable_version,
+                          static_cast< uint32_t >(s.empty_lsns.size()),
+                          s.term,
+                          s.client_token,
+                          s.last_applied_raft_idx,
+                          s.durable_commit_lsn,
+                          s.sync_watermark};
+    std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t));
+    std::memcpy(out.data(), &h, sizeof(h));
+    size_t off = sizeof(h);
+    for (int64_t lsn : s.empty_lsns) {
+        std::memcpy(out.data() + off, &lsn, sizeof(lsn));
+        off += sizeof(lsn);
+    }
+    return out;
+}
+
+std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len) {
+    if (buf == nullptr || len < sizeof(DurableHeader)) return std::nullopt;
+    DurableHeader h;
+    std::memcpy(&h, buf, sizeof(h));
+    if (h.magic != k_durable_magic || h.version != k_durable_version) return std::nullopt;
+    if (len != sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t)) return std::nullopt;
+    CraftDurableState s{.term = h.term,
+                        .client_token = h.client_token,
+                        .last_applied_raft_idx = h.last_applied_raft_idx,
+                        .durable_commit_lsn = h.durable_commit_lsn,
+                        .sync_watermark = h.sync_watermark};
+    int64_t prev = s.durable_commit_lsn;
+    for (uint32_t i = 0; i < h.n_empty; ++i) {
+        int64_t lsn;
+        std::memcpy(&lsn, buf + sizeof(h) + i * sizeof(int64_t), sizeof(lsn));
+        if (lsn <= prev) return std::nullopt; // strictly ascending, and above the frontier
+        s.empty_lsns.insert(s.empty_lsns.end(), lsn);
+        prev = lsn;
+    }
+    return s;
+}
+
+async_status CraftReplDev::persist_state() {
+    if (!state_store_) co_return ok();
+    shared< sisl::async::shared_awaitable< bool > > round;
+    bool start;
+    {
+        std::lock_guard lk{state_mu_};
+        if (!persist_next_) persist_next_ = std::make_shared< sisl::async::shared_awaitable< bool > >();
+        round = persist_next_;
+        start = !std::exchange(persist_running_, true);
+    }
+    if (start) detail::detach(run_persist());
+    if (co_await *round) co_return ok();
+    co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+}
+
+// The one writer behind persist_state(). Each round writes the image as it is when the round is taken, which holds
+// every update its callers made before joining it; a caller joining meanwhile waits for the next round.
+async_status CraftReplDev::run_persist() {
+    auto self = shared_from_this();
+    for (;;) {
+        shared< sisl::async::shared_awaitable< bool > > round;
+        CraftDurableState image;
+        {
+            std::lock_guard lk{state_mu_};
+            round = std::exchange(persist_next_, nullptr);
+            if (!round) {
+                persist_running_ = false;
+                co_return ok();
+            }
+            image = durable_;
+        }
+        // An escaping exception would end the writer with persist_running_ still set: no persist would complete again.
+        status r;
+        try {
+            r = co_await state_store_->persist(image);
+        } catch (std::exception const& e) {
+            LOGE("persisting the durable partition state threw: {}", e.what());
+            r = std::unexpected(std::make_error_condition(std::errc::io_error));
+        } catch (...) {
+            LOGE("persisting the durable partition state threw an unknown exception");
+            r = std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+        if (!r) LOGE("persisting the durable partition state failed: {}", r.error().message());
+        round->complete(static_cast< bool >(r)); // never under state_mu_: resumes the round's callers
+    }
+}
+
+async_status CraftReplDev::restore_state() {
+    if (!state_store_) co_return ok();
+    result< std::optional< CraftDurableState > > loaded;
+    try {
+        loaded = state_store_->load();
+    } catch (std::exception const& e) {
+        LOGE("restore_state: loading the durable partition state threw: {}", e.what());
+        loaded = std::unexpected(std::make_error_condition(std::errc::io_error));
+    }
+    if (!loaded) {
+        LOGE("restore_state: durable partition state unreadable: {}", loaded.error().message());
+        co_return std::unexpected(loaded.error());
+    }
+    if (!*loaded) co_return ok(); // never persisted: a new partition
+    CraftDurableState const& d = **loaded;
+
+    auto tail = co_await journal_->tail_lsn();
+    if (!tail) {
+        LOGE("restore_state: journal tail unavailable: {}", tail.error().message());
+        co_return std::unexpected(tail.error());
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        durable_ = d;
+        state_.term = d.term;
+        state_.client_token = d.client_token;
+        login_fence_term_ = std::max(login_fence_term_, d.term);
+        state_.commit_lsn = d.durable_commit_lsn;
+        indexing_lsn_ = d.durable_commit_lsn;
+        state_.last_append_lsn = std::max({*tail, d.sync_watermark, d.durable_commit_lsn});
+        applied_sync_lsn_ = std::max(applied_sync_lsn_, d.sync_watermark);
+        empty_lsns_ = std::unordered_set< int64_t >(d.empty_lsns.begin(), d.empty_lsns.end());
+        missing_lsns_.clear(); // rebuild_overlay() marks every slot above commit_lsn that the journal doesn't hold
+        replay_upto_ = std::max(*tail, d.durable_commit_lsn);
+        last_checkpoint_lsn_ = d.durable_commit_lsn;
+    }
+    {
+        std::lock_guard lk{apply_mu_};
+        restored_raft_idx_ = d.last_applied_raft_idx;
+    }
+    LOGI("restore_state: term={} commit_lsn={} journal tail={} sync_watermark={} empties={} last_applied_raft_idx={}",
+         d.term, d.durable_commit_lsn, *tail, d.sync_watermark, d.empty_lsns.size(), d.last_applied_raft_idx);
+    co_return ok();
 }
 
 // ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
@@ -2547,10 +2823,7 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             }
         }
         // Freed while the claim is still held, so no other writer can journal the slot in between.
-        if (voided && blkid_allocated) {
-            if (auto fr = co_await journal_->free_data(blkid); !fr)
-                LOGE("pre_resolve_slots: free_data failed for voided fill lsn={}: {}", slot->lsn, fr.error().message());
-        }
+        if (voided && blkid_allocated) co_await free_voided(slot->lsn, blkid);
     }
     if (capped > 0)
         LOGW("pre_resolve_slots: missing_lsns_ at capacity -- left {} slot(s) above the frontier unresolved", capped);
@@ -2625,6 +2898,15 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
     }
     state_.last_append_lsn = std::max(state_.last_append_lsn, rs_commit_lsn);
 
+    // The image takes the verdicts (above its frontier) and the watermark now, with the state change: every block a
+    // verdict voids, here or by a write or fill it beats, is freed only once an image holding the verdict is durable
+    // (free_voided()). Without a store the verdicts aren't kept: nothing would ever prune them.
+    if (state_store_) {
+        for (int64_t lsn : empty_slots)
+            if (lsn > durable_.durable_commit_lsn) durable_.empty_lsns.insert(lsn);
+    }
+    durable_.sync_watermark = std::max(durable_.sync_watermark, rs_commit_lsn);
+
     // The voided slots stop being readable now, not once their blocks are freed: commit never retires their overlay
     // entries, since its advance steps over Empty slots.
     for (int64_t lsn : to_free)
@@ -2638,6 +2920,15 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
     // external owner drops it mid-apply (drain_apply() holds one too). Requires a shared_ptr-owned CraftReplDev.
     auto self = shared_from_this();
 
+    // The verdicts are durable before any of their blocks is freed (free_voided() says why): one persist for them all.
+    if (!to_free.empty()) {
+        if (auto r = co_await persist_state(); !r) {
+            LOGE("apply_sync_rs_commit_lsn: verdicts not durable: {} -- leaking {} voided slot(s) rather than risk "
+                 "freeing them twice",
+                 r.error().message(), to_free.size());
+            to_free.clear();
+        }
+    }
     for (int64_t lsn : to_free) {
         if (auto fr = co_await journal_->free_slot(lsn); !fr) {
             LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn, fr.error().message());
@@ -2730,11 +3021,7 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                     }
                 }
                 // Freed while the claim is still held, as in pre_resolve_slots.
-                if (voided && blkid_allocated) {
-                    if (auto fr = co_await journal_->free_data(blkid); !fr)
-                        LOGE("apply_sync_rs_commit_lsn: free_data failed for voided fill lsn={}: {}", slot.lsn,
-                             fr.error().message());
-                }
+                if (voided && blkid_allocated) co_await free_voided(slot.lsn, blkid);
             }
         }
     }
@@ -2793,13 +3080,26 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 
 // ─── InternalLogin apply (S5 / SDSTOR-22887) ─────────────────────────────────
 //
-// Pure in-memory state transition -- no journal I/O, no peer fetch -- so this stays synchronous
-// (unlike apply_sync_rs_commit_lsn); the apply queue runs it in log order like any other entry.
+// No journal I/O, no peer fetch; the apply queue runs it in log order like any other entry.
 // "Enforce single-writer exclusivity" needs no explicit rejection here: every other RPC's term-fence
 // check (STALE_TERM on mismatch) already does that. Overwriting state_.term is what invalidates any
 // existing session -- a caller still presenting the old term is fenced out on its very next call.
+//
+// The new session is made durable before it is admitted: once a write of it is acked, a restart must come back with
+// its term, or the old session's writes would be admitted again. If persisting fails the session isn't admitted (the
+// login fence raised at commit keeps the old one out), the apply fails, and a restart applies this entry again.
 
-void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
+async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
+    {
+        std::lock_guard lk{state_mu_};
+        durable_.term = std::max(durable_.term, term);
+        durable_.client_token = client_token;
+    }
+    if (auto r = co_await persist_state(); !r) {
+        LOGE("apply_internal_login: persisting session term={} failed: {} -- new session NOT admitted", term,
+             r.error().message());
+        co_return r;
+    }
     std::lock_guard lk{state_mu_};
     state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
     // A new session starts with no confirmed prefix of its own.
@@ -2809,6 +3109,7 @@ void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
     // log order blindly.
     state_.term = std::max(state_.term, term);
     LOGD("apply_internal_login client_token={} term={}", client_token, state_.term);
+    co_return ok();
 }
 
 } // namespace homeblocks

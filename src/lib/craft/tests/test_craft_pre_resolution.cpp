@@ -177,6 +177,19 @@ protected:
     // Runs within the device's current session, as a well-behaved caller does.
     auto do_pre_resolve(int64_t upto) { return do_pre_resolve(upto, dev_->term()); }
 
+    // Replaces dev_ with one whose durable state goes to the returned store, over a fresh journal mock, wired as
+    // SetUp() (and CraftAppendTest's) wire theirs.
+    MockCraftStateStore* with_store() {
+        auto store = std::make_unique< MockCraftStateStore >();
+        auto* raw = store.get();
+        auto mock = std::make_unique< MockCraftJournalBackend >();
+        journal_ = mock.get();
+        dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr, std::move(store));
+        dev_->set_raft_proposer(&proposer_);
+        dev_->set_peer_fetcher(&fetcher_);
+        return raw;
+    }
+
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftQuorumFetcher fetcher_;
     MockCraftRaftProposer proposer_;
@@ -693,6 +706,24 @@ TEST_F(CraftPreResolutionTest, FillVoidedByEmptyDuringWriteIsNotPublished) {
     EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // slot 3 was never published
     EXPECT_EQ(journal_->free_data_calls, 1); // slot 4's blocks were freed
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// With a state store the voided fill's blocks are freed only once the verdict is durable: if it can't be made durable
+// they leak, rather than be freed a second time by a restart replaying the Sync.
+TEST_F(CraftPreResolutionTest, FillVoidedDuringWriteLeaksIfTheVerdictCantBeMadeDurable) {
+    with_store()->fail_persist = true;
+    dev_->seed_lsns(5, {4});
+    fetcher_.response = {QuorumSlotResponse{
+        .slots = {JournalSlot{.lsn = 4, .lba_off_bytes = k_page_size, .len_bytes = k_page_size, .csums = {7}}}}};
+    journal_->on_write = [this](int64_t lsn) {
+        if (lsn == 4) dev_->seed_empty({4});
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->overlay_lsn_for(1), -1);
+    EXPECT_EQ(journal_->free_data_calls, 0);
 }
 
 // ── membership-aware quorum ───────────────────────────────────────────────────
@@ -1343,6 +1374,36 @@ TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsRejectedAndFreed) {
     EXPECT_TRUE(dev_->is_empty_slot(0));
     EXPECT_FALSE(dev_->is_missing(0));
     EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
+// With a state store the write's blocks are freed once the verdict is durable -- or leak if it can't be made durable,
+// rather than be freed a second time by a restart replaying the Sync.
+TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsFreedOnlyOnceTheVerdictIsDurable) {
+    for (bool const durable : {true, false}) {
+        auto* store = with_store();
+        store->fail_persist = !durable;
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
+        serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, {0});
+        journal_->on_write = [&](int64_t lsn) {
+            if (lsn != 0) return;
+            cintrusive< homestore::repl_req_ctx > ctx{};
+            dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                            sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+        };
+
+        auto w = do_write(0);
+
+        ASSERT_FALSE(w.has_value());
+        EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
+        EXPECT_EQ(journal_->free_data_calls, durable ? 1 : 0) << "durable=" << durable;
+        if (durable) {
+            ASSERT_TRUE(store->saved.has_value());
+            EXPECT_EQ(store->saved->empty_lsns, (std::set< int64_t >{0}));
+        }
+        EXPECT_EQ(dev_->invariant_violations(), std::vector< std::string >{});
+    }
 }
 
 // ── failures ──────────────────────────────────────────────────────────────────

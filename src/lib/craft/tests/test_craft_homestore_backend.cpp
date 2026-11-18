@@ -108,7 +108,7 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
 }
 
 // truncate_to(lsn) must drop journal entries above lsn from the real logdev's tail -- verified via
-// the log_store's own tail_lsn() rather than read_slot (not yet implemented; returns not_supported).
+// the backend's tail_lsn().
 TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
@@ -120,11 +120,20 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
                                                                   std::vector< homestore::csum_t >{}));
         ASSERT_TRUE(r.has_value());
     }
-    ASSERT_EQ(logstore->tail_lsn(), 4);
+    ASSERT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 4);
 
     auto r = homeblocks::detail::sync_get(backend->truncate_to(2));
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(logstore->tail_lsn(), 2);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 2);
+}
+
+// A journal never written to has tail -1: restart recovery takes max(tail, ...) for last_append_lsn, so any other
+// value would invent appended slots.
+TEST_F(CraftHomeStoreBackendTest, TailLsnOfANewJournalIsMinusOne) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), -1);
 }
 
 // read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
@@ -401,28 +410,32 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
 
     auto r = homeblocks::detail::sync_get(trigger(/* force = */ true));
     ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(*r) << "a forced checkpoint flushes";
 }
 
 // cp_mgr()'s in-flight-flush gate (m_in_flush_phase) is a synchronous check-and-set at entry: the
 // first of several concurrent trigger_cp_flush(false) calls holds it for the duration of the real
 // flush, so every other concurrent call observes it already set and gets HomeStore's synchronous
-// false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to ok()
-// when force=false; every one of these concurrent calls must succeed, not just the one that
-// actually flushed.
+// false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to false
+// (coalesced) when force=false; every one of these concurrent calls must succeed, and the one that
+// actually flushed reports true.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFails) {
     auto trigger = make_homestore_checkpoint_trigger_fn();
 
     constexpr int k_concurrent = 20;
-    std::vector< homestore::async_status > futs; // async_status is itself a sisl::async::task<result<...>>
+    std::vector< async_result< bool > > futs; // each a sisl::async::task<result<bool>>
     futs.reserve(k_concurrent);
     for (int i = 0; i < k_concurrent; ++i) {
         futs.push_back(trigger(/* force = */ false));
     }
 
     auto const results = homeblocks::detail::sync_get(sisl::async::when_all(std::move(futs)));
+    int flushed = 0;
     for (auto const& r : results) {
-        EXPECT_TRUE(r.has_value());
+        ASSERT_TRUE(r.has_value());
+        flushed += *r ? 1 : 0;
     }
+    EXPECT_GE(flushed, 1);
 }
 
 int main(int argc, char* argv[]) {
