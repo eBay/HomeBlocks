@@ -2392,6 +2392,80 @@ TEST_F(CraftRaftEntriesTest, ReclaimWaitsForTheFrontierToBePersisted) {
     EXPECT_EQ(dev_->reclaimed_upto(), 4);
 }
 
+// A Sync's verdicts let the commit, a checkpoint and the client's committed prefix pass the slots they void while its
+// apply waits in the queue; the apply then frees their blocks, read from the slots' journal records. Till then the
+// reclaim stays below them.
+TEST_F(CraftRaftEntriesTest, ReclaimWaitsForTheFreesOfAQueuedSync) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 3}, /*zeros=*/true);
+    journal_->slots[2] = page_slot(2); // blocks the Sync frees
+    dev_->seed_lsns(3, {});
+    dev_->pause_apply();
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(3, 0, {2}));
+    auto const c = homeblocks::detail::sync_get(dev_->commit_with(
+        3, [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) { return ok(); },
+        [](lba_t, lba_t, std::vector< homestore::blk_id >&) { return ok(); }));
+    ASSERT_TRUE(c.has_value());
+    ASSERT_EQ(dev_->durable_state().durable_commit_lsn, 3) << "the checkpoint the commit fires";
+    ASSERT_TRUE(keep_alive_with(*dev_, 3).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 1) << "reclaimed a slot the queued Sync still frees";
+
+    dev_->resume_apply();
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    EXPECT_EQ(dev_->reclaimed_upto(), 3);
+}
+
+// So does one queued again at a restart, past whose voided slots the restored frontier may be.
+TEST_F(CraftRaftEntriesTest, ReclaimWaitsForTheFreesOfASyncQueuedAgainAtARestart) {
+    auto image = sample_state();
+    image.durable_commit_lsn = 3; // past slot 2, which the queued Sync voided
+    image.empty_lsns = {2};
+    image.sync_watermark = 3;
+    image.pending = {pending_sync(10, 3, {2})};
+    auto* store = with_store();
+    store->saved = std::move(image);
+    journal_->slots = page_slots({0, 1, 3}, /*zeros=*/true);
+    journal_->slots[2] = page_slot(2); // blocks the Sync frees
+    dev_->pause_apply();
+    dev_->trigger_on_restart();
+    ASSERT_FALSE(dev_->is_faulted());
+    ASSERT_TRUE(keep_alive_with(*dev_, 3).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 1) << "reclaimed a slot the queued Sync still frees";
+
+    dev_->resume_apply();
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    EXPECT_EQ(dev_->reclaimed_upto(), 3);
+}
+
+// A write an Empty verdict voids while it is journalled frees the blocks it holds: the verdict lets the commit and the
+// reclaim pass the slot, so its journal record may be gone by the time the free runs.
+TEST_F(CraftRaftEntriesTest, VoidedWriteFreesTheBlocksItHolds) {
+    auto* store = with_store();
+    journal_->on_write = [&](int64_t lsn) {
+        dev_->seed_empty({lsn});
+        store->hold = true; // the free waits behind the verdict's persist
+    };
+    std::optional< std::error_condition > failed;
+    homeblocks::detail::detach(
+        [](CraftReplDev& dev, std::optional< std::error_condition >& failed) -> sisl::async::task< void > {
+            std::vector< uint8_t > buf(k_page_size, 1);
+            sisl::sg_list data;
+            data.size = k_page_size;
+            data.iovs.push_back(iovec{buf.data(), buf.size()});
+            auto const r = co_await dev.write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1},
+                                              /*dlsn=*/0, /*addr=*/0, /*len=*/k_page_size, std::move(data));
+            failed = r ? std::error_condition{} : r.error();
+        }(*dev_, failed));
+    ASSERT_FALSE(failed.has_value()) << "freed before the verdict was durable";
+    journal_->slots.erase(0); // reclaimed meanwhile
+    store->gate.complete(true);
+    ASSERT_TRUE(failed.has_value());
+    EXPECT_EQ(*failed, make_error_condition(volume_error::EMPTY_SLOT));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+}
+
 // ── stop (destroy, shutdown) ──
 
 // A shutdown's stop waits out the apply in progress and leaves the queued entries unapplied, also those committed

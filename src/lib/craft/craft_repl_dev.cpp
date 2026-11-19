@@ -1172,8 +1172,9 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
     }
     if (voided_post_flight) {
-        // Apply didn't free this slot (it was still missing then), so free its blocks here.
-        co_await free_voided(dlsn);
+        // Apply didn't free this slot (it was still missing then), so free its blocks here: those in hand, as the
+        // slot's journal record may be reclaimed by now (the verdict lets the commit step over it).
+        if (blkid_allocated) co_await free_voided(dlsn, blkid);
         co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
     }
 
@@ -1316,19 +1317,14 @@ async_status CraftReplDev::free_blocks(int64_t lsn, std::vector< homestore::blk_
 // Every block an Empty verdict voids is freed only once the verdict is durable, wherever the free happens (a Sync's
 // apply, a voided write or fill). Otherwise a restart replaying the Sync with no memory of the verdict finds the slot's
 // journal record and frees the same blocks a second time. If the verdict can't be made durable, the blocks leak.
-async_status CraftReplDev::free_voided(int64_t lsn, std::optional< homestore::multi_blk_id > fill) {
+async_status CraftReplDev::free_voided(int64_t lsn, homestore::multi_blk_id blkid) {
     if (auto r = co_await persist_state(); !r) {
         LOGE("verdict voiding lsn={} not durable: {} -- leaking its blocks rather than risk freeing them twice", lsn,
              r.error().message());
         co_return ok();
     }
-    status fr;
-    if (fill) {
-        fr = co_await journal_->free_data(*fill);
-    } else {
-        fr = co_await journal_->free_slot(lsn);
-    }
-    if (!fr) LOGE("freeing the blocks of voided lsn={} failed: {} -- they may leak", lsn, fr.error().message());
+    if (auto fr = co_await journal_->free_data(blkid); !fr)
+        LOGE("freeing the blocks of voided lsn={} failed: {} -- they may leak", lsn, fr.error().message());
     co_return ok();
 }
 
@@ -2742,9 +2738,10 @@ void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
         std::lock_guard lk{apply_mu_};
         for (auto const& p : pending) {
             if (p.raft_idx <= restored_raft_idx_) continue; // applied before the restart
-            if (p.type == CraftEntryType::InternalLogin) {
+            {
                 std::lock_guard sl{state_mu_};
-                login_fence_term_ = std::max(login_fence_term_, p.term);
+                if (p.type == CraftEntryType::InternalLogin) login_fence_term_ = std::max(login_fence_term_, p.term);
+                awaiting_free_.insert(p.to_free.begin(), p.to_free.end());
             }
             apply_queue_.push_back(PendingApply{.lsn = p.raft_idx,
                                                 .type = p.type,
@@ -3095,7 +3092,8 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
 // Without a state store nothing is persisted, so the persisted frontier stays -1 and nothing is ever reclaimed: the
 // journal is then the only copy.
 int64_t CraftReplDev::reclaim_floor_locked() const {
-    return std::min(persisted_durable_commit_, state_.all_committed_lsn);
+    auto const floor = std::min(persisted_durable_commit_, state_.all_committed_lsn);
+    return awaiting_free_.empty() ? floor : std::min(floor, *awaiting_free_.begin() - 1);
 }
 
 void CraftReplDev::request_reclaim() {
@@ -3508,6 +3506,7 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
     // entries, since its advance steps over Empty slots.
     for (int64_t lsn : to_free)
         retire_overlay_slot(lsn);
+    awaiting_free_.insert(to_free.begin(), to_free.end());
     return std::vector< int64_t >(to_free.begin(), to_free.end());
 }
 
@@ -3523,13 +3522,21 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
             LOGE("apply_sync_rs_commit_lsn: verdicts not durable: {} -- leaking {} voided slot(s) rather than risk "
                  "freeing them twice",
                  r.error().message(), to_free.size());
-            to_free.clear();
+        } else {
+            for (int64_t lsn : to_free) {
+                if (auto fr = co_await journal_->free_slot(lsn); !fr) {
+                    LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn,
+                         fr.error().message());
+                }
+            }
         }
-    }
-    for (int64_t lsn : to_free) {
-        if (auto fr = co_await journal_->free_slot(lsn); !fr) {
-            LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn, fr.error().message());
+        {
+            std::lock_guard lk{state_mu_};
+            for (int64_t lsn : to_free) {
+                if (auto it = awaiting_free_.find(lsn); it != awaiting_free_.end()) awaiting_free_.erase(it);
+            }
         }
+        request_reclaim(); // the reclaim may pass them now
     }
 
     std::vector< int64_t > to_fetch;

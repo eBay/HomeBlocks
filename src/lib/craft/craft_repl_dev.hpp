@@ -1010,17 +1010,20 @@ private:
     // reaches replacing_lsn (until then a restart re-applies older slots, which may still need them).
     async_status release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks);
     async_status free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks);
-    // Frees what an Empty verdict voided -- lsn's journal record, or `fill`, blocks the verdict beat to the journal --
-    // once the verdict is durable; leaks them if it can't be made durable (see the .cpp).
-    async_status free_voided(int64_t lsn, std::optional< homestore::multi_blk_id > fill = std::nullopt);
+    // Frees the blocks of a write or fill an Empty verdict voided at lsn, once the verdict is durable; leaks them if it
+    // can't be made durable (see the .cpp).
+    async_status free_voided(int64_t lsn, homestore::multi_blk_id blkid);
 
     // ── journal reclaim (S8) ──
-    // The journal is reclaimed up to floor = min(durable commit frontier as persisted, all_committed_lsn):
+    // The journal is reclaimed up to floor = min(durable commit frontier as persisted, all_committed_lsn), and below
+    // every slot a committed Sync still has to free:
     //   - below the persisted frontier the index is durable, so a restart no longer applies those slots again;
     //   - below all_committed_lsn every member has committed, so no member's catch-up needs them. It is the client's
     //     word: taking the min with our own durable frontier keeps a wrong value from reclaiming anything a restart
     //     here still needs. One that is too large can leave a lagging member unable to catch up (liveness, not
-    //     safety: a fetch of a reclaimed slot fails, it never reads as not held).
+    //     safety: a fetch of a reclaimed slot fails, it never reads as not held);
+    //   - a Sync's verdicts let the commit, and so both of the above, step over the slots they void long before its
+    //     apply frees their blocks, which it reads from the slots' journal records (awaiting_free_).
     // Recomputed when a durable frontier is persisted and on each keep_alive; one runner at a time. Never without a
     // state store: the journal is then the only copy.
     int64_t reclaim_floor_locked() const;
@@ -1280,6 +1283,9 @@ private:
     bool reclaim_running_{false};          // a run_reclaim() is active
     bool reclaim_unsupported_{false};      // the backend said not_supported: stop asking
     bool reclaim_stopped_{false};          // stop(): no reclaim runs anymore
+    // The slots committed Syncs void and free when they apply (from the commit, or the re-queue at a restart, until the
+    // frees are done): the reclaim stays below them.
+    std::multiset< int64_t > awaiting_free_;
     // fire_checkpoint_trigger()'s detached rounds still running: after its flush, one persists the frontier and frees
     // blocks, so stop() waits for them. Guarded by state_mu_.
     int checkpoints_running_{0};
