@@ -404,6 +404,19 @@ TEST_F(CraftLoginTest, ResolveVerdictsEmptyOnQuiescedLacks) {
     EXPECT_EQ(*r, (std::vector< int64_t >{3}));
 }
 
+// An empty quiesced set counts no member's lack (it isn't "no filter"), though replies still supply data: slot 3 is
+// filled from member 1, but no lack of 4 counts, so the login fails.
+TEST_F(CraftLoginTest, ResolveWithNoQuiescedMemberCountsNoLack) {
+    dev_->seed_lsns(2, {});
+    poller_.fetched = {holding(1, {zeros(3)}), holding(2)};
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/4, /*quiesced=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_TRUE(journal_->slots.contains(3));
+}
+
 TEST_F(CraftLoginTest, ResolveVerdictsEmptyAtFiveMembers) {
     proposer_.members = 5;
     dev_->seed_lsns(2, {});
