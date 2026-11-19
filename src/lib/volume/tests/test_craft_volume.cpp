@@ -891,8 +891,8 @@ TEST_F(CraftVolumeTest, LeftoverIndexTableIsTakenOver) {
 // and then DISABLED_CrashAfter, on devices, a RAFT port and settings of their own (main()) ──
 
 // The first child: a session and journal writes that a checkpoint covers, then RAFT entries committed past it: a Sync
-// voiding a slot this member holds, a second login, a write, and a Sync that no persist records. Then it is killed, so
-// no checkpoint at shutdown covers them.
+// voiding a slot this member holds, a second login, a write, and a Sync that commits but never applies, so nothing here
+// records it. Then it is killed, so no checkpoint at shutdown covers them.
 TEST_F(CraftVolumeTest, DISABLED_CrashBefore) {
     if (SISL_OPTIONS["crash_phase"].as< uint32_t >() != 1) { GTEST_SKIP() << "the crash case's first child only"; }
     auto info = craft_vol_info("craft_vol_crash");
@@ -919,9 +919,12 @@ TEST_F(CraftVolumeTest, DISABLED_CrashBefore) {
     craft::client_hdr const hdr9{9 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
     auto const w = write_slot(*vol, hdr9, 4);
     ASSERT_TRUE(w) << w.error().message();
-    auto const last = propose_sync(id, 4 /* rs_commit_lsn */, 44 /* client_token */, {});
-    ASSERT_TRUE(last) << last.error().message();
-    ASSERT_TRUE(wait_until([dev] { return dev->commit_lsn() == 4; }));
+    // Applied, the last Sync could be recorded as applied before the kill, and the restart would rightly skip it. Its
+    // proposal waits for the apply: a thread of its own makes it, which the kill ends. Committed, it raised the
+    // watermark.
+    dev->pause_apply();
+    std::thread([id] { (void)propose_sync(id, 4 /* rs_commit_lsn */, 44 /* client_token */, {}); }).detach();
+    ASSERT_TRUE(wait_until([dev] { return dev->durable_state().sync_watermark == 4; }));
     std::raise(SIGKILL);
 }
 
