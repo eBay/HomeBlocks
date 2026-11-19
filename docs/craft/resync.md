@@ -1059,10 +1059,11 @@ request for `r | 0` by restarting region `r`.
    restart from a new leader all correct, and the receiver can merge onto whatever B-tree it already has (open
    question 9).
 3. **A fuzzy read is enough.** `W` and `S` come from the tuple captured at `L`, before any region is read; the
-   leader then reads the live index, while commits continue. A region may therefore carry versions newer than `W`. The receiver re-fetches
-   and applies every slot above `W` in order after the install, so it converges to the same state, as a fuzzy
-   checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the index and reads
-   the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is never sent.
+   leader then reads the live index, while commits continue. A region may therefore carry versions newer than `W`.
+   The receiver re-fetches and applies every slot above `W` in order after the install, so it converges to the same
+   state, as a fuzzy checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the
+   index and reads the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is
+   never sent.
 4. **`W` must cover the receiver.** On object 0 the receiver compares `W` with its own durable `commit_lsn`. If
    `W` is lower (the leader's data trails this member's), installing would roll back data the member has already
    certified, after UBD has pruned its Missing entries on the strength of that certificate. The receiver refuses
