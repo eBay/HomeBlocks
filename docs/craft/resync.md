@@ -1020,6 +1020,15 @@ As in HomeObject, creating a snapshot copies no data. `create_snapshot(ctx)` rec
 `last_snapshot()` survives restarts. `apply_snapshot(ctx)` records the installed context the same way. HomeStore
 only lets the leader serve a snapshot once every RAFT entry up to `L` has been committed and applied.
 
+**The control tuple is captured at `L`, not when served.** `create_snapshot` runs after entry `L` is applied and
+before `L + 1` (the ordered apply queue keeps the local state at exactly `L`). It captures, in the same superblock
+write: the control state, `W` (the `commit_lsn` at `L`), `S` (the last applied `rs_commit_lsn`) and the Empty
+verdicts in `(W, S]`. Object `0 | 0` serves that persisted tuple, unchanged on every retry and resume. Sampling it
+when the object is served would include the effects of entries after `L`, which the receiver then replays a second
+time: a later Sync that voids slot 101 and advances `W` past it would leave the receiver with a tombstone outside
+`(W, S]`, and replaying that Sync then hits the indexed-slot check in `install_sync_rs_commit_lsn`. The regions are
+still read live (fuzzy, requirement 3); only the control tuple must match `L`.
+
 #### The object stream (`read_snapshot_obj` on the leader, `write_snapshot_obj` on the receiver)
 
 The receiver pulls objects by a 64-bit id, the same layout HomeObject uses: `type (1) | region (48) | batch (15)`,
@@ -1028,7 +1037,7 @@ it wants next, which is how it asks for a resend or resumes after a crash.
 
 | Object | Content |
 |---|---|
-| `0 \| 0`: partition metadata | The control state (session term, client token, fence and abort state once they exist), what a member needs to **create the volume** if it has none (volume id, name, geometry, partition id, journal and index parameters: see "Bootstrap" below), the data watermark `W` (the leader's `commit_lsn` when the object is built), the Sync watermark `S` (the highest `rs_commit_lsn` the leader has applied), the Empty verdicts in `(W, S]`, and the number of LBA regions |
+| `0 \| 0`: partition metadata | The control state (session term, client token, fence and abort state once they exist), what a member needs to **create the volume** if it has none (volume id, name, geometry, partition id, journal and index parameters: see "Bootstrap" below), the data watermark `W`, the Sync watermark `S` (the highest `rs_commit_lsn` applied) and the Empty verdicts in `(W, S]`, all as captured at `L` (above), and the number of LBA regions |
 | `r \| b` (r ≥ 1): region batch | One LBA range `[a, b)` of region `r`, read from the leader's index: every mapped LBA with its data and checksum; holes are implicit. Batches are cut at a byte budget; the last batch of a region says so |
 | `R+1 \| 0`: trailer | `W_hi`, the leader's `last_append_lsn` when the last region was read. A fuzzy region may carry any version up to `W_hi`, so the receiver must not serve reads below it (requirement 7) |
 | `LAST_OBJ_ID` | End of the snapshot |
@@ -1049,8 +1058,8 @@ request for `r | 0` by restarting region `r`.
    holes included". The receiver deletes its own mappings in `[a, b)` first. That makes a resend, a resume and a
    restart from a new leader all correct, and the receiver can merge onto whatever B-tree it already has (open
    question 9).
-3. **A fuzzy read is enough.** The leader records `W` and `S` before it reads any region and then reads the live
-   index, while commits continue. A region may therefore carry versions newer than `W`. The receiver re-fetches
+3. **A fuzzy read is enough.** `W` and `S` come from the tuple captured at `L`, before any region is read; the
+   leader then reads the live index, while commits continue. A region may therefore carry versions newer than `W`. The receiver re-fetches
    and applies every slot above `W` in order after the install, so it converges to the same state, as a fuzzy
    checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the index and reads
    the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is never sent.
@@ -1058,9 +1067,14 @@ request for `r | 0` by restarting region `r`.
    `W` is lower (the leader's data trails this member's), installing would roll back data the member has already
    certified, after UBD has pruned its Missing entries on the strength of that certificate. The receiver refuses
    the snapshot (an error from `write_snapshot_obj`, so nuraft retries later) and the leader catches up first.
-5. **The receiver serves nothing while installing.** nuraft pauses its RAFT apply. CRAFT additionally rejects client
-   IO (`OFFLINE`), answers peer fetches with an error, and flags itself in poll replies so the leader does not
-   count it as a data holder.
+5. **An exclusive install barrier.** nuraft pauses the receiver's RAFT apply, but that alone leaves work already
+   running (client writes, the commit path, the catch-up runner) free to change the journal or index during range
+   replacement. A write could even be acknowledged mid-install and then dropped at completion, so UBD's record of
+   who holds it would be wrong. So on object `0 | 0`, before replacing any range, the receiver raises a barrier: it
+   admits no new client IO (`OFFLINE`), stops the catch-up runner, answers peer fetches with an error, and flags
+   itself in poll replies so the leader does not count it as a data holder. Then it **drains** every write and
+   commit already admitted, each completing or failing before the barrier is up. `P` (requirement 7) is read after
+   the drain, so every write the member acknowledged is at or below it. The barrier holds until completion.
 6. **Resumable.** The receiver persists `{snapshot index L, W, S, region cursor}` in a superblock at each region
    boundary, after a checkpoint flush, so the cursor never runs ahead of durable data (HomeObject's per-shard
    cursor). After a crash it reloads the context; if nuraft resumes the same snapshot `L`, it asks for the region
