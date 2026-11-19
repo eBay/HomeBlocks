@@ -694,8 +694,18 @@ async_result< CraftReplDev::LoginPoll > CraftReplDev::login_poll(uint64_t term) 
 
 async_result< std::vector< int64_t > > CraftReplDev::login_resolve(int64_t rs_commit_lsn, uint64_t term,
                                                                    std::vector< craft::peer_id_t > quiesced) {
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_resolve rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     auto pre = co_await pre_resolve_slots(rs_commit_lsn, term, std::move(quiesced));
     if (!pre) co_return std::unexpected(pre.error());
+    // Rechecked after the await: a partition that faulted meanwhile can't vouch for these verdicts (a Sync that
+    // faulted it never raised the settled floor, say).
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_resolve: partition faulted during pre-resolution -- abandoning rs_commit_lsn={}", rs_commit_lsn);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     if (!pre->unresolved.empty()) {
         LOGW("login_resolve: {} slot(s) <= {} unresolved (first {}) -- login fails, nothing proposed",
              pre->unresolved.size(), rs_commit_lsn, *std::ranges::min_element(pre->unresolved));

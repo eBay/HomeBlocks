@@ -82,6 +82,7 @@ public:
     uint64_t last_term{0};
     bool last_is_login{false};
     std::vector< QuorumSlotResponse > fetched;
+    std::function< void() > on_fetch; // runs inside the fetch, to change state mid-await
     std::vector< int64_t > last_fetch;
 
     async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t, bool) override { co_return RsCommitLsnReply{}; }
@@ -91,6 +92,7 @@ public:
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                         uint32_t) override {
         last_fetch = std::move(lsns);
+        if (on_fetch) on_fetch();
         co_return fetched;
     }
     async_result< std::vector< QuorumLsnResponse > > poll_quorum_lsns(uint64_t term, bool is_login, uint32_t) override {
@@ -473,6 +475,29 @@ TEST_F(CraftLoginTest, ResolveNeverVerdictsEmptyAtOrBelowTheSettledFloor) {
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), no_quorum());
+}
+
+// A faulted leader can't run a login: its state, the settled floor included, can't be trusted.
+TEST_F(CraftLoginTest, ResolveOnFaultedLeaderFailsInternalError) {
+    fault_partition();
+    ASSERT_TRUE(dev_->is_faulted());
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/5, /*quiesced=*/{test_member_id(1), test_member_id(2)});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+// ...and verdicts computed while it faulted aren't returned: the Sync that faulted it never raised the settled floor.
+TEST_F(CraftLoginTest, ResolveFaultedDuringTheFetchFailsInternalError) {
+    dev_->seed_lsns(2, {});
+    poller_.fetched = {holding(1), holding(2)};
+    poller_.on_fetch = [this] { fault_partition(); };
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/3, /*quiesced=*/{test_member_id(1), test_member_id(2)});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
 // An old-session write still in flight on this leader owns its slot; until that drains, the login fails and retries.

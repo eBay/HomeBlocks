@@ -687,8 +687,8 @@ private:
 
     // Login step 2, leader-only: resolves every slot this member lacks up to rs_commit_lsn, holes below its own
     // last_append_lsn included, counting only the quiesced members' lacks. All or nothing: the watermark is fixed by
-    // the poll, so any slot left unresolved fails NO_QUORUM before anything is proposed. Returns the Empty verdicts
-    // the login's SyncRSCommitLSN carries.
+    // the poll, so any slot left unresolved fails NO_QUORUM before anything is proposed; a partition that is or becomes
+    // faulted fails INTERNAL_ERROR. Returns the Empty verdicts the login's SyncRSCommitLSN carries.
     async_result< std::vector< int64_t > > login_resolve(int64_t rs_commit_lsn, uint64_t term,
                                                          std::vector< craft::peer_id_t > quiesced);
 
