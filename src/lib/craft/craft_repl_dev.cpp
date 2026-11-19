@@ -220,16 +220,16 @@ public:
             k_journal_magic, k_journal_version, term, lsn, lba, len, static_cast< uint8_t >(all_zeros)};
         uint32_t nlbas = static_cast< uint32_t >(csums.size());
         uint32_t blkid_sz = blkid.serialized_size();
-        sisl::io_blob_safe blob{slot_blob_size(nlbas, blkid_sz)};
-        std::memcpy(blob.bytes(), &hdr, sizeof(CraftJournalEntry));
+        auto const blob = std::make_shared< sisl::io_blob_safe >(slot_blob_size(nlbas, blkid_sz));
+        std::memcpy(blob->bytes(), &hdr, sizeof(CraftJournalEntry));
         if (nlbas > 0) {
-            std::memcpy(blob.bytes() + k_csum_array_offset, csums.data(), nlbas * sizeof(homestore::csum_t));
+            std::memcpy(blob->bytes() + k_csum_array_offset, csums.data(), nlbas * sizeof(homestore::csum_t));
         }
         sisl::blob blkid_blob = blkid.serialize(); // non-owning view — copy before blkid goes out of scope
         // Internal HomeStore-API contract, not client-reachable: serialize() must return exactly
         // serialized_size() bytes, or the memcpy below overreads blkid_blob's owned buffer.
         DEBUG_ASSERT_EQ(blkid_blob.size(), blkid_sz, "multi_blk_id::serialize() size mismatch");
-        std::memcpy(blob.bytes() + blkid_offset(nlbas), blkid_blob.cbytes(), blkid_sz);
+        std::memcpy(blob->bytes() + blkid_offset(nlbas), blkid_blob.cbytes(), blkid_sz);
         // Bridge write_async (callback) to co_await via value_awaitable<bool>.
         //   • Deadlock-safe: the callback posts va->complete() to an iomgr reactor via run_on_forget,
         //     decoupling coroutine resume from LogDev::m_flush_mtx. In production HomeBlocks always has
@@ -242,8 +242,9 @@ public:
         //     log-dev mode used by solo_repl_dev, append_async -> flush_if_necessary()), value_awaitable::
         //     await_suspend atomically detects k_done and returns false so the coroutine never suspends —
         //     no UB from frame destruction inside the callback.
-        //   • blob lifetime: blob is a coroutine-frame local; the frame stays alive through co_await.
-        //     write_async holds only a reference, which remains valid for the full I/O duration.
+        //   • blob lifetime: write_async keeps only a view of blob, until HomeStore flushes it -- which may be
+        //     after this write timed out and returned (below). The completion callback owns blob, so it lives
+        //     until then; a write HomeStore never completes leaks it, with the partition it faulted.
         //
         // KNOWN RISK (lost completion -> permanent suspension): write_async's callback isn't
         // guaranteed to fire, verified against homestore source (log_dev.cpp, log_store.cpp). Two
@@ -259,8 +260,8 @@ public:
         //     has a deadline (craft_journal_write_timeout_ms) and fails timed_out past it.
         auto w = std::make_shared< JournalWriteDeadlines::Wait >();
         auto write_ret = logstore_->write_async(
-            static_cast< homestore::logstore_seq_num_t >(lsn), blob, nullptr,
-            [w](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
+            static_cast< homestore::logstore_seq_num_t >(lsn), *blob, nullptr,
+            [w, blob](homestore::logstore_seq_num_t, sisl::io_blob&, homestore::logdev_key, void*) mutable {
                 iomanager.run_on_forget(iomgr::reactor_regex::least_busy_io,
                                         [w = std::move(w)]() mutable { w->complete(true); });
             });

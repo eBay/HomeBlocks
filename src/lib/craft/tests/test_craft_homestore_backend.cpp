@@ -35,6 +35,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -46,6 +48,7 @@
 
 #include "hb_internal.hpp"
 #include "homeblks_impl.hpp"
+#include "home_blks_config.hpp"
 #include "craft/craft_repl_dev.hpp"
 #include "coro_helpers.hpp"
 #include "test_common.hpp"
@@ -106,6 +109,37 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
         backend->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096, homestore::multi_blk_id{},
                             /* all_zeros = */ true, std::vector< homestore::csum_t >{}));
     ASSERT_TRUE(r.has_value());
+}
+
+// A write HomeStore hasn't written by its deadline fails timed_out, and HomeStore writes the entry later, whole: its
+// buffer outlives the write. This log flushes only when asked, so the entry is still pending when the deadline passes.
+TEST_F(CraftHomeStoreBackendTest, AWritePastItsDeadlineIsWrittenWholeLater) {
+    auto const logdev_id = homestore::logstore_service().create_new_logdev(homestore::flush_mode_t::EXPLICIT);
+    auto logstore = homestore::logstore_service().create_new_log_store(logdev_id, /* append_mode = */ false);
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto const timeout = HB_DYNAMIC_CONFIG(craft_journal_write_timeout_ms);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_journal_write_timeout_ms = 1; });
+    std::optional< status > written;
+    homeblocks::detail::detach([](CraftJournalBackend* b, std::optional< status >& out) -> async_status {
+        out = co_await b->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                     homestore::multi_blk_id{}, /* all_zeros = */ true, {});
+        co_return ok();
+    }(backend.get(), written));
+    HB_SETTINGS_FACTORY().modifiable_settings([timeout](auto& s) { s.craft_journal_write_timeout_ms = timeout; });
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    backend->expire_overdue();
+    ASSERT_TRUE(written.has_value());
+    ASSERT_FALSE(*written);
+    EXPECT_EQ(written->error(), std::errc::timed_out);
+
+    ASSERT_TRUE(logstore->flush());
+    auto const slot = homeblocks::detail::sync_get(backend->read_slot(0));
+    ASSERT_TRUE(slot) << slot.error().message();
+    EXPECT_EQ(slot->lsn, 0);
+    EXPECT_TRUE(slot->all_zeros);
+    EXPECT_EQ(slot->len_bytes, 4096u);
 }
 
 // truncate_to(lsn) must drop journal entries above lsn from the real logdev's tail -- verified via
