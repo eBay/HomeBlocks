@@ -315,6 +315,10 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
         auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
         HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
         auto const handed_off = g_helper->leaderships_handed_off();
+        // A hand-off queued earlier (a retry's, an earlier election's) that runs while member 1 follows keeps the
+        // backoff going.
+        std::dynamic_pointer_cast< HomeBlocksImpl >(hb())->on_craft_group_leader(id);
+        std::this_thread::sleep_for(std::chrono::seconds{1});
         EXPECT_TRUE(wait_until([&id] {
             auto const rd = group(id);
             if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {

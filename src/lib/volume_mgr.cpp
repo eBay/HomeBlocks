@@ -655,9 +655,16 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     };
     inc_ref();
     HandOffRef const ref{*this};
-    auto const forget = [this, &id] {
+    // A hand-off is forgotten only once its backoff is over: a job queued before it (a retry's, an earlier election's)
+    // finds this member following, and forgetting it then would let the next election hand off again at once.
+    auto const now = std::chrono::steady_clock::now();
+    auto const backoff = std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)};
+    auto const forget = [this, &id, now, backoff] {
         std::lock_guard lk{craft_handoff_mu_};
-        craft_handed_off_at_.erase(id);
+        if (auto const it = craft_handed_off_at_.find(id);
+            it != craft_handed_off_at_.end() && now - it->second >= backoff) {
+            craft_handed_off_at_.erase(it);
+        }
     };
     if (is_shutting_down()) { return; }
     {
@@ -670,12 +677,11 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     }
     // nuraft nominates the responsive member of the highest priority, deterministically: with the member holding the
     // replica (the group's creator) unresponsive, two members without one would nominate each other forever.
-    auto const now = std::chrono::steady_clock::now();
     {
         std::lock_guard lk{craft_handoff_mu_};
         auto const [it, first] = craft_handed_off_at_.try_emplace(id, now);
         if (!first) {
-            if (now - it->second < std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)}) {
+            if (now - it->second < backoff) {
                 return; // keeps leadership for now: retry_craft_handoffs() tries again
             }
             it->second = now;
