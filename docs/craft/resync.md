@@ -329,10 +329,11 @@ sequenceDiagram
 ### Case 6: Snapshot for a replica past retention
 
 Journals are bounded. If a replica fell so far behind that the writes it needs were cleaned up everywhere, it
-cannot heal through Case 2. It instead receives a **snapshot**: the volume's whole state (the HomeBlocks B-tree with
-its data) as of one point, then the writes after that point. The transfer rides **nuraft's own snapshot
-mechanism** on the volume's RAFT group, the way HomeObject resyncs a PG; HomeBlocks only supplies the content
-through the RAFT listener's snapshot callbacks (§4.9).
+cannot heal through Case 2. It instead receives a **snapshot**: the volume's mapped data as of one point, then the
+writes after that point. The B-tree is not sent: the leader walks its own B-tree to find each mapped LBA's blocks
+and sends the data; the receiver writes it to blocks it allocates and builds its own index entries. The transfer
+rides **nuraft's own snapshot mechanism** on the volume's RAFT group, the way HomeObject resyncs a PG; HomeBlocks
+only supplies the content through the RAFT listener's snapshot callbacks (§4.9).
 
 #### Flow
 
@@ -361,7 +362,7 @@ sequenceDiagram
     loop every LBA region, in batches
         R->>L: next object (region, batch)
         L-->>R: LBA range with data and holes (checksummed)
-        R->>R: replace that range in its own B-tree
+        R->>R: write the data to its own blocks, replace that range in its own B-tree
     end
     R->>R: commit point = W, writes above W marked missing
     L->>R: RAFT entries after the snapshot apply as usual
@@ -954,7 +955,7 @@ streamed the snapshot over the CRAFT peer plane instead; §6 says why that was d
 | Gap | Mechanism | Cost proportional to |
 |---|---|---|
 | Still in the journal (every missing slot is above the members' reclaim floor) | The FetchData loop (§4.3): range requests, byte-bounded and continued | The **writes** missed. Every version is replayed, including overwritten ones |
-| Past retention | **nuraft snapshot:** the leader's B-tree with its data as of watermark `W`, then FetchData for the writes above `W` | The volume's **mapped data**, whatever the gap size |
+| Past retention | **nuraft snapshot:** the volume's mapped data as of watermark `W` (the leader walks its B-tree and sends each LBA's data; the receiver builds its own index), then FetchData for the writes above `W` | The volume's **mapped data**, whatever the gap size |
 
 #### Triggers
 
@@ -1143,8 +1144,8 @@ depend on regions touched, not volume size, and needs no per-entry dLSN in the i
 dLSN would *not* work: zero writes erase index entries, so unmaps would be invisible. *Deferred: the full B-tree
 snapshot is the baseline. Revisit once outage-length and volume-size data are available.*
 
-**A CRAFT peer-plane snapshot stream (the earlier option b′).** An earlier draft streamed the B-tree member to
-member over the CRAFT peer plane (`snap_begin` / `snap_chunk` / `snap_end`), with nuraft snapshots carrying control
+**A CRAFT peer-plane snapshot stream (the earlier option b′).** An earlier draft streamed the volume's mapped data
+(found by walking the B-tree) member to member over the CRAFT peer plane (`snap_begin` / `snap_chunk` / `snap_end`), with nuraft snapshots carrying control
 state only and a data-side trigger (`reclaimed_below`). It would let any healthy member be the source and would
 cover the C2 member without a membership change. *Rejected:* it is a second snapshot transport, with new wire ops,
 leases, pins and source selection, when nuraft already provides one on the volume's RAFT group, and the team's
