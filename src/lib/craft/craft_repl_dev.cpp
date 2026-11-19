@@ -1120,9 +1120,15 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         }
         co_return std::unexpected(res.error());
     }
-    // The slot references blkid durably now: from here on it is the allocator's to keep across restarts. A failure is
-    // logged; the slot stays (a restart commits it again while it is above the durable frontier).
-    if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false);
+    // The slot references blkid durably now: from here on it is the allocator's to keep across restarts. If that can't
+    // be recorded, a checkpoint passing the slot would leave it pointing at blocks the allocator may hand out again:
+    // the partition faults, persisting nothing more, and the blocks the journal references stay.
+    if (blkid_allocated) {
+        if (auto r = journal_->commit_data(blkid, /* recovering = */ false); !r) {
+            fault();
+            co_return std::unexpected(r.error());
+        }
+    }
 
     // Post-flight recheck: while write_slot was in flight, a login may have committed or applied (the session moved
     // on), a login poll may have quiesced this term, or the slot may have been voted Empty.
@@ -3383,7 +3389,12 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
             result.unresolved.push_back(slot->lsn);
             continue;
         }
-        if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false); // as in write()
+        if (blkid_allocated) { // as in write()
+            if (auto r = journal_->commit_data(blkid, /* recovering = */ false); !r) {
+                fault();
+                co_return std::unexpected(r.error());
+            }
+        }
         bool voided = false;
         {
             // Term checked in the same critical section as the erase. If it changed during write_slot, the
@@ -3599,7 +3610,12 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                     }
                     continue;
                 }
-                if (blkid_allocated) (void)journal_->commit_data(blkid, /* recovering = */ false); // as in write()
+                if (blkid_allocated) { // as in write()
+                    if (auto r = journal_->commit_data(blkid, /* recovering = */ false); !r) {
+                        fault();
+                        co_return std::unexpected(r.error());
+                    }
+                }
                 bool voided;
                 {
                     std::lock_guard lk{state_mu_};

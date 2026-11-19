@@ -1261,6 +1261,24 @@ TEST_F(CraftRaftEntriesTest, WriteWhoseJournalWriteTimesOutFaultsAndKeepsItsBloc
     EXPECT_EQ(journal_->free_data_calls, 0);
 }
 
+// A write whose blocks the allocator can't be told to keep: a checkpoint passing its slot would leave the slot pointing
+// at blocks the allocator may hand out again. The partition faults, the write fails, and the blocks the journal
+// references aren't freed.
+TEST_F(CraftRaftEntriesTest, WriteWhoseBlocksCantBeCommittedFaults) {
+    journal_->fail_commit = true;
+    std::vector< uint8_t > buf(k_page_size, 'x');
+    sisl::sg_list data;
+    data.size = k_page_size;
+    data.iovs.push_back(iovec{buf.data(), buf.size()});
+    auto const r = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/0,
+                    /*addr=*/0, /*len=*/k_page_size, std::move(data)));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(journal_->free_data_calls, 0);
+}
+
 // The deadline sweep completes an overdue proposal with timed_out (its outcome is unknown, not rejected), and leaves
 // one still within its deadline pending.
 TEST_F(CraftRaftEntriesTest, DeadlineSweepExpiresOverdueProposal) {
