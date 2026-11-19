@@ -647,6 +647,14 @@ void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
 }
 
 void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
+    // Counted before the shutdown check and released on every exit, as a create is: a shutdown either waits for this
+    // or is seen here, before it calls into HomeStore.
+    struct HandOffRef {
+        HomeBlocksImpl& hb;
+        ~HandOffRef() { hb.dec_ref(); }
+    };
+    inc_ref();
+    HandOffRef const ref{*this};
     auto const forget = [this, &id] {
         std::lock_guard lk{craft_handoff_mu_};
         craft_handed_off_at_.erase(id);
