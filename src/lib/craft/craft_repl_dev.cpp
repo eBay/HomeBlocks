@@ -714,6 +714,41 @@ async_result< std::vector< int64_t > > CraftReplDev::login_resolve(int64_t rs_co
     co_return std::move(pre->empty_slots);
 }
 
+async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                                      std::vector< int64_t > empty_slots, uint64_t term) {
+    DEBUG_ASSERT(static_cast< bool >(lock), "login_sync without holding watermark_mu_");
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_sync rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    auto self = shared_from_this();
+    // Proposed even if rs_commit_lsn is already covered: the entry carries the new client's token and the verdicts,
+    // each member's apply re-runs its catch-up up to rs_commit_lsn, and the check below is then about this entry.
+    if (auto r = co_await propose_sync(lock, rs_commit_lsn, client_token, empty_slots, term); !r)
+        co_return std::unexpected(r.error());
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_sync: partition faulted applying SyncRSCommitLSN({})", rs_commit_lsn);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+
+    // The entry has applied here (a proposal completes after its apply). InternalLogin will truncate to
+    // rs_commit_lsn, so this member must be exactly there: past it, an earlier round's timed-out Sync committed late
+    // and the watermark is stale; short of it, a slot login_resolve() settled is somehow still missing. Either way
+    // the login fails and the client retries.
+    std::lock_guard lk{state_mu_};
+    if (state_.commit_lsn > rs_commit_lsn) {
+        LOGW("login_sync: commit_lsn {} is past the login's watermark {} -- a late Sync; login fails",
+             state_.commit_lsn, rs_commit_lsn);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    if (state_.commit_lsn < rs_commit_lsn) {
+        LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {} (first missing {}) -- login fails",
+             state_.commit_lsn, rs_commit_lsn, missing_lsns_.empty() ? -1 : *missing_lsns_.begin());
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    co_return ok();
+}
+
 // ─── truncate (S4) ────────────────────────────────────────────────────────────
 //
 // Called only during the login sequence, while no writes are in-flight (the
@@ -1796,8 +1831,7 @@ void CraftReplDev::on_watchdog_tick() {
     if (faulted_.load(std::memory_order_acquire)) return;
     // Only the leader proposes; followers' ticks just detect staleness.
     if (raft_proposer_ == nullptr || !raft_proposer_->is_leader()) return;
-    if (sync_in_flight_.load(std::memory_order_acquire) || watchdog_round_in_flight_.load(std::memory_order_acquire))
-        return;
+    if (watermark_mu_.locked() || watchdog_round_in_flight_.load(std::memory_order_acquire)) return;
     // A tick can race the destructor's cancel(wait=true): the refcount may already be zero, where
     // shared_from_this() would throw. Held across detach so watchdog_sync() can take its own reference.
     auto self = weak_from_this().lock();
@@ -1868,7 +1902,7 @@ async_status CraftReplDev::watchdog_sync() {
 
 void CraftReplDev::maybe_trigger_periodic_sync() {
     if (raft_proposer_ == nullptr || sync_lsn_interval_ <= 0) return;
-    if (sync_in_flight_.load(std::memory_order_acquire)) return;
+    if (watermark_mu_.locked()) return;
     if (!raft_proposer_->is_leader()) return;
 
     int64_t sync_to;
@@ -1917,48 +1951,52 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
     if (upto < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
 
     // hdr.term, not a fresh read: if InternalLogin applies before append() checks, this old-session request
-    // must fail STALE_TERM rather than run inside the new session.
-    co_return co_await append(upto, client_token, hdr.term);
+    // must fail STALE_TERM rather than run inside the new session. Waits its turn behind a running round: failing
+    // would leave the client's failed slot unresolved until its next failed write.
+    co_return co_await append(upto, client_token, hdr.term, /*wait_turn=*/true);
 }
 
 // ─── append: propose SyncRSCommitLSN (S5 / SDSTOR-22908) ─────────────────────
 
-async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, uint64_t client_token, uint64_t term) {
-    // Covers every trigger: a faulted leader's state is missing a committed entry, so it can't plan a round.
-    if (faulted_.load(std::memory_order_acquire)) {
-        LOGE("append rejected: partition permanently faulted sync_to={}", sync_to);
-        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-    }
-    if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
-    if (!raft_proposer_->is_leader())
-        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
-    if (sync_to < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
-    // Checked, not adopted: a caller's session that InternalLogin has since replaced must not run here.
-    // pre_resolve_slots() and the pre-propose check below re-verify it after every await.
-    {
+async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, uint64_t client_token, uint64_t term,
+                                                              bool wait_turn) {
+    // Checked on entry, and again by a Resolve once it has waited for watermark_mu_: the round it waited out may have
+    // changed any of these.
+    auto const refused = [this, sync_to, term]() -> std::optional< std::error_condition > {
+        // Covers every trigger: a faulted leader's state is missing a committed entry, so it can't plan a round.
+        if (faulted_.load(std::memory_order_acquire)) {
+            LOGE("append rejected: partition permanently faulted sync_to={}", sync_to);
+            return make_error_condition(volume_error::INTERNAL_ERROR);
+        }
+        if (raft_proposer_ == nullptr) return std::make_error_condition(std::errc::not_supported);
+        if (!raft_proposer_->is_leader()) return craft::make_error_condition(craft::craft_error::NOT_LEADER);
+        if (sync_to < 0) return std::make_error_condition(std::errc::invalid_argument);
+        // Checked, not adopted: a caller's session that InternalLogin has since replaced must not run here.
+        // pre_resolve_slots() and propose_sync() re-verify it after every await.
         std::lock_guard lk{state_mu_};
         if (!session_current_locked(term)) {
             LOGW("append: term moved past the caller's ({} -> {}) -- abandoning sync_to={}", term, state_.term,
                  sync_to);
-            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+            return craft::make_error_condition(craft::craft_error::STALE_TERM);
         }
-    }
+        return std::nullopt;
+    };
+    if (auto const e = refused()) co_return std::unexpected(*e);
 
     // Triggers detach this; keep the device alive across the awaits below.
     auto self = shared_from_this();
 
-    // TODO(S7): a Resolve that lands here gets operation_in_progress, and the client doesn't retry until its next
-    // failed write; background rounds stop at the client's commit_lsn, so the failed slot stays unresolved
-    // meanwhile. Make Resolve wait for the running round (S7's sync_round_done_ latch) instead.
-    bool expected = false;
-    if (!sync_in_flight_.compare_exchange_strong(expected, true)) {
-        LOGD("append: another append() in flight -- skipping sync_to={}", sync_to);
-        co_return std::unexpected(std::make_error_condition(std::errc::operation_in_progress));
+    std::optional< AsyncMutex::Lock > round;
+    if (wait_turn) {
+        round = co_await watermark_mu_.lock();
+        if (auto const e = refused()) co_return std::unexpected(*e);
+    } else {
+        round = watermark_mu_.try_lock();
+        if (!round) {
+            LOGD("append: another round or a login holds the watermark -- skipping sync_to={}", sync_to);
+            co_return std::unexpected(std::make_error_condition(std::errc::operation_in_progress));
+        }
     }
-    struct SyncInFlightGuard {
-        CraftReplDev* dev;
-        ~SyncInFlightGuard() { dev->sync_in_flight_.store(false, std::memory_order_release); }
-    } in_flight_guard{this};
 
     auto pre = co_await pre_resolve_slots(sync_to, term);
     if (!pre) co_return std::unexpected(pre.error());
@@ -1979,30 +2017,8 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     }
 
     if (!skip) {
-        // Pre-resolution awaited: re-check right before proposing.
-        if (!raft_proposer_->is_leader())
-            co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
-        {
-            std::lock_guard lk{state_mu_};
-            if (!session_current_locked(term))
-                co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
-        }
-
-        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
-        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
-        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(verdicts.size()));
-        serialize_sync_rs_commit_lsn(key.data(), target, client_token, verdicts);
-
-        if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
-                                                      sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
-            !r) {
-            if (r.error() == std::errc::timed_out) {
-                LOGW("append: SyncRSCommitLSN({}) proposal timed out -- outcome unknown, it may still commit", target);
-            } else {
-                LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
-            }
+        if (auto r = co_await propose_sync(*round, target, client_token, verdicts, term); !r)
             co_return std::unexpected(r.error());
-        }
     }
 
     // Every Empty verdict <= target, earlier rounds' included, so a client that lost a reply still learns them.
@@ -2011,9 +2027,8 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     craft::resolution_result result{.resolved_upto = target, .empty_slots = {}};
     {
         std::lock_guard lk{state_mu_};
-        // The entry committed whichever session is current now, so the watermark moves either way.
-        if (!skip) last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, target);
-        // The reply doesn't: if InternalLogin replaced the caller's session during the awaits above, it's gone.
+        // If InternalLogin replaced the caller's session during the awaits above, the reply is gone (the entry
+        // committed regardless, and propose_sync() moved the watermark).
         if (!session_current_locked(term)) {
             LOGW("append: term moved past the caller's ({} -> {}) after resolving to {}", term, state_.term, target);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
@@ -2027,6 +2042,40 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
                              result.empty_slots.end());
     LOGD("append: SyncRSCommitLSN resolved_upto={} (asked {}) verdicts={}", target, sync_to, verdicts.size());
     co_return result;
+}
+
+async_status CraftReplDev::propose_sync([[maybe_unused]] AsyncMutex::Lock const& lock, int64_t rs_commit_lsn,
+                                        uint64_t client_token, std::vector< int64_t > const& empty_slots,
+                                        uint64_t term) {
+    DEBUG_ASSERT(static_cast< bool >(lock), "propose_sync without holding watermark_mu_");
+    // The caller awaited (pre-resolution at least): re-check right before proposing.
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    {
+        std::lock_guard lk{state_mu_};
+        if (!session_current_locked(term))
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
+
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
+    serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, empty_slots);
+
+    if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                                  sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
+        !r) {
+        if (r.error() == std::errc::timed_out) {
+            LOGW("SyncRSCommitLSN({}) proposal timed out -- outcome unknown, it may still commit", rs_commit_lsn);
+        } else {
+            LOGE("SyncRSCommitLSN({}) proposal failed: {}", rs_commit_lsn, r.error().message());
+        }
+        co_return std::unexpected(r.error());
+    }
+    // The entry committed whichever session is current now, so the watermark moves either way.
+    std::lock_guard lk{state_mu_};
+    last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, rs_commit_lsn);
+    co_return ok();
 }
 
 // ─── fetch_data (S6) ──────────────────────────────────────────────────────────
