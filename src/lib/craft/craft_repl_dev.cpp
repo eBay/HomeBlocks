@@ -215,8 +215,21 @@ public:
 
     status commit_data(homestore::multi_blk_id const& blkid, bool recovering) override {
         if (!blkid.is_valid()) return ok();
-        // recommit: a recovery here runs after HomeStore's start, when commit_blk() no longer reserves in memory.
-        if (auto r = homestore::data_service().commit_blk(blkid, /* recommit = */ recovering); !r) {
+        if (!recovering) return commit_blks(blkid, false);
+        // Only the blocks the allocator lost with the restart, those no checkpoint persisted (written after the last
+        // one before a crash): it has held the rest since the load, and once HomeStore has started it refuses to
+        // persist them again. Nothing else allocates in this volume's chunks before its recovery is done. recommit: the
+        // recovery may run after HomeStore's start, when commit_blk() no longer reserves in memory.
+        auto pieces = blkid.iterate();
+        while (auto const piece = pieces.next()) {
+            if (homestore::data_service().is_blk_alloced(*piece)) continue;
+            if (auto r = commit_blks(homestore::multi_blk_id{*piece}, true); !r) return r;
+        }
+        return ok();
+    }
+
+    static status commit_blks(homestore::multi_blk_id const& blkid, bool recommit) {
+        if (auto r = homestore::data_service().commit_blk(blkid, recommit); !r) {
             LOGE("commit_blk {} failed: {}", blkid.to_string(), r.error().message());
             return std::unexpected(r.error());
         }

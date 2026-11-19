@@ -158,8 +158,8 @@ public:
     // Highest lsn reclaimed so far, -1 for none. Read at restart.
     virtual int64_t reclaimed_upto() const { return -1; }
     // Commits the blocks a durable slot references: HomeStore's allocator persists an allocation only once committed,
-    // so without it a restart frees them. recovering: a restart commits a live slot's blocks again, as the commit may
-    // not have been persisted; it also reserves them in memory, where nothing holds them after a restart.
+    // so without it a restart frees them. recovering: a restart commits again those of a live slot that no checkpoint
+    // persisted before it, the allocator holding no others, and reserves them in memory too.
     virtual status commit_data(homestore::multi_blk_id const& /* blkid */, bool /* recovering */) { return ok(); }
     // Fails the writes in flight past their deadline (see JournalWriteDeadlines). HomeBlocks calls it every second.
     virtual void expire_overdue() {}
