@@ -724,12 +724,13 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
     auto self = shared_from_this();
     // Proposed even if rs_commit_lsn is already covered: the entry carries the new client's token and the verdicts,
     // each member's apply re-runs its catch-up up to rs_commit_lsn, and the check below is then about this entry.
-    if (auto r = co_await propose_sync(lock, rs_commit_lsn, client_token, empty_slots, term); !r)
-        co_return std::unexpected(r.error());
+    auto const proposed = co_await propose_sync(lock, rs_commit_lsn, client_token, empty_slots, term);
+    // Checked whatever the outcome: a fault during the proposal outranks its failure or timeout.
     if (faulted_.load(std::memory_order_acquire)) {
-        LOGE("login_sync: partition faulted applying SyncRSCommitLSN({})", rs_commit_lsn);
+        LOGE("login_sync: partition faulted during SyncRSCommitLSN({})", rs_commit_lsn);
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
+    if (!proposed) co_return std::unexpected(proposed.error());
 
     // The entry has applied here (a proposal completes after its apply). An earlier login's timed-out InternalLogin
     // may have committed meanwhile, replacing the session without moving commit_lsn.

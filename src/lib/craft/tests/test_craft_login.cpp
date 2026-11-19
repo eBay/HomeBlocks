@@ -672,6 +672,18 @@ TEST_F(CraftLoginTest, SyncFaultedDuringTheProposalFailsInternalError) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
+// The partition faults while the proposal is out, and the proposal then times out: the permanent fault wins.
+TEST_F(CraftLoginTest, SyncFaultedDuringATimedOutProposalFailsInternalError) {
+    dev_->seed_lsns(5, {});
+    proposer_.on_propose = [this] { fault_partition(); };
+    proposer_.time_out = true;
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
 } // namespace
 } // namespace homeblocks
 
