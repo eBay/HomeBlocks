@@ -18,9 +18,12 @@
 // guards, the range of CRAFT IO, the journal reattach at restart, the rollback of a failed create, and a replica's
 // teardown when its group is destroyed. test_craft_volume_multi covers a group with several members.
 
+#include <csignal>
 #include <filesystem>
 #include <limits>
 #include <set>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <gtest/gtest.h>
 #include <sisl/options/options.h>
 #include <sisl/flip/flip_client.hpp>
@@ -37,10 +40,16 @@
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_craft_volume_setup,
                   (repl_port, "", "repl_port", "this node's RAFT port",
-                   ::cxxopts::value< uint16_t >()->default_value("47451"), "port"));
+                   ::cxxopts::value< uint16_t >()->default_value("47451"), "port"),
+                  (crash_repl_port, "", "crash_repl_port", "the RAFT port of the crash case's child processes",
+                   ::cxxopts::value< uint16_t >()->default_value("47453"), "port"),
+                  (crash_phase, "", "crash_phase", "internal: runs as the crash case's child, before (1) or after (2)",
+                   ::cxxopts::value< uint32_t >()->default_value("0"), "phase"));
 
 // `config`: --config_path / --override_config, used to shorten HomeStore's repl dev reaper interval.
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_craft_volume_setup, config)
+
+extern char** environ;
 
 std::unique_ptr< test_common::HBTestHelper > g_helper;
 
@@ -131,6 +140,18 @@ public:
             make_homestore_raft_proposer(group(id), peer_id_t{})
                 ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
                           sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}));
+    }
+
+    // A SyncRSCommitLSN through the volume's group, voiding the slots `voided`.
+    static status propose_sync(volume_id_t const& id, int64_t rs_commit_lsn, uint64_t client_token,
+                               std::vector< int64_t > const& voided) {
+        CraftEntryHeader header{CraftEntryType::SyncRSCommitLSN};
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(voided.size()));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, voided);
+        return homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(group(id), peer_id_t{})
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
+                          sisl::blob{key.data(), static_cast< uint32_t >(key.size())}));
     }
 
     // A SyncRSCommitLSN the volume's group committed at raft_lsn, without Empty verdicts, handed to its device as
@@ -865,6 +886,116 @@ TEST_F(CraftVolumeTest, LeftoverIndexTableIsTakenOver) {
 }
 #endif
 
+#ifdef _PRERELEASE
+// ── An abrupt crash: ACrashReplaysWhatCommittedPastTheCheckpoint runs this binary twice more, as DISABLED_CrashBefore
+// and then DISABLED_CrashAfter, on devices, a RAFT port and settings of their own (main()) ──
+
+// The first child: a session and journal writes that a checkpoint covers, then RAFT entries committed past it: a Sync
+// voiding a slot this member holds, a second login, a write, and a Sync that no persist records. Then it is killed, so
+// no checkpoint at shutdown covers them.
+TEST_F(CraftVolumeTest, DISABLED_CrashBefore) {
+    if (SISL_OPTIONS["crash_phase"].as< uint32_t >() != 1) { GTEST_SKIP() << "the crash case's first child only"; }
+    auto info = craft_vol_info("craft_vol_crash");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    auto* const dev = (*vol)->craft_dev();
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    ASSERT_TRUE(wait_until([dev] { return dev->term() == 7; }));
+    craft::client_hdr const hdr7{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        auto const w = write_slot(*vol, hdr7, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    ASSERT_TRUE(homeblocks::detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true /* force */)));
+
+    auto const voiding = propose_sync(id, 3 /* rs_commit_lsn */, 42 /* client_token */, {2});
+    ASSERT_TRUE(voiding) << voiding.error().message();
+    ASSERT_TRUE(wait_until([dev] { return dev->commit_lsn() == 3; }));
+    auto const relogin = propose_login(id, 44 /* client_token */, 9 /* term */);
+    ASSERT_TRUE(relogin) << relogin.error().message();
+    ASSERT_TRUE(wait_until([dev] { return dev->term() == 9; }));
+    craft::client_hdr const hdr9{9 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    auto const w = write_slot(*vol, hdr9, 4);
+    ASSERT_TRUE(w) << w.error().message();
+    auto const last = propose_sync(id, 4 /* rs_commit_lsn */, 44 /* client_token */, {});
+    ASSERT_TRUE(last) << last.error().message();
+    ASSERT_TRUE(wait_until([dev] { return dev->commit_lsn() == 4; }));
+    std::raise(SIGKILL);
+}
+
+// The second child, restarted on the first one's devices with its journal's reattach held (main()): HomeStore's RAFT
+// log replay hands the volume the entries committed past the checkpoint, held until the device has recovered. The
+// device comes back with the session and the verdict, persisted before they took effect, skips the entries whose effect
+// it holds, and applies the last Sync, which only the replay brought back.
+TEST_F(CraftVolumeTest, DISABLED_CrashAfter) {
+    if (SISL_OPTIONS["crash_phase"].as< uint32_t >() != 2) { GTEST_SKIP() << "the crash case's second child only"; }
+    auto const ids = hb()->volume_ids();
+    ASSERT_EQ(ids.size(), 1u);
+    auto vol = hb()->get_volume(ids[0]);
+    ASSERT_TRUE(vol);
+    auto* const dev = (*vol)->craft_dev();
+    ASSERT_NE(dev, nullptr);
+    EXPECT_FALSE(dev->is_faulted());
+    EXPECT_EQ(dev->term(), 9u);
+    EXPECT_EQ(dev->client_token(), 44u);
+    EXPECT_TRUE(wait_until([dev] { return dev->commit_lsn() == 4; })) << "commit_lsn " << dev->commit_lsn();
+
+    craft::client_hdr const hdr{9 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    auto const late = write_slot(*vol, hdr, 2);
+    ASSERT_FALSE(late) << "a write to the slot voided before the crash";
+    EXPECT_EQ(late.error(), make_error_condition(volume_error::EMPTY_SLOT));
+    for (int64_t dlsn : {0, 1, 3, 4}) {
+        EXPECT_TRUE(reads_back(*vol, hdr, 4 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
+    // Every slot's blocks are the allocator's: slot 4's, written past the checkpoint, because the recovery committed
+    // them again, and slot 2's, because nothing freed them twice: the free its verdict made before the crash, the crash
+    // undid (its blocks leak), and the replayed Sync isn't applied again.
+    for (int64_t dlsn = 0; dlsn <= 4; ++dlsn) {
+        auto const slot = homeblocks::detail::sync_get(dev->journal_slot_for_test(dlsn));
+        ASSERT_TRUE(slot) << "slot " << dlsn << ": " << slot.error().message();
+        auto pieces = slot->blkid.iterate();
+        while (auto const piece = pieces.next()) {
+            EXPECT_TRUE(homestore::data_service().is_blk_alloced(*piece)) << "slot " << dlsn;
+        }
+    }
+}
+
+// Runs this binary as the crash case's child `phase` and returns its wait status.
+static int run_crash_child(uint32_t phase) {
+    std::vector< std::string > args{
+        "/proc/self/exe", fmt::format("--crash_phase={}", phase),
+        fmt::format("--gtest_filter=CraftVolumeTest.DISABLED_Crash{}", phase == 1 ? "Before" : "After"),
+        "--gtest_also_run_disabled_tests",
+        fmt::format("--repl_port={}", SISL_OPTIONS["crash_repl_port"].as< uint16_t >()),
+        fmt::format("--index_chunk_size_mb={}", SISL_OPTIONS["index_chunk_size_mb"].as< uint32_t >()),
+        fmt::format("--data_chunk_size_mb={}", SISL_OPTIONS["data_chunk_size_mb"].as< uint32_t >()),
+        "--config_path=craft_volume_crash_cfg",
+        // Only the test's own checkpoint: what commits after it, a timer's can't cover.
+        "--override_config", "homestore_config.generic.cp_timer_us:3600000000"};
+    std::vector< char* > argv;
+    for (auto& a : args) {
+        argv.push_back(a.data());
+    }
+    argv.push_back(nullptr);
+    pid_t pid;
+    if (posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), environ) != 0) { return -1; }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) { return -1; }
+    return status;
+}
+
+// An abrupt crash with RAFT entries committed past the last checkpoint: the replay of the RAFT log brings them back,
+// into the volume's hold while its journal's reattach is held, and the device recovers with every effect once.
+TEST_F(CraftVolumeTest, ACrashReplaysWhatCommittedPastTheCheckpoint) {
+    auto const crashed = run_crash_child(1);
+    ASSERT_TRUE(crashed != -1 && WIFSIGNALED(crashed) && WTERMSIG(crashed) == SIGKILL) << "wait status " << crashed;
+    auto const recovered = run_crash_child(2);
+    EXPECT_TRUE(recovered != -1 && WIFEXITED(recovered) && WEXITSTATUS(recovered) == 0) << "wait status " << recovered;
+}
+#endif
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     char** orig_argv = argv;
@@ -882,7 +1013,10 @@ int main(int argc, char* argv[]) {
         std::filesystem::create_directories(SISL_OPTIONS["config_path"].as< std::string >());
     }
 
-    g_helper = std::make_unique< test_common::HBTestHelper >("test_craft_volume", args, orig_argv);
+    // A child of the crash case runs on devices of its own: the first one formats them, the second restarts on them.
+    auto const crash_phase = SISL_OPTIONS["crash_phase"].as< uint32_t >();
+    g_helper = std::make_unique< test_common::HBTestHelper >(
+        crash_phase ? "test_craft_volume_crash" : "test_craft_volume", args, orig_argv);
     auto const port = SISL_OPTIONS["repl_port"].as< uint16_t >();
     g_helper->set_config_hook([port](home_blocks_config& cfg) {
         cfg.repl_mode = replication_mode::CRAFT;
@@ -890,7 +1024,11 @@ int main(int argc, char* argv[]) {
         // A single node: every group has this node as its only member.
         cfg.lookup_peer = [port](peer_id_t const&) { return std::pair< std::string, uint16_t >{"127.0.0.1", port}; };
     });
-    g_helper->setup();
+#ifdef _PRERELEASE
+    // After the crash, the journal's reattach is held: the RAFT log replay hands its entries to the volume's hold.
+    if (crash_phase == 2) { g_helper->set_retval_flip("craft_reattach_delay_ms", 5000 /* ms */, 1000); }
+#endif
+    g_helper->setup(crash_phase != 2 /* format */);
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();
 
