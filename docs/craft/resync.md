@@ -387,14 +387,21 @@ sequenceDiagram
 ### Case 7: New member joins
 
 A new or replacement replica starts empty. RAFT adds it as a non-voting learner (HomeStore's `replace_member`), and
-nuraft sends it a snapshot as in Case 6. It is promoted once it holds the data.
+nuraft sends it a snapshot as in Case 6. It is promoted once it holds the data. UBD follows the move without
+logging in again: it swaps the member in place while I/O keeps running.
 
 #### Flow
 
 1. The leader adds the replica as a learner and records the volume's current position as its promotion gate.
 2. nuraft sends the snapshot (Case 6); the replica then fetches the writes above `W` from any member.
-3. Once its commit point passes the gate, the leader promotes it to voter. UBD re-logs in and picks up the new
-   member list.
+3. Once its commit point passes the gate, the leader promotes it to voter and removes the replica it replaces. OM's
+   volume record now lists the new replica in that partition.
+4. UBD's health check polls OM's volume info, sees the partition's replica list change, re-exposes once for the new
+   endpoint, and swaps the member in place (`craft::replace_member`, through ublkpp's `craft_disk`). There is no
+   re-login and no I/O pause: the session, its term and every other member stay as they are.
+5. At the swap, UBD takes `J`, the highest dLSN it has issued. Every write above `J` goes to the new replica; writes
+   at or below `J` that were already in flight to the old one finish there. UBD reads from the new replica only once
+   its own `commit_lsn` reaches `J`, so until then reads go to the other members.
 
 ![Figure 7](resync-diagrams/fig7.png)
 
@@ -405,15 +412,21 @@ sequenceDiagram
     participant L as Leader
     participant N as New replica
     participant P as Any member
+    participant O as OM
     participant C as UBD
     L->>N: RAFT: add as learner (gate = current position)
     L->>N: nuraft snapshot (as in Case 6)
     N->>P: fetch the writes above W
     P-->>N: write data
     N-->>L: commit point passes the gate
-    L->>N: RAFT: promote to voter
-    L-->>C: term changes (member list updated)
-    C->>L: re-login, new member list
+    L->>N: RAFT: promote to voter, remove the old replica
+    Note over O: volume record lists the new replica
+    C->>O: health check: volume info, replica list changed
+    C->>O: re-expose once, new endpoint
+    C->>C: swap the member in place, J = highest dLSN issued
+    C->>N: writes above J
+    N-->>C: commit_lsn reaches J
+    Note over C,N: from here UBD also reads from it
 ```
 
 </details>
@@ -423,7 +436,14 @@ sequenceDiagram
 #### Guarantees
 
 - **A replica votes only once it holds the data** up to the gate.
-- **UBD never writes to a learner**, so the new replica pulls everything; it is never pushed.
+- **UBD never reads from the new replica before it holds the data** up to the swap point `J`. Writes above `J` reach
+  it directly; everything at or below `J` it pulls from the other BMs (snapshot plus FetchData). UBD itself copies no
+  data.
+- **No write is lost across the swap.** A write either took its dLSN before `J` was read (it may go to the old
+  replica, and the new one gets it by resync) or after (it goes to the new replica). The client publishes the new
+  member before it reads `J`, so no write falls between the two.
+- **No re-login.** The session and term are unchanged; late replies from the old replica are tagged with the slot's
+  old generation and ignored.
 
 ### Case 8: Snapshot interrupted
 
