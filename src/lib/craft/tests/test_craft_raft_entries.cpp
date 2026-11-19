@@ -290,6 +290,8 @@ protected:
         dev_->raft_listener().on_commit(raft_lsn, as_blob(header), as_blob(key), {}, ctx);
     }
 
+    void fault() { dev_->fault(); }
+
 public:
     // Public: a detached coroutine in a test body reaches it through a pointer to this fixture.
     async_status persist() { return dev_->persist_state(); }
@@ -2042,6 +2044,28 @@ TEST_F(CraftRaftEntriesTest, AFaultedPartitionPersistsNothingMore) {
     EXPECT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
     EXPECT_EQ(store->persist_calls, calls);
     EXPECT_EQ(store->saved, saved);
+}
+
+// A partition that faults while a checkpoint saves it (here, while the round ahead of the save's is being written): the
+// save succeeds, its record marked faulted, rather than failing the checkpoint, which stops the process.
+TEST_F(CraftRaftEntriesTest, AFaultDuringACheckpointSaveFailsNoCheckpoint) {
+    auto* store = with_store();
+    store->hold = true;
+    std::optional< status > held, saved;
+    homeblocks::detail::detach([](CraftRaftEntriesTest* t, std::optional< status >& out) -> async_status {
+        out = co_await t->persist();
+        co_return ok();
+    }(this, held)); // the writer starts, held by the store
+    homeblocks::detail::detach([](CraftReplDev* dev, std::optional< status >& out) -> async_status {
+        out = co_await dev->save_state();
+        co_return ok();
+    }(dev_.get(), saved)); // the checkpoint's save, in the next round
+    fault();
+    store->gate.complete(true);
+    ASSERT_TRUE(held && saved);
+    EXPECT_FALSE(held->has_value()) << "written after the fault: refused";
+    EXPECT_TRUE(saved->has_value());
+    EXPECT_TRUE(store->faulted);
 }
 
 // A record marked faulted faults the next restart at once.

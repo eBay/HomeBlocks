@@ -2907,8 +2907,13 @@ void CraftReplDev::fault() {
 }
 
 async_status CraftReplDev::save_state() {
-    if (faulted_.load(std::memory_order_acquire)) co_return ok();
-    co_return co_await persist_state();
+    if (!faulted_.load(std::memory_order_acquire)) {
+        auto r = co_await persist_state();
+        if (r || !faulted_.load(std::memory_order_acquire)) co_return r;
+    }
+    // Only once the mark is durable, whoever makes it: the checkpoint may cover entries this record lacks.
+    if (state_store_) state_store_->mark_faulted();
+    co_return ok();
 }
 
 async_status CraftReplDev::persist_state() {

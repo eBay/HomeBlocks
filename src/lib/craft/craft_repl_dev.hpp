@@ -374,6 +374,7 @@ public:
     virtual void destroy() = 0;
     // Marks the state faulted for good: persist() fails from then on, and load() too, after a restart as well. The
     // partition can't be trusted any more, and coming back from its last image would forget what it applied since.
+    // Idempotent; a call returns once the mark is durable, also when another call made it.
     virtual void mark_faulted() = 0;
     virtual ~CraftStateStore() = default;
 };
@@ -648,7 +649,8 @@ public:
     // Persists the durable image, with the entries committed but not yet applied. HomeBlocks' checkpoint step calls it
     // for every CRAFT partition before HomeStore records the checkpoint: the RAFT log replay after a restart starts
     // above that checkpoint, so an entry it covers that isn't applied yet survives only here. A no-op without a store.
-    // A faulted partition saves nothing: its record stays marked faulted (see fault()).
+    // A partition faulted before or during the save saves nothing, and succeeds once its record is marked faulted
+    // (see fault()): a checkpoint fails, which stops the process, only for a save that failed otherwise.
     async_status save_state();
 
     // The partition is being destroyed: removes its durable state from the store for good. Persists after it fail.
