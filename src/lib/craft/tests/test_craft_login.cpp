@@ -600,6 +600,37 @@ TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotStaysMissing) {
     EXPECT_EQ(dev_->commit_lsn(), 2);
 }
 
+// A late Sync past the watermark whose catch-up can't fetch its new slots leaves commit_lsn at the watermark, but
+// InternalLogin would still truncate slots that Sync settled.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumBelowAnAppliedSyncsWatermark) {
+    loop_back_proposals();
+    dev_->seed_lsns(5, {});
+    commit_sync(/*rs_commit_lsn=*/7); // nobody serves slots 6 and 7
+    ASSERT_EQ(dev_->commit_lsn(), 5);
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+}
+
+// An earlier login's timed-out InternalLogin commits ahead of the Sync: the session is replaced, though commit_lsn
+// ends at the watermark.
+TEST_F(CraftLoginTest, SyncFailsStaleTermWhenALoginCommitsAheadOfIt) {
+    dev_->seed_lsns(5, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        commit_login(/*term=*/1);
+        cintrusive< homestore::repl_req_ctx > ctx{};
+        dev_->raft_listener().on_commit(1, h, k, {}, ctx);
+    };
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
 TEST_F(CraftLoginTest, SyncProposalFailurePropagates) {
     proposer_.fail = true;
     dev_->seed_lsns(5, {});

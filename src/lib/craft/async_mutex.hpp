@@ -14,6 +14,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -27,9 +28,10 @@ namespace homeblocks {
 
 // A mutex a coroutine can wait on without blocking its thread. One holder at a time: try_lock() gives up if it's held,
 // and lock() queues. A releasing holder hands the mutex straight to the longest waiter, so a try_lock() can't slip in
-// ahead of one. The next holder resumes inline, on the releasing thread. A waiter whose frame is destroyed before its
-// turn (its caller gave up) leaves the queue; destroying it while another thread hands it the mutex is a race the
-// caller must avoid, as for any coroutine destroyed mid-await.
+// ahead of one. The next holder resumes on the releasing thread, after any hand-off that thread is already resuming,
+// so waiters that release at once run one after another rather than nested. A waiter whose frame is destroyed before
+// it resumes (its caller gave up) gives up its place or its hand-off; destroying it while another thread hands it the
+// mutex is a race the caller must avoid, as for any coroutine destroyed mid-await.
 class AsyncMutex {
 public:
     // Holds the mutex until it goes out of scope or reset(). Move-only.
@@ -94,7 +96,8 @@ public:
 private:
     struct Waiter {
         sisl::async::value_awaitable< bool > turn;
-        bool handed{false}; // guarded by mu_: release() gave this waiter the mutex
+        bool handed{false};                   // guarded by mu_: release() gave this waiter the mutex
+        std::atomic< bool > abandoned{false}; // its frame was destroyed after that, before it resumed
     };
 
     struct AbandonGuard {
@@ -117,10 +120,30 @@ private:
             waiters_.pop_front();
             next->handed = true;
         }
-        next->turn.complete(true); // outside the lock: resumes that waiter, which now holds the mutex
+        hand_off(std::move(next)); // outside the lock
     }
 
-    // A waiting lock() frame was destroyed before its turn.
+    // Resumes a waiter release() gave the mutex. Resuming it inline lets one that releases at once re-enter
+    // release(), nesting a hand-off per waiter; so a thread already resuming one queues the next, and resumes it once
+    // that returns.
+    static void hand_off(std::shared_ptr< Waiter > next) {
+        thread_local std::deque< std::shared_ptr< Waiter > >* resuming{nullptr};
+        if (resuming) {
+            resuming->push_back(std::move(next));
+            return;
+        }
+        std::deque< std::shared_ptr< Waiter > > queue;
+        queue.push_back(std::move(next));
+        resuming = &queue;
+        while (!queue.empty()) {
+            auto waiter = std::move(queue.front());
+            queue.pop_front();
+            if (!waiter->abandoned.load(std::memory_order_acquire)) waiter->turn.complete(true);
+        }
+        resuming = nullptr;
+    }
+
+    // A waiting lock() frame was destroyed before it resumed.
     void abandon(std::shared_ptr< Waiter > const& waiter) {
         {
             std::lock_guard lk{mu_};
@@ -129,7 +152,9 @@ private:
                 return;
             }
         }
-        release(); // it was handed the mutex but will never hold it: pass it on
+        // It was handed the mutex but will never hold it: a queued hand-off must skip it, and the mutex passes on.
+        waiter->abandoned.store(true, std::memory_order_release);
+        release();
     }
 
     mutable std::mutex mu_;

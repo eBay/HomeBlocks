@@ -731,14 +731,21 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
 
-    // The entry has applied here (a proposal completes after its apply). InternalLogin will truncate to
-    // rs_commit_lsn, so this member must be exactly there: past it, an earlier round's timed-out Sync committed late
-    // and the watermark is stale; short of it, a slot login_resolve() settled is somehow still missing. Either way
-    // the login fails and the client retries.
+    // The entry has applied here (a proposal completes after its apply). An earlier login's timed-out InternalLogin
+    // may have committed meanwhile, replacing the session without moving commit_lsn.
     std::lock_guard lk{state_mu_};
-    if (state_.commit_lsn > rs_commit_lsn) {
-        LOGW("login_sync: commit_lsn {} is past the login's watermark {} -- a late Sync; login fails",
-             state_.commit_lsn, rs_commit_lsn);
+    if (!session_current_locked(term)) {
+        LOGW("login_sync: term moved past the login's ({} -> {}) during SyncRSCommitLSN({})", term, state_.term,
+             rs_commit_lsn);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
+    // InternalLogin will truncate to rs_commit_lsn, so this member must be exactly there: past it (or past an applied
+    // Sync's watermark it couldn't yet catch up to), an earlier round's timed-out Sync committed late and the watermark
+    // is stale; short of it, a slot login_resolve() settled is somehow still missing. Either way the login fails and
+    // the client retries.
+    if (state_.commit_lsn > rs_commit_lsn || applied_sync_lsn_ > rs_commit_lsn) {
+        LOGW("login_sync: commit_lsn {} / applied Sync {} past the login's watermark {} -- a late Sync; login fails",
+             state_.commit_lsn, applied_sync_lsn_, rs_commit_lsn);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     if (state_.commit_lsn < rs_commit_lsn) {

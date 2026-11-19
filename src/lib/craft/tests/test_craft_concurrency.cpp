@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -611,6 +612,33 @@ TEST(AsyncMutexTest, AbandonedWaiterLeavesTheQueue) {
 
     EXPECT_EQ(order, (std::vector< int >{2}));
     next.reset();
+    EXPECT_FALSE(mu.locked());
+}
+
+// Takes `mu`, records the stack frame it runs on, and lets the mutex go at once.
+sisl::async::task< void > take_and_release(AsyncMutex& mu, std::vector< std::uintptr_t >& frames) {
+    auto lock = co_await mu.lock();
+    frames.push_back(reinterpret_cast< std::uintptr_t >(__builtin_frame_address(0)));
+}
+
+// Waiters that release as soon as they get the mutex resume one after another, not each inside the last one's
+// release(): a long queue of them (every queued Resolve failing its recheck when leadership goes) mustn't run the
+// releasing thread out of stack.
+TEST(AsyncMutexTest, WaitersThatReleaseAtOnceDontNest) {
+    AsyncMutex mu;
+    auto first = mu.try_lock();
+    ASSERT_TRUE(first.has_value());
+    constexpr size_t n = 10'000;
+    std::vector< std::uintptr_t > frames;
+    frames.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        homeblocks::detail::detach(take_and_release(mu, frames));
+
+    first.reset();
+
+    ASSERT_EQ(frames.size(), n);
+    auto const [lo, hi] = std::minmax_element(frames.begin(), frames.end());
+    EXPECT_LT(*hi - *lo, 64u * 1024) << "hand-offs nested: the stack grew by " << (*hi - *lo) << " bytes";
     EXPECT_FALSE(mu.locked());
 }
 

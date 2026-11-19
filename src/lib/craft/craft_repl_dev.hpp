@@ -701,8 +701,8 @@ private:
     // Login step 3, leader-only, under watermark_mu_ (`lock` is the proof): proposes SyncRSCommitLSN{rs_commit_lsn,
     // the new client's token, the step-2 verdicts} and waits for the leader to apply it, then checks the leader is
     // exactly at rs_commit_lsn. Always proposes, even if rs_commit_lsn is already covered. Fails NO_QUORUM if
-    // commit_lsn isn't rs_commit_lsn afterwards (a late Sync past it, or a slot still missing) and INTERNAL_ERROR if
-    // the partition is or becomes faulted.
+    // commit_lsn isn't rs_commit_lsn afterwards (a late Sync past it, or a slot still missing), STALE_TERM if a login
+    // replaced the session meanwhile, and INTERNAL_ERROR if the partition is or becomes faulted.
     async_status login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                             std::vector< int64_t > empty_slots, uint64_t term);
 
