@@ -249,6 +249,12 @@ public:
         return craft_dev_;
     }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
+    // CRAFT: this replica serves its partition, or will once its device is reattached. One whose device faulted, or
+    // never came back at a restart (its journal didn't replay), doesn't.
+    bool serves_craft() const {
+        std::lock_guard lk{craft_hold_mu_};
+        return craft_dev_expected_ || (craft_dev_ && !craft_dev_->is_faulted());
+    }
     // CRAFT recovery, at load: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and
     // hands its store to `replayed` once HomeStore's log replay has replayed it. HomeStore calls that with the log
     // device locked: it only passes the store on. From here on the volume expects its device: the committed entries

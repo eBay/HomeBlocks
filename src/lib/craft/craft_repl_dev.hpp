@@ -599,6 +599,8 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.all_committed_lsn;
     }
+    // True once the partition is permanently faulted (see faulted_): never false again.
+    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
 
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
@@ -621,6 +623,10 @@ public:
     // (SDSTOR-22888). One checkpoint_trigger_fn_t is shared by every volume's CraftReplDev; tests
     // inject a mock.
     void set_checkpoint_trigger(checkpoint_trigger_fn_t fn) { checkpoint_trigger_ = std::move(fn); }
+
+    // Runs once, in the fault that makes the partition faulted (see faulted_), possibly with state_mu_ held: it only
+    // hands work off. HomeBlocks hands the group's RAFT leadership to a member that can serve. Set before any use.
+    void set_on_fault(std::function< void() > fn) { on_fault_ = std::move(fn); }
 
     // Overrides the commit_lsn delta between checkpoint triggers (default matches
     // sync_rs_commit_lsn_interval's own default of 128, tying checkpoint cadence to the periodic
@@ -767,9 +773,8 @@ public:
     // is_faulted() for the failure outcome instead).
     bool is_recovering() const { return recovering_.load(std::memory_order_acquire); }
 
-    // Test-only observability for faulted_: true once the partition is permanently faulted. Never
-    // transitions back to false.
-    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
+    // Faults the partition, as a failure would.
+    void fault_for_test() { fault(); }
 #endif
 
 private:
@@ -1231,6 +1236,7 @@ private:
     // nothing is persisted.
     std::atomic< bool > faulted_{false};
     void fault();
+    std::function< void() > on_fault_; // set_on_fault()
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()

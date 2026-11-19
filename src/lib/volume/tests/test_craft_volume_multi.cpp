@@ -521,6 +521,41 @@ TEST_F(CraftVolumeMultiTest, EntriesCommittedBeforeTheReattachAreHeld) {
     }
     ASSERT_TRUE(sync());
 }
+
+// A faulted replica can't serve its partition: leading, it would fail every resolution while the other members refuse
+// them as not the leader. Its member hands leadership to one that can. Last: a member restarted after it would find
+// the partition faulted for good.
+TEST_F(CraftVolumeMultiTest, AMemberWhoseReplicaFaultsHandsLeadershipOff) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(9);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(9)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        auto const rd = group(id);
+        EXPECT_TRUE(wait_until([&rd] {
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        auto const handed_off = g_helper->leaderships_handed_off();
+        (*hb()->get_volume(id))->craft_dev()->fault_for_test();
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+}
 #endif
 
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a

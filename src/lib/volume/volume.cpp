@@ -335,6 +335,10 @@ shared< CraftReplDev > volume::make_craft_dev(shared< homestore::home_log_store 
     dev->set_checkpoint_trigger(make_homestore_checkpoint_trigger_fn());
     dev->set_peer_fetch_timeout_ms(HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms));
     dev->set_checkpoint_lsn_interval(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval));
+    // Faulted, the replica can't serve its partition: leadership, if this member holds it, goes to one that can.
+    dev->set_on_fault([id = id()] {
+        if (auto const hb = HomeBlocksImpl::instance()) { hb->on_craft_replica_faulted(id); }
+    });
     return dev;
 }
 

@@ -642,8 +642,10 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
 }
 
 // A member whose local create failed stays in the group without a replica, reported, until a partition move replaces
-// it; RAFT may still elect it, as it has the whole log. Not while a create of the volume runs here (that create needs
-// this member to lead), nor when alone in the group: there is nobody to hand leadership to.
+// it; RAFT may still elect it, as it has the whole log. So may a member whose replica faulted, or whose device never
+// came back at a restart: it can't serve the partition either, also when that happens while it leads. Not while a
+// create of the volume runs here (that create needs this member to lead), nor while its device is being reattached
+// (checked again once it is), nor when alone in the group: there is nobody to hand leadership to.
 void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
     if (is_shutting_down()) { return; }
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
@@ -670,10 +672,13 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
         }
     };
     if (is_shutting_down()) { return; }
+    volume_handle vol;
     {
         auto lg = std::shared_lock(vol_lock_);
-        if (vol_map_.contains(id) || creating_vols_.contains(id)) { return forget(); }
+        if (creating_vols_.contains(id)) { return forget(); }
+        if (auto const it = vol_map_.find(id); it != vol_map_.end()) { vol = it->second; }
     }
+    if (vol && vol->serves_craft()) { return forget(); }
     auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
     if (!rd || !(*rd)->is_leader() || is_going_away(**rd) || (*rd)->get_replication_quorum().size() < 2) {
         return forget();
@@ -690,10 +695,15 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
             it->second = now;
         }
     }
-    LOGW("vol={}: RAFT leader without a replica here: handing leadership to another member",
-         boost::uuids::to_string(id));
+    LOGW("vol={}: RAFT leader {} here: handing leadership to another member", boost::uuids::to_string(id),
+         vol ? "with a faulted replica" : "without a replica");
     COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
     (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
+}
+
+void HomeBlocksImpl::on_craft_replica_faulted(volume_id_t const& id) {
+    std::lock_guard lk{craft_handoff_mu_};
+    craft_faulted_since_.insert(id);
 }
 
 void HomeBlocksImpl::retry_craft_handoffs() {
@@ -705,6 +715,8 @@ void HomeBlocksImpl::retry_craft_handoffs() {
         for (auto const& [id, at] : craft_handed_off_at_) {
             if (now - at >= backoff) { due.push_back(id); }
         }
+        due.insert(due.end(), craft_faulted_since_.begin(), craft_faulted_since_.end());
+        craft_faulted_since_.clear();
     }
     for (auto const& id : due) {
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
