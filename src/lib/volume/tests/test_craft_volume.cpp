@@ -171,6 +171,7 @@ public:
         return std::all_of(dest.cbytes(), dest.cbytes() + k_page, [dlsn](uint8_t b) { return b == 'a' + dlsn; });
     }
 
+#ifdef _PRERELEASE
     // The volumes with a CRAFT state record in the meta service, read as a boot reads them.
     static std::set< volume_id_t > state_records() {
         std::set< volume_id_t > ids;
@@ -180,6 +181,7 @@ public:
         }
         return ids;
     }
+#endif
 };
 
 TEST_F(CraftVolumeTest, CreateFormsGroupAndAttachesCraftDev) {
@@ -393,7 +395,9 @@ TEST_F(CraftVolumeTest, SessionSurvivesRestarts) {
     ASSERT_TRUE(vol);
     commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
     ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+#ifdef _PRERELEASE
     EXPECT_TRUE(state_records().contains(id));
+#endif
 
     for (int i = 0; i < 2; ++i) {
         g_helper->restart();
@@ -544,6 +548,7 @@ TEST_F(CraftVolumeTest, RestartKeepsTheBlocksOfLiveSlots) {
         ASSERT_EQ(kvs.size(), 1u) << "slot " << dlsn;
         EXPECT_TRUE(homestore::data_service().is_blk_alloced(kvs[0].second.blkid())) << "slot " << dlsn;
     }
+#ifdef _PRERELEASE
     for (int64_t dlsn = 2; dlsn < 4; ++dlsn) {
         auto const slot = homeblocks::detail::sync_get((*again)->craft_dev()->journal_slot_for_test(dlsn));
         ASSERT_TRUE(slot) << slot.error().message();
@@ -552,6 +557,7 @@ TEST_F(CraftVolumeTest, RestartKeepsTheBlocksOfLiveSlots) {
             EXPECT_TRUE(homestore::data_service().is_blk_alloced(*piece)) << "slot " << dlsn;
         }
     }
+#endif
     for (int64_t dlsn = 4; dlsn < 12; ++dlsn) {
         auto const w = write_slot(*again, hdr, dlsn);
         ASSERT_TRUE(w) << w.error().message();
@@ -562,6 +568,7 @@ TEST_F(CraftVolumeTest, RestartKeepsTheBlocksOfLiveSlots) {
     remove(id);
 }
 
+#ifdef _PRERELEASE
 // A RAFT entry a checkpoint covers is never replayed after a restart. One that hasn't applied yet survives in the
 // partition's durable state, which the checkpoint saves with it, and the restart applies it from there.
 TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
@@ -583,6 +590,7 @@ TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
     EXPECT_EQ((*again)->craft_dev()->client_token(), 42u);
     remove(id);
 }
+#endif
 
 // The group is destroyed (here directly; by the partition's removal or a create rollback in practice): each member's
 // replica follows it, through on_destroy, and its durable state record with it.
@@ -593,7 +601,9 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     ASSERT_TRUE(vol);
     commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
     ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+#ifdef _PRERELEASE
     ASSERT_TRUE(state_records().contains(id));
+#endif
     // A CRAFT op the replica serves until then, in the session: it changes nothing.
     craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
     auto alive = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
@@ -613,7 +623,9 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     auto late = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_FALSE(late);
     EXPECT_EQ(late.error(), std::errc::operation_not_supported);
+#ifdef _PRERELEASE
     EXPECT_FALSE(state_records().contains(id));
+#endif
 }
 
 // Same, but the node restarts right after the destroy committed: whether the reaper ran first (on_destroy) or HomeStore
@@ -626,12 +638,16 @@ TEST_F(CraftVolumeTest, GroupDestroyedAcrossRestartRemovesReplica) {
     ASSERT_TRUE(vol);
     commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
     ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+#ifdef _PRERELEASE
     ASSERT_TRUE(state_records().contains(id));
+#endif
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
     g_helper->restart();
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
+#ifdef _PRERELEASE
     EXPECT_FALSE(state_records().contains(id));
+#endif
 }
 
 // After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in

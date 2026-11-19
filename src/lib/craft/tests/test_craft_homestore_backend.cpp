@@ -462,6 +462,7 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFail
     EXPECT_GE(flushed, 1);
 }
 
+#ifdef _PRERELEASE
 // Every CRAFT state record in the meta service, by volume, read as a boot reads them.
 static auto read_state_records() {
     return std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records();
@@ -535,6 +536,7 @@ TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
     EXPECT_FALSE(homeblocks::detail::sync_get(store->persist(small)));
     EXPECT_TRUE(read_state_records().empty());
 }
+#endif
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
