@@ -250,6 +250,9 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
         auto lg = std::scoped_lock(vol_lock_);
         creating_vols_.erase(id);
     }
+    // Failed, it leaves no replica here, while the group may live on (a create retried on a member without one): an
+    // election while it ran left leadership alone, so whether to hand it off is checked again.
+    if (!ret) on_craft_group_leader(id);
     co_return ret;
 }
 
