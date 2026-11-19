@@ -119,7 +119,8 @@ verdicts) → `SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once 
 the leader. **A follower
 returns LoginResult with `term==0` and `leader_hint` set to the current leader's id (not an error)**;
 the client finds the matching handle by id and retries login there. `NO_QUORUM` / `REPLICA_DOWN` are
-returned as errors. Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
+returned as errors, and so is `STALE_TERM` when a member is already past the session's term (a newer login
+won). Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
 session term. Other members reach both as they apply the two entries, in the background; the client admits
 IO once a quorum accepts the new term and at least one member has `commit_lsn ≥ dLSN`.
 
@@ -231,18 +232,19 @@ verbs and never cross the client wire, so no CRAFT server exposes them.
 ### `get_lsns` / `get_rs_commit_lsn`
 
 ```cpp
-struct rs_commit_lsn_reply { uint64_t term; int64_t commit_lsn; int64_t last_append_lsn; };
+struct RsCommitLsnReply { lsn_pair lsns; uint64_t term; };
 
 async_result<lsn_pair> get_lsns();   // local snapshot of {commit_lsn, last_append_lsn}
-async_result<rs_commit_lsn_reply> get_rs_commit_lsn(uint64_t term, bool is_login);
+async_result<RsCommitLsnReply> get_rs_commit_lsn(uint64_t term, bool is_login);
 ```
 
 Peer-to-peer; not a client-facing free function. The leader polls every other member via
 `get_rs_commit_lsn` before proposing a `SyncRSCommitLSN`; at login it takes `rs_commit_lsn` as the max
 `last_append_lsn` over itself and every responder. `term` is the current session term T. With
 `is_login=true` the replica quiesces first, rejecting writes whose term is ≤ T; it fences the request's
-term rather than its own, which may lag. The reply's `term` is the replica's own session term, so the
-leader can abort with `STALE_TERM` if a responder is already past T.
+term rather than its own, which may lag. The reply's `term` is the replica's own session term, counting an
+`InternalLogin` it has committed but not yet applied, so the leader can abort with `STALE_TERM` if a responder
+is already past T.
 
 ### `truncate`
 

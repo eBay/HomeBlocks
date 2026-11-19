@@ -185,6 +185,23 @@ add_dependencies(test_craft_pre_resolution ${PROJECT_NAME}_core)
 
 add_test(NAME CraftPreResolutionTest COMMAND test_craft_pre_resolution)
 
+# Unit tests for the leader's login steps (S7: SDSTOR-22744), starting with the login poll (SDSTOR-22889). Same
+# pattern: compile craft_repl_dev.cpp directly.
+add_executable(test_craft_login)
+target_sources(test_craft_login PRIVATE
+    test_craft_login.cpp
+    ../craft_repl_dev.cpp
+)
+target_compile_definitions(test_craft_login PRIVATE _PRERELEASE)
+target_sources(test_craft_login PRIVATE ${HB_CONFIG_BINDUMP})
+target_link_libraries(test_craft_login
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+add_dependencies(test_craft_login ${PROJECT_NAME}_core)
+
+add_test(NAME CraftLoginTest COMMAND test_craft_login)
+
 # Heavy integration test for CraftReplDev::commit()/read() against a REAL VolumeIndexTable and real
 # data blocks (via a real, ordinarily-created volume) -- same pattern as
 # test_craft_homestore_backend.cpp (links the full library, real HomeStore bring-up).
