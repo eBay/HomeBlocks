@@ -863,7 +863,13 @@ private:
         std::vector< int64_t > unresolved;
     };
     // term: the session the round belongs to (STALE_TERM if state_.term differs, at entry or later).
-    async_result< PreResolution > pre_resolve_slots(int64_t upto, uint64_t term);
+    // counted_lackers, if set, are the only members whose lack counts toward a fresh Empty; every responder still
+    // supplies data and committed Empty verdicts. Login sets it to the members its poll quiesced: one it didn't could
+    // still ack an old-session write to a slot after reporting it lacks it. Set, a fetch with no usable reply fails
+    // NO_QUORUM rather than not_supported.
+    async_result< PreResolution >
+    pre_resolve_slots(int64_t upto, uint64_t term,
+                      std::optional< std::vector< craft::peer_id_t > > counted_lackers = std::nullopt);
 
     // Login step 1, leader-only: quiesces this member's writes at or below `term` (the latest committed session
     // term), then polls every other member with the same fence and waits for all of them up to the poll timeout.
@@ -876,6 +882,13 @@ private:
         std::vector< craft::peer_id_t > quiesced{};
     };
     async_result< LoginPoll > login_poll(uint64_t term);
+
+    // Login step 2, leader-only: resolves every slot this member lacks up to rs_commit_lsn, holes below its own
+    // last_append_lsn included, counting only the quiesced members' lacks. All or nothing: the watermark is fixed by
+    // the poll, so any slot left unresolved fails NO_QUORUM before anything is proposed; a partition that is or becomes
+    // faulted fails INTERNAL_ERROR. Returns the Empty verdicts the login's SyncRSCommitLSN carries.
+    async_result< std::vector< int64_t > > login_resolve(int64_t rs_commit_lsn, uint64_t term,
+                                                         std::vector< craft::peer_id_t > quiesced);
 
     // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
     // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
