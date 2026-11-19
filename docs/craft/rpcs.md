@@ -257,8 +257,9 @@ RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [
 Proposed by the leader via `CraftReplDev::append()` — triggered by login, the watchdog, the periodic
 checkpoint, or the client-requested **Resolve** RPC (#5). **Before proposing**, the leader resolves
 every unresolved slot ≤ `rs_commit_lsn`: fetch from any holder, or record an `Empty` verdict on
-quorum-lacks evidence; it never proposes past an unresolved slot. On RAFT commit each replica: mark
-`empty_slots` as permanent no-op holes (discarding any local data there), fetch the remaining missing
+quorum-lacks evidence (at login, only from members its poll quiesced); it never proposes past an
+unresolved slot. On RAFT commit each replica: mark `empty_slots` as permanent no-op holes (discarding
+any local data there), fetch the remaining missing
 slots from peers, then advance `commit_lsn` to the contiguous prefix bounded by `rs_commit_lsn` --
 skipping `Empty` slots but never past an unresolved `Missing` one. `client_token` is carried on the
 entry but not checked against local state at apply time: `SyncRSCommitLSN` applies before the
