@@ -451,8 +451,9 @@ A snapshot can take hours, so the leader or the receiver may fail during it.
 
 #### Flow
 
-1. **The receiver crashes:** it restarts with its saved snapshot context (snapshot point and region cursor). When
-   nuraft resumes the same snapshot, the receiver asks for the region after the last one it made durable.
+1. **The receiver crashes:** it restarts with its saved snapshot context (transfer identity, region cursor, read
+   gate). When nuraft resumes the same transfer (same snapshot point and same control tuple), the receiver asks for
+   the region after the last one it made durable; otherwise it starts over.
 2. **The leader fails or changes:** the new leader's nuraft starts a snapshot of its own (a new snapshot point).
    The receiver sees a different snapshot point and starts over. Every batch replaces its whole range, so whatever
    the first leader had sent is overwritten consistently.
@@ -1027,7 +1028,16 @@ verdicts in `(W, S]`. Object `0 | 0` serves that persisted tuple, unchanged on e
 when the object is served would include the effects of entries after `L`, which the receiver then replays a second
 time: a later Sync that voids slot 101 and advances `W` past it would leave the receiver with a tombstone outside
 `(W, S]`, and replaying that Sync then hits the indexed-slot check in `install_sync_rs_commit_lsn`. The regions are
-still read live (fuzzy, requirement 3); only the control tuple must match `L`.
+still read live (fuzzy, requirement 3); only the control tuple must match `L`. The tuple also gets a digest; `L`
+plus that digest is the **transfer identity** the receiver resumes against (requirement 6). `L` alone is not
+enough: two leaders can hold different data watermarks at the same RAFT index.
+
+**A stored context can go stale.** It may be served long after it was created, by which time the members may have
+reclaimed the slots above `W` that the receiver needs to replay. So before serving object `0 | 0`, the leader checks
+that the tail is still there: every member's `journal_floor` (from its probe reply) is at or below `W`. If not,
+`read_snapshot_obj` returns an error and the leader creates a fresh snapshot at its current index (HomeStore's
+`trigger_snapshot_creation`); nuraft then serves the new context. A context that passes the check is protected from
+then on by the `RetainFrom` pin (§4.8), which the leader proposes before it serves any region.
 
 #### The object stream (`read_snapshot_obj` on the leader, `write_snapshot_obj` on the receiver)
 
@@ -1064,32 +1074,48 @@ request for `r | 0` by restarting region `r`.
    state, as a fuzzy checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the
    index and reads the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is
    never sent.
-4. **`W` must cover the receiver.** On object 0 the receiver compares `W` with its own durable `commit_lsn`. If
-   `W` is lower (the leader's data trails this member's), installing would roll back data the member has already
-   certified, after UBD has pruned its Missing entries on the strength of that certificate. The receiver refuses
-   the snapshot (an error from `write_snapshot_obj`, so nuraft retries later) and the leader catches up first.
+4. **`W` must cover the receiver.** If `W` is below the receiver's durable `commit_lsn` (the leader's data trails
+   this member's), installing would roll back data the member has already certified, after UBD has pruned its
+   Missing entries on the strength of that certificate. The receiver cannot refuse: `write_snapshot_obj` returns
+   `void` in HomeStore's listener, and the adapter carries on. So the **donor** checks. Before serving object
+   `0 | 0` it probes the receiver's `commit_lsn` over the peer plane, and if `W` is lower, `read_snapshot_obj`
+   returns an error: nuraft retries later, and by then the leader has caught up and created a newer snapshot.
+   Should HomeStore gain a receiver-side rejection, the receiver would also check; until then this is a donor
+   duty and an SN2 item.
 5. **An exclusive install barrier.** nuraft pauses the receiver's RAFT apply, but that alone leaves work already
    running (client writes, the commit path, the catch-up runner) free to change the journal or index during range
    replacement. A write could even be acknowledged mid-install and then dropped at completion, so UBD's record of
    who holds it would be wrong. So on object `0 | 0`, before replacing any range, the receiver raises a barrier: it
    admits no new client IO (`OFFLINE`), stops the catch-up runner, answers peer fetches with an error, and flags
    itself in poll replies so the leader does not count it as a data holder. Then it **drains** every write and
-   commit already admitted, each completing or failing before the barrier is up. `P` (requirement 7) is read after
-   the drain, so every write the member acknowledged is at or below it. The barrier holds until completion.
-6. **Resumable.** The receiver persists `{snapshot index L, W, S, region cursor}` in a superblock at each region
-   boundary, after a checkpoint flush, so the cursor never runs ahead of durable data (HomeObject's per-shard
-   cursor). After a crash it reloads the context; if nuraft resumes the same snapshot `L`, it asks for the region
-   after the cursor, otherwise it starts over.
+   commit already admitted, including a `commit()` suspended on journal IO and the catch-up runner's in-flight
+   fetch-and-install, each completing or failing before the barrier is up. Every index mutation also carries the
+   volume's **install epoch**, which the barrier increments: a completion from before the barrier that still lands
+   afterwards finds a newer epoch and is discarded, so it can never overwrite a range the snapshot replaced. `P`
+   (requirement 7) is read after the drain, so every write the member acknowledged is at or below it. The barrier
+   holds until completion.
+6. **Resumable.** The receiver persists `{transfer identity (L, tuple digest), W, S, P, region cursor}` in a
+   superblock at each region boundary, after a checkpoint flush, so the cursor never runs ahead of durable data
+   (HomeObject's per-shard cursor). After a crash it reloads the context. It resumes after the cursor only if
+   object `0 | 0` carries the **same transfer identity**; a different `L`, or the same `L` with a different tuple,
+   restarts every region, because regions copied against one baseline cannot be completed against another.
 7. **Completion.** On the last object the receiver drops its **whole** journal: slots at or below `W` are
    superseded by the snapshot, and slots above it may be an earlier session's (anything durable is fetched again).
    It sets `journal_floor = W`, so a peer fetch below `W` gets `reclaimed_below` and a stale record can never be
    served from it. It sets `commit_lsn = W`, `last_append_lsn = max(W, S)`, marks `(W, S]` minus the shipped
-   Empty verdicts as missing, adopts the control state, clears its overlay and persists the snapshot context.
+   Empty verdicts as missing, merges the control state, clears its overlay and persists the snapshot context. The
+   control state is **merged, not adopted**: `session_term`, `fence_term` and `aborted_upto` each take the maximum of
+   the local and the shipped value. A login fence the receiver raised after `L` is therefore kept until replay
+   applies the committed `InternalLogin` or `LoginAborted` that ends it; adopting the older tuple would re-admit the
+   old session without a committed outcome.
    Then it lifts the IO gate **for writes only**. Reads stay gated until its `commit_lsn` reaches
    `G = max(W_hi, P)`, where `W_hi` comes from the trailer and `P` is the receiver's own `last_append_lsn` before
    the install. Below `W_hi` a fuzzy region may hold a version newer than the read horizon, which `read_impl` does
    not filter out of the base index. Up to `P` the member may have acknowledged writes that it just dropped, and the
    client has no Missing entry for those. While gated it answers reads `NOT_ELIGIBLE`, so the client fails over.
+   The gate is durable: `P` is persisted with the context at the barrier (requirement 5), before any range is
+   replaced, and `G` with the completion. A restart restores the gate from the superblock and keeps it until
+   `commit_lsn` durably reaches `G`, so a crash between install and replay cannot reopen reads early.
    RAFT entries after `L` then apply normally, and catch-up fetches `(W, S]` and beyond from any member over the
    peer plane (block_mgr2, S9).
 8. **Integrity and throttling.** Batches are CRC-checked (G4). The batch byte budget is configurable (HomeObject's
@@ -1309,8 +1335,8 @@ coverage** for `src/lib/craft/` and for every function a PR adds or changes (the
 | **S8a. Durable state + restart** | HomeBlocks | this work | `CraftStateStore` / `CraftDurableState` written ahead of each control change (§4.11); restart restores it and rebuilds the range from the journal; replay-safe re-apply; checkpoint trigger reports whether it flushed; Sync/catch-up advance goes through `commit()` | H6, H9 |
 | **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
 | **SN1. Snapshot context** | HomeBlocks | this work | `CraftGroupListener` forwards the snapshot callbacks to `CraftReplDev`, and creates the volume from object `0 | 0` on a member that has none (bootstrap); `create_snapshot` / `last_snapshot` / `apply_snapshot` persist the context in a per-volume superblock | — |
-| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, trailer with `W_hi`, resend and resume), `free_user_snp_ctx`; the `RetainFrom` pin around a transfer | — |
-| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: refuse `W` below its own `commit_lsn`, range replace, resumable region cursor persisted after a checkpoint flush, completion (whole journal dropped, `journal_floor = W`, `commit_lsn = W`, `(W, S]` missing), IO gate while installing and a read gate up to `G` after | — |
+| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, trailer with `W_hi`, resend and resume), `free_user_snp_ctx`; before serving: the receiver's `commit_lsn` covered by `W` and the tail above `W` still retained, otherwise regenerate the snapshot; the `RetainFrom` pin around a transfer | — |
+| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: install barrier with drain and install epoch, range replace, resume on the same transfer identity only, resumable region cursor persisted after a checkpoint flush, completion (whole journal dropped, `journal_floor = W`, `commit_lsn = W`, `(W, S]` missing), IO gate while installing and a persisted read gate up to `G` after; monotonic control-state merge | — |
 | **SN4. Triggers** | HomeBlocks | this work | RAFT-log compaction following the cleanup floor (`trigger_snapshot_creation`); the C2 re-add as a learner (with S10) | C2 |
 | Later | HomeBlocks | tbd | Lease / `InternalLogout` / stand-in; membership promotion gate (S10) | — |
 
@@ -1452,8 +1478,9 @@ non-convergence is open question 10.
 
 ### 9.5 Small specification holes
 
-- ~~**Snapshot resume across a leader change.**~~ Resolved by the nuraft transfer: a new leader's snapshot has a
-  new RAFT index `L`, and the receiver resumes only the same `L` and otherwise starts over (§4.9 requirement 6).
+- ~~**Snapshot resume across a leader change.**~~ Resolved: the receiver resumes only the same transfer identity,
+  `L` plus the control tuple's digest, and otherwise starts over (§4.9 requirement 6). `L` alone is not enough,
+  since two leaders can hold different data watermarks at the same RAFT index.
 
 ## 10. Open questions
 
