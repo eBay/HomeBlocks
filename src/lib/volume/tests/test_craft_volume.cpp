@@ -624,6 +624,14 @@ TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
     commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */); // never delivered again
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true /* force */)));
     EXPECT_EQ(dev->term(), 0u) << "applied before the checkpoint";
+    // Saved by this checkpoint, not only by the shutdown's below: a crash now would find it too.
+    auto records = std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records();
+    ASSERT_TRUE(records.contains(id));
+    auto const image = make_homestore_state_store(id, std::move(records.at(id)))->load();
+    ASSERT_TRUE(image && *image);
+    ASSERT_EQ((*image)->pending.size(), 1u);
+    EXPECT_EQ((*image)->pending[0].type, CraftEntryType::InternalLogin);
+    EXPECT_EQ((*image)->pending[0].term, 7u);
 
     g_helper->restart();
     auto again = hb()->get_volume(id);
