@@ -599,12 +599,21 @@ uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
     }
 }
 
-// Counted from the replay on, so a checkpoint that ends HomeStore's start already waits for it. Every journal reopened
-// at load replays during HomeStore's start: by the time init waits, every reattach is counted.
-void HomeBlocksImpl::on_craft_journal_replayed(volume_handle vol, shared< homestore::home_log_store > journal) {
+void HomeBlocksImpl::expect_craft_reattach(volume_id_t const& id) {
+    std::lock_guard lk{craft_reattach_mu_};
+    if (craft_reattaching_++ == 0) craft_reattached_ = std::make_shared< sisl::async::shared_awaitable< bool > >();
+    craft_unreplayed_.insert(id);
+}
+
+void HomeBlocksImpl::on_craft_journal_replayed(volume_id_t const& id, volume_handle vol,
+                                               shared< homestore::home_log_store > journal) {
     {
         std::lock_guard lk{craft_reattach_mu_};
-        if (craft_reattaching_++ == 0) craft_reattached_ = std::make_shared< sisl::async::shared_awaitable< bool > >();
+        if (craft_unreplayed_.erase(id) == 0) return; // given up already (finish_craft_reattach)
+    }
+    if (!vol) {
+        end_craft_reattach();
+        return;
     }
     // A worker, not the replay's thread: HomeStore holds the log device locked, and its start goes on meanwhile.
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, vol = std::move(vol), journal]() mutable {
@@ -629,6 +638,10 @@ sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vo
     if (auto const r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid()); !r) {
         COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
     }
+    end_craft_reattach();
+}
+
+void HomeBlocksImpl::end_craft_reattach() {
     shared< sisl::async::shared_awaitable< bool > > done;
     {
         std::lock_guard lk{craft_reattach_mu_};
@@ -669,11 +682,23 @@ void HomeBlocksImpl::stop_craft_devices() {
     }
 }
 
+// HomeStore has started: every journal reopened at load that replays has replayed by now. One that hasn't won't (its
+// log store is missing), and the entries held for it can't be saved: its partition is faulted for good, its record
+// marked before the count lets a checkpoint cover them, so a later boot doesn't bring it back from that record.
 void HomeBlocksImpl::finish_craft_reattach() {
-    detail::sync_get(craft_reattaches_done());
-    for (auto const& vol : craft_volumes()) {
-        vol->abandon_craft_hold();
+    std::unordered_set< volume_id_t > unreplayed;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        unreplayed.swap(craft_unreplayed_);
     }
+    for (auto const& id : unreplayed) {
+        if (auto const vol = get_volume(id)) {
+            COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
+            (*vol)->fault_unreplayed_craft();
+        }
+        end_craft_reattach();
+    }
+    detail::sync_get(craft_reattaches_done());
 }
 
 void HomeBlocksImpl::start_reaper_thread() {

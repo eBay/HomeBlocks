@@ -260,8 +260,9 @@ public:
     // load, recovers it, hands it the entries held meanwhile in log order, then publishes it. Returns recover()'s
     // outcome; on a failure the device is published faulted. `my_id`: as in make_craft_volume().
     async_status reattach_craft_dev(shared< homestore::home_log_store > journal, peer_id_t my_id);
-    // CRAFT recovery: the device expected since the load won't come (its journal never replayed): drops what is held.
-    void abandon_craft_hold();
+    // CRAFT recovery: the device expected since the load won't come, as the journal never replayed (its log store is
+    // missing): the partition is faulted for good, its state record marked so, and what is held for it dropped.
+    void fault_unreplayed_craft();
     // CRAFT: an entry the volume's RAFT group committed, for its CraftReplDev: handed to it, or held until it is
     // published while one is expected. False if this volume won't have one (being destroyed, or never reattached).
     bool deliver_craft_entry(int64_t lsn, sisl::blob const& header, sisl::blob const& key,

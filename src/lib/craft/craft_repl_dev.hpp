@@ -398,6 +398,9 @@ inline const std::string craft_state_meta_name{"CraftState"};
 // A CraftStateStore in the partition's own meta blk record (craft_state_sb_t). `sb` is the record loaded at boot, or an
 // empty one named craft_state_meta_name for a partition that has none yet: its first persist creates it.
 unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb);
+// Marks a partition's state record faulted as CraftStateStore::mark_faulted() does, keeping its image if it has one, or
+// writes a header alone: for a partition whose device never came, so has no store.
+void mark_craft_state_faulted(volume_id_t vol_id, homestore::superblk< craft_state_sb_t >& sb);
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //

@@ -288,12 +288,13 @@ async_status volume::reattach_craft_dev(shared< homestore::home_log_store > jour
     co_return recovered;
 }
 
-void volume::abandon_craft_hold() {
+void volume::fault_unreplayed_craft() {
     std::lock_guard lk{craft_hold_mu_};
-    if (!craft_dev_expected_) return;
-    LOGE("CRAFT volume: {} uuid: {}: its journal's log replay never reported it, not reattached; {} committed "
-         "entr(ies) held for it dropped",
+    if (!craft_dev_expected_) return; // being destroyed
+    LOGE("CRAFT volume: {} uuid: {}: its journal never replayed, partition faulted for good; {} committed entr(ies) "
+         "held for it dropped",
          vol_info_->name, id_str(), craft_held_.size());
+    mark_craft_state_faulted(id(), craft_state_sb_);
     craft_held_.clear();
     craft_dev_expected_ = false;
 }

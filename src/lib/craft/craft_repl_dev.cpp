@@ -2825,6 +2825,16 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
 }
 
 namespace {
+// The record is this partition's, in this format, and holds the image its header announces.
+bool valid_state_record(volume_id_t const& vol_id, homestore::superblk< craft_state_sb_t >& sb) {
+    if (sb.is_empty()) return false;
+    auto const buf = sb.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
+    auto const* const hdr = sb.get();
+    return buf->size() >= sizeof(craft_state_sb_t) && hdr->magic == craft_state_sb_t::k_magic &&
+        hdr->version == craft_state_sb_t::k_version && hdr->vol_id == vol_id &&
+        hdr->image_len <= buf->size() - sizeof(craft_state_sb_t);
+}
+
 // The image goes in the partition's own meta blk record, after a craft_state_sb_t header. The mutex orders a persist
 // against destroy(), which the volume's destroy calls while a persist round may still be running.
 class HomeStoreCraftStateStore : public CraftStateStore {
@@ -2838,7 +2848,7 @@ public:
         auto const buf = sb_.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
         auto const* const hdr = sb_.get();
         std::optional< CraftDurableState > d;
-        if (valid_header_locked()) {
+        if (valid_state_record(vol_id_, sb_)) {
             if (hdr->faulted) return std::unexpected(std::make_error_condition(std::errc::state_not_recoverable));
             d = decode_durable_state(buf->cbytes() + sizeof(craft_state_sb_t), hdr->image_len);
         }
@@ -2866,29 +2876,14 @@ public:
         sb_.destroy();
     }
 
-    // Keeps the image when the record has one, for whoever looks at it later; otherwise writes a header alone.
     void mark_faulted() override {
         std::lock_guard lk{mu_};
         if (destroyed_ || faulted_) return;
         faulted_ = true;
-        if (!valid_header_locked()) {
-            sb_.create(static_cast< uint32_t >(sizeof(craft_state_sb_t)));
-            sb_->vol_id = vol_id_;
-        }
-        sb_->faulted = 1;
-        sb_.write();
+        mark_craft_state_faulted(vol_id_, sb_);
     }
 
 private:
-    bool valid_header_locked() {
-        if (sb_.is_empty()) return false;
-        auto const buf = sb_.raw_buf(); // may be longer than the record: rounded up to the meta blk alignment
-        auto const* const hdr = sb_.get();
-        return buf->size() >= sizeof(craft_state_sb_t) && hdr->magic == craft_state_sb_t::k_magic &&
-            hdr->version == craft_state_sb_t::k_version && hdr->vol_id == vol_id_ &&
-            hdr->image_len <= buf->size() - sizeof(craft_state_sb_t);
-    }
-
     std::mutex mu_;
     volume_id_t const vol_id_;
     homestore::superblk< craft_state_sb_t > sb_;
@@ -2899,6 +2894,16 @@ private:
 
 unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb) {
     return std::make_unique< HomeStoreCraftStateStore >(vol_id, std::move(sb));
+}
+
+// Keeps the image when the record has one, for whoever looks at it later.
+void mark_craft_state_faulted(volume_id_t vol_id, homestore::superblk< craft_state_sb_t >& sb) {
+    if (!valid_state_record(vol_id, sb)) {
+        sb.create(static_cast< uint32_t >(sizeof(craft_state_sb_t)));
+        sb->vol_id = vol_id;
+    }
+    sb->faulted = 1;
+    sb.write();
 }
 
 void CraftReplDev::fault() {

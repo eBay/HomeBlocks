@@ -88,9 +88,16 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
     } else if (vol_ptr->is_craft()) {
         // Only now that its index table is installed: the CraftReplDev made once the journal replays keeps it. A CRAFT
         // volume torn down above leaves its journal unopened, and HomeStore purges it.
+        expect_craft_reattach(id);
         vol_ptr->reopen_craft_journal(
-            [this, weak = std::weak_ptr< volume >(vol_ptr)](shared< homestore::home_log_store > journal) {
-                if (auto vol = weak.lock()) { on_craft_journal_replayed(std::move(vol), std::move(journal)); }
+            [this, id, weak = std::weak_ptr< volume >(vol_ptr)](shared< homestore::home_log_store > journal) {
+#ifdef _PRERELEASE
+                // As if HomeStore never reported this journal's replay, its log store missing.
+                if (iomgr_flip::instance()->test_flip("craft_journal_replay_lost", boost::uuids::to_string(id))) {
+                    return;
+                }
+#endif
+                on_craft_journal_replayed(id, weak.lock(), std::move(journal));
             });
     }
 }

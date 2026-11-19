@@ -172,6 +172,18 @@ public:
     }
 
 #ifdef _PRERELEASE
+    // At the next restart, HomeStore never reports the replay of this volume's journal, as if its log store were
+    // missing.
+    static void lose_journal_replay(volume_id_t const& id) {
+        flip::FlipClient* fc = iomgr_flip::client_instance();
+        flip::FlipCondition this_volume;
+        fc->create_condition("", flip::Operator::EQUAL, boost::uuids::to_string(id), &this_volume);
+        flip::FlipFrequency freq;
+        freq.set_count(1);
+        freq.set_percent(100);
+        fc->inject_noreturn_flip("craft_journal_replay_lost", std::array< flip::FlipCondition, 1 >{this_volume}, freq);
+    }
+
     // The volumes with a CRAFT state record in the meta service, read as a boot reads them.
     static std::set< volume_id_t > state_records() {
         std::set< volume_id_t > ids;
@@ -569,6 +581,37 @@ TEST_F(CraftVolumeTest, RestartKeepsTheBlocksOfLiveSlots) {
 }
 
 #ifdef _PRERELEASE
+// A journal that never replays at a restart: the partition's device can't come, and the entries committed meanwhile
+// can't be saved. The partition is faulted for good, its record marked before init ends, so a restart whose journal
+// replays faults it again rather than bring it back from a record that lacks them.
+TEST_F(CraftVolumeTest, AJournalThatNeverReplaysFaultsThePartitionForGood) {
+    auto info = craft_vol_info("craft_vol_unreplayed");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+
+    lose_journal_replay(id);
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    EXPECT_EQ((*again)->craft_dev(), nullptr) << "a device without its journal";
+    auto records = std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records();
+    ASSERT_TRUE(records.contains(id));
+    auto const loaded = make_homestore_state_store(id, std::move(records.at(id)))->load();
+    ASSERT_FALSE(loaded) << "its record isn't marked faulted";
+    EXPECT_EQ(loaded.error(), std::make_error_condition(std::errc::state_not_recoverable));
+
+    g_helper->restart();
+    again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    ASSERT_NE((*again)->craft_dev(), nullptr) << "its journal replays again";
+    EXPECT_TRUE((*again)->craft_dev()->is_faulted());
+    remove(id);
+}
+
 // A RAFT entry a checkpoint covers is never replayed after a restart. One that hasn't applied yet survives in the
 // partition's durable state, which the checkpoint saves with it, and the restart applies it from there.
 TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {

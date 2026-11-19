@@ -115,6 +115,7 @@ private:
     std::mutex craft_reattach_mu_;
     uint32_t craft_reattaching_{0};                                             // guarded by craft_reattach_mu_
     shared< sisl::async::shared_awaitable< bool > > craft_reattached_{nullptr}; // guarded by craft_reattach_mu_
+    std::unordered_set< volume_id_t > craft_unreplayed_; // counted, journal not replayed yet; guarded by the same
 
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
@@ -220,14 +221,19 @@ public:
     }
 
     void start_reaper_thread();
-    // CRAFT: a volume loaded at boot has its journal replayed: its device is made and recovered on a worker
-    // (reattach_craft_volume), counted until published. HomeStore calls this from the replay, with the log device
-    // locked.
-    void on_craft_journal_replayed(volume_handle vol, shared< homestore::home_log_store > journal);
+    // CRAFT: a volume loaded at boot reopens its journal: its reattach is counted from now on, so a checkpoint, even
+    // one a partition recovered earlier triggers, waits for the entries held for it.
+    void expect_craft_reattach(volume_id_t const& id);
+    // CRAFT: that journal replayed: the volume's device is made and recovered on a worker (reattach_craft_volume),
+    // counted until published. HomeStore calls this from the replay, with the log device locked. `vol`: null if gone.
+    void on_craft_journal_replayed(volume_id_t const& id, volume_handle vol,
+                                   shared< homestore::home_log_store > journal);
+    // CRAFT: one counted reattach is over.
+    void end_craft_reattach();
     // CRAFT: once no reattach is pending. A checkpoint's flush waits for this, so it never covers entries a volume
     // holds for its device.
     sisl::async::task< void > craft_reattaches_done();
-    // CRAFT, end of init: waits for every reattach, then gives up the devices whose journal never replayed.
+    // CRAFT, end of init: faults for good the partitions whose journal never replayed, then waits for every reattach.
     void finish_craft_reattach();
     // CRAFT, at shutdown: stops every CRAFT device (CraftReplDev::stop), keeping their queued entries.
     void stop_craft_devices();
