@@ -624,14 +624,15 @@ void HomeBlocksImpl::on_craft_journal_replayed(volume_id_t const& id, volume_han
 sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vol,
                                                                 shared< homestore::home_log_store > journal) {
 #ifdef _PRERELEASE
-    // Holds the reattach, for a test to commit entries meanwhile. It resumes from a message on a worker, as it started:
-    // the flip's timer fires on a reactor where it would otherwise run inline, so a thread sends it.
-    if (auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
-        iomgr_flip::instance()->delay_flip("craft_reattach_delay", [held]() {
-            std::thread([held]() {
-                iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
-            }).detach();
-        })) {
+    // Holds the reattach for the flip's milliseconds, for a test to commit entries meanwhile, and resumes from a
+    // message on a worker, as it started. A thread of its own waits them out, not an iomgr delay flip: each file's
+    // first use of iomgr's flips replaces their timer, leaving one still pending to fire on a destroyed object.
+    if (auto const ms = iomgr_flip::instance()->get_test_flip< long >("craft_reattach_delay_ms")) {
+        auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
+        std::thread([held, ms = *ms]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds{ms});
+            iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
+        }).detach();
         co_await *held;
     }
 #endif

@@ -355,6 +355,16 @@ public:
         LOGDEBUG("Flip {} set", flip_name);
     }
 
+    // A flip that hands its caller `value`, `count` times.
+    void set_retval_flip(const std::string flip_name, long value, uint32_t count = 1) {
+        flip::FlipCondition null_cond;
+        flip::FlipFrequency freq;
+        freq.set_count(count);
+        freq.set_percent(100);
+        m_fc.inject_retval_flip< long >(flip_name, std::array< flip::FlipCondition, 1 >{null_cond}, freq, value);
+        LOGDEBUG("Flip {} set", flip_name);
+    }
+
     void remove_flip(const std::string flip_name) {
         m_fc.remove_flip(flip_name);
         LOGDEBUG("Flip {} removed", flip_name);

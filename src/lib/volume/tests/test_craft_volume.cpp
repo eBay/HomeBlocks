@@ -386,10 +386,10 @@ TEST_F(CraftVolumeTest, InitWaitsForTheReattach) {
     auto info = craft_vol_info("craft_vol_slow_reattach");
     auto const id = info.id;
     ASSERT_TRUE(create(std::move(info)));
-    g_helper->set_delay_flip("craft_reattach_delay", 2 * 1000 * 1000 /* usec */, 1000 /* every volume */);
+    g_helper->set_retval_flip("craft_reattach_delay_ms", 2000 /* ms */, 1000 /* every volume */);
     auto const start = std::chrono::steady_clock::now();
     g_helper->restart();
-    g_helper->remove_flip("craft_reattach_delay");
+    g_helper->remove_flip("craft_reattach_delay_ms");
     EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::seconds(2)) << "the reattach wasn't held";
     auto vol = hb()->get_volume(id);
     ASSERT_TRUE(vol);

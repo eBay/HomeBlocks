@@ -510,9 +510,9 @@ TEST_F(CraftVolumeMultiTest, EntriesCommittedBeforeTheReattachAreHeld) {
     ASSERT_TRUE(sync());
 
     if (me() == 1) {
-        g_helper->set_delay_flip("craft_reattach_delay", 10 * 1000 * 1000 /* usec */, 1000 /* every volume */);
+        g_helper->set_retval_flip("craft_reattach_delay_ms", 10000 /* ms */, 1000 /* every volume */);
         g_helper->start();
-        g_helper->remove_flip("craft_reattach_delay");
+        g_helper->remove_flip("craft_reattach_delay_ms");
         auto vol = hb()->get_volume(id);
         ASSERT_TRUE(vol);
         ASSERT_NE((*vol)->craft_dev(), nullptr) << "init returned before the reattach";
