@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -270,6 +271,22 @@ TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {
 
     EXPECT_EQ(fetcher_.poll_calls.load(), 0);
     EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// While a login holds the watermark (SDSTOR-22891), a stale tick starts no round: it neither polls nor proposes.
+TEST_F(CraftWatchdogTest, StaleTickSkipsWhileALoginHoldsTheWatermark) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    std::optional< AsyncMutex::Lock > login = homeblocks::detail::sync_get(dev_->watermark_mutex().lock());
+    arm_as_leader(7, /*client_commit_lsn=*/5);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620)); // stale ticks past the 300ms timeout
+    EXPECT_GE(dev_->watchdog_fire_count(), 1);
+    EXPECT_EQ(fetcher_.poll_calls.load(), 0); // no round can run while the watermark is held, so these are stable
+    EXPECT_TRUE(proposer_.proposed.empty());
+
+    login.reset(); // before the device goes
+    destroy_dev();
 }
 
 // A poll slower than the tick interval: later stale ticks must not start overlapping rounds (each would hold

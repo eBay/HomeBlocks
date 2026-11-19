@@ -18,7 +18,9 @@
 // watermark. The replica side of the poll is in test_craft_peer_exchange.cpp, and what each entry point does under
 // the quiesce is in the fence matrix (test_craft_pre_resolution.cpp). Step 2, login_resolve() (SDSTOR-22890):
 // resolve every slot up to the watermark, counting only quiesced members' lacks; pre_resolve_slots() itself is
-// covered in test_craft_pre_resolution.cpp.
+// covered in test_craft_pre_resolution.cpp. Step 3, login_sync() (SDSTOR-22891): commit the watermark under the
+// watermark mutex; the mutex against rounds is covered in test_craft_pre_resolution.cpp, and AsyncMutex itself in
+// test_craft_concurrency.cpp.
 //
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_raft_entries.cpp).
@@ -142,6 +144,20 @@ protected:
     auto do_login_poll(uint64_t term) { return homeblocks::detail::sync_get(dev_->login_poll(term)); }
     auto do_login_resolve(int64_t rs_commit_lsn, std::vector< craft::peer_id_t > quiesced, uint64_t term = 0) {
         return homeblocks::detail::sync_get(dev_->login_resolve(rs_commit_lsn, term, std::move(quiesced)));
+    }
+    // Holds the watermark as a login does, for the call.
+    auto do_login_sync(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots,
+                       uint64_t term = 0) {
+        auto lock = homeblocks::detail::sync_get(dev_->watermark_mu_.lock());
+        return homeblocks::detail::sync_get(
+            dev_->login_sync(lock, rs_commit_lsn, client_token, std::move(empty_slots), term));
+    }
+    // Proposals commit and apply on this member, as RAFT would.
+    void loop_back_proposals() {
+        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+            cintrusive< homestore::repl_req_ctx > ctx{};
+            dev_->raft_listener().on_commit(1, h, k, {}, ctx);
+        };
     }
 
     // Commit an entry on this member as RAFT would, with no proposal of its own.
@@ -523,6 +539,106 @@ TEST_F(CraftLoginTest, ResolveLeavesALeadersInFlightWriteUnresolved) {
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), no_quorum());
+}
+
+// ── login_sync (SDSTOR-22891) ─────────────────────────────────────────────────
+
+// The entry carries the login's watermark, the new client's token and the verdicts, and the leader ends exactly at
+// the watermark (slot 5 is Empty, so commit_lsn passes it).
+TEST_F(CraftLoginTest, SyncProposesTheWatermarkTokenAndVerdicts) {
+    loop_back_proposals();
+    dev_->seed_lsns(4, {});
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{5});
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    auto const sync = decode(proposer_.proposed[0]);
+    EXPECT_EQ(sync.type, CraftEntryType::SyncRSCommitLSN);
+    EXPECT_EQ(sync.rs_commit_lsn, 5);
+    EXPECT_EQ(sync.client_token, 42u);
+    EXPECT_EQ(sync.empty_slots, (std::vector< int64_t >{5}));
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+}
+
+// Unlike append(), it proposes even when the watermark is already covered.
+TEST_F(CraftLoginTest, SyncProposesEvenWhenTheWatermarkIsCovered) {
+    loop_back_proposals();
+    dev_->seed_lsns(5, {});
+    ASSERT_TRUE(do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{}).has_value());
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/43, /*empty_slots=*/{});
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[1]).client_token, 43u);
+}
+
+// An earlier round's Sync past the watermark (a timed-out proposal that committed late) leaves it stale: InternalLogin
+// would truncate below the committed prefix.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenALateSyncPassedTheWatermark) {
+    loop_back_proposals();
+    dev_->seed_lsns(7, {});
+    commit_sync(/*rs_commit_lsn=*/7);
+    ASSERT_EQ(dev_->commit_lsn(), 7);
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+}
+
+// A slot below the watermark still missing after the apply stops commit_lsn short of it.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotStaysMissing) {
+    loop_back_proposals();
+    dev_->seed_lsns(5, {3}); // the apply's catch-up can't fetch it
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+}
+
+TEST_F(CraftLoginTest, SyncProposalFailurePropagates) {
+    proposer_.fail = true;
+    dev_->seed_lsns(5, {});
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
+}
+
+TEST_F(CraftLoginTest, SyncProposalTimeoutPropagates) {
+    proposer_.time_out = true;
+    dev_->seed_lsns(5, {});
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out));
+}
+
+TEST_F(CraftLoginTest, SyncOnFaultedLeaderFailsInternalErrorWithoutProposing) {
+    fault_partition();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// The partition faults while the Sync commits: the check after the proposal can't be trusted.
+TEST_F(CraftLoginTest, SyncFaultedDuringTheProposalFailsInternalError) {
+    dev_->seed_lsns(2, {});
+    proposer_.on_commit = [this](sisl::blob const&, sisl::blob const&) { fault_partition(); };
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
 } // namespace
