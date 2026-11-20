@@ -1037,9 +1037,13 @@ enough: two leaders can hold different data watermarks at the same RAFT index.
 **A stored context can go stale.** It may be served long after it was created, by which time the members may have
 reclaimed the slots above `W` that the receiver needs to replay. Checking first and pinning second would leave a
 window in which reclaim passes `W`, so the order is **pin, then validate**. On the first object `0 | 0` of a context
-the leader proposes `RetainFrom{W, L}` (§4.8) and waits until it has committed and every member has acknowledged it
-in a probe reply. Only then does it check that every member's `journal_floor` is still at or below `W`; once a
-member has applied the pin its floor cannot pass `W`, so a passing check stays true. If the check fails (a member
+the leader proposes `RetainFrom{W, L}` (§4.8) and waits until it has committed and every **journal source** has
+acknowledged it in a probe reply. Only then does it check that every source's `journal_floor` is still at or below
+`W`; once a member has applied the pin its floor cannot pass `W`, so a passing check stays true. The sources are all
+members except snapshot recipients (those reporting `snapshot_receiving`, and a learner with no volume yet). A
+recipient is behind on the RAFT log, so it could not apply the pin before the install anyway, and waiting for it
+would deadlock the transfer. Leaving it out is safe: a durable slot is on at least two members, so with one
+recipient out of three, every durable slot above `W` still has a holder that keeps it. If the check fails (a member
 reclaimed past `W` before it applied the pin), the leader clears the pin, `read_snapshot_obj` returns an error, and
 the leader creates a fresh snapshot at its current index (HomeStore's `trigger_snapshot_creation`); nuraft then
 serves the new context.
@@ -1086,9 +1090,13 @@ request for `r | 0` by restarting region `r`.
    which member it is serving. Only the receiver knows its own `commit_lsn`, so the **receiver** decides, on object
    `0 | 0`. If `W` is at or above its `commit_lsn`, it installs normally. If `W` is below, it does a **control-only
    install**: it merges the control tuple and applies the shipped verdicts (requirement 7's merge rules), keeps its
-   own data, journal and `commit_lsn`, and asks for `LAST_OBJ_ID` next so the donor sends no regions. Its data
-   already covers `W`, the RAFT entries after `L` replay normally, and catch-up fetches anything above its own
-   `commit_lsn`. No HomeStore change is needed; a recipient-aware callback would only let the donor skip the
+   own certified data and `commit_lsn`, and asks for `LAST_OBJ_ID` next so the donor sends no regions. Its data
+   already covers `W`, and the RAFT entries after `L` replay normally. Its journal **above** its own `commit_lsn`
+   is dropped, though: the logins compacted into the snapshot may have truncated slots there (a session-7 slot 101
+   that a session-8 login truncated at 100), and those truncations will never replay. The certified prefix stays;
+   `(commit_lsn, max(own last_append_lsn, S)]` minus the shipped Empty verdicts is marked missing; and reads stay
+   gated, as in requirement 7, until `commit_lsn` reaches the pre-install `last_append_lsn` `P`. So any write the
+   member acknowledged in that tail is fetched back before it serves a read again. No HomeStore change is needed; a recipient-aware callback would only let the donor skip the
    object-0 round trip.
 5. **An exclusive install barrier.** nuraft pauses the receiver's RAFT apply, but that alone leaves work already
    running (client writes, the commit path, the catch-up runner) free to change the journal or index during range
@@ -1347,8 +1355,8 @@ coverage** for `src/lib/craft/` and for every function a PR adds or changes (the
 | **S8a. Durable state + restart** | HomeBlocks | this work | `CraftStateStore` / `CraftDurableState` written ahead of each control change (§4.11); restart restores it and rebuilds the range from the journal; replay-safe re-apply; checkpoint trigger reports whether it flushed; Sync/catch-up advance goes through `commit()` | H6, H9 |
 | **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
 | **SN1. Snapshot context** | HomeBlocks | this work | `CraftGroupListener` forwards the snapshot callbacks to `CraftReplDev`, and creates the volume from object `0 | 0` on a member that has none (bootstrap); `create_snapshot` / `last_snapshot` / `apply_snapshot` persist the context in a per-volume superblock | — |
-| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, trailer with `W_hi`, resend and resume), `free_user_snp_ctx`; on the first object 0 of a context: pin `RetainFrom{W, L}`, wait for it, then validate the retained tail, otherwise clear it and regenerate the snapshot; clear the pin when no transfer of `L` is active and every member reached `W` | — |
-| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: control-only install when `W` is below its own `commit_lsn`; install barrier with drain and install epoch, range replace, resume on the same transfer identity only, resumable region cursor persisted after a checkpoint flush, completion (whole journal dropped, `journal_floor = W`, `commit_lsn = W`, `(W, S]` missing), IO gate while installing and a persisted read gate up to `G` after; control-state merge with fence reconciliation | — |
+| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, trailer with `W_hi`, resend and resume), `free_user_snp_ctx`; on the first object 0 of a context: pin `RetainFrom{W, L}`, wait for every journal source (not snapshot recipients) to apply it, then validate the retained tail, otherwise clear it and regenerate the snapshot; clear the pin when no transfer of `L` is active and every member reached `W` | — |
+| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: control-only install when `W` is below its own `commit_lsn` (uncertified tail dropped, reads gated); install barrier with drain and install epoch, range replace, resume on the same transfer identity only, resumable region cursor persisted after a checkpoint flush, completion (whole journal dropped, `journal_floor = W`, `commit_lsn = W`, `(W, S]` missing), IO gate while installing and a persisted read gate up to `G` after; control-state merge with fence reconciliation | — |
 | **SN4. Triggers** | HomeBlocks | this work | RAFT-log compaction following the cleanup floor (`trigger_snapshot_creation`); the C2 re-add as a learner (with S10) | C2 |
 | Later | HomeBlocks | tbd | Lease / `InternalLogout` / stand-in; membership promotion gate (S10) | — |
 
