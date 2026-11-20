@@ -643,10 +643,11 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
 
 // A member whose local create failed stays in the group without a replica, reported, until a partition move replaces
 // it; RAFT may still elect it, as it has the whole log. So may a member whose replica can't serve the partition: its
-// device faulted, or never came back at a restart. Not while a create of the volume runs here (that create needs this
-// member to lead), nor while its device is being reattached, nor when alone in the group: there is nobody to hand
-// leadership to. A replica can also stop serving after the election (its device faults while it leads, or fails its
-// recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
+// device faulted, or never came back at a restart, or fault containment took the volume offline, or the whole node
+// (restricted: the CRAFT API refuses every op either way). Not while a create of the volume runs here (that create
+// needs this member to lead), nor while its device is being reattached, nor when alone in the group: there is nobody to
+// hand leadership to. A replica can also stop serving after the election (its device faults while it leads, or fails
+// its recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
 void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
     if (is_shutting_down()) { return; }
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
@@ -679,7 +680,7 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
         if (creating_vols_.contains(id)) { return forget(); }
         if (auto const it = vol_map_.find(id); it != vol_map_.end()) { vol = it->second; }
     }
-    if (vol && vol->serves_craft()) { return forget(); }
+    if (vol && vol->serves_craft() && !is_restricted()) { return forget(); }
     auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
     // Its stage before its RAFT server: once a destroyed group's reaper has run, the server is freed, and is_leader()
     // would read freed memory.
@@ -699,7 +700,7 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
         }
     }
     LOGW("vol={}: RAFT leader {} here: handing leadership to another member", boost::uuids::to_string(id),
-         vol ? "with a faulted replica" : "without a replica");
+         vol ? "with a replica that can't serve" : "without a replica");
     COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
     (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
 }
@@ -715,8 +716,9 @@ void HomeBlocksImpl::retry_craft_handoffs() {
         }
     }
     // Not one being destroyed: its group is going away too.
+    bool const restricted = is_restricted();
     for (auto const& vol : craft_volumes()) {
-        if (!vol->is_destroying() && !vol->serves_craft()) { due.push_back(vol->id()); }
+        if (!vol->is_destroying() && (restricted || !vol->serves_craft())) { due.push_back(vol->id()); }
     }
     for (auto const& id : due) {
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });

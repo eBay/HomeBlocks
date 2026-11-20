@@ -249,9 +249,11 @@ public:
         return craft_dev_;
     }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
-    // CRAFT: this replica serves its partition, or will once its device is reattached. One whose device faulted, or
-    // never came back at a restart (its journal didn't replay), doesn't.
+    // CRAFT: this replica serves its partition, or will once its device is reattached. One that fault containment took
+    // offline doesn't (the CRAFT API refuses its every op), nor one whose device faulted, or never came back at a
+    // restart (its journal didn't replay).
     bool serves_craft() const {
+        if (is_offline()) return false;
         std::lock_guard lk{craft_hold_mu_};
         return craft_dev_expected_ || (craft_dev_ && !craft_dev_->is_faulted());
     }

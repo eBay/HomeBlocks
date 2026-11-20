@@ -558,6 +558,44 @@ TEST_F(CraftVolumeMultiTest, AMemberWhoseReplicaFaultsHandsLeadershipOff) {
 }
 #endif
 
+// So does one whose volume fault containment took offline, though its device is healthy: the CRAFT API refuses the
+// volume's every op. Back online, the volume serves again.
+TEST_F(CraftVolumeMultiTest, AMemberWhoseVolumeGoesOfflineHandsLeadershipOff) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(11);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(11)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        auto const rd = group(id);
+        EXPECT_TRUE(wait_until([&rd] {
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+        auto vol = *hb()->get_volume(id);
+        auto const handed_off = g_helper->leaderships_handed_off();
+        impl->fault_containment(vol, "test");
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+        impl->exit_fc(vol);
+        EXPECT_TRUE(vol->serves_craft());
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+}
+
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
 // settings directory each (they rewrite their settings files at startup).
 static std::vector< pid_t > start_members(std::vector< std::string > const& args, std::string const& shm_name) {
