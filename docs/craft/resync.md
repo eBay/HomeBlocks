@@ -1,0 +1,1597 @@
+# CRAFT resync: design for HomeBlocks
+
+> **Status.** Design proposal, November 2026. It covers the resync path that HomeBlocks' `CraftReplDev` and the
+> CRAFT peer plane need, measured against the protocol in the wiki and against the code on `dev/v6.x` (§3).
+> **Ownership.** Login orchestration (S7) and the peer transport / CraftConnector (S9) are owned by another
+> engineer; this document states the contracts it needs from them (§4.6, §8). The UBD-side changes live in the
+> `craft_client` repo.
+> **Sources.** The protocol is [CRAFT Design](https://github.com/eBay/HomeBlocks/wiki/CRAFT-Design) (§ *Resync / catch-up: the FetchData loop*,
+> § *Reconfiguration*, deep-dive 1), and its store binding is
+> [CRAFT on HomeBlocks](https://github.com/eBay/HomeBlocks/wiki/CRAFT-on-HomeBlocks) (§ *Journal reclaim and the
+> returning-voter snapshot trigger*, § *Reconfiguration mechanics*). The wiki is the source of truth for *what*
+> resync guarantees. This page covers *how* HomeBlocks delivers it, and §3 lists what the code does today
+> and where it disagrees with the design.
+
+## Overview: resync by case
+
+This part describes resync **case by case, at the level of who talks to whom**. Each case has a short flow, a
+sequence diagram, and what it guarantees. The mechanisms, invariants, wire formats, defects and risks behind them
+are in the detailed design that follows.
+
+**Terminology.** **UBD** is the CRAFT client (the ublk driver that assigns dLSNs, sends every write to all
+replicas and routes reads). The **application** is whatever receives the acknowledgement: XFS and above. A
+**replica** is a CRAFT partition replica on a **BM**.
+
+**Who drives resync.** Resync is driven by the **CRAFT BM side**: the leader BM decides when, and the data moves
+BM to BM. UBD does not drive it and does not carry resync data. It only remembers which replica missed what,
+routes reads around it, and reports its commit point on its normal writes and keep-alives.
+
+**Background in four sentences.** UBD sends every write directly to all replicas and calls it durable
+once a **quorum** (2 of 3) has stored it. RAFT runs alongside but carries only small control entries (who the
+writer is, how far everyone should be), never the data. So a replica can fall behind on data while being fully up
+to date on RAFT, and closing that gap replica-to-replica is **resync**. Resync has two jobs: copy durable writes to every
+replica that lacks them, and, at login only, decide the fate of writes that never reached a quorum (*durable* or
+*void*).
+
+| Case | When it happens |
+|---|---|
+| 1. One replica misses a write | A write reaches 2 of 3 replicas: the application gets success, one replica lags |
+| 2. Healing a lagging replica | A replica missed some writes; they are still in the other replicas' journals |
+| 3. A write fails | Fewer than 2 of 3 replicas stored it: the application gets an error |
+| 4. Login | A new UBD takes over the volume |
+| 5. Login aborted | The leader crashes in the middle of a login |
+| 6. Snapshot for a replica past retention | The writes a replica needs are no longer in any journal |
+| 7. New member joins | A replica is added or replaced |
+| 8. Snapshot interrupted | The leader or the receiving replica fails mid-transfer |
+| 9. UBD disappears | UBD stops without logging out |
+
+### Case 1: One replica misses a write
+
+UBD sends every write to all three replicas and reports success to the application once **two** have
+stored it. If the third misses it (a timeout, a slow disk), the write is still durable. UBD only has to
+remember **which replica missed what**, and keep reads of that data away from it.
+
+#### Flow
+
+1. The write reaches two replicas, so the application gets success.
+2. UBD records the miss in its per-replica map: *replica C, write 101, LBA range*.
+3. A read of that range goes only to replicas that hold write 101. Every other range can still be read from
+   replica C.
+4. Replica C heals in the background, driven by the BMs (Case 2); UBD takes no part in it. When its reply shows its commit point past 101, UBD drops
+   the entry, and C serves that range again.
+
+The same map covers a replica that is **catching up through the log** or **receiving a snapshot** (Case 6):
+whatever it does not hold yet is routed around, and it rejoins range by range as its commit point advances.
+
+![Figure 1](resync-diagrams/fig1.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant C as UBD
+    participant A as Replica A
+    participant B as Replica B
+    participant X as Replica C
+    C->>A: write 101 (LBA 0-8)
+    C->>B: write 101
+    C->>X: write 101
+    A-->>C: ok
+    B-->>C: ok
+    X--xC: timeout
+    C->>C: 2 of 3 stored it: success to the application
+    C->>C: remember: Replica C missed 101 (LBA 0-8)
+    C->>A: read LBA 0-8 (Replica C skipped)
+    A-->>C: data
+    C->>X: read LBA 100-108 (Replica C holds it)
+    X-->>C: data
+    Note over X: Replica C heals BM-to-BM (Case 2), UBD is not involved
+    X-->>C: next reply: commit point past 101
+    C->>C: forget the entry: Replica C serves LBA 0-8 again
+    Note over C,X: Same while a replica catches up through the log or a snapshot: what it lacks is routed around
+```
+
+</details>
+
+*Figure 1: One replica misses a write, sequence diagram*
+
+#### Guarantees
+
+- **No error and no read stall:** the application sees success, and reads keep flowing from replicas that hold
+  the data.
+- **Reads stay correct:** a replica is never asked for data it does not hold.
+- **Bounded:** entries are kept as merged LBA ranges and removed once the replica's commit point passes them. If
+  the map overflows, that replica is skipped for all reads until it catches up.
+- **Resync is still needed:** the map only keeps reads away from the gap. Healing removes it, so the replica can
+  apply past it, journals can be cleaned up, and the write is back to three copies.
+
+### Case 2: Healing a lagging replica
+
+A replica that misses some writes (a dropped connection, a slow disk) keeps serving every range it holds, and the
+UBD simply routes reads for the missed ranges elsewhere. Healing brings it back in full. It is **driven by the
+leader BM** on its own schedule; UBD does not request or drive it.
+
+#### Flow
+
+1. The leader BM periodically checks how far each replica is (every K writes or T seconds, and when UBD goes
+   idle), up to the commit point UBD last reported on its normal traffic.
+2. Every write up to that point is already durable on a quorum, so there is nothing to decide. The leader records
+   the target through RAFT.
+3. The lagging replica fetches the writes it is missing, in chunks, from the leader first and then from any other
+   replica, and applies them in order.
+4. Its next reply to UBD shows the higher commit point, and UBD routes reads to it again.
+
+![Figure 2](resync-diagrams/fig2.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant C as UBD
+    participant L as Leader
+    participant R as Lagging replica
+    participant P as Other replica
+    Note over C,P: UBD keeps writing to all replicas. R misses some writes.
+    L->>L: periodic check (every K writes or T seconds)
+    L->>R: how far are you?
+    L->>P: how far are you?
+    R-->>L: commit point
+    P-->>L: commit point
+    L->>R: RAFT: everyone should reach N
+    L->>P: RAFT: everyone should reach N
+    R->>L: fetch the writes I am missing (chunked)
+    L-->>R: write data
+    R->>R: apply in order up to N
+    C->>R: next write or keep-alive
+    R-->>C: reply shows commit point N
+    C->>C: route reads for those ranges to R again
+    Note over R,P: If the writes R needs are gone from every journal, R takes a snapshot (Case 6)
+```
+
+</details>
+
+*Figure 2: Healing a lagging replica, sequence diagram*
+
+#### Guarantees
+
+- **Trigger:** BM-side only: periodic, or when UBD is idle (watchdog). Bounded by UBD's commit point, so writes still
+  in flight are never touched.
+- **Success:** the replica's commit point reaches the target and its reads come back.
+- **Failure:** a fetch that keeps failing is retried with backoff. A fetch answered with "reclaimed" escalates to a
+  snapshot (Case 6).
+- **Fill only:** these rounds copy durable writes. They never mark a write Empty; that happens only at login.
+- **Cost:** proportional to the number of writes missed; every version is copied, even overwritten ones.
+
+### Case 3: A write fails
+
+UBD reports a write error to the application **only when fewer than two of the three replicas stored it**. In
+our deployment the application is XFS: on a write error it takes the filesystem offline, and the volume is then
+detached. So a failed write is **not** completed or resolved during the session. UBD finishes the I/Os already
+queued and detaches, and the failed slot is decided at the **next login**.
+
+#### Flow
+
+1. Write 101 reaches only one replica (C), so UBD returns an error to the application.
+2. XFS goes offline. UBD finishes the remaining queued I/Os and is asked to unmount and detach the volume.
+3. Until then nothing about slot 101 changes. It only holds the commit point, because replicas apply in order.
+4. At the next login (Case 4) the leader decides slot 101 under the fence:
+   - **a responding replica holds it**, so it is filled everywhere: the write completed late;
+   - **no responding replica holds it** (for example C is down), so it is marked **Empty** (void), and C drops its
+     copy when it rejoins.
+
+![Figure 3](resync-diagrams/fig3.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant A as Application (XFS)
+    participant U as UBD
+    participant R as Replicas
+    participant L as Leader
+    U->>R: write 101 (to all three)
+    R-->>U: only Replica C stored it
+    U-->>A: write error
+    A->>A: filesystem goes offline
+    U->>R: finish queued I/Os
+    U->>U: detach the volume
+    Note over R: slot 101 stays undecided, it only holds the commit point
+    Note over U,L: Next attach: login (Case 4)
+    L->>R: fence, how far are you?
+    alt a responding replica holds 101
+        L->>R: fetch 101 and fill it everywhere
+    else no responding replica holds 101
+        L->>R: RAFT: 101 is Empty (void)
+    end
+    L->>R: RAFT: InternalLogin
+```
+
+</details>
+
+*Figure 3: A write fails and is resolved at the next login, sequence diagram*
+
+#### Guarantees
+
+- **Error only below a quorum:** one missed replica is Case 1, not an error.
+- **No mid-session decision:** nothing is marked Empty while a UBD is writing, so an acknowledged write can never
+  be voided by a race with resync. Every Empty decision happens at login, under the fence.
+- **Either outcome is legal:** the application got an error, so the write may land late or be dropped.
+- **Retries are bounded:** UBD does not retry a failed write forever. The error must reach the application.
+
+### Case 4: Login
+
+A new UBD (or the same one after a failover) takes over. Before the new session writes anything, every replica
+must agree on a starting point, and the old session's UBD must be stopped so that none of its writes are acknowledged
+and then lost.
+
+#### Flow
+
+1. **Pre-sync:** the leader catches up on what it is missing **without** stopping anyone, repeating until the
+   remaining gap is small.
+2. **Fence:** the leader stops the old session on every replica, itself included, and each replica reports the
+   last write it holds. The highest one reported by a quorum becomes the starting point.
+3. The leader fills the small remaining gap and records the starting point through RAFT.
+4. The leader commits **InternalLogin** through RAFT. Each replica drops anything above the starting point and
+   admits the new session in the same step. The fence lifts **only** here, or on an explicit abort (Case 5),
+   never on a timer.
+5. The new UBD starts writing just above the starting point.
+
+![Figure 4](resync-diagrams/fig4.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant N as New UBD
+    participant L as Leader
+    participant R as Replicas
+    participant Z as Old UBD
+    N->>L: login
+    Note over L,R: Phase 1, pre-sync: nobody is fenced
+    L->>R: how far are you?
+    R-->>L: last write held
+    L->>R: fetch what I am missing
+    R-->>L: write data
+    Note over L,R: repeated until the remaining gap is small
+    Note over L,R: Phase 2, fence
+    L->>L: fence the old session
+    L->>R: fence the old session, how far are you?
+    R-->>L: last write held
+    Z->>R: write
+    R-->>Z: rejected (fenced)
+    L->>R: fetch the small remaining gap
+    L->>R: RAFT: everyone reaches the starting point
+    L->>R: RAFT: InternalLogin (new term, starting point)
+    R->>R: drop writes above the starting point, admit the new session
+    L-->>N: login OK, start above the starting point
+    Note over R,Z: Old-session writes are rejected from the fence until InternalLogin. No timeout lifts the fence.
+```
+
+</details>
+
+*Figure 4: Login with pre-sync and a fence that holds until commit, sequence diagram*
+
+#### Guarantees
+
+- **No acknowledged write is lost across a takeover.** Everything acknowledged before the fence is covered by
+  the starting point, and nothing can be acknowledged after it.
+- **Short fenced window:** the expensive catch-up happens in pre-sync, before anyone is fenced.
+- **Cost of the safety:** between the fence and InternalLogin the replicas accept neither the old nor the new
+  session. That is normally about two round trips.
+
+### Case 5: Login aborted
+
+If the leader crashes after fencing but before committing InternalLogin, the fence must not lift by itself (that
+would reopen the window Case 4 closes). A new leader cleans up instead.
+
+#### Flow
+
+1. Leader 1 fences the replicas, then crashes.
+2. The old session's UBD (the current owner, whose session was never torn down) keeps being rejected.
+3. RAFT elects a new leader, which notices an unfinished login: a replica's fence is ahead of its session.
+4. The new leader commits **LoginAborted** through RAFT, and the replicas lift the fence. The old session's UBD can
+   write again, or a new login proceeds.
+
+![Figure 5](resync-diagrams/fig5.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant O as Old UBD
+    participant L1 as Leader 1
+    participant R as Replicas
+    participant L2 as New leader
+    L1->>R: fence the old session (login started)
+    L1-xL1: crashes
+    O->>R: write
+    R-->>O: rejected (fenced)
+    R->>L2: RAFT elects a new leader
+    L2->>R: how far are you?
+    R-->>L2: fenced, login unfinished
+    L2->>R: RAFT: LoginAborted
+    R->>R: lift the fence
+    O->>R: write
+    R-->>O: ok
+    Note over R,L2: If RAFT has no quorum, the fence stays until it recovers (accepted trade-off)
+```
+
+</details>
+
+*Figure 5: Login aborted after the leader crashed, sequence diagram*
+
+#### Guarantees
+
+- **The fence ends only through a committed RAFT decision**: InternalLogin or LoginAborted, exactly one per login.
+- **Trade-off:** the old session's UBD stays blocked while RAFT has no quorum. That happens only during a failover that
+  was already under way.
+
+### Case 6: Snapshot for a replica past retention
+
+Journals are bounded. If a replica fell so far behind that the writes it needs were cleaned up everywhere, it
+cannot heal through Case 2. It instead receives a **snapshot**: the volume's mapped data as of one point, then the
+writes after that point. The B-tree is not sent: the leader walks its own B-tree to find each mapped LBA's blocks
+and sends the data; the receiver writes it to blocks it allocates and builds its own index entries. The transfer
+rides **nuraft's own snapshot mechanism** on the volume's RAFT group, the way HomeObject resyncs a PG; HomeBlocks
+only supplies the content through the RAFT listener's snapshot callbacks (§4.9).
+
+#### Flow
+
+1. The RAFT log is compacted in step with the journal cleanup floor (§4.8). A replica that missed writes now
+   cleaned up has also missed RAFT entries that were compacted, so the leader's nuraft sends it a snapshot.
+2. The leader serves the snapshot as a sequence of objects that the replica pulls one at a time: first the
+   partition's control state and its data watermark `W`, then the volume's LBA regions in batches.
+3. The replica installs each batch by replacing that LBA range in its own B-tree (data and holes). nuraft keeps
+   its RAFT apply paused meanwhile, and the replica serves no client IO.
+4. After the last object the replica sets its commit point to `W`, marks everything above `W` up to the leader's
+   Sync watermark as missing, and resumes. Normal catch-up (Case 2) fetches those writes from any member.
+
+![Figure 6](resync-diagrams/fig6.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant L as Leader (snapshot donor)
+    participant R as Behind replica
+    participant P as Any member
+    L->>L: RAFT log compacted up to the cleanup floor
+    L->>R: nuraft: you are behind the log, install a snapshot
+    R->>L: object 0
+    L-->>R: control state, watermark W, region count
+    loop every LBA region, in batches
+        R->>L: next object (region, batch)
+        L-->>R: LBA range with data and holes (checksummed)
+        R->>R: write the data to its own blocks, replace that range in its own B-tree
+    end
+    R->>R: commit point = W, writes above W marked missing
+    L->>R: RAFT entries after the snapshot apply as usual
+    R->>P: fetch the writes above W (Case 2)
+    P-->>R: write data
+```
+
+</details>
+
+*Figure 6: Snapshot for a replica past retention, sequence diagram*
+
+#### Guarantees
+
+- **No new transport:** nuraft carries the objects, retries them and paces them (the receiver pulls).
+- **A crash on either side loses nothing:** the receiver records its region cursor durably and resumes; a new
+  leader simply serves the snapshot again (Case 8).
+- **Cost:** proportional to the volume's mapped data, whatever the gap. Region-level deltas are a later
+  optimization.
+- **One case needs an explicit trigger:** a replica that applied every RAFT entry but whose data still fell behind
+  (C2). Compaction alone never makes nuraft send it a snapshot, so the leader re-adds it as a learner (§4.9).
+
+### Case 7: New member joins
+
+A new or replacement replica starts empty. RAFT adds it as a non-voting learner (HomeStore's `replace_member`), and
+nuraft sends it a snapshot as in Case 6. It is promoted once it holds the data. UBD follows the move without
+logging in again: it swaps the member in place while I/O keeps running.
+
+#### Flow
+
+1. The leader adds the replica as a learner and records the volume's current position as its promotion gate.
+2. nuraft sends the snapshot (Case 6); the replica then fetches the writes above `W` from any member.
+3. Once its commit point passes the gate, the leader promotes it to voter and removes the replica it replaces. OM's
+   volume record now lists the new replica in that partition.
+4. UBD's health check polls OM's volume info, sees the partition's replica list change, re-exposes once for the new
+   endpoint, and swaps the member in place (`craft::replace_member`, through ublkpp's `craft_disk`). There is no
+   re-login and no I/O pause: the session, its term and every other member stay as they are.
+5. At the swap, UBD takes `J`, the highest dLSN it has issued. Every write above `J` goes to the new replica; writes
+   at or below `J` that were already in flight to the old one finish there. UBD reads from the new replica only once
+   its own `commit_lsn` reaches `J`, so until then reads go to the other members.
+
+![Figure 7](resync-diagrams/fig7.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant L as Leader
+    participant N as New replica
+    participant P as Any member
+    participant O as OM
+    participant C as UBD
+    L->>N: RAFT: add as learner (gate = current position)
+    L->>N: nuraft snapshot (as in Case 6)
+    N->>P: fetch the writes above W
+    P-->>N: write data
+    N-->>L: commit point passes the gate
+    L->>N: RAFT: promote to voter, remove the old replica
+    Note over O: volume record lists the new replica
+    C->>O: health check: volume info, replica list changed
+    C->>O: re-expose once, new endpoint
+    C->>C: swap the member in place, J = highest dLSN issued
+    C->>N: writes above J
+    N-->>C: commit_lsn reaches J
+    Note over C,N: from here UBD also reads from it
+```
+
+</details>
+
+*Figure 7: New member joins, sequence diagram*
+
+#### Guarantees
+
+- **A replica votes only once it holds the data** up to the gate.
+- **UBD never reads from the new replica before it holds the data** up to the swap point `J`. Writes above `J` reach
+  it directly; everything at or below `J` it pulls from the other BMs (snapshot plus FetchData). UBD itself copies no
+  data.
+- **No write is lost across the swap.** A write either took its dLSN before `J` was read (it may go to the old
+  replica, and the new one gets it by resync) or after (it goes to the new replica). The client publishes the new
+  member before it reads `J`, so no write falls between the two.
+- **No re-login.** The session and term are unchanged; late replies from the old replica are tagged with the slot's
+  old generation and ignored.
+
+### Case 8: Snapshot interrupted
+
+A snapshot can take hours, so the leader or the receiver may fail during it.
+
+#### Flow
+
+1. **The receiver crashes:** it restarts with its saved snapshot context (transfer identity, region cursor, read
+   gate). When nuraft resumes the same transfer (same snapshot point and same control tuple), the receiver asks for
+   the region after the last one it made durable; otherwise it starts over.
+2. **The leader fails or changes:** the new leader's nuraft starts a snapshot of its own (a new snapshot point).
+   The receiver sees a different snapshot point and starts over. Every batch replaces its whole range, so whatever
+   the first leader had sent is overwritten consistently.
+
+![Figure 8](resync-diagrams/fig8.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant R as Receiver
+    participant L1 as Leader 1
+    participant L2 as Leader 2
+    R->>L1: regions 1..k
+    L1-->>R: batches
+    L1-xL1: crashes
+    L2->>R: nuraft: install snapshot (new snapshot point)
+    R->>R: different snapshot point: start over
+    loop every region
+        R->>L2: next object
+        L2-->>R: LBA range (replaces what Leader 1 sent)
+    end
+```
+
+</details>
+
+*Figure 8: Snapshot interrupted, sequence diagram*
+
+#### Guarantees
+
+- **Always correct:** each batch replaces its whole range, and the writes above `W` are fetched again in order.
+- **Cost:** a leader change restarts the copy; a receiver crash resumes at a region boundary.
+
+### Case 9: UBD disappears
+
+If UBD stops without logging out, the leader BM detects it through its lease, heals what
+it safely can, and then takes over as a stand-in so that the replicas fully converge before the next attach.
+
+#### Flow
+
+1. Each BM keeps a lease that UBD's writes and keep-alives reset. BMs never ping UBD: UBD opens every
+   connection. When the leader's lease sees no traffic for T (watchdog), it heals up to UBD's last reported
+   commit point (Case 2).
+2. When UBD's lease expires, the leader commits **InternalLogout** through RAFT. Replicas reject the old
+   session from then on.
+3. The leader acts as a stand-in for UBD: it runs a login without a UBD (Case 4), which converges every replica
+   to one starting point.
+4. It keeps healing laggards until a real UBD logs in.
+
+![Figure 9](resync-diagrams/fig9.png)
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+```mermaid
+sequenceDiagram
+    participant C as UBD
+    participant L as Leader
+    participant R as Replicas
+    C-xC: stops (crash or detach)
+    Note over R: no UBD traffic for T: watchdog fires
+    L->>R: heal up to UBD's last commit point (Case 2)
+    Note over L: lease expired
+    L->>R: RAFT: InternalLogout
+    L->>R: stand-in login: fence, converge, InternalLogin (no UBD)
+    L->>R: keep healing laggards
+    Note over L,R: The next real login finds every replica already converged
+```
+
+</details>
+
+*Figure 9: UBD disappears, sequence diagram*
+
+#### Guarantees
+
+- **Healing never depends on UBD being alive.**
+- **The stand-in uses the login path**, so it inherits Case 4's safety argument instead of needing its own.
+
+### Decisions taken
+
+| Topic | Decision | Rejected |
+|---|---|---|
+| Login fence (C1) | Lifts only on a committed InternalLogin or LoginAborted, with a pre-sync before fencing (Cases 4–5) | A timeout release, which loses acknowledged writes when a login is slow; relying on the attach layer alone |
+| Snapshot path | nuraft's snapshot mechanism on the volume's RAFT group, with HomeBlocks' content through the listener callbacks, modeled on HomeObject (Cases 6–8, §4.9). RAFT-log compaction follows the journal cleanup floor; a member current on RAFT but behind on data is re-added as a learner (C2) | A CRAFT peer-plane snapshot stream (the earlier option b′): a second transport with new wire ops (§6) |
+| Snapshot receive | Merge onto the existing B-tree; every batch replaces its whole LBA range | Open question 9 |
+| Failed writes | Error to the application, which (XFS) goes offline; the volume detaches and the slot is filled or marked Empty at the next login (Case 3) | UBD resending the write; a mid-session leader resolution round |
+| Who drives resync | The CRAFT BM side (leader BM); data moves BM to BM | UBD driving or carrying resync |
+| Region-level delta snapshots | Later optimization | — |
+
+---
+
+## Detailed design: contents
+
+1. [What resync is for](#1-what-resync-is-for)
+2. [Invariants resync must hold](#2-invariants-resync-must-hold)
+3. [As-built: HomeBlocks `CraftReplDev` today](#3-as-built-homeblocks-craftrepldev-today)
+4. [Design](#4-design)
+   - 4.1 [Triggers and their safe targets](#41-triggers-and-their-safe-targets)
+   - 4.2 [The leader's resolution round](#42-the-leaders-resolution-round)
+   - 4.3 [Follower catch-up (SyncRSCommitLSN apply)](#43-follower-catch-up-syncrscommitlsn-apply)
+   - 4.4 [Failed writes: resolved at login only](#44-failed-writes-resolved-at-login-only)
+   - 4.5 [No mid-session verdicts](#45-no-mid-session-verdicts)
+   - 4.6 [Login-time resync](#46-login-time-resync)
+   - 4.7 [Peer-plane wire v2](#47-peer-plane-wire-v2)
+   - 4.8 [Journal reclaim and the retention floor](#48-journal-reclaim-and-the-retention-floor)
+   - 4.9 [Baseline resync (snapshot) and large gaps](#49-baseline-resync-snapshot-and-large-gaps)
+   - 4.10 [Detached operation: logout, lease, and the stand-in](#410-detached-operation-logout-lease-and-the-stand-in)
+   - 4.11 [Threading, persistence, observability](#411-threading-persistence-observability)
+5. [Failure walk-throughs](#5-failure-walk-throughs)
+6. [Alternatives considered](#6-alternatives-considered)
+7. [Test plan](#7-test-plan)
+8. [Implementation plan](#8-implementation-plan)
+9. [Gaps and risks](#9-gaps-and-risks)
+10. [Open questions](#10-open-questions)
+
+Appendix A. [craft_client reference server defects](#appendix-a-craft_client-reference-server-defects)
+
+---
+
+> **Terminology in the detailed design.** "Client" means **UBD**, the CRAFT client; code names such as
+> `craft_client` and `client_hdr` keep their names. "Application" means what receives the acknowledgement (XFS).
+> Resync is driven by the **CRAFT BM side**; UBD never drives it.
+
+## 1. What resync is for
+
+CRAFT acknowledges a write once a **quorum** has appended it, so replicas fall behind by design. Three kinds of
+lag come up:
+
+| Lag | How it arises | Who notices |
+|---|---|---|
+| **Holes** (Missing slots below a member's `last_append_lsn`) | A broadcast leg timed out or was dropped while later legs landed | The member itself: `apply_up_to` stalls at the first hole and `commit_lsn` pins |
+| **Suffix lag** (`last_append_lsn` frozen) | The member was down or partitioned for a stretch of writes | Only the client and its peers. The member cannot see writes it never received |
+| **Unresolved slots** (sub-quorum writes) | A write reached fewer than a quorum (the app got an error). Its outcome is undefined until it is completed or voided | The client. It reports the error, pins its frontier `F`, and serves overlapping reads as of just before the slot, **without blocking**. The application (XFS) goes offline and the volume detaches; the slot is resolved at the **next login** (§4.4) |
+
+Resync has two jobs:
+
+1. **Resolve.** Give every slot a final, set-wide fate: *durable* (filled from a holder) or *Empty* (proven never
+   acked). Only the RAFT leader decides, and only inside a resolution round.
+2. **Fill.** Copy every resolved, durable slot to each member that lacks it, so that every member's contiguous
+   `commit_lsn` reaches the watermark. The `commit_lsn` certificate in the member's IO replies then prunes the
+   client's per-member Missing map, and the member becomes readable again for the ranges it missed.
+
+All of this happens server-side and replica-to-replica. Resync traffic never passes through the client, and the
+read path never fetches.
+
+**Non-goals here.** The client's Missing-map implementation (`read_route_map`, already built), membership-change
+orchestration beyond the data-plane hooks it needs, and HomeStore-specific bindings (CP pinning, logstore
+`fill_gap`), which live on the wiki's HomeBlocks page.
+
+---
+
+## 2. Invariants resync must hold
+
+These come from the wiki, sharpened where this design depends on them. Every mechanism below is checked against
+them.
+
+| # | Invariant | Why |
+|---|---|---|
+| **I1** | **Only the leader verdicts `Empty`**, and only on positive quorum-lacks evidence (itself included; non-responders never count). The verdict rides a `SyncRSCommitLSN` entry. | Two replicas deciding independently under asymmetric reachability would diverge. Quorum intersection guarantees a quorum-durable slot can never be verdicted Empty. |
+| **I2** | **An acked write is never voided.** A slot is verdicted Empty only if the client's ack path for it is closed (login quiesce, or the client already reported it failed). | An Empty verdict on an in-flight slot can race its own quorum ack. See §4.4. |
+| **I3** | **Held data is never applied before its verdict.** A replica must not advance `commit_lsn` over a slot whose committed verdict it has not yet applied. | Otherwise an Empty slot's sub-quorum copy lands in the index, and no un-apply path exists. See §4.5: the client's piggybacked commit can outrun the RAFT apply. |
+| **I4** | **A fetch never overwrites, and Empty beats data.** `install` fills only a hole. A verdict tombstone overwrites held data. | Convergence on the merge key without per-entry version checks. |
+| **I5** | **Truncation is login-only**, performed when `InternalLogin` is applied. | The new session reuses slot numbers above `rs_commit_lsn`, so stale-session and new-session data must never share a slot. |
+| **I6** | **A login never truncates below a committed watermark.** Login takes `rs_commit_lsn = max(max(quorum.last_append), N_committed)`, where `N_committed` is the highest `SyncRSCommitLSN` watermark in the RAFT log the leader has applied (RAFT leader completeness guarantees a new leader has it). Applying a Sync also raises every member's `last_append_lsn` to `N` (the covered range is marked missing), so polls normally report it anyway. | A leader can commit `Sync(100)` and fail before the others fetch the data; without the lower bound a poll quorum could pick `rs = 99` and truncate below a committed watermark. |
+| **I7** | **Fetch stays within retention.** A responder answers `reclaimed` for slots below its journal floor, and the requester escalates to baseline resync. | The bounded journal must not silently drop a fill. |
+| **I8** | **The login fence holds until a committed outcome.** A replica fenced by a login poll keeps rejecting the old session until it applies `InternalLogin` or `LoginAborted` for that login. No timeout lifts it, and neither does a restart. | Login truncation drops everything above `rs_commit_lsn`. A write acked to the old client after its fence lifted, but before truncation, would be lost (§9.1 C1). |
+
+---
+
+## 3. As-built: HomeBlocks `CraftReplDev` today
+
+> **Status (2026-11-18).** This section was measured at `51d051a`. Since then `dev/v6.x` gained CRAFT volume creation
+> with a RAFT group per volume (#195), `append()` and the Sync triggers (#189), distinct-voter quorum evidence
+> (#206), proposal deadlines (#207) and log-order apply (#211); the login poll with quiesce fencing is in review
+> (#212). The snapshot callbacks are still stubs.
+
+**In one sentence:** the resync building blocks exist in `src/lib/craft/craft_repl_dev.{hpp,cpp}` (below:
+`CRD.cpp`), but almost nothing drives them. `login`, `logout`, the `SyncRSCommitLSN` proposer `append()` and
+`request_resolution` are stubs, pre-resolution runs only in tests, and the peer channel has no production
+implementation. Snapshot and membership change are not started. Measured on `dev/v6.x` at `51d051a`.
+
+The defects of craft_client's **reference** server (`RaftReplica`, D1–D17) are kept in
+[Appendix A](#appendix-a-craft_client-reference-server-defects). They matter for the reference server and test
+tooling, not for HomeBlocks.
+
+### 3.1 The pieces
+
+| Concern | Where | State |
+|---|---|---|
+| Login orchestration (S7) | `CraftReplDev::login` (`CRD.cpp:530`) | **Stub**, returns `not_supported`. Owned by the S7/S9 owner |
+| Logout | `CraftReplDev::logout` (`CRD.cpp:535`) | Stub |
+| `SyncRSCommitLSN` proposer | `CraftReplDev::append` (`CRD.cpp:1419`) | **Stub**. The watchdog calls it (`CRD.cpp:1410`); `write_counter_` (periodic trigger, `CRD.hpp:647`) is never used |
+| Client-requested round | `CraftReplDev::request_resolution` (`CRD.cpp:1413`) | Stub. Stays a stub: failed writes are resolved at login (§4.4) |
+| Login poll (callee) | `CraftReplDev::get_rs_commit_lsn` (`CRD.cpp:414`) | Returns `{commit_lsn, last_append_lsn}`; **ignores `term` and `is_login`**, so there is no quiesce |
+| Leader pre-resolution | `CraftReplDev::pre_resolve_slots` (`CRD.cpp:1658`) | Implemented, **called only from tests**. Any single responder suffices; a peer's `is_empty` decides the slot |
+| `SyncRSCommitLSN` apply | `apply_sync_rs_commit_lsn` (`CRD.cpp:1811`), dispatched from `on_commit` (`CRD.cpp:1535`) | Implemented, but **detached** from the RAFT commit path (FIXME at `CRD.cpp:1566`); one fetch, no retry; raises `last_append_lsn` to `N` unconditionally; token not checked |
+| `InternalLogin` entry | `InternalLoginPayload` (`craft_raft_entries.hpp:71`), `apply_internal_login` (`CRD.cpp:1970`) | Payload `{client_token, term}`; apply sets the token and `term = max(term, new)`. **No `rs_commit_lsn`, no truncation** |
+| Truncate | `CraftReplDev::truncate` (`CRD.cpp:439`) | Implemented (frees blocks, rolls back the journal, prunes missing set and overlay), asserts `lsn ≥ commit_lsn`; **no caller** |
+| Peer channel | `CraftPeerFetcher` (`CRD.hpp:142`) | Interface only; null in production until S9 (CraftConnector). No term or partition on `fetch_data` |
+| `fetch_data` (callee) | `CraftReplDev::fetch_data` (`CRD.cpp:1443`) | Implemented: Empty beats data, zero, omitted. No size limit or chunking, no `reclaimed` status |
+| IO term fence | write / read / keep_alive (`CRD.cpp:592`, `:1049`, `:1282`) | `hdr.term != state_.term` → `STALE_TERM` |
+| Persistence / replay | `CraftPartitionState` (`CRD.hpp:59`), `on_restart` (`CRD.cpp:1617`) | No superblock recovery, no last-applied RAFT index. Replay safety only from max-monotonic fields |
+| Reclaim, compaction | `all_committed_lsn` captured, not used (`TODO(S8)`, `CRD.hpp:61`) | Not started (S8) |
+| Snapshot callbacks | `CraftRaftListener` (`CRD.hpp:482`) | Stubs (`create_snapshot` ok, `apply_snapshot` true, `last_snapshot` null) |
+| Membership change | `replace_member` / `remove_member` callbacks (`CRD.hpp:470`) | No-ops (S10 not started) |
+| Tests | `src/lib/craft/tests/` (`test_craft_raft_entries.cpp`, `test_craft_pre_resolution.cpp`, `test_craft_peer_exchange.cpp`, `test_craft_truncate.cpp`, `test_craft_watchdog.cpp`, …) | One gtest executable per file, `MockCraftJournalBackend` + stub fetchers; run by `conan create` |
+
+### 3.2 Defects to fix (H1–H9)
+
+| # | Severity | Defect | Consequence | Fixed in |
+|---|---|---|---|---|
+| **H1** | **High** | `InternalLogin` carries no `rs_commit_lsn`, and its apply does not truncate. | I5 unmet: a stale-session tail above the login point survives, and the new session reuses its slot numbers. | PR A |
+| **H2** | **High** | `SyncRSCommitLSN` apply is detached (`CRD.cpp:1566`): it runs to its first `co_await` and `on_commit` returns, so the next entry applies while it is half done. Its Empty verdicts are installed before that point; block reclaim, catch-up and the `commit_lsn` advance land later, at a point that differs per replica. | Replicas apply entries in different effective orders; once login truncates (H1), an unfinished sync overlaps the truncation. | PR A ([#196](https://github.com/eBay/HomeBlocks/pull/196)) |
+| **H3** | **High** | `pre_resolve_slots` declares Empty when every member that happened to respond lacks the slot, with no quorum check, and is not restricted to login. | I1 unmet. Safe by accident at N=3 (both non-leader members hold any acked write the leader lacks); at N=5 a write acked by three silent members is voided when the two responders lack it. Mid-session verdicts also race in-flight acks. | PR B ([#197](https://github.com/eBay/HomeBlocks/pull/197)) |
+| **H4** | Medium | Sync catch-up fetches once, with no retry, inline in the apply (raising `last_append_lsn` to `N` is fine: the new range is marked missing in the same step). | A follower that fails one fetch stays stuck until the next Sync, and a slow peer stalls apply. | PR A (catch-up off the apply path), PR E (retry) |
+| **H5** | **High** | No quiesce: `get_rs_commit_lsn` ignores `is_login`; there is a single `term` field. | I8 unmet: an old client can be acked after the login poll and then truncated. Needs the fence/session split (§4.6). | PR A (state), PR C |
+| **H6** | Medium | No persisted partition state and no last-applied RAFT index; the token overwrite is unguarded on replay. | After a restart, replayed entries can change the session; persistence arrives with S8. | PR A (guards), S8a |
+| **H7** | Medium | `fetch_data` is unbounded and has no term or partition fence; the peer channel is not wired. | Large catch-ups cannot complete; a deposed leader's request is indistinguishable. | PR E (with S9) |
+| **H8** | Low | The watchdog calls the stub `append()`; the periodic trigger is dead code. | No healing during a session. | S7/S9 owner (`append`), PR E |
+| **H9** | **High** | `advance_commit_after_sync` (Sync apply and catch-up) moves `commit_lsn` over present slots without applying them to the index. `commit()` never revisits a slot below `commit_lsn`, and `read()` serves overlay entries only above it. | A read of an LBA last written by such a slot returns the older index value. `commit_lsn` is also useless as a durable restart frontier. | S8a |
+
+### 3.3 Design-to-code map
+
+| Design item | HomeBlocks function / file | Status |
+|---|---|---|
+| Ordered apply of RAFT entries (§4.3) | `CraftRaftListener::on_commit`, `apply_sync_rs_commit_lsn` | **Fix** (PR A) |
+| `InternalLogin` v2 with `rs_commit_lsn`, truncate on apply (§4.6) | `InternalLoginPayload`, `apply_internal_login`, `truncate` | **Fix** (PR A) |
+| Fence / session term split, `LoginAborted` (§4.6, I8) | `CraftPartitionState`, new entry type, IO term checks | **New** (PR A, PR C) |
+| Login orchestration with pre-sync (§4.6) | `login` | **New**, S7/S9 owner (contract in §4.6) |
+| Leader round, Empty only at login (§4.2) | `pre_resolve_slots` | **Fix** (PR B) |
+| Fill-only rounds, watchdog and periodic triggers (§4.1) | `append`, `on_watchdog_tick`, `write_counter_` | **New**, S7/S9 owner (`append`); triggers PR E |
+| Follower catch-up with retry, chunked fetch v2 (§4.3, §4.7) | `apply_sync_rs_commit_lsn` (catch-up part), `fetch_data`, `CraftPeerFetcher` | **Fix/New** (PR E) |
+| Failed writes resolved at login only (§4.4) | `request_resolution` | **Keep as stub**; client side in craft_client (PR F) |
+| Reclaim floor, persistence (§4.8, §4.11) | `TODO(S8)` | **New** (S8) |
+| Snapshot (§4.9) | `CraftGroupListener` snapshot callbacks (stubs) forwarded to `CraftReplDev` | **New** (SN1–SN4) |
+| Lease, logout, stand-in (§4.10) | `touch_watchdog`, `logout` | **New** (later) |
+
+## 4. Design
+
+### 4.1 Triggers and their safe targets
+
+Every resolution round has a **target `N`**. Each trigger needs its own bound on `N`, because I2 (never void an
+acked write) depends on which slots might still be in flight:
+
+| Trigger | Initiator | Target `N` | Why it is safe |
+|---|---|---|---|
+| **Login** | leader | `rs_commit_lsn = max(quorum.last_append)` | The quiesce barrier closes every old-session ack path before `last_append` is reported. The leader quiesces too (fixes D5). |
+| ~~Client request~~ (failed write) | — | — | **Removed.** A failed write is resolved at the next login (§4.4). |
+| **Periodic checkpoint** (every *K* dLSNs or *T* seconds of applied progress) | leader | `F_seen` | Every slot ≤ `F` is resolved client-side (acked or provably Empty), so nothing is in flight |
+| **Watchdog** (no client IO for `T_ka`) | leader | `F_seen` | Same as periodic |
+| **Member catch-up** (after snapshot, or a returning voter) | leader | `F_seen` | Same as periodic |
+| **Stand-in** (after `InternalLogout` commits) | leader | `max(quorum.last_append)` under quiesce | Implemented as a **login with no client** (§4.10) |
+
+`F_seen` is the highest `client_hdr.commit_lsn` the leader has received in the current term. The client
+broadcasts every write, so the leader sees `F` on its own IO path. After a leader change `F_seen` starts at the
+login `L` (always safe) and rises with the next IO. Using a stale, lower `F_seen` is always safe; it only delays
+healing.
+
+Triggers **coalesce**: at most one round runs per partition at a time, and a trigger that arrives during a round
+raises the pending target. Rounds are cheap when there is nothing to do, because the probe returns a
+`commit_lsn` ≥ target from everyone and the round ends without a proposal.
+
+### 4.2 The leader's resolution round
+
+The round has two steps. First, a **metadata probe** of every member, in parallel, with no payload. Second, a
+**targeted fetch** of only the slots the leader itself lacks, from exactly one holder each. This replaces the
+current brute force, which fetches every missing payload from every peer and moves N−1 copies to keep one.
+
+```
+round(target, may_verdict):                  # target = F_seen (fill-only) or rs_commit_lsn at login (§4.1)
+  lo   = own.commit_lsn                       # the leader holds everything <= its own commit_lsn: nothing to probe
+  P    = parallel probe(partition, raft_term, (lo, target]) to every member incl. self, deadline T_probe
+  if |responders| < quorum: abort (retry with backoff)
+
+  new_empty = []; N = target; stop_reclaimed = false
+  for d in (lo, target]:                      # walked as intervals, not slot by slot
+      if d already verdicted (leader journal tombstone)        -> resolved
+      elif some responder holds d (data or zero)               -> durable; if leader lacks d, queue fetch(d, holder)
+      elif may_verdict and count(fenced responders lacking d) >= quorum -> new_empty += d # login only, under fence;
+                                                        # a responder counts as lacking d only if d > its journal_floor
+                                                        # (a reclaimed gap may be an acked write: not evidence) AND its
+                                                        # reply shows fence_term == the login term: it has fenced and
+                                                        # drained its in-flight writes (§4.6 phase 2). The login probe
+                                                        # carries the login term and fences like the poll, so a member
+                                                        # that missed the poll fences on the probe before it answers.
+      else                                                     -> N = d - 1
+                                                                  stop_reclaimed = (no responder holds d and some
+                                                                    responder reports d <= its journal_floor)
+                                                                  break
+  fetch queued slots (chunked, §4.7); install on leader (never overwrite)
+  a failed fetch: N = min(N, d - 1)
+  new_empty = [d for d in new_empty if d <= N]   # filter AFTER every failure has lowered N
+  if stop_reclaimed: request baseline recovery (§4.9) for the members that lack slot N + 1, the hole that stopped
+                    the round (checked against the ORIGINAL target range, not the resolved prefix, so repeated
+                    rounds cannot stall on the same reclaimed hole)
+  if N > last_proposed or new_empty nonempty:
+      propose SyncRSCommitLSN{N, token, term, empty_slots = new_empty}       # empty_slots always <= N
+  return N
+```
+
+Points that differ from today:
+
+- **Partial progress is proposed.** An unresolved slot caps the watermark at `d−1`; it does not fail the whole
+  round (the current `sync_rs_commit_lsn` returns `INTERNAL`).
+- **Empty verdicts only at login.** `may_verdict` is true only for the login round, which runs under the fence,
+  so every ack path is closed and I2 holds by construction. Periodic and watchdog rounds are bounded by `F_seen`,
+  below which every slot is already durable, so they only fill. Verdicts are therefore always ≤ `N`, as in the
+  wiki.
+- **Evidence comes from the probe, not from Empty answers.** A responder reports *held / absent / tombstoned*.
+  A tombstone counts only as "already resolved", and only committed verdicts create tombstones, because D1's
+  unilateral path is removed.
+- **The leader holds every non-Empty slot ≤ `N` before it proposes.** That makes the leader a guaranteed fill
+  source for followers (§4.3) and gives I6 by construction.
+
+### 4.3 Follower catch-up (SyncRSCommitLSN apply)
+
+The apply is split by ordering requirement:
+
+**Synchronous, in RAFT log order (on the commit worker, no I/O):**
+
+1. Verify `client_token` and term against the partition state, and log any mismatch. The entry is authoritative
+   either way, because RAFT committed it.
+2. Install the `empty_slots[]` tombstones. These overwrite held data (I4, reconciliation).
+3. Raise the partition's `sync_target = max(sync_target, N)` and wake the catch-up task.
+
+Because tombstones and truncation (`InternalLogin`) apply in log order on one worker, a member that has applied
+`InternalLogin` has necessarily applied every earlier verdict. This holds **only if a member admits new-session
+IO no earlier than its `InternalLogin` apply**. Today's quiesce admits the new term at poll time (D14), so §4.6
+splits the fence term from the session term. With that split, the term check on IO guarantees that no new-session
+write or piggyback reaches a member that has not applied the login's Sync and truncation.
+
+`internal_login` and `apply_sync` must also be **idempotent under replay** (D15). The applied RAFT index is
+persisted with the partition state, and an entry at or below it is skipped.
+
+**Asynchronous (one catch-up task per partition, off the commit worker):**
+
+```
+loop while commit_lsn < sync_target:
+  M = missing intervals in (commit_lsn, sync_target]          # interval set, not a dLSN list
+  for chunk in M (bounded by max bytes / max slots):
+      try leader first (it holds every non-Empty slot <= any N it proposed), then other peers
+      fetch v2(chunk) -> slots; install each (fill-only); status reclaimed -> escalate to baseline (§4.9)
+  apply_up_to(sync_target); persist
+  if progress stalled: backoff (100 ms .. 5 s, jittered); re-read sync_target (it may have risen)
+abort/restart when: term changes (InternalLogin applied -> truncation happened), or partition closes
+```
+
+- Fetches are **pipelined** with bounded in-flight bytes (default 8 MiB) and run in parallel across sources.
+- An install takes `mu_` per chunk, so the client IO path is never blocked by a whole catch-up.
+- Retry with backoff replaces today's "stall until next login" (D10). If a peer is genuinely unable to supply a
+  slot, the slot was by construction on the leader at propose time. The leader losing it afterwards is a second
+  failure, and the next periodic round re-resolves.
+
+### 4.4 Failed writes: resolved at login only
+
+A write is reported failed only when fewer than a quorum stored it. In our deployment the application is XFS,
+which goes offline on a write error. Keeping the volume active is then not useful: the client finishes the I/Os
+already queued and the volume is unmounted and detached. So a failed slot is **not** resolved during the session:
+
+- The client reports the error, pins its frontier `F` below the slot, and serves overlapping reads as of just
+  before it (never blocking). It does not resend the write and does not request a resolution round.
+- The slot is decided at the **next login** (§4.6). If a responding replica holds it, it is filled everywhere (it
+  completed late). Otherwise it is verdicted Empty, and a replica holding a copy discards it when it applies the
+  verdict. The same applies to provably-empty slots (every replica rejected the write).
+- Retries are bounded: the client never retries a failed write indefinitely, because the error must reach the
+  application.
+
+**What this removes.** The client-requested round (`request_resolution`, wire `resolve` op 13/14), the explicit
+failed set, verdicts above the watermark, and the client-side retire path all go away. D3 (an in-flight write
+voided after its ack) and D11 (provably-empty slots pinning commit) disappear with them, and so does D4 (§4.5).
+
+*Rejected:* the client completing the failed write by resending it at the same dLSN, and a mid-session leader
+round. Both keep a volume alive after the application has already given up on it, and the leader round brings
+races that need extra machinery (§6).
+
+### 4.5 No mid-session verdicts
+
+The earlier draft had to solve a race (D4): a slot verdicted Empty mid-session, the client advancing its commit
+past it, and a replica that has not yet applied the verdict applying (or serving) its late copy. The fix needed a
+**verdict epoch** in every request header, plus rejecting reads on lagging replicas.
+
+With failed slots resolved only at login (§4.4), the race cannot occur: no Empty verdict exists while a session
+is writing. Login verdicts are applied, in RAFT log order, **before** `InternalLogin`, and a replica admits the
+new session only when it applies `InternalLogin` (§4.6). So no request of the new session can reach a replica that
+has not applied every login verdict. The verdict epoch, `client_hdr` v2, and the read rejection are all dropped.
+
+### 4.6 Login-time resync
+
+Login reuses the round. It fixes D5, D6, D14 and D16, and closes the fence-timeout window (§9.1 C1) with two
+decided mechanisms: **(d) a pre-sync phase**, which keeps the fenced phase short, and **(a) a fence that lifts
+only on a committed outcome**, which makes it safe however long the login takes.
+
+**Terms.** Each replica keeps two terms:
+- **`session_term`**: the only term whose IO is *admitted*. It changes only when `InternalLogin` is applied.
+- **`fence_term`**: raised by a login poll. IO is admitted iff `hdr.term == session_term` and
+  `session_term ≥ fence_term`. While `fence_term > session_term`, the replica is **fenced** and rejects both
+  the old session and the new one (`stale_term`).
+
+Both terms are **persisted**. A restart must not lift a fence, because a restart is just a very long timeout
+(I8).
+
+**Phases.**
+
+0. **Assign the term from replicated state** (D16). `new_term = max(session_term, fence_term, aborted_upto) + 1`,
+   over the leader's own applied state and the values reported by the pre-sync poll. Never a per-process counter.
+   After `LoginAborted(8)` the fence returns to the old session term 7, so `session_term + 1` would pick 8 again,
+   whose `InternalLogin` is ignored forever; the term must be strictly above every aborted term. `aborted_upto` is
+   therefore persisted, reported in probes, and carried by control snapshots (§4.9). A stale leader cannot finish: its proposals fail once it is no longer the RAFT leader.
+
+1. **Pre-sync, no fence (d).** The leader polls every member with `is_login = false`, which fences nothing, and
+   gets `pre = max(quorum.last_append)`. It fills its own gap up to `pre` from holders, but issues **no
+   verdicts**: slots that no responder holds are left for phase 3. Then it repeats: poll again, fill the new delta.
+   It stops when the remaining delta is below a threshold (default: 1024 slots or 64 MiB), or after `k = 3`
+   iterations. This is the pre-copy idea from live migration. The old client may still be writing, so the
+   target moves, but each pass is shorter than the last. The expensive part of login, catching the leader up,
+   happens **before** anyone is fenced, so it no longer stretches the fenced window.
+
+2. **Fenced poll.** The leader fences itself first (D5), then polls every member with `is_login = true,
+   term = new_term`. A replica sets `fence_term = max(fence_term, new_term)`, persists it, **waits for every write it
+   admitted before the fence to finish** (they can no longer be acked, but they have already advanced
+   `last_append_lsn` and marked their slot missing), and only then reports `{commit_lsn, last_append_lsn}` and
+   answers fetches. Otherwise the final round could count an in-flight slot as lacking and verdict it Empty while
+   the write is still journalling it. A poll with `term ≤ max(fence_term, aborted_upto)` leaves the fence unchanged
+   (D6): after `LoginAborted{term}` has lowered the fence, a delayed poll for that same term must not raise it again,
+   because nothing would lower it a second time.
+   `rs_commit_lsn = max(max(quorum.last_append), N_committed)`, the last committed Sync watermark (I6).
+
+3. **Final round.** Run the round of §4.2 with `target = rs_commit_lsn` and `F_seen := target`. The fence has
+   closed every ack path ≤ `rs`, so quorum-lacks evidence may verdict any slot. After phase 1 the leader is
+   missing at most the small delta, so this phase costs about one fetch round trip. The round must **reach the
+   target**: it may return `N < rs_commit_lsn` (a failed fetch, or a reclaimed hole), and the leader must not
+   advertise a starting point it does not hold. The leader repeats the round until it returns `N = rs_commit_lsn`
+   and that round's `SyncRSCommitLSN{N}` has committed; after `k` failed rounds it proposes `LoginAborted`
+   instead.
+
+4. **Commit the outcome.** The leader proposes `InternalLogin{token, new_term, rs_commit_lsn}`. **The
+   `rs_commit_lsn` field must be serialized** (D2). Each member, in log order:
+   - applies the login's Sync verdicts (they come earlier in the log), then
+   - truncates above `rs` (I5), then
+   - sets `session_term = new_term`, which **lifts the fence and admits the new session in one step** (D14).
+
+   The leader returns `LoginResult{dLSN = rs}` once `InternalLogin` is applied locally. A member that missed the
+   login self-heals when it applies the entry. The wiki's Phase 4 "truncate on every member" RPC is
+   unnecessary.
+
+**Abort (a).** The fence is never lifted by a timer. It lifts only when one of two committed RAFT entries is
+applied:
+
+| Entry | Who proposes it | Effect on apply |
+|---|---|---|
+| `InternalLogin{term}` | The login leader, on success | `session_term = term`. The fence is satisfied, because `fence_term ≤ term`. Ignored if `LoginAborted{term}` was applied earlier: an abort is final for that term. |
+| `LoginAborted{term}` | (1) The login leader, when it gives up (no poll quorum, a failed fill, a propose error); this replaces the wiki's un-replicated "login-aborted signal". (2) **Any newly elected leader** that finds an unfinished login: its own state, or a probe reply, shows `fence_term > session_term`, and it is not itself running that login. | If `fence_term == term`, lower `fence_term` to `session_term`, which re-admits the old session. A newer fence (`fence_term > term`) is left alone. |
+
+RAFT orders the two entries, so exactly one outcome wins for each term. A login leader that loses leadership
+mid-login never returns success: either its `InternalLogin` commits (the new leader then sees no unfinished
+fence), or the new leader's `LoginAborted` commits first and the late `InternalLogin` is ignored.
+
+**The trade-off we accept.** If a login fails **and** RAFT has no quorum, nobody can commit `LoginAborted`, so the
+fenced members keep rejecting the old owner until RAFT recovers. That availability loss happens only during a
+failover that was already under way: someone was replacing the owner. We take it in exchange for I8. The attach
+layer's hard fence (CSI) remains a second line of defense, no longer the only one.
+
+**Followers may still be behind `L` after login.** That is allowed: the client admits reads only to members with
+`Synced ≥ L` (`read_route_map`), and the leader is filled through `L` by construction. Catch-up (§4.3) brings the
+others up, and their `commit_lsn` certificates re-admit them.
+
+### 4.7 Peer-plane wire v2
+
+The opcodes keep the request-odd/response-even convention. `k_max_op` is bumped.
+
+| Op | Code | Request | Response |
+|---|---|---|---|
+| `get_rs_commit_lsn` | 17/18 | add `partition_id[16]`, `leader_raft_term` | add `session_term`, `fence_term` (so a new leader can find unfinished logins, §4.6) |
+| `fetch_data` (v2) | 19/20 | `partition_id`, `session_term`, `range_count`, `max_bytes`, body: `[lo, hi]` i64 pairs | `session_term`, `slot_count`, `next` (continuation dLSN, −1 = done), `reclaimed_below` (−1 = none), then descriptors and data as today |
+| `probe_slots` (new) | 21/22 | `partition_id`, `leader_raft_term`, `session_term`, `[lo, hi]`; at login also the login term, which fences like the poll (§4.2) | `commit_lsn`, `last_append_lsn`, `journal_floor`, `session_term`, `fence_term`, `snapshot_receiving`, `snapshot_sessions_served`, body: run-length intervals tagged `held_data`, `held_zero`, `tombstone` (absent = gaps) |
+
+- **Status codes:** add `reclaimed = 8`. `CraftTcpPeer` maps statuses properly instead of returning `INTERNAL`
+  for everything (D8). `not_leader` and `stale_term` are significant on this plane too.
+- **Bounded responses:** the responder stops at `max_bytes` (default and cap: the negotiated `max_tx`) and returns
+  `next`. The requester loops. This fixes D9.
+- **Fencing:** peer requests carry `leader_raft_term`. A responder drops requests from a stale RAFT term, so a
+  deposed leader's probe cannot be mistaken for evidence.
+- **Session binding:** one RAFT term can hold several CRAFT logins, so the RAFT term alone cannot tell old-session
+  data from a new write that reuses its slot. Requests and replies also carry `session_term`. A requester discards
+  data from a responder whose `session_term` is below its own for any slot above that session's truncation point
+  (the responder has not applied that `InternalLogin` yet, so its copy may be an old session's). Login's own rounds
+  run before `InternalLogin`, at the current session, so they still pre-resolve earlier-session data as intended.
+- **Ownership:** `do_fetch` returns `owned_data` (a refcount), so serialization outside `mu_` is safe (D7).
+- **Concurrency:** `CraftTcpPeer` gets a per-connection mutex now, and a small connection pool or io_uring
+  multiplexing later (D8).
+- **Transport choice:** this binding is the reference. HomeBlocks may carry the same messages over its own
+  inter-node RPC channel (see `docs/peer-plane.md`). The codec in `include/craft/peer.hpp` is transport-agnostic
+  and gains the v2 encoders.
+
+### 4.8 Journal reclaim and the retention floor
+
+Each member may reclaim journal slots below:
+
+```
+floor = min(checkpointed commit_lsn, all_committed_lsn)
+```
+
+`all_committed_lsn` already arrives in every `client_hdr` (the client computes it as the min of the members'
+`commit_lsn`). The leader's stand-in computes it from probes when no client is attached. A member never re-fetches
+below its own monotonic `commit_lsn`, so a stale min is merely conservative. A replica that just installed a
+snapshot reports `commit_lsn = W` (§4.9), which holds every member's floor at or below `W` until it has fetched
+the writes above `W`. That report comes too late for the transfer itself, and a learner is not in UBD's member list,
+so its progress is not in `all_committed_lsn` at all. So the leader also **pins `W` before it sends any region
+data**: it proposes `RetainFrom{W, L}` through RAFT, and every member reclaims only below
+`min(all_committed_lsn, every live pin)`. The pin is keyed by the **snapshot context** `L`, not by a receiver:
+HomeStore's snapshot callbacks do not tell the donor which member it is serving, and several members may install the
+same context at once. The leader clears it (`RetainFrom{none, L}`) once no transfer of `L` is active (the last
+iterator for it was freed) and every member, learners included, reports `commit_lsn ≥ W` in its probe replies; or
+by the retention cap below, in which case a receiver that has not finished starts over on its next snapshot.
+
+- `probe_slots` and `fetch_data` report `journal_floor`. A request for slots below it gets `reclaimed_below`; that
+  replica needs a snapshot (§4.9, I7).
+- **A silent member freezes the floor** (its `commit_lsn` is stale in the min). That is bounded by a retention
+  cap: once the journal exceeds `R` slots or bytes above the floor, the cap **relaxes only `all_committed_lsn`** (the
+  silent member's stale vote) and the silent member is consigned to a snapshot. The checkpointed `commit_lsn`
+  bound stays hard (local durability). The cap never relaxes for a member that reports it is installing a snapshot
+  or fetching the writes after one. The cap is a **local** decision, so it cannot tell *silent* from *slow*: a live
+  member that is merely slow can be pushed to a snapshot too. Set `R` well above the expected catch-up lag. Open
+  question 7 asks whether the leader should own the decision instead.
+- **RAFT log compaction follows the floor** (`docs/craft/subtasks.md` S8). The leader compacts the RAFT log below
+  the `SyncRSCommitLSN` entry whose watermark is at or below the floor (HomeStore's `trigger_snapshot_creation`).
+  A member that missed writes now reclaimed has then also missed compacted RAFT entries, so nuraft sends it a
+  snapshot (§4.9) with no separate trigger: returning voters and joiners alike. The exception is a member that
+  applied every RAFT entry but whose data still fell behind (C2); §4.9 gives it an explicit trigger.
+
+### 4.9 Baseline resync (snapshot) and large gaps
+
+**Decision: nuraft carries the snapshot.** The volume's RAFT group (one per CRAFT volume, since #195) already has
+a snapshot transport: nuraft decides when a follower needs one, moves it as a sequence of objects the follower
+pulls, retries and paces them, and pauses the follower's apply until it is installed. HomeBlocks supplies only the
+content, through the RAFT listener's snapshot callbacks, modeled on HomeObject's `ReplicationStateMachine`
+(`create_snapshot`, `read_snapshot_obj`, `write_snapshot_obj`, `apply_snapshot`, `last_snapshot`,
+`free_user_snp_ctx`). This is what `docs/craft/subtasks.md` specifies (S8, S10). An earlier draft of this document
+streamed the snapshot over the CRAFT peer plane instead; §6 says why that was dropped.
+
+#### Choosing the tier
+
+| Gap | Mechanism | Cost proportional to |
+|---|---|---|
+| Still in the journal (every missing slot is above the members' reclaim floor) | The FetchData loop (§4.3): range requests, byte-bounded and continued | The **writes** missed. Every version is replayed, including overwritten ones |
+| Past retention | **nuraft snapshot:** the volume's mapped data as of watermark `W` (the leader walks its B-tree and sends each LBA's data; the receiver builds its own index), then FetchData for the writes above `W` | The volume's **mapped data**, whatever the gap size |
+
+#### Triggers
+
+- **Compaction (the common case).** RAFT-log compaction follows the journal cleanup floor (§4.8), so a member that
+  is past retention is also behind the compacted RAFT log, and nuraft sends it a snapshot. This covers returning
+  voters and joiners (S10's learners).
+- **A member current on RAFT but behind on data (C2).** It applied every RAFT entry, so compaction never makes
+  nuraft send it a snapshot, while every fetch answers `reclaimed_below`. The member reports this in its probe
+  replies; the leader then removes it from the group and adds it back as a **fresh** learner, which makes nuraft
+  send a snapshot, and promotes it back once it passes the gate. Until then it has nuraft priority 0 so it cannot
+  become leader. `replace_member(C, C)` does **not** do this: HomeStore's `replace_member` keeps an incoming
+  member that already exists (it ignores `SERVER_ALREADY_EXISTS`), so C keeps its RAFT log position and nuraft has
+  no reason to send a snapshot. The sequence is `remove_member(C)`; C destroys its local RAFT state for the group
+  (log and snapshot context; its CRAFT journal is dropped at install anyway); `add_member(C)` as a learner. Whether
+  HomeStore supports re-adding a removed member id this way, or needs an explicit force-snapshot call, is open
+  question 14.
+
+#### The snapshot context (`create_snapshot`, `last_snapshot`, `apply_snapshot`)
+
+As in HomeObject, creating a snapshot copies no data. `create_snapshot(ctx)` records nuraft's snapshot context
+(its RAFT index `L`) and persists it in a per-volume snapshot superblock after a checkpoint flush, so that
+`last_snapshot()` survives restarts. `apply_snapshot(ctx)` records the installed context the same way. HomeStore
+only lets the leader serve a snapshot once every RAFT entry up to `L` has been committed and applied.
+
+**The control tuple is captured at `L`, not when served.** `create_snapshot` runs after entry `L` is applied and
+before `L + 1` (the ordered apply queue keeps the local state at exactly `L`). It captures, in the same superblock
+write: the control state, `W` (the `commit_lsn` at `L`), `S` (the last applied `rs_commit_lsn`) and the Empty
+verdicts in `(W, S]`. Object `0 | 0` serves that persisted tuple, unchanged on every retry and resume. Sampling it
+when the object is served would include the effects of entries after `L`, which the receiver then replays a second
+time: a later Sync that voids slot 101 and advances `W` past it would leave the receiver with a tombstone outside
+`(W, S]`, and replaying that Sync then hits the indexed-slot check in `install_sync_rs_commit_lsn`. The regions are
+still read live (fuzzy, requirement 3); only the control tuple must match `L`. The tuple also gets a digest; `L`
+plus that digest is the **transfer identity** the receiver resumes against (requirement 6). `L` alone is not
+enough: two leaders can hold different data watermarks at the same RAFT index.
+
+**A stored context can go stale.** It may be served long after it was created, by which time the members may have
+reclaimed the slots above `W` that the receiver needs to replay. Checking first and pinning second would leave a
+window in which reclaim passes `W`, so the order is **pin, then validate**. On the first object `0 | 0` of a context
+the leader proposes `RetainFrom{W, L}` (§4.8) and waits until it has committed and every **journal source** has
+acknowledged it in a probe reply. Only then does it check that every source's `journal_floor` is still at or below
+`W`; once a member has applied the pin its floor cannot pass `W`, so a passing check stays true. The sources are all
+members except snapshot recipients (those reporting `snapshot_receiving`, and a learner with no volume yet). A
+recipient is behind on the RAFT log, so it could not apply the pin before the install anyway, and waiting for it
+would deadlock the transfer. Leaving it out is safe: a durable slot is on at least two members, so with one
+recipient out of three, every durable slot above `W` still has a holder that keeps it. If the check fails (a member
+reclaimed past `W` before it applied the pin), the leader clears the pin, `read_snapshot_obj` returns an error, and
+the leader creates a fresh snapshot at its current index (HomeStore's `trigger_snapshot_creation`); nuraft then
+serves the new context.
+
+#### The object stream (`read_snapshot_obj` on the leader, `write_snapshot_obj` on the receiver)
+
+The receiver pulls objects by a 64-bit id, the same layout HomeObject uses: `type (1) | region (48) | batch (15)`,
+with `LAST_OBJ_ID` (all ones) as the end marker. The receiver's `write_snapshot_obj` answers each object with the id
+it wants next, which is how it asks for a resend or resumes after a crash.
+
+| Object | Content |
+|---|---|
+| `0 \| 0`: partition metadata | The control state (session term, client token, fence and abort state once they exist), what a member needs to **create the volume** if it has none (volume id, name, geometry, partition id, journal and index parameters: see "Bootstrap" below), the data watermark `W`, the Sync watermark `S` (the highest `rs_commit_lsn` applied) and the Empty verdicts in `(W, S]`, all as captured at `L` (above), and the number of LBA regions |
+| `r \| b` (r ≥ 1): region batch | One LBA range `[a, b)` of region `r`, read from the leader's index: every mapped LBA with its data and checksum; holes are implicit. Batches are cut at a byte budget; the last batch of a region says so |
+| `R+1 \| 0`: trailer | `W_hi`, the leader's `last_append_lsn` when the last region was read. A fuzzy region may carry any version up to `W_hi`, so the receiver must not serve reads below it (requirement 7) |
+| `LAST_OBJ_ID` | End of the snapshot |
+
+Every object starts with a sealed header (magic, version, payload size, payload CRC, header CRC), like HomeObject's
+`SyncMessageHeader`. A receiver that finds it corrupt asks for the same object again.
+
+The leader's side is an iterator kept in nuraft's `user_ctx` for the length of the transfer (HomeObject's
+`PGBlobIterator`), freed by `free_user_snp_ctx`. It answers a repeated id by rebuilding the same batch, and a
+request for `r | 0` by restarting region `r`.
+
+**Requirements.**
+
+1. **Data, not B-tree nodes.** An index entry points to a `blkid` on the leader's disk, which means nothing on the
+   receiver. The leader reads each mapped LBA's data and sends it with the checksum the index holds for it; the
+   receiver allocates its own blocks and writes its own index entries.
+2. **Each batch replaces its whole range.** A batch for `[a, b)` means "the volume over `[a, b)` is exactly this,
+   holes included". The receiver deletes its own mappings in `[a, b)` first. That makes a resend, a resume and a
+   restart from a new leader all correct, and the receiver can merge onto whatever B-tree it already has (open
+   question 9).
+3. **A fuzzy read is enough.** `W` and `S` come from the tuple captured at `L`, before any region is read; the
+   leader then reads the live index, while commits continue. A region may therefore carry versions newer than `W`.
+   The receiver re-fetches and applies every slot above `W` in order after the install, so it converges to the same
+   state, as a fuzzy checkpoint plus log replay does. The leader checks each LBA's data against the checksum in the
+   index and reads the index entry again on a mismatch, so a block freed and reused by a concurrent overwrite is
+   never sent.
+4. **Never roll a receiver back.** If `W` is below the receiver's durable `commit_lsn` (the leader's data trails
+   this member's), installing the regions would roll back data the member has already certified, after UBD has
+   pruned its Missing entries on the strength of that certificate. Neither side can simply refuse:
+   `write_snapshot_obj` returns `void` in HomeStore's listener, and the donor's `read_snapshot_obj` is not told
+   which member it is serving. Only the receiver knows its own `commit_lsn`, so the **receiver** decides, on object
+   `0 | 0`. If `W` is at or above its `commit_lsn`, it installs normally. If `W` is below, it does a **control-only
+   install**: it merges the control tuple and applies the shipped verdicts (requirement 7's merge rules), keeps its
+   own certified data and `commit_lsn`, and asks for `LAST_OBJ_ID` next so the donor sends no regions. Its data
+   already covers `W`, and the RAFT entries after `L` replay normally. Its journal **above** its own `commit_lsn`
+   is dropped, though: the logins compacted into the snapshot may have truncated slots there (a session-7 slot 101
+   that a session-8 login truncated at 100), and those truncations will never replay. The certified prefix stays;
+   `(commit_lsn, max(own last_append_lsn, S)]` minus the shipped Empty verdicts is marked missing; and reads stay
+   gated, as in requirement 7, until `commit_lsn` reaches the pre-install `last_append_lsn` `P`. So any write the
+   member acknowledged in that tail is fetched back before it serves a read again. No HomeStore change is needed;
+   a recipient-aware callback would only let the donor skip the object-0 round trip.
+5. **An exclusive install barrier.** nuraft pauses the receiver's RAFT apply, but that alone leaves work already
+   running (client writes, the commit path, the catch-up runner) free to change the journal or index during range
+   replacement. A write could even be acknowledged mid-install and then dropped at completion, so UBD's record of
+   who holds it would be wrong. So on object `0 | 0`, before replacing any range, the receiver raises a barrier: it
+   admits no new client IO (`OFFLINE`), stops the catch-up runner, answers peer fetches with an error, and flags
+   itself in poll replies so the leader does not count it as a data holder. Then it **drains** every write and
+   commit already admitted, including a `commit()` suspended on journal IO and the catch-up runner's in-flight
+   fetch-and-install, each completing or failing before the barrier is up. Every index mutation also carries the
+   volume's **install epoch**, which the barrier increments: a completion from before the barrier that still lands
+   afterwards finds a newer epoch and is discarded, so it can never overwrite a range the snapshot replaced. `P`
+   (requirement 7) is read after the drain, so every write the member acknowledged is at or below it. The barrier
+   holds until completion.
+6. **Resumable.** The receiver persists `{transfer identity (L, tuple digest), W, S, P, region cursor}` in a
+   superblock at each region boundary, after a checkpoint flush, so the cursor never runs ahead of durable data
+   (HomeObject's per-shard cursor). After a crash it reloads the context. It resumes after the cursor only if
+   object `0 | 0` carries the **same transfer identity**; a different `L`, or the same `L` with a different tuple,
+   restarts every region, because regions copied against one baseline cannot be completed against another.
+7. **Completion.** On the last object the receiver drops its **whole** journal: slots at or below `W` are
+   superseded by the snapshot, and slots above it may be an earlier session's (anything durable is fetched again).
+   It sets `journal_floor = W`, so a peer fetch below `W` gets `reclaimed_below` and a stale record can never be
+   served from it. It sets `commit_lsn = W`, `last_append_lsn = max(W, S)`, marks `(W, S]` minus the shipped
+   Empty verdicts as missing, merges the control state, clears its overlay and persists the snapshot context. The
+   control state is **merged, not adopted**. `session_term` and `aborted_upto` take the maximum of the local and the
+   shipped value. `fence_term` takes the maximum too, and is then **reconciled** with those committed outcomes: a
+   fence at or below `max(session_term, aborted_upto)` belongs to a login that has already ended, by a committed
+   `InternalLogin` or by an abort of that term or a later one, so it is lowered to `session_term`. Only a newer,
+   still unresolved fence stays raised, until replay applies the `InternalLogin` or `LoginAborted` that ends it. For
+   example, local `(session 7, fence 8, aborted 0)` and shipped `(7, 7, 8)` merge to `(7, 7, 8)`: the abort of 8 is
+   at or below `L`, and replay would never deliver it again. Adopting the older tuple instead would re-admit the old
+   session past a fence that is still unresolved.
+   Then it lifts the IO gate **for writes only**. Reads stay gated until its `commit_lsn` reaches
+   `G = max(W_hi, P)`, where `W_hi` comes from the trailer and `P` is the receiver's own `last_append_lsn` before
+   the install. Below `W_hi` a fuzzy region may hold a version newer than the read horizon, which `read_impl` does
+   not filter out of the base index. Up to `P` the member may have acknowledged writes that it just dropped, and the
+   client has no Missing entry for those. While gated it answers reads `NOT_ELIGIBLE`, so the client fails over.
+   The gate is durable: `P` is persisted with the context at the barrier (requirement 5), before any range is
+   replaced, and `G` with the completion. A restart restores the gate from the superblock and keeps it until
+   `commit_lsn` durably reaches `G`, so a crash between install and replay cannot reopen reads early.
+   RAFT entries after `L` then apply normally, and catch-up fetches `(W, S]` and beyond from any member over the
+   peer plane (block_mgr2, S9).
+8. **Integrity and throttling.** Batches are CRC-checked (G4). The batch byte budget is configurable (HomeObject's
+   `max_snapshot_batch_size_mb`, default 128 MB).
+
+**Bootstrap.** A joining member has no volume yet: `CraftGroupListener::craft_volume()` returns null until
+`CreateVolume` has built the local volume and `CraftReplDev`, and that RAFT entry may have been compacted away.
+So the listener handles object `0 | 0` itself when it has no volume: it creates the volume, journal and index from
+the metadata in that object and persists a creation superblock before it forwards any region object, so a restart
+mid-snapshot reopens the same volume instead of creating a second one. Every later object is forwarded to
+`CraftReplDev` as usual.
+
+**The donor is always the leader** (nuraft's choice). That costs the leader read bandwidth during a snapshot; it is
+accepted for now (G13).
+
+**Promotion gate (new and replacement members).** When the member change is committed, the leader records
+`gate_lsn` (the replica set's dLSN at that moment). The learner is promoted to voter only once it reports
+`commit_lsn ≥ gate_lsn`, which is the wiki's `commit_lsn ≥ startLSN` gate. It does *not* use nuraft's log-index
+monitor, which cannot see CRAFT data.
+
+**Reads during and after.** The member serves no reads while installing, and none after until its `commit_lsn`
+reaches the read gate `G` (requirement 7). Both are data-journal dLSNs; `L`, the snapshot's RAFT index, plays no
+part in read routing. Once past `G`, the client's usual checks apply: its synced `commit_lsn` against the login
+starting point, and the per-range Missing map. The client keeps broadcasting writes to a returning voter, which the
+member journals once the install has finished. A catching-up learner is not a client IO target (wiki,
+*Reconfiguration*).
+
+### 4.10 Detached operation: logout, lease, and the stand-in
+
+- **Lease detection:** each member arms a recurring `Watchdog` timer per active session, reset by every
+  term-valid IO or `keep_alive`. This finishes the "deferred seam" in `do_keep_alive`.
+- **Expiry on the leader:** the leader first runs a watchdog round (target `F_seen`, safe while the client may
+  still be alive). If the lease has fully expired, it proposes `InternalLogout{term}`. Once that commits, members
+  clear the session and reject old-term IO.
+- **Stand-in:** after `InternalLogout` commits, the leader runs **a login with no client**: a quiesce poll, a
+  round to `max(quorum.last_append)`, and `InternalLogin{token = 0, term + 1, rs}`. Reusing the login path means
+  the stand-in inherits its safety argument (quiesce plus apply-time truncation) instead of needing a separate
+  one. With no client attached there is no live tail, so the periodic trigger keeps healing laggards (target =
+  last `rs`) until the next real `InternalLogin`. Because the stand-in replaces the owner token with 0, the
+  previous client's re-login is a **fresh** login, not an owner-presented re-login (the wiki's "accept only the
+  current owner" rule). That is correct: its session ended at `InternalLogout`.
+
+### 4.11 Threading, persistence, observability
+
+**Threads.** The RAFT commit worker only applies (tombstones, truncation, session state, and raising the target);
+it never blocks on the network. A per-partition **resync task** runs both the leader's rounds and the follower's
+catch-up. Initially these are coroutines on a small shared executor; the peer RPCs become `async_result` (they
+already are at the interface; `sync_get` is used only at today's call sites).
+
+**Persistence and restart.** The partition state persists `{commit_lsn, last_append_lsn, session term, fence
+term, token, last_applied_raft_idx}` after every mutation (D12 covers install and
+tombstone). Persisting `last_applied_raft_idx` is what makes replay safe (D15): `echo_state_machine` returns it
+from `last_commit_index()`, so nuraft resumes after it instead of re-applying from index 0. The **catch-up target**
+(`sync_target`, the highest applied Sync watermark) is persisted with `last_applied_raft_idx`, and catch-up restarts
+from it during recovery. Otherwise a follower that applied `Sync(100)` and restarted before fetching the data would
+lose the target, could not replay the entry (its applied index is past it), and with no new writes the leader
+would not propose the same watermark again, so catch-up would stay stuck. The catch-up loop is idempotent
+(fill-only installs, tombstones are no-ops). A leader that restarts mid-round loses nothing, because a round has no effect
+until its entry commits.
+
+**Persistence (S8a).** `CraftDurableState` is written through a `CraftStateStore` (a HomeStore superblock in
+production) **ahead of** the in-memory change it protects:
+
+| Change | Persisted first | Why first |
+|---|---|---|
+| `InternalLogin` raises the fence | `fence_term` | A replica that restarts unfenced would admit the old session again. |
+| `InternalLogin` admits the term | `term`, `client_token` | Once a new-term write is acked, a re-applied login must be a no-op, not truncate it. |
+| `LoginAborted` lowers the fence | `aborted_upto`, lowered `fence_term` | The fence is lowered only once the abort is durable. |
+| `SyncRSCommitLSN` frees verdicted blocks | Empty verdicts, `sync_watermark`, `catch_up_target` | A re-applied Sync with no memory of its verdicts would free the same blocks twice. |
+| Apply queue finishes an entry | `last_applied_raft_idx` | Entries at or below it are not re-applied. |
+| A checkpoint that actually flushed | `durable_commit_lsn` | Restart resumes `commit` there; verdicts at or below it are dropped. |
+
+On restart `commit_lsn = durable_commit_lsn`, `last_append_lsn = max(journal tail, sync_watermark)`, and every slot
+above `commit_lsn` the journal does not hold (and is not Empty) is missing; catch-up resumes toward
+`catch_up_target`. Slots up to the journal tail are re-applied to the index without freeing the blocks they replace,
+because a checkpoint may already have put a newer slot's block there. That leaks a bounded number of blocks and never
+corrupts. A store or journal tail that cannot be read faults the partition instead of restarting it empty. The login poll's fence
+(PR C) must also be persisted before the poll is answered; that is a one-line follow-up once PR C and S8a are both in.
+
+**Observability.** Add to `replica_stats` and the REST endpoint: `sync_target`,
+`catchup_inflight_bytes`, `catchup_last_error`, `rounds_{proposed,partial,aborted}`, `journal_floor`, and
+`reclaimed_requests`. Logs: one INFO line per round (target, N, fills, empties, unresolved, duration) and one
+per catch-up completion.
+
+---
+
+## 5. Failure walk-throughs
+
+N = 3, members A, B, C, leader A unless stated.
+
+| Scenario | What happens | Outcome |
+|---|---|---|
+| **C missed writes 50–80 (suffix lag)** | The periodic round (target `F_seen = 90`) probes: A and B hold 50–80, so nothing is unresolved. A proposes `Sync(90)`. C's catch-up fetches `[50, 80]` from A in chunks and applies to 90. | C's `commit_lsn` certificate clears the client's Missing map, and C is readable again. |
+| **Write 100 lands on A only, B/C time out** | The client reports an error; XFS goes offline and the volume detaches. At the next login A holds 100, so the leader fills it everywhere. | The failed write completed late (benign false-include). |
+| **Write 100 lands on C only, C is down at the next login** | A and B lack 100 (a quorum, under the fence), so the login verdicts it Empty. C rejoins, applies the verdict and discards its copy before it applies `InternalLogin`. | Converged; no mid-session race to guard. |
+| **Write 99 in flight while 100 fails** | Nothing is verdicted mid-session, so 99 resolves through its own acks. | No acked write can be voided. |
+| **All three reject 101 deterministically** | The client resolves it Empty locally and reports the error; the next login verdicts it Empty on every replica. | `commit_lsn` passes 101 everywhere after login. |
+| **B missed the login (down)** | B rejoins and applies the entries it missed: the login's Sync tombstones, then `InternalLogin`, which truncates above `rs` and sets the session term. Catch-up fills up to `rs` and beyond. | Stale-session tail dropped before any new-term IO can be admitted (I5, with D2 and D14 fixed). |
+| **B was polled, then is slow to apply `InternalLogin`** | B's `fence_term` rejects the old session. B's session term has not changed yet, so it also rejects the new session's first writes (`stale_term`). The client gets its quorum from A and C. B applies the entry, truncates, admits the new term, and later legs land. | No new-session write is ever truncated (D14). B is briefly a straggler and heals through normal resync. |
+| **B restarts after many sessions** | nuraft resumes from B's persisted `last_applied_raft_idx`. Old `InternalLogin` entries are not re-applied. | No term rollback and no truncation above an old `rs` (D15). |
+| **Leader fails over, then a new login** | The new leader assigns `state_.term + 1` from replicated state, not from its own process counter. | Terms stay unique and monotonic, so fencing holds (D16). |
+| **Slow login while the old client is still writing** | Phase 1 pre-syncs the leader with nobody fenced. The fenced phase then takes about two round trips. If it still runs long (a slow RAFT commit), B and C **stay fenced** until `InternalLogin` is applied, so the zombie's writes are rejected and never acked. | No acked write is lost (I8; the C1 scenario). |
+| **Login leader crashes after fencing** | B and C remain fenced and reject both sessions. The new RAFT leader sees `fence_term > session_term` in its own state or its probes, commits `LoginAborted{term}`, and the old owner is re-admitted. Alternatively, the new client retries and the new leader runs a fresh login. | The owner is wedged only until a new leader is elected. If RAFT has no quorum, until it regains one (the accepted trade-off). |
+| **Leader change mid-round** | The old leader's proposal fails or never commits. Its probes carried the old RAFT term, so they are ignored. The new leader's next trigger runs a fresh round. | No partial verdict ever takes effect. Rounds are atomic at the entry. |
+| **C down for an hour (past retention)** | The RAFT log was compacted with the cleanup floor, so C is behind it and the leader's nuraft sends C a snapshot: control state and `W`, then every LBA region. C then fetches the writes above `W` from any member. The leader keeps C at priority 0 throughout. | Re-admitted when its `commit_lsn` certificate reaches the client's view. No promotion gate, because C is already a voter. |
+| **C online but its data path failed for hours** (current on RAFT) | Every RAFT entry was applied, but fetches kept failing until retention passed C, after which it gets `reclaimed_below` and says so in its probe replies. Compaction alone would never send C a snapshot, so the leader removes C and re-adds it as a learner (`replace_member`); nuraft then sends the snapshot as above, and C is promoted back once it passes the gate. | The C2 case: recovered, not stuck. C could not win an election meanwhile (priority 0). |
+| **The leader crashes mid-snapshot** | The new leader's nuraft sends C a snapshot of its own, with a new snapshot index. C sees the new index and starts over; every batch replaces its whole range, so what the old leader sent is overwritten. If C itself crashes instead, it resumes the same snapshot from its saved region cursor. | Correct, at the cost of a restart. |
+| **Client vanishes** | The watchdog round heals up to `F_seen`. The lease expires, `InternalLogout` commits, and the stand-in login converges everyone to `max(quorum.last_append)`. | The volume is fully converged before the next attach, so the next login is cheap. |
+
+---
+
+## 6. Alternatives considered
+
+**Resolving failed writes during the session** (client resend at the same dLSN, or a client-requested leader
+round with an explicit failed set and a verdict epoch). *Rejected:* the application (XFS) goes offline on a
+write error and the volume detaches, so keeping it alive to complete the write is not useful. The leader-round
+variant also brings races (D3, D4) that need a failed-set wire, a verdict epoch in every request, and read
+rejection on lagging replicas. Resolving at login removes all of it (§4.4–§4.5).
+
+**Followers fetch only from the leader.** Simpler, and the leader is guaranteed to hold every non-Empty slot ≤
+`N`. But it makes the leader's egress the catch-up bottleneck, which is the very thing CRAFT moved off the
+leader. *Kept as the first source, not the only one.*
+
+**Resolve per dLSN list (today's wire).** Lists are O(gap) and unbounded. Intervals are O(number of gaps) and
+match how gaps actually occur (contiguous outages). *Replaced.*
+
+**Region-level delta snapshots (later optimization).** A full snapshot ships the whole mapped volume even for
+a short outage on a large volume (10 GB of changes on 10 TB copies 10 TB). Survivors could keep a **dirty-region
+bitmap** for a member that stops reporting `commit_lsn` (DRBD-style, for example 1 bit per 1 MiB, about 1.25 MB for
+10 TB). They would set a bit on every apply, including zero writes, so unmaps are captured too. The snapshot would
+then ship only the dirty regions from the frozen tree, using range-replace chunks. That would make snapshot cost
+depend on regions touched, not volume size, and needs no per-entry dLSN in the index. A delta keyed on per-entry
+dLSN would *not* work: zero writes erase index entries, so unmaps would be invisible. *Deferred: the full B-tree
+snapshot is the baseline. Revisit once outage-length and volume-size data are available.*
+
+**A CRAFT peer-plane snapshot stream (the earlier option b′).** An earlier draft streamed the volume's mapped data
+(found by walking the B-tree) member to member over the CRAFT peer plane (`snap_begin` / `snap_chunk` / `snap_end`), with nuraft snapshots carrying control
+state only and a data-side trigger (`reclaimed_below`). It would let any healthy member be the source and would
+cover the C2 member without a membership change. *Rejected:* it is a second snapshot transport, with new wire ops,
+leases, pins and source selection, when nuraft already provides one on the volume's RAFT group, and the team's
+plan (`subtasks.md` S8, S10) specifies nuraft's snapshot callbacks modeled on HomeObject. The C2 member is handled
+by re-adding it as a learner instead (§4.9).
+
+**Other ways to force a nuraft snapshot for the C2 member.** Setting the follower's `receiving_snapshot` flag in
+`srv_state` (through our state manager and a group restart, or a small NuRaft fork API), or a leader-side fork API
+marking a peer as needing a snapshot. *Rejected for now:* both need NuRaft changes; `replace_member` already exists
+and is needed for S10 anyway.
+
+**Server-side fan-out variant** (`docs/peer-plane.md`, parked). It would make the peer plane hot. Nothing here
+forecloses it. Its `appended_upto` watermark is computable from the same Missing intervals §4.3 maintains.
+
+---
+
+## 7. Test plan
+
+**Unit (no network: `CraftReplDev` with `MockCraftJournalBackend` and stub `CraftPeerFetcher`s, `src/lib/craft/tests/`):**
+- Round decision table: every combination of held / absent / tombstone / non-responder over N = 3 and 5, for
+  fill-only rounds (no verdicts ever) and login rounds. Assert verdicts and `N`.
+- Tombstone overwrites held data; install never overwrites; a late write into a tombstone is rejected.
+- `InternalLoginMsg` JSON round-trip preserves `rs_commit_lsn` (regression for D2).
+- Monotonic `fence_term`, which is persisted and survives a restart. No timer lifts it; only an applied
+  `InternalLogin` or `LoginAborted` for its term does. `InternalLogin` after `LoginAborted` for the same term is
+  ignored. **The C1 scenario as a test:** delay `InternalLogin` past any former timeout while a zombie client keeps
+  writing, and assert that no zombie write is acked. Pre-sync converges in ≤ k passes under a steady write load.
+  A new-term write is rejected between the poll
+  and the `InternalLogin` apply (D14).
+- Replay: re-deliver old `InternalLogin` / Sync entries through `on_commit` after newer ones. Assert the session
+  term does not roll back and nothing above the latest `rs` is truncated (H6).
+- Ordering: a Sync followed by an `InternalLogin` installs the Sync's verdicts before the login truncates (H2).
+- `InternalLogin` v1 payloads still decode (no `rs`, no truncation); v2 truncates above `rs` (H1).
+- `peer` codec v2: ranges, continuation, `reclaimed_below`, truncated or malformed inputs.
+
+**Reference cluster (in-process, `make_local_cluster` fault knobs):**
+- Suffix lag and mid-gap holes heal and re-admit reads (assert `reads_served` shifts back).
+- A failed write is not resolved mid-session; the client issues no resolution request; the next login fills or
+  verdicts it.
+- Unanimous reject: after the next login, a tombstone everywhere and an advancing `commit_lsn`.
+- Large catch-up, more than 10 × `max_tx`, completes in chunks.
+
+**TCP and RAFT cluster (`tools/craft_test_driver`):**
+- Kill or restart a member during fio, then verify byte-for-byte convergence across members (new `verify`
+  command: hash the index per member at a quiesced `commit_lsn`).
+- Leader failover mid-round; member restart mid-catch-up; member down past retention leading to snapshot.
+- **Snapshot:** a member past retention is RAFT-log-behind after compaction and receives a nuraft snapshot,
+  then fetches the writes above `W`. A member current on RAFT but data-behind is re-added as a learner and recovers
+  the same way (the C2 case). The leader crashes mid-transfer and the receiver starts over with the new leader. The
+  receiver crashes and resumes from its region cursor. A corrupt object header or payload is detected and asked
+  for again. Empty verdicts in `(W, S]` reach the receiver, so a member holding a late copy of a voided slot does
+  not apply it. A member installing a snapshot rejects client IO and cannot become leader.
+- **Unit (mock journal and index):** the object id codec; the donor iterator (metadata, region batches at the
+  byte budget, resend, restart of a region, checksum mismatch re-read); the receiver (range replace, idempotent
+  resend, resume from the cursor, start over on a new snapshot index, completion state).
+- Thin check: zero writes stay unmapped after resync (`mapped_blocks` equal across members).
+
+Run the suites under TSAN (`tsan.supp` exists). The catch-up task, the commit worker, and the IO path share `mu_`.
+
+---
+
+## 8. Implementation plan
+
+> **Status (2026-11-18).** Overlaps with work merged meanwhile: A's apply ordering landed as #211 (InternalLogin v2
+> truncation and `LoginAborted` are not on `dev/v6.x`); B overlaps #206; C overlaps #212. S8a and S8b are closed.
+> The snapshot work is SN1–SN4.
+
+Each PR is small and testable with the existing mock scaffold (`src/lib/craft/tests/`). Target: **≥ 80% line
+coverage** for `src/lib/craft/` and for every function a PR adds or changes (the repo's `gcovr.cfg` threshold).
+
+| PR | Repo | Owner | Scope | Fixes |
+|---|---|---|---|---|
+| **A. RAFT-entry correctness** ([#196](https://github.com/eBay/HomeBlocks/pull/196)) | HomeBlocks | this work | Ordered apply queue in `on_commit` (no detach); Sync apply split into an ordered local part (verdicts, `commit_lsn`) and one serialized catch-up runner that re-checks each slot against new verdicts; InternalLogin apply raises a local fence and drains in-flight writes before truncating; keep raising `last_append_lsn` to `N` on Sync apply (I6); `InternalLoginPayload` v2 with `rs_commit_lsn` (v1 still decodes); `apply_internal_login` truncates above `rs` and sets the session term, with a replay guard; `session_term` / `fence_term` / `aborted_upto` / `last_applied_raft_idx` state; `LoginAborted` entry + apply; IO admission `hdr.term == session_term ≥ fence_term` | H1, H2, H4 (state), H5 (state), H6 (guards) |
+| **B. Pre-resolution safety** ([#197](https://github.com/eBay/HomeBlocks/pull/197)) | HomeBlocks | this work | `pre_resolve_slots(upto, may_verdict)`: count responders including the leader, Empty only at login with quorum-lacks evidence; a peer tombstone means "already resolved"; return the partial watermark | H3 |
+| **C. Quiesce** | HomeBlocks | this work | `get_rs_commit_lsn(term, is_login)` raises `fence_term` monotonically before reporting, ignoring a term at or below `aborted_upto`; reply carries both terms | H5 |
+| **D. Login + `append()`** | HomeBlocks | **S7/S9 owner** | Login per §4.6 (term from replicated state, pre-sync, fenced poll, final round that must reach `rs_commit_lsn` and count lacks only from fenced responders, Sync + `InternalLogin` v2, `LoginAborted` on failure; new-leader abort); `append()` as a fill-only round to `F_seen`. This doc is the contract | H8 (`append`) |
+| **E. Catch-up and fetch v2** | HomeBlocks + craft_client | this work, with S9 | Async catch-up with retry and backoff; chunked range fetch (`max_bytes`, continuation, `reclaimed_below`); term, session and partition fence on peer requests; periodic trigger; `peer.hpp` codec v2 + version bump | H4, H7, H8 |
+| **F. UBD side** | craft_client | this work | Stop calling `request_resolution` on a failed write; drop the connection on any send failure (D17); data digests on by default for peer traffic | D3, D4, D11, D17 |
+| **E1. Catch-up retry + range fetch** ([#200](https://github.com/eBay/HomeBlocks/pull/200)) | HomeBlocks | this work | Retry with backoff; range-based, byte-bounded `fetch_range` with continuation and `reclaimed_below` (callee side) | H4, H7 (callee) |
+| **S8a. Durable state + restart** | HomeBlocks | this work | `CraftStateStore` / `CraftDurableState` written ahead of each control change (§4.11); restart restores it and rebuilds the range from the journal; replay-safe re-apply; checkpoint trigger reports whether it flushed; Sync/catch-up advance goes through `commit()` | H6, H9 |
+| **S8b. Journal reclaim** | HomeBlocks | this work | Floor `min(durable_commit_lsn, all_committed_lsn)`; journal truncate below it; `fetch_range` reports `reclaimed_below` | — |
+| **SN1. Snapshot context** | HomeBlocks | this work | `CraftGroupListener` forwards the snapshot callbacks to `CraftReplDev`, and creates the volume from object `0 | 0` on a member that has none (bootstrap); `create_snapshot` / `last_snapshot` / `apply_snapshot` persist the context in a per-volume superblock | — |
+| **SN2. Snapshot donor** | HomeBlocks | this work | Object id codec, sealed object header, the region iterator in `read_snapshot_obj` (metadata, checksum-verified region batches, trailer with `W_hi`, resend and resume), `free_user_snp_ctx`; on the first object 0 of a context: pin `RetainFrom{W, L}`, wait for every journal source (not snapshot recipients) to apply it, then validate the retained tail, otherwise clear it and regenerate the snapshot; clear the pin when no transfer of `L` is active and every member reached `W` | — |
+| **SN3. Snapshot receiver** | HomeBlocks | this work | `write_snapshot_obj`: control-only install when `W` is below its own `commit_lsn` (uncertified tail dropped, reads gated); install barrier with drain and install epoch, range replace, resume on the same transfer identity only, resumable region cursor persisted after a checkpoint flush, completion (whole journal dropped, `journal_floor = W`, `commit_lsn = W`, `(W, S]` missing), IO gate while installing and a persisted read gate up to `G` after; control-state merge with fence reconciliation | — |
+| **SN4. Triggers** | HomeBlocks | this work | RAFT-log compaction following the cleanup floor (`trigger_snapshot_creation`); the C2 re-add as a learner (with S10) | C2 |
+| Later | HomeBlocks | tbd | Lease / `InternalLogout` / stand-in; membership promotion gate (S10) | — |
+
+PR A should land after the S7/S9 owner agrees the entry formats (`InternalLogin` v2, `LoginAborted`), because
+their login code proposes them.
+
+## 9. Gaps and risks
+
+This section lists what is still wrong, missing, or risky **in this design**. The code defects found in today's
+implementation are H1–H9 in §3.2 (HomeBlocks) and D1–D17 in Appendix A (reference server). Each gap gives its impact and how it should be handled. "Design" means this
+document should close it before implementation, "Defer" means it is accepted for now, and "Decide" means it needs an
+owner's call (§10).
+
+### 9.1 Design concerns
+
+These are weak points in the **design itself**, independent of today's code. C1 and C2 are inherited from the
+wiki, so they apply to any CRAFT implementation. The others are trade-offs this document introduced. They are
+ordered by how much they worry me.
+
+**C1. The login quiesce was safe only if timing cooperated. Decided: (a) + (d), see §4.6.** In the wiki a
+polled replica fences the old session but lifts the fence on a timeout ("a replica-side quiesce timeout … so a
+failed or partitioned login can never wedge the current owner"). Login truncation is safe only if no write above
+`rs_commit_lsn` was ever acked, and the fence guarantees that only **while it holds**. If it lifts first:
+
+```
+t0    new client N → leader A: login
+t1    A polls B, C: each fences old client Z, reports last_append.  rs_commit_lsn = 100.  Timers start.
+t2    A is still busy (filling its own gap in Phase 1b, slow RAFT commit, a pause) for longer than the timeout
+t1+T  B and C time out together (polled together, same timeout) and lift their fences
+t3    zombie Z writes dLSN 101 → B and C ack → quorum → Z tells its application "durable"
+t4    InternalLogin(rs = 100) is applied on B and C → truncate above 100 → 101 deleted
+t5    N writes its own, different, dLSN 101
+```
+
+An acked write is lost **with zero failures**. No ordering of the steps saves it: without the truncation, the
+slot reuse at t5 would put two different writes under one dLSN, which is divergence. It needs (1) a zombie old
+client that still reaches the replicas (the normal failover shape), (2) a quorum lifting together (they do,
+because they were polled together), and (3) a login slower than the timeout. (3) is realistic: Phase 1b makes a
+lagging leader fetch its whole gap *inside* the fenced window, while the timeout is sized to a few round trips.
+The wiki leans on the CSI hard fence as the real protection, but a slow login during a messy failover is exactly
+when CSI is most likely to be late.
+
+| Option | Verdict |
+|---|---|
+| (a) Lift the fence only on a committed `InternalLogin` / `LoginAborted`; a new leader aborts unfinished logins | **Adopted.** Safe by construction (I8). Cost: the old owner stays fenced if a login fails while RAFT has no quorum. |
+| (d) Pre-sync the leader before fencing, iterating until the remaining delta is small | **Adopted.** Keeps the fenced window to about two round trips, so (a)'s stall is short in the normal case. |
+| (b) Make the CSI hard fence mandatory and the quiesce redundant | Rejected as the *only* protection. CSI stays as a second line of defense. |
+| (c) Keep the timeout | Rejected: unsafe whenever a login is slower than the timeout. |
+
+This **changes the wiki** (open question 6).
+
+**C2. "The RAFT log is the snapshot trigger" misses a member that is current on RAFT but behind on data.
+Decided: re-add it as a learner, see §4.9.** Each member has two independent positions: its **RAFT position** (how many of
+the small control entries it has applied) and its **data position** (`commit_lsn`). In classic RAFT they are the
+same thing, because the data is the log. CRAFT moves the data out of the log, so they diverge. Applying
+`SyncRSCommitLSN(N)` takes a microsecond, while fetching the data up to `N` can take a long time or keep failing:
+a slow disk, a broken data path, or the retention cap overtaking a slow member. nuraft sends a snapshot only to a
+follower behind the compacted RAFT log, so such a member would get `reclaimed_below` on every fetch and **never
+receive a snapshot**. It would be stuck permanently, silently reducing the volume to two copies while still
+voting. Worse, if it became RAFT leader, every login and every round would fail, because the leader must fill
+itself first.
+
+**Resolution.** Snapshots go through nuraft (§4.9), and compaction follows the cleanup floor, which covers every
+member that is behind on RAFT. For the member that is current on RAFT but past retention on data, the trigger is
+data-side: it reports `reclaimed_below` in its probe replies, and the leader removes it and re-adds it as a learner
+through HomeStore's `replace_member`, which makes nuraft send it a snapshot. A data-behind or snapshot-receiving
+member gets nuraft priority 0, so it cannot become leader. Options considered: a CRAFT peer-plane snapshot stream
+(the earlier option b′), forcing a nuraft snapshot through the follower's `receiving_snapshot` flag or a
+leader-side fork API, and never letting retention pass a live member (§6).
+
+**C3. The verdict epoch reconnected the data path to consensus. Resolved: no mid-session verdicts (§4.5).** The
+epoch, and with it the read rejection on replicas lagging on RAFT, are gone.
+
+**C4. Healing depends on the leader hearing the client.** `F_seen` comes only from IO the leader receives. If
+the leader holds RAFT but cannot reach the client, periodic rounds stay at a stale `F_seen`. Fix, cheap: every
+member reports the highest `client_hdr.commit_lsn` it has seen in its probe reply, and the leader takes the max.
+Any such value came from the client, so it is safe. This should go into §4.1/§4.2.
+
+**C5. Trusting client-reported facts. Mostly resolved.** Mid-session rounds only fill, so a wrong `F_seen` can
+no longer void an acked write; it can only delay or over-request healing. Empty verdicts come only from login,
+under the fence.
+
+**C6. Retention pins had no owner and no expiry. Resolved.** The earlier design pinned every member's journal
+through a replicated `retain_from` with no way to drop it, so a dead snapshot target could freeze that pin
+indefinitely. The pin is back (§4.8), because a learner's progress is not in `all_committed_lsn` and voters could
+otherwise reclaim the writes above `W` mid-transfer, but now it has an owner and an expiry: the leader proposes it
+per snapshot context (pin first, then validate the tail), clears it once no transfer of that context is active and
+every member reports `commit_lsn ≥ W`, and the retention cap drops it if a receiver goes silent (that receiver's
+next snapshot starts over).
+
+**C7. Tombstones above the watermark. Resolved:** verdicts happen only at login and are always ≤ `N`, as in the
+wiki.
+
+**C8. Many interacting mechanisms, none verified together.** Fewer now: the fence/session term split,
+`LoginAborted`, pre-sync, `F_seen`-bounded fill rounds, compaction following the cleanup floor, the IO gate during
+snapshot receive, idempotent replay, and partial-progress rounds. Their combination is still unproven. Before
+PR 2, write a model (TLA+ or P), check I1–I8 under loss, delay, reordering and crash, and prefer the simpler
+mechanism wherever safety is equal.
+
+**C9. Snapshot economics (accepted).** A full copy of the mapped volume, always served by the leader (nuraft's
+choice), and possible non-convergence under a sustained write rate. The fuzzy read needs no pinned checkpoint, so
+the leader's space does not grow during a transfer. Region deltas are deferred (§6), and the policy for
+non-convergence is open question 10.
+
+### 9.2 Safety and correctness
+
+| # | Gap | Impact | Handling |
+|---|---|---|---|
+| **G1** | **Data quorum versus voter quorum is not distinguished.** The doc says "quorum" everywhere. In skinny mode (N data < M voters), an Empty verdict, the probe quorum, and `all_committed_lsn` must count **data members only**, while RAFT commit counts voters. | As written, an arbiter's "I don't have it" would count as lacks-evidence: the classic arbiter bug, which the wiki rules out by construction. | **Design.** Define `Q_data` (majority of N) and `Q_raft` (majority of M). Every rule in §4.2 and §4.8 uses `Q_data`. Arbiters are never probe or fetch targets. |
+| **G2** | **The peer plane is unauthenticated and shares the client port.** `fetch_data` and `get_rs_commit_lsn` run on `craft_tcp_server` with no session check, no peer authentication, and no RAFT-term check. | Anyone who can reach the port can **read any journal slot** (data exfiltration). They can also send `get_rs_commit_lsn{is_login, term=X}` to **freeze IO** for the quiesce window, repeatedly, and (with D6) **set the term to an arbitrary value**. `create_volume` is equally open. | **Design.** Use a separate peer listener, or require mutual authentication (a per-cluster credential) on peer connections. Reject peer ops on client-session connections. Validate `leader_raft_term` (§4.7). Fold into PR 1. |
+| **G3** | **No divergence detection.** Nothing compares replicas. | Every defect class found here (D1, D2, D4, D14) causes **silent** divergence, and nothing would notice until a failover serves wrong data. | **Design.** Add anti-entropy: a periodic per-LBA-range digest compared across members at a common, quiesced `commit_lsn` (the leader drives it, like a round), plus a metric and alert. In tests, a byte-exact verifier (§7). |
+| **G4** | **No end-to-end data integrity on resync.** Wire data digests are optional. `fetch_data` and the snapshot copy whatever the holder has, with no verification. | Corruption on one member (media or bug) **propagates** to the members it heals. | **Design.** Make the data digest mandatory on peer-plane traffic. Verify a per-block checksum, if the store keeps one, on fetch or snapshot read. Otherwise record it as a store requirement. |
+| **G5** | **"Never delivered" is a load-bearing transport contract.** The client's provably-empty conclusion, and therefore Empty verdicts at or below `F_seen`, rely on `REPLICA_DOWN` meaning the write provably never reached the replica. The blocking TCP transport honors this: a send failure is "down", while recv, closed, or malformed is a timeout (`tcp_replica.cpp:49`). The async transport currently **violates** it (D17). | If any transport, such as the planned pipelined io_uring transport or a `SEND_ZC` edge case, reports "down" for a write that landed, the client treats the slot as Empty while a replica holds it. The periodic round then **fills** it, and reads can go newer then older (a read-stability violation). | **Design.** State it as a transport requirement in `docs/transport.md`, with a conformance test per transport. |
+| **G6** | ~~RESOLVE when the client cannot reach the leader~~ | — | **Removed** with the client-requested round (§4.4). |
+| **G7** | ~~Coarse read rejection under the verdict epoch~~ | — | **Removed** with the verdict epoch (§4.5). |
+| **G8** | **No formal model.** The fixes interact: fence/session split, `LoginAborted`, pre-sync, snapshot sessions and pins, apply suspension during snapshot receive, replay idempotence. | D3, D4 and D14 were ordering races found only by reading. The fixes may have their own. | **Design.** Write a TLA+ or P model of login, resolution, catch-up and snapshot before PR 2. Model-check I1–I7 under message loss, delay, and crash. |
+| **G9** | **The wiki and this doc disagree** until the protocol changes are upstreamed: failed writes resolved at login only, the fence/session term split, snapshot triggering by compaction plus the learner re-add for C2, and the IO gate during snapshot receive. | A HomeBlocks implementer following the wiki would rebuild D3, D4 and D14. | **Decide** (open question 6). |
+
+### 9.3 Performance and resources
+
+| # | Gap | Impact | Handling |
+|---|---|---|---|
+| **G10** | **Journal replay copies history.** Every version of every slot in the gap is shipped and applied. | Hot-overwrite workloads replay much more than what actually changed. | **Defer.** The tier is chosen by retention only (§4.9). |
+| **G11** | **Snapshot cost scales with the whole volume, and the leader serves it.** | Multi-TB copies take hours and load the leader's disk and NIC while it also serves IO and consensus. | **Defer** region-level deltas (§6). **Design** a byte-rate limit on `read_snapshot_obj`. |
+| **G12** | **A snapshot may never converge** under a sustained write rate. | The member never rejoins, and the source's journal pin keeps growing (one member, lease-bounded). | **Decide** (open question 10). |
+| **G13** | **No QoS.** Catch-up and snapshot traffic are unthrottled against client IO, or they starve behind it. | Latency spikes during resync, or resync never finishes. | **Design.** Token-bucket limits per partition and per node, with a floor that guarantees progress. |
+| **G14** | **Journal growth while a member lags or a snapshot is pinned.** Every member holds the journal. | Risk of a full disk on healthy members. | **Design.** A journal budget per partition, an alert, and the retention cap (open question 7 decides who owns it). |
+| **G15** | **No defaults for any configuration value:** probe timeout, periodic K/T, watchdog `T_ka`, backoff, `R`, freeze bound, chunk size, in-flight bytes. | The design cannot be sized or reviewed for latency or space. | **Design.** A defaults table, after measurements on the test cluster. |
+
+### 9.4 Operations and lifecycle
+
+| # | Gap | Impact | Handling |
+|---|---|---|---|
+| **G16** | **Disk full or allocation failure** during catch-up or snapshot receive is unspecified. | Undefined state and possible partial installs. | **Design.** Abort the task, keep the member read-ineligible, report it in stats, alert, and retry with backoff. Never advance `commit_lsn` past an uninstalled slot. |
+| **G17** | **Shutdown and cancellation** of resync tasks, in-flight rounds, and snapshots are not specified, nor is deleting a partition mid-resync. | Hangs or use-after-free at teardown (the current code already uses detached threads and coroutines). | **Design.** Cancellation tokens per partition. Rounds have no effect until their entry commits, so cancelling one is always safe. |
+| **G18** | **Rolling upgrade and versioning.** Three wire changes (`client_hdr` v2, `resolve` v2, peer v2) and new RAFT-entry fields (`LoginAborted`, the metadata snapshot, …). `from_json` uses `j.at()`, so an entry missing a field **throws** and is dropped. | Mixed-version clusters either fail to decode or silently ignore safety fields. | **Design.** Version every RAFT entry, default absent fields on decode, negotiate the wire version at LOGIN/HELO, and define the upgrade order (servers first). |
+| **G19** | **Observability has no alerts or SLOs.** | Lag, stalls and divergence are invisible in operation. | **Design.** Alerts on: member lag (dLSN and bytes), time since last `commit_lsn` advance, unresolved-want age, re-freeze count, journal budget, digest mismatch (G3). |
+| **G20** | **`CraftReplDev` state is not persisted** (H6). | Fences, terms and the snapshot cursor are lost on restart until S8. | **Fixed** by S8a (§4.11), except the production superblock store and the login poll's fence (follow-ups). |
+| **G21** | **One partition per process** (D13). | The peer wire is ready (it carries `partition_id`), but the server is not. | **Decide** (open question 5). |
+
+### 9.5 Small specification holes
+
+- ~~**Snapshot resume across a leader change.**~~ Resolved: the receiver resumes only the same transfer identity,
+  `L` plus the control tuple's digest, and otherwise starts over (§4.9 requirement 6). `L` alone is not enough,
+  since two leaders can hold different data watermarks at the same RAFT index.
+
+## 10. Open questions
+
+1. ~~**Wire versioning.**~~ Moot: `client_hdr` v2 is no longer needed. Peer-plane v2 still needs a version
+   (G18).
+2. ~~**Failed-set size.**~~ Moot: failed writes are resolved at login (§4.4).
+3. **Peer transport for HomeBlocks.** Use the craft TCP binding, or HomeBlocks' existing inter-node RPC? The
+   codec is shared either way, and the decision belongs with the HomeBlocks binding.
+4. **`F_seen` after leader change.** Starting at `L` delays healing until the first IO. Should the new leader
+   probe the client-visible `all_committed_lsn` instead? (It is not a frontier, so probably not.)
+5. ~~**Multi-partition reference server (D13).**~~ Moot for HomeBlocks: one `CraftReplDev` per partition. Peer
+   requests still need a partition id (PR E).
+6. **Wiki follow-up.** Upstream these to *CRAFT Design*, because they refine the protocol, not just this
+   implementation: failed writes resolved at login only, never mid-session (§4.4–§4.5); §4.6 (fence term separate from session term; the wiki's quiesce text does not say which term a polled replica
+   admits); and **C1's decision**: no quiesce timeout, the fence lifts only on a committed `InternalLogin` /
+   `LoginAborted`, plus pre-sync before fencing; and the **snapshot triggers**: RAFT-log compaction follows the journal cleanup
+   floor, and a member current on RAFT but behind on data is re-added as a learner.
+7. **Retention cap ownership.** Should the leader decide when a member is relegated to baseline (it sees every
+   member's progress in probes) instead of each member capping locally (§4.8)?
+8. ~~**Read rejection granularity.**~~ Moot: no read rejection (§4.5).
+9. **Snapshot receive: wipe or merge?** Merge is the likely choice: apply range-replace chunks onto the
+   receiver's existing B-tree, so an interrupted transfer resumes without starting from empty. The alternative is
+   to wipe and rebuild into a staging tree, then swap. Range-replace semantics (§4.9 requirement 2) keep both
+   correct.
+10. **Snapshot vs write rate.** What limit on transfer time or size triggers a re-freeze, and what happens when a
+    snapshot never catches up: alert, temporarily throttle client writes, or neither?
+11. ~~**Data-behind but RAFT-current members (C2).**~~ **Decided:** nuraft snapshots throughout; such a member is removed and re-added as a fresh learner, with priority 0 while behind. See §4.9. The HomeStore mechanism is open question 14.
+12. ~~**Verdict delivery (C3).**~~ **Decided:** no mid-session verdicts; failed writes are resolved at login (§4.4–§4.5).
+13. ~~**Quiesce release (C1).**~~ **Decided:** (a) lift the fence only on a committed outcome, plus (d) pre-sync before fencing. See §4.6 and I8.
+14. **Forcing a snapshot for a RAFT-current member (C2).** `replace_member(C, C)` keeps C's RAFT state, so nuraft
+    sends no snapshot. Does HomeStore support `remove_member(C)`, wiping C's local group state, then re-adding the
+    same member id as a learner? Or does it need an explicit force-snapshot call? Check against HomeStore before
+    SN4.
+
+---
+
+## Appendix A: craft_client reference server defects
+
+These describe craft_client's in-memory reference server (`RaftReplica`), not HomeBlocks.
+
+**In one sentence:** resync is built **only as part of login**. The leader fills itself, proposes
+`SyncRSCommitLSN`, and followers fetch their holes when they apply it. The peer RPCs (`get_rs_commit_lsn`,
+`fetch_data`) run over TCP. **Missing:** any resync during a session (periodic or watchdog triggers, retry,
+chunking), a correct client-requested round on the RAFT server, journal reclaim, snapshots, and lease/stand-in.
+Its defects are listed below (A.2) for the reference server's own maintenance.
+
+### A.1 The pieces
+
+| Concern | Where | State |
+|---|---|---|
+| Leader resolution (Phase 1b) | `RaftReplica::resolve_and_apply` (`src/raft/raft_replica.cpp:357`) | Brute force: asks every peer for the whole missing list with payloads, then decides per slot |
+| Propose watermark | `RaftReplica::sync_rs_commit_lsn` (`:424`) | All-or-nothing: fails the whole round if any slot is unresolved |
+| Follower catch-up | `RaftReplica::apply_sync` (`:594`) | Applies verdicts, then pulls serially from peers with blocking `sync_get` **on the RAFT commit worker** |
+| Missing computation | `RaftReplica::get_missing_slots` (`:340`) | Explicit list of every absent dLSN in `(commit_lsn, N]` |
+| Peer verbs | `craft_peer` (`include/craft/peer.hpp`), `CraftTcpPeer` (`src/net/tcp_peer.cpp`), `craft_tcp_server::on_fetch_data` / `on_get_rs_commit_lsn` (`src/net/tcp_server.cpp:383,406`) | Opcodes 17–20 allocated. No partition id, no term, no size cap, no chunking |
+| Client-requested round | `craft_client::request_resolution_round` (`src/client.cpp:250`), then `craft_tcp_server::on_resolve` (`src/net/tcp_server.cpp:303`) | Server side runs **N=1 local resolution** (`srv_resolve`, then `do_resolve_local`) on every member |
+| Reference model round | `MemTransport::run_resolution` (`src/mem/cluster.cpp:371`) | Correct shape (leader-only, quorum-lacks), synchronous and in-process |
+| Triggers | n/a | Login and the client request only. No periodic, watchdog, or stand-in trigger |
+| Reclaim / snapshot | `do_keep_alive` ("deferred seam"); `echo_state_machine` snapshot callbacks are no-ops | Not started |
+| Client side | `dlsn_tracker`, `read_route_map` | Built: Missing map, `advance_synced` certificate pruning, `all_committed_lsn`, resolution want and retire |
+
+### A.2 Defects found while reviewing
+
+These are ranked by severity. Several need fixing before any of the §4 design work makes sense. They are the
+first PR in §8.
+
+| # | Severity | Defect | Consequence |
+|---|---|---|---|
+| **D1** | **Critical** | `on_resolve` calls `srv_resolve`, so every member that receives the client's **broadcast** RESOLVE unilaterally verdicts **every local hole ≤ `upto`** as Empty and advances `commit_lsn` (`src/net/tcp_server.cpp:313`, `src/mem/replica.cpp:326`). The function was designed for the N=1 standalone server, and `RaftReplica` does not override it. | A member that merely *missed* an acked write tombstones it: permanent divergence (violates I1). The tombstone then spreads. `resolve_and_apply` counts a peer's `is_empty` as lacks-evidence (`raft_replica.cpp:398`), and `apply_sync` installs a peer's Empty with `cold_mark_empty`. Every member answers OK instead of `NOT_LEADER`. |
+| **D2** | **High** | `to_json(InternalLoginMsg)` drops `rs_commit_lsn` (`src/raft/raft_state_machine.hpp:47`). The committed entry decodes it as −1, so `internal_login` **never truncates** (`raft_replica.cpp:658`). | Violates I5. A stale-session tail survives login. Such a tail exists on any member whose `last_append_lsn` exceeds `rs_commit_lsn`, typically one that did not answer the login poll. Its slots are reused by the new session, and a member that missed new write *d* but holds stale *d* (a) applies the stale data when the client's piggybacked `commit_lsn` passes *d*, and (b) serves the stale data as a fill to `fetch_data`. |
+| **D3** | **High** | The client-requested round resolves "every unresolved slot ≤ `upto`", and `retire_upto` retires **in-flight** slots off the reply (`src/dlsn_tracker.hpp:152`), yet the write coroutine still returns success at quorum (`src/client.cpp`, `acks >= quorum()`). | A slot still in flight below a failed one can be verdicted Empty, then reach a quorum ack, so the app sees success for a voided write (violates I2). The window is narrow in `MemTransport` (peek and mark are not atomic) and wide over RAFT (the tombstone exists only after async apply). |
+| **D4** | **High** | The verdict and the client's commit race: the client advances `F` past a verdicted-Empty slot as soon as the round replies, and piggybacks it. A member that holds a late copy and has not yet applied the Sync entry applies the copy. | Violates I3. Divergence. The wiki's "resolved-prefix" argument assumes the verdict reaches every member before the client's commit does, and asynchronous RAFT apply does not guarantee that. This is a protocol-level gap, addressed in §4.5. |
+| **D14** | **High** | The login quiesce poll sets `state_.term` to the **new** term (`raft_replica.cpp:297`), so it does two things at once: it fences the old session *and admits the new one*, before `InternalLogin` is applied (and therefore before truncation). | Once D2 is fixed, a new-session write *d > rs* accepted by B before B applies `InternalLogin` is erased by that apply's truncation. The client believes B holds *d*, and reads of that range routed to B return older data. Both D2 and D14 must be fixed together (§4.6: separate fence term from session term). |
+| **D15** | **High** (latent until D2 is fixed) | `echo_state_machine::last_commit_idx_` starts at 0 and is not persisted (`raft_state_machine.hpp`), so after a restart nuraft **re-applies every entry** in the log store. | A replayed `InternalLogin` rolls the term back, and once D2 is fixed it truncates above an **old** `rs_commit_lsn`, deleting newer acked writes on that member. Apply must be idempotent: persist the last applied index, or guard with `m.term > state_.term`. |
+| **D16** | **High** | The login term comes from a **per-server, in-memory counter**: `session_term_ = ++next_term_`, starting at 0 (`tcp_server.cpp:131`, `tcp_server.hpp:73`). It is not derived from the replicated session term. | After leader failover or a restart, a new leader issues terms equal to or lower than the current one. Combined with D6, term fencing (which all resync safety leans on) is broken. The term must be `state_.term + 1` from replicated state, assigned by the leader. |
+| **D17** | **High** (low probability) | **The async client transport can desynchronize the stream.** `craft_async_conn::ring_send_all` loops over partial sends and returns `-EAGAIN` if no SQE is free, possibly *after* part of the frame is already on the socket (`src/net/async_conn.cpp:132`). `round_trip` then returns `net_error::send` **without dropping the connection** (`:217`). `net_to_error` maps that to `REPLICA_DOWN`, "never delivered" (`tcp_replica.cpp:51`). | The next request's bytes follow a half-sent frame. The server can parse a write whose header is intact but whose payload includes the next message's bytes, and data digests are off by default (`wire::digest_cfg{}`), so nothing catches it. That replica journals **corrupt data** at a dLSN the client recorded as never delivered. The replica never re-fetches a slot it already holds, so once its `commit_lsn` certificate clears the client's Missing entry, reads serve the corrupt data. If every leg hits this, the client's provably-empty conclusion is also false. Fix: on any send failure, `fail_all()` and `drop_fd()`, so the partial frame dies with the connection and "never delivered" holds. Enable data digests on both planes. |
+| **D5** | Medium | The login leader snapshots **its own** `{commit, last_append}` without quiescing itself (`raft_replica.cpp:483`). Only peers set the new term. | A write acked by {leader, B}, with B absent from the poll quorum, can land on the leader after its snapshot. Then `rs_commit_lsn` misses it, and truncation (once D2 is fixed) drops an acked write. |
+| **D6** | Medium | The quiesce poll sets `state_.term = term` unconditionally (`raft_replica.cpp:297`), with no monotonic check. | A delayed or duplicated poll from an older login can roll the term back. |
+| **D7** | Medium | `do_fetch` returns iovecs that borrow the journal slot's buffer **after `mu_` is released** (`src/mem/replica.cpp:300`). `on_fetch_data` serializes them later. A concurrent `cold_mark_empty` or truncate can drop the last reference. | Use-after-free under concurrent resync and login. Fix: populate `JournalSlot::owned_data`, which is a refcount bump, not a copy. |
+| **D8** | Low (verify) | `CraftTcpPeer` drives one blocking connection with no lock, shared by every user of the registry entry. All non-ok statuses map to `INTERNAL`. | Concurrent use is possible (the leader's `apply_sync` worker alongside a login on the server thread) but rare on today's paths, because the leader's own `apply_sync` normally has nothing to fetch. It becomes real once §4.3 runs rounds and catch-up concurrently. |
+| **D9** | Medium | No size bound: the request is one i64 per missing dLSN, and the response must fit `k_default_max_tx` (`tcp_peer.cpp`, `TODO` at `tcp_server.cpp:407`). | Catching up a long suffix (for example a member down for minutes) fails on every retry. The exact error depends on which side rejects first. |
+| **D10** | Medium | Catch-up runs **synchronously on the single RAFT commit worker**, and an unfilled slot has **no retry**: nothing proposes another Sync until the next login. | A stalled member stays stalled. On a follower, every later entry (including that member's `InternalLogin` apply) queues behind blocking peer RPCs. The leader is mostly unaffected, because it filled itself before proposing. |
+| **D11** | Medium | A **provably-empty** slot (unanimous deterministic reject) is resolved locally by the client, but no replica ever tombstones it (`client.cpp`: `if (!provably_empty) request_resolution_round`). | Every member's `commit_lsn` pins just below it forever, so no journal reclaim, no Missing-map pruning, and the overlay grows. |
+| **D12** | Low | `apply_sync` ignores `client_token`. `cold_install_slot` and `cold_mark_empty` do not call `on_state_changed()`, so the `last_append_lsn` bump is not persisted. Snapshot callbacks report success while doing nothing (`raft_state_machine.hpp:88`). | Latent. The snapshot no-op becomes critical the moment log compaction is enabled, because a follower would skip `InternalLogin` entries. |
+| **D13** | Note | Peer ops carry no partition id. `RaftReplica`'s journal is keyed by replica, not partition, so the reference server is effectively one partition per process. | Out of scope here, but every v2 peer message below carries `partition_id` so the wire does not need another change later. |
+
+**D3, D4 and D11 no longer need fixes:** they all come from resolving failed writes mid-session. That path is
+removed (§4.4–§4.5): the client-requested round is dropped, and failed slots are resolved only at login.
+
+`docs/peer-plane.md` is stale: it still says "no peer opcodes allocated". It should be updated alongside this
+work.
+
+---
