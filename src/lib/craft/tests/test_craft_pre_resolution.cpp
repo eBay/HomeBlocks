@@ -1050,9 +1050,10 @@ protected:
         serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
+    // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
     void commit_login(uint64_t term) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        serialize_internal_login(key.data(), /*client_token=*/7, term, /*rs_commit_lsn=*/-1);
+        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
         commit_entry(CraftEntryType::InternalLogin, key);
     }
 };

@@ -710,8 +710,9 @@ private:
     // Login step 4, leader-only, under watermark_mu_: proposes InternalLogin{the new client's token, term + 1,
     // rs_commit_lsn} and waits for it to apply, which installs the new session. term is the session the login
     // replaces. Fails STALE_TERM if that session is already gone, an earlier InternalLogin took term + 1 first, or a
-    // newer one has already committed behind it, INTERNAL_ERROR if the partition is or becomes faulted, and otherwise
-    // with propose_entry()'s error (NOT_LEADER, timed_out: the entry may still commit, ...).
+    // newer one has already committed behind it, NO_QUORUM if a Sync committed ahead of it moved the watermark past
+    // rs_commit_lsn (another leader's, after a leadership change), INTERNAL_ERROR if the partition is or becomes
+    // faulted, and otherwise with propose_entry()'s error (NOT_LEADER, timed_out: the entry may still commit, ...).
     async_status login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                uint64_t term);
 
@@ -752,7 +753,8 @@ private:
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
-    // empty_slots, an InternalLogin's write fence) and queues the rest. Under apply_mu_, so once stop_apply() has run,
+    // empty_slots, an InternalLogin's write fence, or its rejection if a committed Sync is past its watermark) and
+    // queues the rest. Under apply_mu_, so once stop_apply() has run,
     // nothing changes.
     void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
     std::optional< PendingApply > next_apply();

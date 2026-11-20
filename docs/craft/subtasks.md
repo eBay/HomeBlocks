@@ -139,7 +139,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 
 **InternalLogin:**
 - RAFT entry carries `{client_token, term, rs_commit_lsn}` (`rs_commit_lsn` added by S7)
-- On apply, if `term` is newer than `state.term`: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5). An entry whose `term` isn't newer (a replay, or a login that lost its term to an earlier one) is ignored outright, and its proposer gets `STALE_TERM`
+- On apply, if `term` is newer than `state.term`: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5). An entry whose `term` isn't newer (a replay, or a login that lost its term to an earlier one) is ignored outright, and its proposer gets `STALE_TERM`. An entry whose `rs_commit_lsn` is below the watermark of a `SyncRSCommitLSN` committed ahead of it (another leader's, after a leadership change mid-login) is rejected at commit, in log order, without fencing the old session; its proposer gets `NO_QUORUM`
 - All subsequent IO with a different `term` is rejected
 - Proposed immediately after `SyncRSCommitLSN` commits during login
 

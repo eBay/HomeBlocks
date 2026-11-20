@@ -170,9 +170,10 @@ protected:
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
+    // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
     void commit_login(uint64_t term) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        serialize_internal_login(key.data(), /*client_token=*/7, term, /*rs_commit_lsn=*/-1);
+        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
         commit_entry(CraftEntryType::InternalLogin, key);
     }
     void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
@@ -749,6 +750,22 @@ TEST_F(CraftLoginTest, InstallFailsStaleTermWhenANewerLoginCommittedBehindIt) {
     EXPECT_EQ(dev_->term(), 1u); // ours did install
     EXPECT_EQ(dev_->client_token(), 42u);
     dev_->resume_apply();
+}
+
+// Across a leadership change, another leader's Sync past the login's watermark commits ahead of its InternalLogin:
+// the session would start below committed slots, so the entry is rejected.
+TEST_F(CraftLoginTest, InstallFailsNoQuorumWhenASyncPassedTheWatermarkAheadOfIt) {
+    dev_->seed_lsns(7, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        commit_sync(/*rs_commit_lsn=*/7);
+        loop_back(proposer_, *dev_, h, k);
+    };
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->term(), 0u);
 }
 
 // A newer login has committed but not yet applied: the fence has risen though the session term hasn't.

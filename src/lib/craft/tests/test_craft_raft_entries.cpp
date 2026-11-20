@@ -39,6 +39,7 @@
 //   - a wrong-size key or one of another version is rejected, state untouched
 //   - a newer InternalLogin replaces the session; one whose term isn't newer is ignored outright, and its
 //     proposal fails STALE_TERM
+//   - one whose watermark is below a Sync committed ahead of it is rejected at commit, without fencing
 //   - once applied, write()'s term-fence check reflects the new term end-to-end
 //   - InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- old or
 //     new token, the apply proceeds the same either way
@@ -945,6 +946,47 @@ TEST_F(CraftRaftEntriesTest, IgnoredInternalLoginFailsItsProposalStaleTerm) {
     EXPECT_EQ(lost->error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
+// Another leader's Sync(7), committed ahead of an InternalLogin that settled at 5 (a leadership change mid-login):
+// the session would start below committed slots, so the entry is rejected at commit. It doesn't fence the old
+// session either: a write at its term still goes through.
+TEST_F(CraftRaftEntriesTest, InternalLoginBelowACommittedSyncIsRejected) {
+    dev_->seed_lsns(7, {});
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, /*empty_slots=*/{});
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/42, /*term=*/1, /*rs_commit_lsn=*/5);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->client_token(), 0u);
+    auto w = homeblocks::detail::sync_get(
+        dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/8,
+                    /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}));
+    EXPECT_TRUE(w.has_value()) << w.error().message();
+}
+
+// At the committed watermark it installs as usual.
+TEST_F(CraftRaftEntriesTest, InternalLoginAtTheCommittedWatermarkInstalls) {
+    dev_->seed_lsns(7, {});
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, /*empty_slots=*/{});
+    dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/42, /*term=*/1, /*rs_commit_lsn=*/7);
+
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {});
+
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->client_token(), 42u);
+}
+
 // Happy-path regression check for the write()-term-check-under-lock reorg: a matching term still
 // succeeds normally (only the mismatch path changed).
 TEST_F(CraftRaftEntriesTest, WriteSucceedsWithMatchingTermAfterInternalLogin) {
@@ -1185,7 +1227,7 @@ TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
     auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const sync_ctx = make_test_proposal_ctx();
 
     dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
@@ -1349,7 +1391,7 @@ TEST_F(CraftRaftEntriesTest, InternalLoginWaitsForSuspendedSyncApply) {
     auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const sync_ctx = make_test_proposal_ctx();
 
     dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
@@ -1459,7 +1501,7 @@ TEST_F(CraftRaftEntriesTest, QueuedLoginFencesOldSessionWritesAtCommit) {
     auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const write_at = [this](uint64_t term, int64_t dlsn) {
         return homeblocks::detail::sync_get(
             dev_->write(craft::client_hdr{.term = term, .commit_lsn = -1, .all_committed_lsn = -1}, dlsn,
@@ -1491,7 +1533,7 @@ TEST_F(CraftRaftEntriesTest, QueuedLoginFencesInFlightOldSessionWrite) {
     auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {}); // held in catch-up
     journal_->on_write = [&](int64_t) {
         dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {}); // queued behind it
@@ -1518,7 +1560,7 @@ TEST_F(CraftRaftEntriesTest, MalformedEntryFailsAtOnceWithoutStallingTheQueue) {
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     std::vector< uint8_t > bad_hdr; // too small to hold an entry type
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const bad_ctx = make_test_proposal_ctx();
 
     dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, {});
@@ -1543,7 +1585,7 @@ TEST_F(CraftRaftEntriesTest, StopApplyWaitsOutInFlightApplyAndDropsTheRest) {
     auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
-    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5);
+    auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const sync_ctx = make_test_proposal_ctx();
     auto const login_ctx = make_test_proposal_ctx();
     auto const canceled = std::make_error_condition(std::errc::operation_canceled);

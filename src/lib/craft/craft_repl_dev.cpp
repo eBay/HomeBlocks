@@ -2308,9 +2308,19 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
                     rejected = to_free.error();
                 }
             } else if (entry.type == CraftEntryType::InternalLogin) {
-                // The old session can't write while the login waits for its turn; the login itself applies in order.
                 std::lock_guard sl{state_mu_};
-                login_fence_term_ = std::max(login_fence_term_, entry.term);
+                if (entry.rs_commit_lsn < applied_sync_lsn_) {
+                    // A Sync committed ahead of it moved the watermark past this login's, which only another leader
+                    // can do (a leadership change mid-login): the session would start below committed slots. Decided
+                    // here, in log order, so every replica rejects it; and it doesn't fence the old session it no
+                    // longer replaces.
+                    LOGW("InternalLogin(term={}) lsn={}: its watermark {} is below a committed Sync's {} -- rejected",
+                         entry.term, entry.lsn, entry.rs_commit_lsn, applied_sync_lsn_);
+                    rejected = craft::make_error_condition(craft::craft_error::NO_QUORUM);
+                } else {
+                    // The old session can't write while the login waits for its turn; the login applies in order.
+                    login_fence_term_ = std::max(login_fence_term_, entry.term);
+                }
             }
             if (!rejected) {
                 apply_queue_.push_back(std::move(entry));
