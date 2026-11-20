@@ -3107,8 +3107,9 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
         LOGE("restore_state: durable partition state unreadable: {}", loaded.error().message());
         co_return std::unexpected(loaded.error());
     }
-    if (!*loaded) co_return std::vector< CraftPendingEntry >{}; // never persisted: a new partition
-    CraftDurableState const& d = **loaded;
+    // Never persisted: a new partition. Its journal may still hold writes acked before its first persist (a write at
+    // term 0 needs no login): it starts from the default image, and its journal is read as any other's.
+    CraftDurableState const d = loaded->value_or(CraftDurableState{});
 
     auto tail = co_await journal_->tail_lsn();
     if (!tail) {

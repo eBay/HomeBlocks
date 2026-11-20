@@ -1946,13 +1946,20 @@ TEST_F(CraftRaftEntriesTest, SupersededBlocksAreFreedAtOnceWithoutAStore) {
 
 // ── restart recovery ──
 
-// A partition that never persisted anything restarts empty and healthy.
-TEST_F(CraftRaftEntriesTest, RestartWithoutAnImageStartsEmpty) {
-    restart(std::nullopt, page_slots({0, 1}));
+// A partition that never persisted anything comes back from its journal: a write at term 0 needs no login, so writes
+// acked before the first persist are there to serve, their blocks kept.
+TEST_F(CraftRaftEntriesTest, RestartWithoutAnImageComesBackFromItsJournal) {
+    auto slots = page_slots({0, 1});
+    slots[1].blkid = homestore::multi_blk_id{102, 1, 0};
+    restart(std::nullopt, std::move(slots));
     EXPECT_FALSE(dev_->is_faulted());
     EXPECT_FALSE(dev_->is_recovering());
+    EXPECT_EQ(dev_->term(), 0u);
     EXPECT_EQ(dev_->commit_lsn(), -1);
-    EXPECT_EQ(dev_->last_append_lsn(), -1);
+    EXPECT_EQ(dev_->last_append_lsn(), 1);
+    EXPECT_EQ(dev_->overlay_lsn_for(1), 1) << "slot 1 isn't served";
+    EXPECT_EQ(journal_->commits, (std::vector< std::pair< homestore::blk_num_t, bool > >{{102, true}}))
+        << "its blocks aren't kept";
 }
 
 // The session comes back from the image; commit_lsn restarts at the durable frontier; last_append_lsn is the larger of
