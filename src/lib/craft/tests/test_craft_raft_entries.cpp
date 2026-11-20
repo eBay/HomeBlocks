@@ -36,8 +36,9 @@
 //
 // InternalLogin tests verify:
 //   - on_commit dispatches to apply_internal_login, which sets client_token/term
-//   - a wrong-size key (too short or too long) is rejected, state untouched
-//   - a second InternalLogin replaces client_token outright but never regresses term
+//   - a wrong-size key or one of another version is rejected, state untouched
+//   - a newer InternalLogin replaces the session; one whose term isn't newer is ignored outright, and its
+//     proposal fails STALE_TERM
 //   - once applied, write()'s term-fence check reflects the new term end-to-end
 //   - InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- old or
 //     new token, the apply proceeds the same either way
@@ -880,10 +881,9 @@ TEST_F(CraftRaftEntriesTest, InternalLoginTermNeverRegresses) {
     EXPECT_EQ(dev_->term(), 5u);
 }
 
-// client_token has no ordering semantics (it's an opaque id, unlike term) -- it's a plain overwrite even
-// when the accompanying term regresses and is guarded. Pins down the intentional asymmetry between the
-// two fields so it doesn't read as an oversight to a future reader.
-TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegresses) {
+// An InternalLogin whose term isn't newer than the session's is ignored outright: its token doesn't replace the
+// session's either.
+TEST_F(CraftRaftEntriesTest, InternalLoginWithALowerTermIsIgnored) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
@@ -892,8 +892,57 @@ TEST_F(CraftRaftEntriesTest, InternalLoginClientTokenOverwrittenEvenWhenTermRegr
     auto key2 = make_internal_login_key(/*client_token=*/99, /*term=*/3); // lower term, different token
     dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
 
-    EXPECT_EQ(dev_->term(), 5u);          // guarded against regression
-    EXPECT_EQ(dev_->client_token(), 99u); // overwritten regardless
+    EXPECT_EQ(dev_->term(), 5u);
+    EXPECT_EQ(dev_->client_token(), 1u);
+}
+
+// Two logins that both proposed the same term: the first to commit wins it.
+TEST_F(CraftRaftEntriesTest, InternalLoginAtTheSameTermIsIgnored) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/5);
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+
+    EXPECT_EQ(dev_->term(), 5u);
+    EXPECT_EQ(dev_->client_token(), 1u);
+}
+
+// Replaying an InternalLogin after a later one has applied changes nothing.
+TEST_F(CraftRaftEntriesTest, ReplayedInternalLoginChangesNothing) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, ctx);
+    auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/6);
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, ctx);
+    dev_->raft_listener().on_commit(3, as_blob(header_buf), as_blob(key1), {}, ctx);
+
+    EXPECT_EQ(dev_->term(), 6u);
+    EXPECT_EQ(dev_->client_token(), 2u);
+}
+
+// The proposer of an ignored InternalLogin learns that its login lost: the proposal fails STALE_TERM.
+TEST_F(CraftRaftEntriesTest, IgnoredInternalLoginFailsItsProposalStaleTerm) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key1 = make_internal_login_key(/*client_token=*/1, /*term=*/5);
+    auto const first = make_test_proposal_ctx();
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key1), {}, first);
+    auto key2 = make_internal_login_key(/*client_token=*/2, /*term=*/5);
+    auto const second = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(2, as_blob(header_buf), as_blob(key2), {}, second);
+
+    auto const won = take_test_proposal_outcome(first);
+    ASSERT_TRUE(won.has_value());
+    EXPECT_TRUE(won->has_value());
+    auto const lost = take_test_proposal_outcome(second);
+    ASSERT_TRUE(lost.has_value());
+    ASSERT_FALSE(lost->has_value());
+    EXPECT_EQ(lost->error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // Happy-path regression check for the write()-term-check-under-lock reorg: a matching term still

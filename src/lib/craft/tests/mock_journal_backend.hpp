@@ -15,6 +15,8 @@
 #pragma once
 
 #include <functional>
+#include <optional>
+#include <utility>
 
 #include "craft/craft_repl_dev.hpp"
 
@@ -58,6 +60,9 @@ public:
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
     std::function< void() > on_propose; // runs first, whichever way the proposal ends
+    // What a committed proposal returns, as the adapter returns its apply's outcome: on_commit sets it through
+    // loop_back(); ok if it doesn't.
+    std::optional< status > commit_outcome;
 
     bool is_leader() const override { return leader; }
     craft::peer_id_t my_id() const override { return self; }
@@ -76,9 +81,18 @@ public:
                               std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
         if (time_out) co_return std::unexpected(std::make_error_condition(std::errc::timed_out));
         if (on_commit) on_commit(header, key);
-        co_return ok();
+        co_return std::exchange(commit_outcome, std::nullopt).value_or(ok());
     }
 };
+
+// Commits a proposed entry on `dev` as RAFT would, and hands the proposer its apply's outcome to return. An apply
+// still waiting in a paused queue has none yet, so the proposal returns ok.
+inline void loop_back(MockCraftRaftProposer& proposer, CraftReplDev& dev, sisl::blob const& header,
+                      sisl::blob const& key) {
+    auto const ctx = make_test_proposal_ctx();
+    dev.raft_listener().on_commit(1, header, key, {}, ctx);
+    proposer.commit_outcome = take_test_proposal_outcome(ctx);
+}
 
 // Decodes one entry MockCraftRaftProposer recorded.
 struct ProposedSync {

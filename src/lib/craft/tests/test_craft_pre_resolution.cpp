@@ -1015,10 +1015,7 @@ protected:
         CraftPreResolutionTest::SetUp();
         dev_->set_peer_fetcher(&fetcher_);
         fetcher_.response = {QuorumSlotResponse{}}; // one responder holding nothing
-        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
-            cintrusive< homestore::repl_req_ctx > ctx{};
-            dev_->raft_listener().on_commit(1, h, k, {}, ctx);
-        };
+        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) { loop_back(proposer_, *dev_, h, k); };
     }
 
     auto do_append(int64_t sync_to, uint64_t token = 0) {
@@ -1111,8 +1108,7 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     dev_->seed_term(1);
     dev_->seed_lsns(5, {});
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
-        cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->raft_listener().on_commit(1, h, k, {}, ctx);
+        loop_back(proposer_, *dev_, h, k);
         dev_->seed_term(2);
     };
 
@@ -1830,7 +1826,7 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
     fetcher_.on_fetch = nullptr;
 }
 
-// ── fence matrix (SDSTOR-26655, SDSTOR-22889) ─────────────────────────────────
+// ── fence matrix (SDSTOR-26655, SDSTOR-22889, SDSTOR-22892) ───────────────────
 //
 // What each entry point does while a fence is up, and once it has settled. Each cell raises one fence and calls one
 // entry point, then settles the fence and calls it again. A new fence or entry point adds its cells here, so a change
@@ -1841,12 +1837,14 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
 //   queued_login  InternalLogin(term=5), committed with the apply queue paused; settles when it applies
 //   quiesce       a login poll (GetRSCommitLSN, is_login) at term 0; settles when the login's InternalLogin applies
 //   plain_poll    a watchdog poll (GetRSCommitLSN, not is_login), which fences nothing
+//   stale_login   InternalLogin(term=0), not newer than the session, committed with the apply queue paused; its apply
+//                 ignores it, so it fences nothing
 // Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
 // (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
 
 constexpr uint64_t k_new_term{5}; // the login's term
 
-enum class Fence { queued_sync, queued_login, quiesce, plain_poll };
+enum class Fence { queued_sync, queued_login, quiesce, plain_poll, stale_login };
 enum class Call { write, write_voided_slot, write_new_term, read, keep_alive, resolve, append, pre_resolve };
 
 struct FenceCell {
@@ -1886,6 +1884,14 @@ std::vector< FenceCell > fence_cells() {
         {"Quiesce_PreResolve", Fence::quiesce, Call::pre_resolve, {}, stale},
         // A watchdog poll never quiesces.
         {"Poll_Write", Fence::plain_poll, Call::write, {}, {}},
+        // A login that isn't newer neither fences the session at commit nor replaces it at apply. The entry points
+        // can't see the token it leaves alone: test_craft_raft_entries.cpp checks that.
+        {"StaleLogin_Write", Fence::stale_login, Call::write, {}, {}},
+        {"StaleLogin_Read", Fence::stale_login, Call::read, no_index, no_index},
+        {"StaleLogin_KeepAlive", Fence::stale_login, Call::keep_alive, {}, {}},
+        {"StaleLogin_Resolve", Fence::stale_login, Call::resolve, {}, {}},
+        {"StaleLogin_Append", Fence::stale_login, Call::append, {}, {}},
+        {"StaleLogin_PreResolve", Fence::stale_login, Call::pre_resolve, {}, {}},
     };
 }
 
@@ -1901,6 +1907,10 @@ protected:
             dev_->pause_apply();
             commit_login(k_new_term);
             break;
+        case Fence::stale_login:
+            dev_->pause_apply();
+            commit_login(/*term=*/0);
+            break;
         case Fence::quiesce:
         case Fence::plain_poll:
             ASSERT_TRUE(homeblocks::detail::sync_get(
@@ -1914,6 +1924,7 @@ protected:
         switch (GetParam().fence) {
         case Fence::queued_sync:
         case Fence::queued_login:
+        case Fence::stale_login:
             dev_->resume_apply();
             break;
         case Fence::quiesce:

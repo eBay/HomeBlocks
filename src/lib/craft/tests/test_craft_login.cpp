@@ -20,7 +20,8 @@
 // resolve every slot up to the watermark, counting only quiesced members' lacks; pre_resolve_slots() itself is
 // covered in test_craft_pre_resolution.cpp. Step 3, login_sync() (SDSTOR-22891): commit the watermark under the
 // watermark mutex; the mutex against rounds is covered in test_craft_pre_resolution.cpp, and AsyncMutex itself in
-// test_craft_concurrency.cpp.
+// test_craft_concurrency.cpp. Step 4, login_install() (SDSTOR-22892): commit the new session; the InternalLogin
+// entry and its apply are covered in test_craft_raft_entries.cpp.
 //
 // This TU defines SISL_LOGGING_DEF for the homeblocks module because it compiles craft_repl_dev.cpp
 // directly (same pattern as test_craft_raft_entries.cpp).
@@ -152,12 +153,13 @@ protected:
         return homeblocks::detail::sync_get(
             dev_->login_sync(lock, rs_commit_lsn, client_token, std::move(empty_slots), term));
     }
-    // Proposals commit and apply on this member, as RAFT would.
+    auto do_login_install(int64_t rs_commit_lsn, uint64_t client_token, uint64_t term = 0) {
+        auto lock = homeblocks::detail::sync_get(dev_->watermark_mu_.lock());
+        return homeblocks::detail::sync_get(dev_->login_install(lock, rs_commit_lsn, client_token, term));
+    }
+    // Proposals commit and apply on this member, as RAFT would, and return the apply's outcome.
     void loop_back_proposals() {
-        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
-            cintrusive< homestore::repl_req_ctx > ctx{};
-            dev_->raft_listener().on_commit(1, h, k, {}, ctx);
-        };
+        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) { loop_back(proposer_, *dev_, h, k); };
     }
 
     // Commit an entry on this member as RAFT would, with no proposal of its own.
@@ -620,8 +622,7 @@ TEST_F(CraftLoginTest, SyncFailsStaleTermWhenALoginCommitsAheadOfIt) {
     dev_->seed_lsns(5, {});
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
         commit_login(/*term=*/1);
-        cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->raft_listener().on_commit(1, h, k, {}, ctx);
+        loop_back(proposer_, *dev_, h, k);
     };
 
     auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
@@ -679,6 +680,120 @@ TEST_F(CraftLoginTest, SyncFaultedDuringATimedOutProposalFailsInternalError) {
     proposer_.time_out = true;
 
     auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+// ── login_install (SDSTOR-22892) ──────────────────────────────────────────────
+
+// The entry carries the new client's token, the next term and the watermark, and once it applies the session is
+// the new client's.
+TEST_F(CraftLoginTest, InstallProposesTheNewSession) {
+    loop_back_proposals();
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    auto& [header, key] = proposer_.proposed[0];
+    EXPECT_EQ(reinterpret_cast< CraftEntryHeader const* >(header.data())->type, CraftEntryType::InternalLogin);
+    auto const login = parse_internal_login(sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
+    ASSERT_TRUE(login);
+    EXPECT_EQ(login->client_token, 42u);
+    EXPECT_EQ(login->term, 1u);
+    EXPECT_EQ(login->rs_commit_lsn, 5);
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->client_token(), 42u);
+}
+
+// An earlier attempt's InternalLogin for the same term commits just ahead: it takes the term, ours is ignored.
+TEST_F(CraftLoginTest, InstallFailsStaleTermWhenAnEarlierLoginTookTheTerm) {
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        commit_login(/*term=*/1); // token 7
+        loop_back(proposer_, *dev_, h, k);
+    };
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->client_token(), 7u);
+}
+
+// A login that committed since the caller read its term: nothing is proposed.
+TEST_F(CraftLoginTest, InstallFailsStaleTermWithoutProposingWhenTheSessionMovedOn) {
+    commit_login(/*term=*/1);
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42, /*term=*/0);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// A newer login has committed but not yet applied: the fence has risen though the session term hasn't.
+TEST_F(CraftLoginTest, InstallFailsStaleTermWithoutProposingWhenALoginIsQueued) {
+    dev_->pause_apply();
+    commit_login(/*term=*/1);
+    ASSERT_EQ(dev_->term(), 0u);
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42, /*term=*/0);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_TRUE(proposer_.proposed.empty());
+    dev_->resume_apply();
+}
+
+TEST_F(CraftLoginTest, InstallOnAFollowerFailsNotLeaderWithoutProposing) {
+    proposer_.leader = false;
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+TEST_F(CraftLoginTest, InstallProposalFailurePropagates) {
+    proposer_.fail = true;
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
+    EXPECT_EQ(dev_->term(), 0u);
+}
+
+// The entry may still commit later; the client logs in again either way.
+TEST_F(CraftLoginTest, InstallProposalTimeoutPropagates) {
+    proposer_.time_out = true;
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out));
+    EXPECT_EQ(dev_->term(), 0u);
+}
+
+TEST_F(CraftLoginTest, InstallOnFaultedLeaderFailsInternalErrorWithoutProposing) {
+    fault_partition();
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// The partition faults while the proposal is out, and the proposal then times out: the permanent fault wins.
+TEST_F(CraftLoginTest, InstallFaultedDuringATimedOutProposalFailsInternalError) {
+    proposer_.on_propose = [this] { fault_partition(); };
+    proposer_.time_out = true;
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
