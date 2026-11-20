@@ -477,6 +477,73 @@ TEST_F(CraftVolumeMultiTest, ProposalWithoutQuorumTimesOut) {
     ASSERT_TRUE(sync());
 }
 
+// A shutdown ends the CRAFT proposals in flight before it waits for the requests in flight: a resolution whose
+// proposal has neither a deadline nor a quorum would otherwise hold it forever.
+TEST_F(CraftVolumeMultiTest, ShutdownEndsAProposalWithoutADeadline) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(10);
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(10)));
+        ASSERT_TRUE(vol) << vol.error().message();
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
+        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto const st = homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(rd, member_id(0))
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)},
+                          sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+        ASSERT_TRUE(st) << st.error().message();
+        ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
+        sisl::io_blob_safe data(page, 512);
+        std::memset(data.bytes(), 'a', page);
+        auto const w = homeblocks::detail::sync_get(homeblocks::async_write(
+            *vol, hdr, 0 /* dlsn */, 0, page, sisl::sg_list{.size = page, .iovs = {iovec{data.bytes(), page}}}));
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const timeout_ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_raft_propose_timeout_ms = 0; });
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        auto* const dev = (*vol)->craft_dev();
+        std::weak_ptr< volume > const watched = *vol;
+        // The request holds the volume until it ends, which is before the shutdown ends: no handle outlives that.
+        auto resolved = std::async(std::launch::async, [vol = std::move(*vol), hdr]() mutable {
+            auto r = homeblocks::detail::sync_get(homeblocks::request_resolution(vol, hdr, 0 /* upto */));
+            vol.reset();
+            return r;
+        });
+        EXPECT_TRUE(wait_until([&watched] {
+            auto const v = watched.lock();
+            return v && v->num_outstanding_reqs() > 0;
+        }));
+        std::this_thread::sleep_for(std::chrono::seconds{1}); // it waits on its proposal by now
+        auto stopped = std::async(std::launch::async, [] { g_helper->stop(); });
+        bool const in_time = stopped.wait_for(std::chrono::seconds{30}) == std::future_status::ready;
+        EXPECT_TRUE(in_time) << "the shutdown waited on a proposal without a deadline";
+        if (!in_time) { dev->stop_proposing(); } // what the shutdown should have done: it ends now
+        stopped.wait();
+        auto const r = resolved.get();
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [timeout_ms](auto& s) { s.craft_raft_propose_timeout_ms = timeout_ms; });
+        g_helper->start(); // first: the cases after this one need it
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->start(); }
+    ASSERT_TRUE(sync());
+}
+
 #ifdef _PRERELEASE
 // A restarting member holds what its group commits until its device has recovered, then applies it in log order: here
 // a login committed while it was down, which it gets when it rejoins, during a reattach held for 10 seconds.

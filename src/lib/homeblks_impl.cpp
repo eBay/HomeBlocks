@@ -158,6 +158,9 @@ void HomeBlocksImpl::shutdown() {
     // set the shutdown flag so that no new requests are accepted;
     // start timer thread if there are still outstanding jobs;
     auto f = shutdown_start();
+    // After the flag, which refuses new CRAFT ops: a request in flight may be waiting on a proposal that only a stop
+    // would end (no deadline, no quorum), and the wait below waits for it.
+    stop_craft_proposals();
 
     f.get();
 
@@ -672,6 +675,12 @@ std::vector< volume_handle > HomeBlocksImpl::craft_volumes() const {
 void HomeBlocksImpl::expire_overdue_craft_waits() {
     for (auto const& vol : craft_volumes()) {
         if (auto const dev = vol->craft_dev_ref()) { dev->expire_overdue(); }
+    }
+}
+
+void HomeBlocksImpl::stop_craft_proposals() {
+    for (auto const& vol : craft_volumes()) {
+        if (auto const dev = vol->craft_dev_ref()) { dev->stop_proposing(); }
     }
 }
 

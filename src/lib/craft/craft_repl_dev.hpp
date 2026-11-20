@@ -617,6 +617,12 @@ public:
         if (raft_proposer_) raft_proposer_->expire_overdue();
         journal_->expire_overdue();
     }
+    // Ends the proposals in flight (timed_out: they may still commit) and fails every later one, as stop() does. A
+    // shutdown calls it before it waits for the requests in flight: one waiting on a proposal without a deadline
+    // (craft_raft_propose_timeout_ms = 0) and without a quorum would hold it forever.
+    void stop_proposing() {
+        if (raft_proposer_) raft_proposer_->stop();
+    }
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).

@@ -237,6 +237,9 @@ public:
     void finish_craft_reattach();
     // CRAFT, at shutdown: stops every CRAFT device (CraftReplDev::stop), keeping their queued entries.
     void stop_craft_devices();
+    // CRAFT, at shutdown, before it waits for the requests in flight: ends every device's proposals
+    // (CraftReplDev::stop_proposing()).
+    void stop_craft_proposals();
     // CRAFT, every second from start_reaper_thread()'s timer: fails each device's proposals and journal writes past
     // their deadline (CraftReplDev::expire_overdue()), those of a volume being destroyed too.
     void expire_overdue_craft_waits();
