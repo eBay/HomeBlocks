@@ -39,7 +39,7 @@ synchronization, and recovery bookkeeping. Write data never flows through the RA
 | **CraftReplDev** | New HomeBlocks replication device class (parallel to `ReplDisk`) that implements CRAFT. |
 | **CraftConnector** | New HomeBlocks RPC frontend (parallel to `ScstConnector`) that terminates the CRAFT client wire (packed binary, see [rpcs.md](rpcs.md)) and translates each RPC to a `CraftReplDev` API call. |
 | **SyncRSCommitLSN** | A RAFT log entry type. On apply, each replica fetches any missing data up to the encoded dLSN and advances `commit_lsn`. |
-| **InternalLogin** | A RAFT log entry type. On apply, stores the new `client_token` and enforces single-writer exclusivity. |
+| **InternalLogin** | A RAFT log entry type. On apply, if its term is newer than the session's, stores the new `client_token` and term and enforces single-writer exclusivity; otherwise it is ignored. |
 | **Missing** | A dLSN slot that a replica knows about (from a peer or from the RAFT log) but has not yet received data for. |
 | **Empty** | A dLSN proven never quorum-durable, declared by the leader; a permanent no-op the commit skips. |
 | **zero write (all_zeros)** | A payload-free write naming just a byte range (WRITE_ZEROES / discard-to-zero), signaled by an **empty `sisl::sg_list`** (no `all_zeros` flag). Takes a dLSN and merges like any write; allocates nothing and unmaps its range on apply, reading back as a hole. |
