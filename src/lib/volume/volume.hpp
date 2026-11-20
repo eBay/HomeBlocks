@@ -223,11 +223,12 @@ public:
     // chunks, the volume's own journal, the index table and the superblock, then the CraftReplDev on top. Applied on
     // CreateVolume commit. `orphan_idx` is the index table of a create that crashed before its superblock, reused
     // instead of creating a second table for the same volume.
+    // `my_id` is this member's id in the group, which proposes through it.
     static volume_handle make_craft_volume(volume_info&& info, shared< VolumeChunkSelector > volume_chunk_sel,
                                            shared< VolumeChunkSelector > index_chunk_sel, bool dynamic_chunk_alloc,
-                                           VolIdxTablePtr orphan_idx) {
+                                           VolIdxTablePtr orphan_idx, peer_id_t const& my_id) {
         auto vol = std::make_shared< volume >(std::move(info), volume_chunk_sel, index_chunk_sel);
-        return vol->init_craft(dynamic_chunk_alloc, std::move(orphan_idx)) ? vol : nullptr;
+        return vol->init_craft(dynamic_chunk_alloc, std::move(orphan_idx), my_id) ? vol : nullptr;
     }
 
     VolIdxTablePtr indx_table() const { return indx_tbl_; }
@@ -242,11 +243,39 @@ public:
     // engine object, NOT a craft::craft_replica: that interface is the CLIENT's view of a member and belongs on
     // the far side of the wire.
     CraftReplDev* craft_dev() const { return craft_dev_.get(); }
+    // The same, safe to read while a destroy may reset it; held, the device outlives that reset.
+    shared< CraftReplDev > craft_dev_ref() const {
+        std::lock_guard lk{craft_hold_mu_};
+        return craft_dev_;
+    }
     bool is_craft() const { return vol_info_->repl_mode == replication_mode::CRAFT; }
-    // CRAFT recovery: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and attaches
-    // the CraftReplDev once HomeStore's log replay opens the journal's store. Call it after init_index_table: the
-    // device keeps the index table it is given.
-    void reopen_craft_journal();
+    // CRAFT: this replica serves its partition, or will once its device is reattached. One that fault containment took
+    // offline doesn't (the CRAFT API refuses its every op), nor one whose device faulted, or never came back at a
+    // restart (its journal didn't replay).
+    bool serves_craft() const {
+        if (is_offline()) return false;
+        std::lock_guard lk{craft_hold_mu_};
+        return craft_dev_expected_ || (craft_dev_ && !craft_dev_->is_faulted());
+    }
+    // CRAFT recovery, at load: reopens the volume's journal, before HomeStore purges the logdevs nobody reopened, and
+    // hands its store to `replayed` once HomeStore's log replay has replayed it. HomeStore calls that with the log
+    // device locked: it only passes the store on. From here on the volume expects its device: the committed entries
+    // that reach it meanwhile are held for it.
+    void reopen_craft_journal(std::function< void(shared< homestore::home_log_store >) > replayed);
+    // CRAFT recovery, at load: the volume's durable state record (none if it never persisted one).
+    void adopt_craft_state(superblk< craft_state_sb_t > sb) { craft_state_sb_ = std::move(sb); }
+    // CRAFT recovery: makes the CraftReplDev on the replayed journal, the state record and the index table installed at
+    // load, recovers it, hands it the entries held meanwhile in log order, then publishes it. Returns recover()'s
+    // outcome; on a failure the device is published faulted. `my_id`: as in make_craft_volume().
+    async_status reattach_craft_dev(shared< homestore::home_log_store > journal, peer_id_t my_id);
+    // CRAFT recovery: the device expected since the load won't come, as the journal never replayed (its log store is
+    // missing): the partition is faulted for good, its state record marked so, and what is held for it dropped.
+    void fault_unreplayed_craft();
+    // CRAFT: an entry the volume's RAFT group committed, for its CraftReplDev: handed to it, or held until it is
+    // published while one is expected. False if this volume won't have one (being destroyed, or never reattached).
+    bool deliver_craft_entry(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                             std::vector< homestore::multi_blk_id > const& blkids,
+                             cintrusive< homestore::repl_req_ctx >& ctx);
 
     volume_info_ptr info() const { return vol_info_; }
 
@@ -305,8 +334,8 @@ private:
     // destroyed automatically; if success, the repl dev will be stored in the volume object;
     //
     bool init(bool is_recovery);
-    bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx);
-    void attach_craft_dev(shared< homestore::home_log_store > journal);
+    bool init_craft(bool dynamic_chunk_alloc, VolIdxTablePtr orphan_idx, peer_id_t const& my_id);
+    shared< CraftReplDev > make_craft_dev(shared< homestore::home_log_store > journal, peer_id_t const& my_id);
 
     status verify_checksum(vol_read_ctx const& read_ctx);
 
@@ -331,6 +360,19 @@ private:
     std::unique_ptr< VolumeMetrics > metrics_;
     shared< CraftReplDev > craft_dev_{nullptr}; // CRAFT per-replica backend; null until a craft volume is wired
     bool journal_open_{false};                  // CRAFT: this boot created or reopened the volume's journal
+    // CRAFT: the durable state record until the CraftReplDev's store takes it (empty if there is none yet).
+    superblk< craft_state_sb_t > craft_state_sb_{craft_state_meta_name};
+    // CRAFT: the committed entries held for the device expected since the load, in log order. Publishing the device,
+    // or giving it up, clears them. Guarded by craft_hold_mu_, which also orders craft_dev_'s changes against them.
+    struct held_craft_entry {
+        int64_t lsn;
+        std::vector< uint8_t > header;
+        std::vector< uint8_t > key;
+        cintrusive< homestore::repl_req_ctx > ctx;
+    };
+    mutable std::mutex craft_hold_mu_;
+    std::vector< held_craft_entry > craft_held_;
+    bool craft_dev_expected_{false};
 };
 
 // RAII: marks an IO in-flight on its volume for the op's duration -- so destroy()/shutdown() wait for it (and

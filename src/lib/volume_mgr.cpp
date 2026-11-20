@@ -20,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <boost/uuid/nil_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <iomgr/iomgr.hpp>
 #include <iomgr/iomgr_flip.hpp>
@@ -60,6 +61,12 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         }
     }
 
+    // Its CRAFT state record, if it ever persisted one: a destroy removes it, a reattach recovers from it.
+    if (auto it = craft_state_sbs_.find(id); it != craft_state_sbs_.end()) {
+        vol_ptr->adopt_craft_state(std::move(it->second));
+        craft_state_sbs_.erase(it);
+    }
+
     {
         auto lg = std::scoped_lock(vol_lock_);
         DEBUG_ASSERT(vol_map_.find(id) == vol_map_.end(),
@@ -79,10 +86,33 @@ void HomeBlocksImpl::on_vol_meta_blk_found(sisl::byte_view const& buf, void* coo
         LOGINFO("volume {} has no RAFT group anymore, removing it", vol_ptr->id_str());
         start_volume_removal(id);
     } else if (vol_ptr->is_craft()) {
-        // Only now that its index table is installed: the CraftReplDev attached when the journal replays keeps it. A
-        // CRAFT volume torn down above leaves its journal unopened, and HomeStore purges it.
-        vol_ptr->reopen_craft_journal();
+        // Only now that its index table is installed: the CraftReplDev made once the journal replays keeps it. A CRAFT
+        // volume torn down above leaves its journal unopened, and HomeStore purges it.
+        expect_craft_reattach(id);
+        vol_ptr->reopen_craft_journal(
+            [this, id, weak = std::weak_ptr< volume >(vol_ptr)](shared< homestore::home_log_store > journal) {
+#ifdef _PRERELEASE
+                // As if HomeStore never reported this journal's replay, its log store missing.
+                if (iomgr_flip::instance()->test_flip("craft_journal_replay_lost", boost::uuids::to_string(id))) {
+                    return;
+                }
+#endif
+                on_craft_journal_replayed(id, weak.lock(), std::move(journal));
+            });
     }
+}
+
+void HomeBlocksImpl::on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    superblk< craft_state_sb_t > sb{craft_state_meta_name};
+    sb.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // The CRC passed, so a bad header is a format bug: never restart a partition without its state.
+    RELEASE_ASSERT(sb.size() >= sizeof(craft_state_sb_t) && sb->magic == craft_state_sb_t::k_magic &&
+                       sb->version == craft_state_sb_t::k_version,
+                   "CRAFT state record of {} bytes, magic {:#x} version {}: unknown format", sb.size(), sb->magic,
+                   sb->version);
+    volume_id_t const id = sb->vol_id;
+    auto const [it, added] = craft_state_sbs_.try_emplace(id, std::move(sb));
+    RELEASE_ASSERT(added, "two CRAFT state records for volume {}", boost::uuids::to_string(id));
 }
 
 shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
@@ -220,6 +250,9 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
         auto lg = std::scoped_lock(vol_lock_);
         creating_vols_.erase(id);
     }
+    // Failed, it leaves no replica here, while the group may live on (a create retried on a member without one): an
+    // election while it ran left leadership alone, so whether to hand it off is checked again.
+    if (!ret) on_craft_group_leader(id);
     co_return ret;
 }
 
@@ -459,8 +492,9 @@ status HomeBlocksImpl::create_craft_volume_local(volume_info&& info) {
     }
 
     auto const ordinal = info.ordinal;
-    auto vol = volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
-                                         dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr);
+    auto vol =
+        volume::make_craft_volume(std::move(info), volume_chunk_selector_, index_chunk_selector_,
+                                  dynamic_chunk_allocation(), orphan_idx ? orphan_idx->first : nullptr, our_uuid());
     if (!vol) {
         if (orphan_idx) {
             // The table stays behind, holding its ordinal, for the next create of this volume to take over.
@@ -571,6 +605,13 @@ async_status HomeBlocksImpl::remove_volume(const volume_id_t& id) {
     co_return ok();
 }
 
+// Reconfiguration (S10) replaces this stub behind the same signature.
+async_status HomeBlocksImpl::replace_member(volume_id_t const& id, peer_id_t const& out, peer_id_t const& in) {
+    LOGW("vol={}: replace_member out={} in={}: membership changes are not supported yet", boost::uuids::to_string(id),
+         boost::uuids::to_string(out), boost::uuids::to_string(in));
+    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+}
+
 bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
     if (is_restricted()) {
         LOGE("Can't remove volume {}, system is in restricted mode.", boost::uuids::to_string(id));
@@ -598,6 +639,101 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
     if (!vol) { return; } // never created here, or already removed
     LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));
     start_volume_removal(id);
+}
+
+// A member whose local create failed stays in the group without a replica, reported, until a partition move replaces
+// it; RAFT may still elect it, as it has the whole log. So may a member whose replica can't serve the partition: its
+// device faulted, or never came back at a restart, or fault containment took the volume offline, or the whole node
+// (restricted: the CRAFT API refuses every op either way). Not while a create of the volume runs here (that create
+// needs this member to lead), nor while its device is being reattached, nor when alone in the group: there is nobody to
+// hand leadership to. A replica can also stop serving after the election (its device faults while it leads, or fails
+// its recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
+void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
+    if (is_shutting_down()) { return; }
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
+}
+
+void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
+    // Counted before the shutdown check and released on every exit, as a create is: a shutdown either waits for this
+    // or is seen here, before it calls into HomeStore.
+    struct HandOffRef {
+        HomeBlocksImpl& hb;
+        ~HandOffRef() { hb.dec_ref(); }
+    };
+    inc_ref();
+    HandOffRef const ref{*this};
+    // A hand-off is forgotten only once its backoff is over: a job queued before it (a retry's, an earlier election's)
+    // finds this member following, and forgetting it then would let the next election hand off again at once.
+    auto const now = std::chrono::steady_clock::now();
+    auto const backoff = std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)};
+    auto const forget = [this, &id, now, backoff] {
+        std::lock_guard lk{craft_handoff_mu_};
+        if (auto const it = craft_handed_off_at_.find(id);
+            it != craft_handed_off_at_.end() && now - it->second >= backoff) {
+            craft_handed_off_at_.erase(it);
+        }
+    };
+    if (is_shutting_down()) { return; }
+    volume_handle vol;
+    {
+        auto lg = std::shared_lock(vol_lock_);
+        if (creating_vols_.contains(id)) { return forget(); }
+        if (auto const it = vol_map_.find(id); it != vol_map_.end()) { vol = it->second; }
+    }
+    if (vol && vol->serves_craft() && !is_restricted()) { return forget(); }
+    auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
+    // Its stage before its RAFT server: once a destroyed group's reaper has run, the server is freed, and is_leader()
+    // would read freed memory.
+    if (!rd || is_going_away(**rd) || !(*rd)->is_leader() || (*rd)->get_replication_quorum().size() < 2) {
+        return forget();
+    }
+    // nuraft nominates the responsive member of the highest priority, deterministically: with the member holding the
+    // replica (the group's creator) unresponsive, two members without one would nominate each other forever.
+    {
+        std::lock_guard lk{craft_handoff_mu_};
+        auto const [it, first] = craft_handed_off_at_.try_emplace(id, now);
+        if (!first) {
+            if (now - it->second < backoff) {
+                return; // keeps leadership for now: retry_craft_handoffs() tries again
+            }
+            it->second = now;
+        }
+    }
+    LOGW("vol={}: RAFT leader {} here: handing leadership to another member", boost::uuids::to_string(id),
+         vol ? "with a replica that can't serve" : "without a replica");
+    COUNTER_INCREMENT(metrics_, craft_leaderships_handed_off, 1);
+    (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
+}
+
+void HomeBlocksImpl::retry_craft_handoffs() {
+    auto const now = std::chrono::steady_clock::now();
+    auto const backoff = std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)};
+    std::vector< volume_id_t > due;
+    {
+        std::lock_guard lk{craft_handoff_mu_};
+        for (auto const& [id, at] : craft_handed_off_at_) {
+            if (now - at >= backoff) { due.push_back(id); }
+        }
+    }
+    // Not one being destroyed: its group is going away too.
+    bool const restricted = is_restricted();
+    for (auto const& vol : craft_volumes()) {
+        if (!vol->is_destroying() && (restricted || !vol->serves_craft())) { due.push_back(vol->id()); }
+    }
+    for (auto const& id : due) {
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
+    }
+}
+
+int64_t HomeBlocksImpl::craft_groups_without_replica() const {
+    // The groups first, then vol_lock_: never call into HomeStore while holding it.
+    std::vector< volume_id_t > groups;
+    homestore::hs()->repl_service().iterate_repl_devs([&groups](cshared< homestore::repl_dev >& rd) {
+        if (!is_going_away(*rd)) { groups.push_back(rd->group_id()); }
+    });
+    auto lg = std::shared_lock(vol_lock_);
+    return std::ranges::count_if(
+        groups, [this](auto const& id) { return !vol_map_.contains(id) && !creating_vols_.contains(id); });
 }
 
 result< volume_handle > HomeBlocksImpl::get_volume(const volume_id_t& id) const {

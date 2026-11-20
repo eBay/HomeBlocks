@@ -31,7 +31,11 @@ SISL_OPTION_GROUP(test_volume_setup,
                   (gc_timer_nsecs, "", "gc_timer_nsecs", "gc timer in seconds",
                    ::cxxopts::value< uint32_t >()->default_value("5"), "seconds"),
                   (shutdown_timer_nsecs, "", "shutdown_timer_nsecs", "shutdown timer in seconds",
-                   ::cxxopts::value< uint32_t >()->default_value("2"), "seconds"));
+                   ::cxxopts::value< uint32_t >()->default_value("2"), "seconds"),
+                  (craft, "", "craft", "run in CRAFT mode: every volume a CRAFT partition",
+                   ::cxxopts::value< bool >()->default_value("false"), "true or false"),
+                  (repl_port, "", "repl_port", "this node's RAFT port in CRAFT mode",
+                   ::cxxopts::value< uint16_t >()->default_value("47452"), "port"));
 
 SISL_OPTIONS_ENABLE(logging, test_common_setup, test_volume_setup)
 SISL_LOGGING_DECL(test_volume)
@@ -40,9 +44,15 @@ std::unique_ptr< test_common::HBTestHelper > g_helper;
 
 using namespace homeblocks;
 
+// CRAFT volumes can't be removed yet: in CRAFT mode, the cases that remove one skip.
+static constexpr auto no_craft_removal = "CRAFT volumes can't be removed yet";
+
 class VolumeTest : public ::testing::Test {
 public:
     void SetUp() override {}
+
+    // In CRAFT mode (--craft) every volume is a CRAFT partition, a one-member RAFT group on this node.
+    static bool craft() { return SISL_OPTIONS["craft"].as< bool >(); }
 
     volume_info gen_vol_info(uint32_t vol_idx) {
         volume_info vol_info;
@@ -50,12 +60,20 @@ public:
         vol_info.size_bytes = 1024 * 1024 * 1024;
         vol_info.page_size = 4096;
         vol_info.id = boost::uuids::random_generator()();
+        if (craft()) {
+            // A CRAFT volume's id is its name's: the name is unique, as these volumes stay until the end of the run.
+            vol_info.name += "_" + boost::uuids::to_string(vol_info.id);
+            vol_info.id = craft_volume_id(vol_info.name);
+            vol_info.repl_mode = replication_mode::CRAFT;
+            vol_info.members = {g_helper->svc_id()};
+        }
         return vol_info;
     }
 };
 
 #ifdef _PRERELEASE
 TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
@@ -103,6 +121,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingRemoveVol) {
 }
 
 TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
+    if (craft()) { GTEST_SKIP() << "its IO is the legacy byte API, which CRAFT volumes reject"; }
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
@@ -137,6 +156,7 @@ TEST_F(VolumeTest, ShutdownWithOutstandingIO) {
 }
 
 TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
@@ -191,6 +211,7 @@ TEST_F(VolumeTest, CreateDestroyVolumeWithOutstandingIO) {
 #endif
 
 TEST_F(VolumeTest, CreateDestroyVolume) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     std::vector< volume_id_t > vol_ids;
     {
         auto hb = g_helper->inst();
@@ -232,6 +253,7 @@ TEST_F(VolumeTest, CreateDestroyVolume) {
 
 // This instance runs legacy volumes (the default DISABLED mode): a CRAFT volume needs one in CRAFT mode.
 TEST_F(VolumeTest, CraftVolumeNeedsCraftMode) {
+    if (craft()) { GTEST_SKIP() << "a legacy-mode case"; }
     auto vinfo = gen_vol_info(0);
     auto const id = vinfo.id;
     vinfo.repl_mode = replication_mode::CRAFT;
@@ -276,6 +298,8 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
         }
     }
 
+    if (craft()) { return; } // CRAFT volumes can't be removed yet
+
     {
         auto hb = g_helper->inst();
         auto vol_mgr = hb;
@@ -294,6 +318,7 @@ TEST_F(VolumeTest, CreateVolumeThenRecover) {
 }
 
 TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
 #ifdef _PRERELEASE
     // every volume crashes: each destroy checks the flip twice, in volume::destroy and in do_remove_volume
@@ -331,6 +356,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashRecovery) {
 
 #ifdef _PRERELEASE
 TEST_F(VolumeTest, DestroyVolumeCrashBeforeChunkRelease) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     // Crash after the volume superblock is destroyed but before the chunks are released: after the restart nothing owns
     // the chunks, but their allocators still hold the volume's blks. Recovery has to reclaim them.
     auto vinfo = gen_vol_info(0);
@@ -367,6 +393,7 @@ TEST_F(VolumeTest, DestroyVolumeCrashBeforeChunkRelease) {
 // Two removals of one volume at once (e.g. a GC pass and the removal that marked it DESTROYING): only the one that
 // claims the destroy runs it.
 TEST_F(VolumeTest, ConcurrentRemovesDestroyOnce) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     auto hb = g_helper->inst();
     auto vinfo = gen_vol_info(0);
     auto const id = vinfo.id;
@@ -406,6 +433,7 @@ TEST_F(VolumeTest, ConcurrentRemovesDestroyOnce) {
 #endif
 
 TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     // Crash after the index table is destroyed but before the volume superblock is: recovery finds a volume being
     // destroyed without index table and has to resume its destroy.
     auto num_vols = SISL_OPTIONS["num_vols"].as< uint32_t >();
@@ -444,6 +472,7 @@ TEST_F(VolumeTest, DestroyVolumeAfterIndexCrashRecovery) {
 }
 
 TEST_F(VolumeTest, ShutdownWithBackedOffRemoveVol) {
+    if (craft()) { GTEST_SKIP() << no_craft_removal; }
     // A remove that finds IO outstanding marks the volume DESTROYING and backs off, leaving the destroy to the reaper.
     // Shutdown starting before the reaper gets to it must not wait for that destroy: it resumes on the next boot.
     auto vinfo = gen_vol_info(0);
@@ -496,7 +525,21 @@ int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_common_setup, test_volume_setup);
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 
-    g_helper = std::make_unique< test_common::HBTestHelper >("test_volume", args, orig_argv);
+    auto const craft = SISL_OPTIONS["craft"].as< bool >();
+    // Its own device files: the CRAFT run may run alongside the legacy one.
+    g_helper =
+        std::make_unique< test_common::HBTestHelper >(craft ? "test_volume_craft" : "test_volume", args, orig_argv);
+    if (craft) {
+        auto const port = SISL_OPTIONS["repl_port"].as< uint16_t >();
+        g_helper->set_config_hook([port](home_blocks_config& cfg) {
+            cfg.repl_mode = replication_mode::CRAFT;
+            cfg.repl_svc_port = port;
+            // A single node: every group has this node as its only member.
+            cfg.lookup_peer = [port](peer_id_t const&) {
+                return std::pair< std::string, uint16_t >{"127.0.0.1", port};
+            };
+        });
+    }
     g_helper->setup();
     auto ret = RUN_ALL_TESTS();
     g_helper->teardown();

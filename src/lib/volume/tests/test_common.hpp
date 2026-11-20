@@ -232,7 +232,8 @@ public:
         config_hook_ = std::move(hook);
     }
 
-    void setup() {
+    // `format`: false to start on the devices another process left, as a restart after its crash does.
+    void setup(bool format = true) {
         sisl::logging::SetLogger(test_name_);
         spdlog::set_pattern("[%D %T.%e] [%n] [%^%l%$] [%t] %v");
 
@@ -240,7 +241,7 @@ public:
         svc_id_ = boost::uuids::random_generator()();
 
         // init device list
-        init_dev_list(true /*init_device*/);
+        init_dev_list(format);
 
         LOGINFO("Starting home_blocks");
         // homeblocks::HomeBlocksImpl::_hs_chunk_size = SISL_OPTIONS["hs_chunk_size_mb"].as< uint64_t >() * Mi;
@@ -252,10 +253,18 @@ public:
 
     void restart(uint64_t delay_secs = 0) {
         LOGINFO("Restart home_blocks");
-        hb_->shutdown();
-        hb_.reset();
+        stop();
         LOGINFO("Start home_blocks after {} secs", delay_secs);
         if (delay_secs > 0) { std::this_thread::sleep_for(std::chrono::seconds(delay_secs)); }
+        start();
+    }
+
+    // A restart in two steps, for a node that stays down while others go on.
+    void stop() {
+        hb_->shutdown();
+        hb_.reset();
+    }
+    void start() {
         auto hb = init_homeblocks(make_config());
         RELEASE_ASSERT(hb.has_value(), "init_homeblocks failed on restart");
         hb_ = hb.value();
@@ -287,6 +296,16 @@ public:
         hb_->shutdown();
         hb_.reset();
         remove_files();
+    }
+
+    // This node's metrics (HomeBlocksMetrics), as a scrape reads them.
+    int64_t groups_without_replica() {
+        using namespace sisl; // the metric's name literal
+        return GAUGE_VALUE(gathered_metrics(), craft_groups_without_replica);
+    }
+    int64_t leaderships_handed_off() {
+        using namespace sisl; // the metric's name literal
+        return COUNTER_VALUE(gathered_metrics(), craft_leaderships_handed_off);
     }
 
     peer_id_t svc_id() { return svc_id_; }
@@ -337,6 +356,16 @@ public:
         LOGDEBUG("Flip {} set", flip_name);
     }
 
+    // A flip that hands its caller `value`, `count` times.
+    void set_retval_flip(const std::string flip_name, long value, uint32_t count = 1) {
+        flip::FlipCondition null_cond;
+        flip::FlipFrequency freq;
+        freq.set_count(count);
+        freq.set_percent(100);
+        m_fc.inject_retval_flip< long >(flip_name, std::array< flip::FlipCondition, 1 >{null_cond}, freq, value);
+        LOGDEBUG("Flip {} set", flip_name);
+    }
+
     void remove_flip(const std::string flip_name) {
         m_fc.remove_flip(flip_name);
         LOGDEBUG("Flip {} removed", flip_name);
@@ -359,6 +388,12 @@ public:
     }
 
 private:
+    homeblocks::HomeBlocksMetrics& gathered_metrics() {
+        auto& metrics = std::dynamic_pointer_cast< homeblocks::HomeBlocksImpl >(hb_)->metrics();
+        metrics.gather();
+        return metrics;
+    }
+
     void init_devices(bool is_file, uint64_t dev_size = 0) {
         if (is_file) {
             for (const auto& fpath : dev_list_) {
@@ -389,15 +424,17 @@ private:
         auto const dev_size = SISL_OPTIONS["dev_size_mb"].as< uint64_t >() * 1024 * 1024;
         if (SISL_OPTIONS.count("device_list")) {
             dev_list_ = SISL_OPTIONS["device_list"].as< std::vector< std::string > >();
-            init_devices(false /*is_file*/);
+            if (init_device) { init_devices(false /*is_file*/); }
         } else {
             // generate devices
             for (uint32_t i = 0; i < ndevices; i++) {
                 std::string dev = test_name_ + std::to_string(i);
                 dev_list_.push_back(dev);
             }
-            LOGINFO("creating {} device files with each of size {} ", ndevices, homestore::in_bytes(dev_size));
-            init_devices(true /*is_file*/, dev_size);
+            if (init_device) {
+                LOGINFO("creating {} device files with each of size {} ", ndevices, homestore::in_bytes(dev_size));
+                init_devices(true /*is_file*/, dev_size);
+            }
         }
     }
 

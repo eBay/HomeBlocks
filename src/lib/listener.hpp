@@ -98,13 +98,41 @@ public:
                   cintrusive< homestore::repl_req_ctx >& ctx) override;
     void on_log_replay_done(homestore::group_id_t const&) override { replaying_ = false; }
     void on_destroy(homestore::group_id_t const& group_id) override;
+    void on_become_leader(homestore::group_id_t const&) override { hb_->on_craft_group_leader(group_id_); }
+
+    // Membership changes come with reconfiguration: until then, one reaching the group is logged, nothing more.
+    void on_start_replace_member(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                 homestore::replica_member_info const& member_in, homestore::trace_id_t tid) override;
+    void on_complete_replace_member(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                    homestore::replica_member_info const& member_in,
+                                    homestore::trace_id_t tid) override;
+    void on_clean_replace_member_task(std::string const& task_id, homestore::replica_member_info const& member_out,
+                                      homestore::replica_member_info const& member_in,
+                                      homestore::trace_id_t tid) override;
+    void on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t tid) override;
+
+    // CRAFT has no snapshots yet, while HomeStore compacts the group's RAFT log: a member that falls behind the
+    // compaction needs one. As its leader, this member refuses to send it (nuraft asks again later), and that member
+    // stays behind until a partition move replaces it. As a member, it never applies one.
+    int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                          std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
+    bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
+    // Each snapshot nuraft takes (every snapshot_freq_distance entries) holds its position alone: nuraft reads it back
+    // through last_snapshot() to compact the log, and dereferences it. Kept in memory: after a restart there is none
+    // until the next one, which nuraft tolerates.
+    homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
+    std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
 
 private:
-    // The volume whose CraftReplDev this group's entries go to, or null (logged) if there is none here (yet).
-    volume_handle craft_volume(int64_t lsn) const;
+    // The published CraftReplDev this group's entries go to, or null; held, it outlives a destroy's reset.
+    shared< CraftReplDev > craft_device() const;
 
     HomeBlocksImpl* hb_;
     homestore::group_id_t group_id_;
     std::atomic< bool > replaying_;
+    std::atomic_flag snapshot_refusal_logged_{};
+    std::atomic_flag entries_dropped_logged_{};
+    std::mutex snapshot_mu_;
+    std::shared_ptr< homestore::snapshot_context > last_snapshot_; // guarded by snapshot_mu_
 };
 } // namespace homeblocks

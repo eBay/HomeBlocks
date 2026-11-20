@@ -54,6 +54,16 @@ table HomeBlksSettings{
     // CRAFT: deadline (in milliseconds) for a RAFT proposal (SyncRSCommitLSN, InternalLogin) to commit. A proposal
     // that misses it completes with timed_out, but the entry may still commit later. 0 = no deadline.
     craft_raft_propose_timeout_ms: uint32 = 10000;
+
+    // CRAFT: deadline (in milliseconds) for a journal write to complete. HomeStore never completes one whose device
+    // write failed (SDSTOR-24993): it fails timed_out instead, and the partition faults, as the write may still land.
+    // 0 = no deadline.
+    craft_journal_write_timeout_ms: uint32 = 30000;
+
+    // CRAFT: a member without a volume's replica hands the group's RAFT leadership off when elected, but not again
+    // within this many milliseconds of its last hand-off: two such members would hand it to each other at once,
+    // forever, while the member with the replica doesn't answer. It retries once the time is over.
+    craft_leadership_handoff_backoff_ms: uint32 = 10000;
 }
 
 root_type HomeBlksSettings;
