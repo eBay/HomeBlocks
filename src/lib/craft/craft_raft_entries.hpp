@@ -31,8 +31,9 @@
 // and is journalled locally. These entries carry only control-plane metadata:
 //
 //   SyncRSCommitLSN — advances the replica-set commit watermark and carries
-//     the Empty verdicts (slots the leader declared unreachable by quorum).
-//     Proposed by the leader; applied by every replica.
+//     the Empty verdicts (slots the leader declared unreachable by quorum), and
+//     the session it was proposed in. Proposed by the leader; applied by every
+//     replica.
 //
 //   InternalLogin — establishes a new client session (token + term), starting at
 //     the login's watermark rs_commit_lsn. Proposed by the leader as the last step
@@ -66,11 +67,13 @@ struct CraftEntryHeader {
 
 // ─── key blob: SyncRSCommitLSN ───────────────────────────────────────────────
 
-// Fixed prefix. Immediately followed by num_empty_slots × int64_t.
+// Fixed prefix. Immediately followed by num_empty_slots × int64_t. term is the session the entry was proposed in: one
+// that commits behind a newer InternalLogin is rejected.
 #pragma pack(push, 1)
 struct SyncRSCommitLSNPayload {
     int64_t rs_commit_lsn;
     uint64_t client_token;
+    uint64_t term;
     uint32_t num_empty_slots;
 };
 
@@ -111,17 +114,16 @@ inline size_t sync_rs_commit_lsn_key_size(size_t num_empty) {
 
 // Writes the fixed payload followed by a packed int64_t array into buf. Caller must size buf via
 // sync_rs_commit_lsn_key_size(empty_slots.size()) first.
-inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, uint64_t client_token,
+inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, uint64_t client_token, uint64_t term,
                                          const std::vector< int64_t >& empty_slots) {
-    // SyncRSCommitLSNPayload's 3 members total 20 bytes but sizeof rounds to 24 (8-byte alignment) --
-    // zero the whole fixed prefix first so that trailing padding, which rides along as part of the
-    // persisted/replicated entry, doesn't leak prior buffer contents or make equivalent entries
-    // byte-different.
+    // Zero the whole fixed prefix first so that any padding, which rides along as part of the persisted/replicated
+    // entry, doesn't leak prior buffer contents or make equivalent entries byte-different.
     std::memset(buf, 0, sizeof(SyncRSCommitLSNPayload));
 
     auto* p = reinterpret_cast< SyncRSCommitLSNPayload* >(buf);
     p->rs_commit_lsn = rs_commit_lsn;
     p->client_token = client_token;
+    p->term = term;
     p->num_empty_slots = static_cast< uint32_t >(empty_slots.size());
     // empty_slots.data() may be null when empty; memcpy(dest, nullptr, 0) is UB regardless of count.
     if (!empty_slots.empty()) { std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t)); }

@@ -176,9 +176,10 @@ protected:
         serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
         commit_entry(CraftEntryType::InternalLogin, key);
     }
+    // A Sync from this member's current session.
     void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
     // Faults the partition: a verdict for a slot it has already committed.
@@ -617,13 +618,29 @@ TEST_F(CraftLoginTest, SyncFailsNoQuorumBelowAnAppliedSyncsWatermark) {
     EXPECT_EQ(r.error(), no_quorum());
 }
 
-// An earlier login's timed-out InternalLogin commits ahead of the Sync: the session is replaced, though commit_lsn
-// ends at the watermark.
+// An earlier login's timed-out InternalLogin commits ahead of the Sync: the Sync's session is replaced, so it's
+// rejected at commit and the watermark doesn't move.
 TEST_F(CraftLoginTest, SyncFailsStaleTermWhenALoginCommitsAheadOfIt) {
     dev_->seed_lsns(5, {});
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
         commit_login(/*term=*/1);
         loop_back(proposer_, *dev_, h, k);
+    };
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_EQ(dev_->commit_lsn(), -1);
+}
+
+// Another leader's InternalLogin commits right behind the Sync, before login_sync() resumes: the Sync applied, but the
+// session it was for is gone.
+TEST_F(CraftLoginTest, SyncFailsStaleTermWhenALoginCommitsBehindIt) {
+    dev_->seed_lsns(5, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        loop_back(proposer_, *dev_, h, k);
+        commit_login(/*term=*/1);
     };
 
     auto r = do_login_sync(/*rs_commit_lsn=*/5, /*client_token=*/42, /*empty_slots=*/{});

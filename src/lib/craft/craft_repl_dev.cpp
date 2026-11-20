@@ -2102,7 +2102,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
 async_status CraftReplDev::propose_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                         std::vector< int64_t > const& empty_slots, uint64_t term) {
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-    serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, empty_slots);
+    serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, term, empty_slots);
 
     if (auto r = co_await propose_entry(lock, CraftEntryType::SyncRSCommitLSN, key, term); !r) {
         log_unapplied_proposal(fmt::format("SyncRSCommitLSN({})", rs_commit_lsn), r.error());
@@ -2268,6 +2268,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
         entry.rs_commit_lsn = payload->rs_commit_lsn;
         entry.client_token = payload->client_token;
+        entry.term = payload->term;
         empty_slots = std::move(*parsed);
         break;
     }
@@ -2299,21 +2300,35 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
         if (apply_stopped_) {
             rejected = std::make_error_condition(std::errc::operation_canceled);
         } else {
-            // Fences take effect at commit; only I/O waits for the queue.
+            // Fences take effect at commit; only I/O waits for the queue. Both session rules below are decided here,
+            // in log order, so every replica decides them the same way.
             if (entry.type == CraftEntryType::SyncRSCommitLSN) {
-                // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
-                if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                bool replaced;
+                {
+                    std::lock_guard sl{state_mu_};
+                    replaced = entry.term < login_fence_term_;
+                }
+                if (replaced) {
+                    // Proposed in a session that a committed InternalLogin has since replaced (another leader's round
+                    // after a leadership change, or one behind a timed-out login): the new session starts at that
+                    // login's watermark, so this entry mustn't settle slots past it.
+                    LOGW("SyncRSCommitLSN({}) lsn={}: session {} was replaced by a committed login -- rejected",
+                         entry.rs_commit_lsn, entry.lsn, entry.term);
+                    rejected = craft::make_error_condition(craft::craft_error::STALE_TERM);
+                } else if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                    // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
                     entry.to_free = std::move(*to_free);
                 } else {
                     rejected = to_free.error();
                 }
             } else if (entry.type == CraftEntryType::InternalLogin) {
                 std::lock_guard sl{state_mu_};
-                if (entry.rs_commit_lsn < applied_sync_lsn_) {
+                // A login that isn't newer than one committed ahead of it is ignored when it applies (STALE_TERM), so
+                // only a newer one is checked here.
+                if (entry.term > login_fence_term_ && entry.rs_commit_lsn < applied_sync_lsn_) {
                     // A Sync committed ahead of it moved the watermark past this login's, which only another leader
-                    // can do (a leadership change mid-login): the session would start below committed slots. Decided
-                    // here, in log order, so every replica rejects it; and it doesn't fence the old session it no
-                    // longer replaces.
+                    // can do (a leadership change mid-login): the session would start below committed slots. It
+                    // doesn't fence the old session it no longer replaces.
                     LOGW("InternalLogin(term={}) lsn={}: its watermark {} is below a committed Sync's {} -- rejected",
                          entry.term, entry.lsn, entry.rs_commit_lsn, applied_sync_lsn_);
                     rejected = craft::make_error_condition(craft::craft_error::NO_QUORUM);

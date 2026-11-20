@@ -1045,9 +1045,10 @@ protected:
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
+    // A Sync from this member's current session.
     void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
     // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
@@ -1118,6 +1119,35 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
+}
+
+// The entry carries the session it was proposed in, so a login committed ahead of it can reject it.
+TEST_F(CraftAppendTest, AppendProposesTheCallersSessionTerm) {
+    dev_->seed_term(2);
+    dev_->seed_lsns(5, {});
+
+    auto r = do_append(5);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).term, 2u);
+}
+
+// Unlike a login that commits behind the round's Sync (above), one that commits ahead of it replaces the session the
+// Sync was proposed in: the Sync is rejected, and the watermark doesn't move.
+TEST_F(CraftAppendTest, LoginCommittedAheadOfTheRoundsSyncRejectsIt) {
+    dev_->seed_lsns(5, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        commit_login(/*term=*/1);
+        loop_back(proposer_, *dev_, h, k);
+    };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), -1);
+    EXPECT_EQ(dev_->term(), 1u);
 }
 
 // An allocation failure lets pre-resolution return without noticing the term moved; with nothing to propose,
@@ -1290,7 +1320,7 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {});
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, /*term=*/0, {});
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
@@ -1333,7 +1363,7 @@ TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsRejectedAndFreed) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
-    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, {0});
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, /*term=*/0, {0});
     journal_->on_write = [&](int64_t lsn) {
         if (lsn != 0) return;
         cintrusive< homestore::repl_req_ctx > ctx{};

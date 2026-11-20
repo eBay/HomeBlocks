@@ -186,10 +186,11 @@ std::vector< uint8_t > make_header(CraftEntryType type) {
     return buf;
 }
 
+// term is the session the Sync was proposed in: the initial session unless a test logs in ahead of it.
 std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64_t client_token,
-                                                   const std::vector< int64_t >& empty_slots) {
+                                                   const std::vector< int64_t >& empty_slots, uint64_t term = 0) {
     std::vector< uint8_t > buf(sync_rs_commit_lsn_key_size(empty_slots.size()));
-    serialize_sync_rs_commit_lsn(buf.data(), rs_commit_lsn, client_token, empty_slots);
+    serialize_sync_rs_commit_lsn(buf.data(), rs_commit_lsn, client_token, term, empty_slots);
     return buf;
 }
 
@@ -985,6 +986,79 @@ TEST_F(CraftRaftEntriesTest, InternalLoginAtTheCommittedWatermarkInstalls) {
 
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_EQ(dev_->client_token(), 42u);
+}
+
+// A login that lost its term to one committed ahead of it gets STALE_TERM, not the watermark check's NO_QUORUM, even
+// with a Sync past its watermark between them; whether the winner has applied yet or is still queued.
+class CraftLosingLoginTest : public CraftRaftEntriesTest, public ::testing::WithParamInterface< bool > {};
+
+TEST_P(CraftLosingLoginTest, BehindASyncFailsStaleTerm) {
+    bool const winner_queued = GetParam();
+    dev_->seed_lsns(5, {});
+    if (winner_queued) dev_->pause_apply();
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto winner = make_internal_login_key(/*client_token=*/1, /*term=*/5, /*rs_commit_lsn=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(login_hdr), as_blob(winner), {}, {});
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/1, {}, /*term=*/5);
+    dev_->raft_listener().on_commit(2, as_blob(sync_hdr), as_blob(sync_key), {}, {});
+    auto loser = make_internal_login_key(/*client_token=*/2, /*term=*/5, /*rs_commit_lsn=*/5);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(3, as_blob(login_hdr), as_blob(loser), {}, ctx);
+    if (winner_queued) dev_->resume_apply();
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(dev_->client_token(), 1u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Winner, CraftLosingLoginTest, ::testing::Bool(),
+                         [](auto const& info) { return std::string{info.param ? "Queued" : "Applied"}; });
+
+// An old-session Sync that commits behind the InternalLogin replacing its session (another leader's round after a
+// leadership change) would settle slots past the new session's watermark: it's rejected at commit, before the login
+// has even applied, and installs nothing.
+TEST_F(CraftRaftEntriesTest, SyncFromAReplacedSessionIsRejected) {
+    dev_->seed_lsns(5, {});
+    dev_->pause_apply();
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/1, /*term=*/1, /*rs_commit_lsn=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(login_hdr), as_blob(login_key), {}, {});
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto old_session = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/0, {7}, /*term=*/0);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(2, as_blob(sync_hdr), as_blob(old_session), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(dev_->last_append_lsn(), 5); // its watermark wasn't installed
+    EXPECT_FALSE(dev_->is_missing(6));     // nor the gap it would have opened
+    dev_->resume_apply();
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// A Sync from the new session goes through.
+TEST_F(CraftRaftEntriesTest, SyncFromTheNewSessionInstalls) {
+    dev_->seed_lsns(5, {});
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/1, /*term=*/1, /*rs_commit_lsn=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(login_hdr), as_blob(login_key), {}, {});
+    auto sync_hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto sync_key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/7, /*client_token=*/1, {6, 7}, /*term=*/1);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(2, as_blob(sync_hdr), as_blob(sync_key), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 7);
 }
 
 // Happy-path regression check for the write()-term-check-under-lock reorg: a matching term still

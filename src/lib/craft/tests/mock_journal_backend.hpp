@@ -99,6 +99,7 @@ struct ProposedSync {
     CraftEntryType type;
     int64_t rs_commit_lsn;
     uint64_t client_token;
+    uint64_t term;
     std::vector< int64_t > empty_slots;
 };
 
@@ -107,7 +108,7 @@ inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8
     auto empties = parse_empty_slots(
         sisl::blob{const_cast< uint8_t* >(entry.second.data()), static_cast< uint32_t >(entry.second.size())});
     return {reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, p->rs_commit_lsn, p->client_token,
-            empties.value_or(std::vector< int64_t >{})};
+            p->term, empties.value_or(std::vector< int64_t >{})};
 }
 
 template < typename Mock >

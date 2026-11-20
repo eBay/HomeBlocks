@@ -716,8 +716,9 @@ private:
     async_status login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                uint64_t term);
 
-    // Proposes SyncRSCommitLSN{rs_commit_lsn, client_token, empty_slots} through propose_entry() and raises
-    // last_proposed_sync_lsn_ once it has applied. The caller holds watermark_mu_ (`lock`): append() and login_sync().
+    // Proposes SyncRSCommitLSN{rs_commit_lsn, client_token, session term, empty_slots} through propose_entry() and
+    // raises last_proposed_sync_lsn_ once it has applied. The caller holds watermark_mu_ (`lock`): append() and
+    // login_sync().
     async_status propose_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                               std::vector< int64_t > const& empty_slots, uint64_t term);
 
@@ -748,14 +749,15 @@ private:
         CraftEntryType type{};
         int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN, InternalLogin
         uint64_t client_token{0};
-        std::vector< int64_t > to_free{};           // SyncRSCommitLSN: held slots its verdicts voided
-        uint64_t term{0};                           // InternalLogin
+        std::vector< int64_t > to_free{}; // SyncRSCommitLSN: held slots its verdicts voided
+        // InternalLogin: its new term. SyncRSCommitLSN: the session it was proposed in.
+        uint64_t term{0};
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
-    // empty_slots, an InternalLogin's write fence, or its rejection if a committed Sync is past its watermark) and
-    // queues the rest. Under apply_mu_, so once stop_apply() has run,
-    // nothing changes.
+    // empty_slots, or its rejection if a committed login replaced its session; an InternalLogin's write fence, or its
+    // rejection if a committed Sync is past its watermark) and queues the rest. Under apply_mu_, so once stop_apply()
+    // has run, nothing changes.
     void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
     std::optional< PendingApply > next_apply();
     async_status drain_apply();
