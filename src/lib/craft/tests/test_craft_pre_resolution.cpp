@@ -1055,7 +1055,7 @@ protected:
     }
     void commit_login(uint64_t term) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        serialize_internal_login(key.data(), /*client_token=*/7, term, /*rs_commit_lsn=*/-1);
         commit_entry(CraftEntryType::InternalLogin, key);
     }
 };
@@ -1570,7 +1570,7 @@ TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 9, .term = 2};
+    serialize_internal_login(key.data(), /*client_token=*/9, /*term=*/2, /*rs_commit_lsn=*/-1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
@@ -1626,7 +1626,7 @@ TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 99, .term = 4};
+    serialize_internal_login(key.data(), /*client_token=*/99, /*term=*/4, /*rs_commit_lsn=*/-1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);

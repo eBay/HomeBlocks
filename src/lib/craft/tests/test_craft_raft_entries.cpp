@@ -191,11 +191,9 @@ std::vector< uint8_t > make_sync_rs_commit_lsn_key(int64_t rs_commit_lsn, uint64
     return buf;
 }
 
-std::vector< uint8_t > make_internal_login_key(uint64_t client_token, uint64_t term) {
+std::vector< uint8_t > make_internal_login_key(uint64_t client_token, uint64_t term, int64_t rs_commit_lsn = -1) {
     std::vector< uint8_t > buf(sizeof(InternalLoginPayload));
-    auto* p = reinterpret_cast< InternalLoginPayload* >(buf.data());
-    p->client_token = client_token;
-    p->term = term;
+    serialize_internal_login(buf.data(), client_token, term, rs_commit_lsn);
     return buf;
 }
 
@@ -814,7 +812,8 @@ TEST_F(CraftRaftEntriesTest, OnCommitDispatchesInternalLogin) {
 
 TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginWrongSize) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    std::vector< uint8_t > short_key(sizeof(InternalLoginPayload) - 1, 0);
+    auto short_key = make_internal_login_key(/*client_token=*/42, /*term=*/5);
+    short_key.pop_back();
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
@@ -828,10 +827,25 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginWrongSize) {
 // must be rejected just as much as one that's too small.
 TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginKeyTooLarge) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
-    std::vector< uint8_t > long_key(sizeof(InternalLoginPayload) + 1, 0);
+    auto long_key = make_internal_login_key(/*client_token=*/42, /*term=*/5);
+    long_key.push_back(0);
     cintrusive< homestore::repl_req_ctx > ctx{};
 
     dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(long_key), {}, ctx);
+
+    EXPECT_EQ(dev_->client_token(), 0u); // untouched
+    EXPECT_EQ(dev_->term(), 0u);         // untouched
+}
+
+// A key written in another layout is rejected rather than misread.
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsInternalLoginOfAnotherVersion) {
+    auto header_buf = make_header(CraftEntryType::InternalLogin);
+    auto key_buf = make_internal_login_key(/*client_token=*/42, /*term=*/5);
+    reinterpret_cast< InternalLoginPayload* >(key_buf.data())->version =
+        static_cast< uint8_t >(InternalLoginPayload::VERSION + 1);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
     EXPECT_EQ(dev_->client_token(), 0u); // untouched
     EXPECT_EQ(dev_->term(), 0u);         // untouched
@@ -1005,6 +1019,50 @@ TEST(CreateVolumeCodecTest, RejectsAnotherVersion) {
         reinterpret_cast< CreateVolumeHeader* >(buf.data())->version = static_cast< uint8_t >(version);
         EXPECT_FALSE(parse_create_volume(as_blob(buf))) << "version " << version;
     }
+}
+
+// ── InternalLogin codec (SDSTOR-22892) ────────────────────────────────────────
+
+TEST(InternalLoginCodecTest, RoundTrip) {
+    auto buf = make_internal_login_key(/*client_token=*/42, /*term=*/5, /*rs_commit_lsn=*/17);
+    EXPECT_EQ(reinterpret_cast< InternalLoginPayload const* >(buf.data())->version, InternalLoginPayload::VERSION);
+
+    auto const out = parse_internal_login(as_blob(buf));
+
+    ASSERT_TRUE(out);
+    EXPECT_EQ(out->client_token, 42u);
+    EXPECT_EQ(out->term, 5u);
+    EXPECT_EQ(out->rs_commit_lsn, 17);
+}
+
+// A login on an empty volume settles at -1.
+TEST(InternalLoginCodecTest, RoundTripsAnEmptyVolumesWatermark) {
+    auto buf = make_internal_login_key(/*client_token=*/42, /*term=*/1, /*rs_commit_lsn=*/-1);
+    auto const out = parse_internal_login(as_blob(buf));
+    ASSERT_TRUE(out);
+    EXPECT_EQ(out->rs_commit_lsn, -1);
+}
+
+TEST(InternalLoginCodecTest, RejectsAKeyOfAnotherSize) {
+    auto buf = make_internal_login_key(/*client_token=*/42, /*term=*/5, /*rs_commit_lsn=*/17);
+    auto truncated = std::vector< uint8_t >(buf.begin(), buf.end() - 1);
+    EXPECT_FALSE(parse_internal_login(as_blob(truncated)));
+    auto padded = buf;
+    padded.push_back(0);
+    EXPECT_FALSE(parse_internal_login(as_blob(padded)));
+}
+
+TEST(InternalLoginCodecTest, RejectsAnotherVersion) {
+    auto buf = make_internal_login_key(/*client_token=*/42, /*term=*/5, /*rs_commit_lsn=*/17);
+    for (int const version : {0, InternalLoginPayload::VERSION + 1}) {
+        reinterpret_cast< InternalLoginPayload* >(buf.data())->version = static_cast< uint8_t >(version);
+        EXPECT_FALSE(parse_internal_login(as_blob(buf))) << "version " << version;
+    }
+}
+
+TEST(InternalLoginCodecTest, RejectsAWatermarkBelowMinusOne) {
+    auto buf = make_internal_login_key(/*client_token=*/42, /*term=*/5, /*rs_commit_lsn=*/-2);
+    EXPECT_FALSE(parse_internal_login(as_blob(buf)));
 }
 
 // ── proposal completion (make_homestore_raft_proposer's ctx) ──────────────────

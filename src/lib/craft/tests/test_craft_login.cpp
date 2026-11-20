@@ -170,7 +170,7 @@ protected:
     }
     void commit_login(uint64_t term) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        serialize_internal_login(key.data(), /*client_token=*/7, term, /*rs_commit_lsn=*/-1);
         commit_entry(CraftEntryType::InternalLogin, key);
     }
     void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {

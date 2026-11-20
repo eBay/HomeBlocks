@@ -731,7 +731,7 @@ private:
     struct PendingApply {
         int64_t lsn{-1};
         CraftEntryType type{};
-        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
+        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN, InternalLogin
         uint64_t client_token{0};
         std::vector< int64_t > to_free{};           // SyncRSCommitLSN: held slots its verdicts voided
         uint64_t term{0};                           // InternalLogin

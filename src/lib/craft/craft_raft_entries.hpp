@@ -34,9 +34,10 @@
 //     the Empty verdicts (slots the leader declared unreachable by quorum).
 //     Proposed by the leader; applied by every replica.
 //
-//   InternalLogin — establishes a new client session (token + term). Proposed
-//     by the leader as step 4 of the login sequence; applied by every replica.
-//     All subsequent IO with a mismatched term is rejected STALE_TERM.
+//   InternalLogin — establishes a new client session (token + term), starting at
+//     the login's watermark rs_commit_lsn. Proposed by the leader as the last step
+//     of the login sequence; applied by every replica. All subsequent IO with a
+//     mismatched term is rejected STALE_TERM.
 //
 //   CreateVolume — the partition's first entry: proposed by the member that formed
 //     the RAFT group; every member creates its local volume when it commits.
@@ -50,8 +51,8 @@
 // SyncRSCommitLSNPayload struct is followed immediately by
 // payload.num_empty_slots × int64_t (the Empty-verdicted LSNs).
 //
-// Parsing: reinterpret_cast<const T*>(blob.cbytes()) — same pattern as
-// MsgHeader / VolJournalEntry in volume.hpp.
+// Parsing: parse_empty_slots, parse_internal_login and parse_create_volume below,
+// which validate the persisted key before trusting it.
 
 namespace homeblocks {
 
@@ -75,9 +76,14 @@ struct SyncRSCommitLSNPayload {
 
 // ─── key blob: InternalLogin ──────────────────────────────────────────────────
 
+// `version` comes first, as in CreateVolumeHeader. rs_commit_lsn is the watermark the login settled, -1 on an empty
+// volume.
 struct InternalLoginPayload {
+    static constexpr uint8_t VERSION{1};
+    uint8_t version;
     uint64_t client_token;
     uint64_t term;
+    int64_t rs_commit_lsn;
 };
 
 // ─── key blob: CreateVolume ───────────────────────────────────────────────────
@@ -95,6 +101,7 @@ struct CreateVolumeHeader {
     uint16_t name_len;
 };
 #pragma pack(pop)
+static_assert(sizeof(InternalLoginPayload) == 1 + 3 * sizeof(uint64_t), "InternalLoginPayload must stay packed");
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -137,6 +144,32 @@ inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob cons
 
     const auto* src = reinterpret_cast< const int64_t* >(p + 1);
     return std::vector< int64_t >(src, src + empty_count);
+}
+
+// Writes an InternalLogin key into buf, which must hold sizeof(InternalLoginPayload) bytes.
+inline void serialize_internal_login(uint8_t* buf, uint64_t client_token, uint64_t term, int64_t rs_commit_lsn) {
+    auto* p = reinterpret_cast< InternalLoginPayload* >(buf);
+    p->version = InternalLoginPayload::VERSION;
+    p->client_token = client_token;
+    p->term = term;
+    p->rs_commit_lsn = rs_commit_lsn;
+}
+
+// A parsed InternalLogin: the payload's fields, unpacked so callers can bind references to them.
+struct InternalLoginEntry {
+    uint64_t client_token;
+    uint64_t term;
+    int64_t rs_commit_lsn;
+};
+
+// `key` is persisted RAFT log data replayed on apply, like parse_create_volume's. Returns std::nullopt if its size or
+// version is wrong or its rs_commit_lsn is below -1.
+inline std::optional< InternalLoginEntry > parse_internal_login(sisl::blob const& key) {
+    if (key.size() != sizeof(InternalLoginPayload)) { return std::nullopt; }
+    InternalLoginPayload p;
+    std::memcpy(&p, key.cbytes(), sizeof(p));
+    if (p.version != InternalLoginPayload::VERSION || p.rs_commit_lsn < -1) { return std::nullopt; }
+    return InternalLoginEntry{p.client_token, p.term, p.rs_commit_lsn};
 }
 
 inline size_t create_volume_key_size(size_t num_members, size_t name_len) {

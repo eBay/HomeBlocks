@@ -123,7 +123,7 @@ protected:
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
         reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        serialize_internal_login(key.data(), /*client_token=*/7, term, /*rs_commit_lsn=*/-1);
         cintrusive< homestore::repl_req_ctx > ctx{};
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);

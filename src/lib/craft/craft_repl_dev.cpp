@@ -2226,14 +2226,14 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         break;
     }
     case CraftEntryType::InternalLogin: {
-        // Fixed-size payload, no variable trailing data (unlike SyncRSCommitLSN) -- exact-size check.
-        if (key.size() != sizeof(InternalLoginPayload)) {
-            LOGE("on_commit lsn={} InternalLogin key wrong size ({} bytes)", lsn, key.size());
+        auto const login = parse_internal_login(key);
+        if (!login) {
+            LOGE("on_commit lsn={} InternalLogin key malformed ({} bytes)", lsn, key.size());
             return invalid();
         }
-        const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
-        entry.client_token = login_payload->client_token;
-        entry.term = login_payload->term;
+        entry.client_token = login->client_token;
+        entry.term = login->term;
+        entry.rs_commit_lsn = login->rs_commit_lsn;
         break;
     }
     default:
