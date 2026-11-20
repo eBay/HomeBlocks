@@ -130,7 +130,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 **Acceptance criteria:**
 
 **SyncRSCommitLSN:**
-- RAFT entry carries `{rs_commit_lsn, client_token, empty_slots[]}`
+- RAFT entry carries `{rs_commit_lsn, client_token, term, empty_slots[]}`, `term` being the session it was proposed in (S7). One that commits behind an `InternalLogin` with a newer term is rejected at commit, in log order: its session was replaced, and the new session starts at that login's `rs_commit_lsn`, so it mustn't settle slots past it. Its proposer gets `STALE_TERM`
 - **Leader pre-resolution:** before proposing `N`, the leader resolves every unresolved slot ≤ `N`: fetch it from any holder, or record an `Empty` verdict on quorum-lacks evidence (leader counts itself; non-responders never count); it must not propose past an unresolved slot
 - On apply: `client_token` is carried on the entry but NOT checked against local state -- `SyncRSCommitLSN` applies before the `InternalLogin` that would establish it, so an equality-fence here would make login itself unreachable; ordering plus the term fence on subsequent IO provide exclusivity instead. Mark `empty_slots` Empty, **discarding any local data held there** (reconciliation); if behind, `fetch_data()` the remaining missing slots from peers; then advance `commit_lsn` to the contiguous prefix bounded by `rs_commit_lsn` (skipping `Empty` slots, never past an unresolved `Missing` one). **Apply never truncates** and replicas **never declare Empty unilaterally**
 - Peer catch-up (`CraftPeerFetcher::fetch_data`) is **timeout-bounded**: every call passes `peer_fetch_timeout_ms` (`home_blks_config.fbs`, default 5000ms); a peer that misses the deadline is treated as a hard failure, same as any other fetch failure (best-effort — unresolved LSNs stay missing and `commit_lsn` stalls just below the first one). The interface only carries the deadline; enforcing it against a real wire call is S9's (the transport's)
@@ -138,8 +138,8 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 - Triggers: periodic every N LSNs (configurable via `home_blks_config.fbs`, default 128), watchdog, login, **client-requested (after a failed sub-quorum write)** — the client's `Resolve` RPC lands on `CraftReplDev::request_resolution(term, upto)`, which runs this same leader pre-resolution and returns the Empty verdicts ≤ `upto` (`craft::resolution_result`). The client broadcasts it to every member (it cannot know the leader mid-session); a follower returns `NOT_LEADER`
 
 **InternalLogin:**
-- RAFT entry carries `{client_token, term}`; S7 adds `rs_commit_lsn`
-- On apply: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5)
+- RAFT entry carries `{client_token, term, rs_commit_lsn}` (`rs_commit_lsn` added by S7)
+- On apply, if `term` is newer than `state.term`: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5). An entry whose `term` isn't newer (a replay, or a login that lost its term to an earlier one) is ignored outright, and its proposer gets `STALE_TERM`. A newer entry whose `rs_commit_lsn` is below the watermark of a `SyncRSCommitLSN` committed ahead of it (another leader's, after a leadership change mid-login) is rejected at commit, in log order, without fencing the old session; its proposer gets `NO_QUORUM`
 - All subsequent IO with a different `term` is rejected
 - Proposed immediately after `SyncRSCommitLSN` commits during login
 

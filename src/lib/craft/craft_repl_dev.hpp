@@ -702,15 +702,31 @@ private:
     // the new client's token, the step-2 verdicts} and waits for the leader to apply it, then checks the leader is
     // exactly at rs_commit_lsn. Always proposes, even if rs_commit_lsn is already covered. Fails NO_QUORUM if
     // commit_lsn isn't rs_commit_lsn afterwards (a late Sync past it, or a slot still missing), STALE_TERM if a login
-    // replaced the session meanwhile, and INTERNAL_ERROR if the partition is or becomes faulted.
+    // replaced the session meanwhile, INTERNAL_ERROR if the partition is or becomes faulted, and otherwise with
+    // propose_entry()'s error (NOT_LEADER, timed_out, ...).
     async_status login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                             std::vector< int64_t > empty_slots, uint64_t term);
 
-    // Proposes SyncRSCommitLSN{rs_commit_lsn, client_token, empty_slots} and waits for it to commit and apply,
-    // re-checking leadership and the session first; raises last_proposed_sync_lsn_ once it has. The caller holds
-    // watermark_mu_ (`lock`): append() and login_sync().
+    // Login step 4, leader-only, under watermark_mu_: proposes InternalLogin{the new client's token, term + 1,
+    // rs_commit_lsn} and waits for it to apply, which installs the new session. term is the session the login
+    // replaces. Fails STALE_TERM if that session is already gone, an earlier InternalLogin took term + 1 first, or a
+    // newer one has already committed behind it, NO_QUORUM if a Sync committed ahead of it moved the watermark past
+    // rs_commit_lsn (another leader's, after a leadership change), INTERNAL_ERROR if the partition is or becomes
+    // faulted, and otherwise with propose_entry()'s error (NOT_LEADER, timed_out: the entry may still commit, ...).
+    async_status login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                               uint64_t term);
+
+    // Proposes SyncRSCommitLSN{rs_commit_lsn, client_token, session term, empty_slots} through propose_entry() and
+    // raises last_proposed_sync_lsn_ once it has applied. The caller holds watermark_mu_ (`lock`): append() and
+    // login_sync().
     async_status propose_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                               std::vector< int64_t > const& empty_slots, uint64_t term);
+
+    // Proposes an entry of `type` with `key` and waits for it to commit and apply, re-checking leadership and session
+    // `term` first: fails NOT_LEADER or STALE_TERM without proposing, or with the proposal's error (the apply's, once
+    // it has applied). The caller holds watermark_mu_ (`lock`) and logs a failure.
+    async_status propose_entry(AsyncMutex::Lock const& lock, CraftEntryType type, std::vector< uint8_t >& key,
+                               uint64_t term);
 
     // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
     // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
@@ -731,15 +747,17 @@ private:
     struct PendingApply {
         int64_t lsn{-1};
         CraftEntryType type{};
-        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN
+        int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN, InternalLogin
         uint64_t client_token{0};
-        std::vector< int64_t > to_free{};           // SyncRSCommitLSN: held slots its verdicts voided
-        uint64_t term{0};                           // InternalLogin
+        std::vector< int64_t > to_free{}; // SyncRSCommitLSN: held slots its verdicts voided
+        // InternalLogin: its new term. SyncRSCommitLSN: the session it was proposed in.
+        uint64_t term{0};
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
-    // empty_slots, an InternalLogin's write fence) and queues the rest. Under apply_mu_, so once stop_apply() has run,
-    // nothing changes.
+    // empty_slots, or its rejection if a committed login replaced its session; an InternalLogin's write fence, or its
+    // rejection if a committed Sync is past its watermark) and queues the rest. Under apply_mu_, so once stop_apply()
+    // has run, nothing changes.
     void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
     std::optional< PendingApply > next_apply();
     async_status drain_apply();
@@ -765,8 +783,8 @@ private:
     // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
-    // InternalLogin's apply, run by the apply queue.
-    void apply_internal_login(uint64_t client_token, uint64_t term);
+    // InternalLogin's apply, run by the apply queue: false if the entry's term isn't newer, and it was ignored.
+    bool apply_internal_login(uint64_t client_token, uint64_t term);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
