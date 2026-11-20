@@ -789,8 +789,19 @@ async_status CraftReplDev::login_install(AsyncMutex::Lock const& lock, int64_t r
         LOGE("login_install: partition faulted during InternalLogin(term={})", term + 1);
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     }
-    if (!proposed) log_unapplied_proposal(fmt::format("InternalLogin(term={})", term + 1), proposed.error());
-    co_return proposed;
+    if (!proposed) {
+        log_unapplied_proposal(fmt::format("InternalLogin(term={})", term + 1), proposed.error());
+        co_return proposed;
+    }
+    // Installed, but a newer login (another leader's, after a leadership change) may have committed behind it while it
+    // waited in the apply queue: that fenced the new session already.
+    std::lock_guard lk{state_mu_};
+    if (!session_current_locked(term + 1)) {
+        LOGW("login_install: session {} was replaced as it was installed (login fence {})", term + 1,
+             login_fence_term_);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
+    co_return ok();
 }
 
 // ─── truncate (S4) ────────────────────────────────────────────────────────────

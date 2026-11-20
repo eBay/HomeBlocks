@@ -709,9 +709,9 @@ private:
 
     // Login step 4, leader-only, under watermark_mu_: proposes InternalLogin{the new client's token, term + 1,
     // rs_commit_lsn} and waits for it to apply, which installs the new session. term is the session the login
-    // replaces. Fails STALE_TERM if that session is already gone or an earlier InternalLogin took term + 1 first,
-    // INTERNAL_ERROR if the partition is or becomes faulted, and otherwise with propose_entry()'s error (NOT_LEADER,
-    // timed_out: the entry may still commit, ...).
+    // replaces. Fails STALE_TERM if that session is already gone, an earlier InternalLogin took term + 1 first, or a
+    // newer one has already committed behind it, INTERNAL_ERROR if the partition is or becomes faulted, and otherwise
+    // with propose_entry()'s error (NOT_LEADER, timed_out: the entry may still commit, ...).
     async_status login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                uint64_t term);
 

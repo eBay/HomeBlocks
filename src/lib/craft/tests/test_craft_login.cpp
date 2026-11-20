@@ -733,6 +733,24 @@ TEST_F(CraftLoginTest, InstallFailsStaleTermWithoutProposingWhenTheSessionMovedO
     EXPECT_TRUE(proposer_.proposed.empty());
 }
 
+// Ours applies, but another leader's newer InternalLogin has already committed behind it: the new session is fenced
+// before login_install() returns.
+TEST_F(CraftLoginTest, InstallFailsStaleTermWhenANewerLoginCommittedBehindIt) {
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        loop_back(proposer_, *dev_, h, k);
+        dev_->pause_apply();
+        commit_login(/*term=*/2);
+    };
+
+    auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u); // ours did install
+    EXPECT_EQ(dev_->client_token(), 42u);
+    dev_->resume_apply();
+}
+
 // A newer login has committed but not yet applied: the fence has risen though the session term hasn't.
 TEST_F(CraftLoginTest, InstallFailsStaleTermWithoutProposingWhenALoginIsQueued) {
     dev_->pause_apply();

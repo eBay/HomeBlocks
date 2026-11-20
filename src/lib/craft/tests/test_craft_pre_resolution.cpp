@@ -1841,6 +1841,9 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
 //                 ignores it, so it fences nothing
 // Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
 // (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
+// A cell that proposes (resolve, append) tests the entry point's checks up to its proposal: with the apply queue
+// paused, the mock returns the proposal once its entry commits. That a proposal waits for its apply is tested in
+// test_craft_raft_entries.cpp (InternalLoginWaitsForSuspendedSyncApply).
 
 constexpr uint64_t k_new_term{5}; // the login's term
 
