@@ -31,9 +31,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <thread>
@@ -522,6 +526,164 @@ TEST_F(CraftConcurrencyTest, ComprehensiveMixedWorkloadStress) {
             EXPECT_EQ(index_.entries[static_cast< lba_t >(l)].new_checksum, expected_csum) << "lba=" << l;
         }
     }
+}
+
+// ── AsyncMutex (SDSTOR-22891) ─────────────────────────────────────────────────
+//
+// The watermark mutex: rounds try_lock() and skip, login and Resolve lock() and wait their turn.
+
+// Takes `mu` (waiting if it must), records `id` in `order` once it has, and keeps the lock in `held`.
+sisl::async::task< void > take_lock(AsyncMutex& mu, int id, std::vector< int >& order,
+                                    std::optional< AsyncMutex::Lock >& held) {
+    held = co_await mu.lock();
+    order.push_back(id);
+}
+
+TEST(AsyncMutexTest, TryLockGivesUpWhileHeld) {
+    AsyncMutex mu;
+    auto first = mu.try_lock();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE(mu.locked());
+    EXPECT_FALSE(mu.try_lock().has_value());
+
+    first.reset();
+
+    EXPECT_FALSE(mu.locked());
+    EXPECT_TRUE(mu.try_lock().has_value());
+}
+
+TEST(AsyncMutexTest, LockOnAFreeMutexDoesNotWait) {
+    AsyncMutex mu;
+    {
+        auto lock = homeblocks::detail::sync_get(mu.lock());
+        EXPECT_TRUE(static_cast< bool >(lock));
+        EXPECT_TRUE(mu.locked());
+    }
+    EXPECT_FALSE(mu.locked());
+}
+
+// Waiters get the mutex in arrival order, each straight from the last holder: it never goes free in between, so a
+// try_lock() can't slip in ahead of a waiter.
+TEST(AsyncMutexTest, ReleaseHandsTheMutexToTheLongestWaiter) {
+    AsyncMutex mu;
+    auto first = mu.try_lock();
+    ASSERT_TRUE(first.has_value());
+    std::vector< int > order;
+    std::optional< AsyncMutex::Lock > second, third;
+    homeblocks::detail::detach(take_lock(mu, 2, order, second));
+    homeblocks::detail::detach(take_lock(mu, 3, order, third));
+    EXPECT_TRUE(order.empty());
+
+    first.reset();
+    EXPECT_EQ(order, (std::vector< int >{2}));
+    EXPECT_FALSE(mu.try_lock().has_value()); // handed over, not freed
+
+    second.reset();
+    EXPECT_EQ(order, (std::vector< int >{2, 3}));
+    EXPECT_FALSE(mu.try_lock().has_value());
+
+    third.reset();
+    EXPECT_FALSE(mu.locked());
+}
+
+// Ignores whatever a started task completes with, but notes in `*completed` (if given) that it did: the tests destroy
+// the task before it should.
+struct DropReceiver {
+    using receiver_concept = stdexec::receiver_t;
+    bool* completed{nullptr};
+    void set_value(auto&&...) && noexcept { note(); }
+    void set_error(auto&&) && noexcept { note(); }
+    void set_stopped() && noexcept { note(); }
+    void note() const {
+        if (completed) *completed = true;
+    }
+};
+
+// A waiter whose frame is destroyed while queued (its caller gave up) leaves the queue: the next release skips it,
+// rather than handing the mutex to a frame that will never hold it.
+TEST(AsyncMutexTest, AbandonedWaiterLeavesTheQueue) {
+    AsyncMutex mu;
+    auto first = mu.try_lock();
+    ASSERT_TRUE(first.has_value());
+    {
+        auto abandoned = stdexec::connect(
+            stdexec::write_env(mu.lock(), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+            DropReceiver{});
+        stdexec::start(abandoned);
+    } // destroyed while queued behind `first`
+    std::vector< int > order;
+    std::optional< AsyncMutex::Lock > next;
+    homeblocks::detail::detach(take_lock(mu, 2, order, next));
+
+    first.reset();
+
+    EXPECT_EQ(order, (std::vector< int >{2}));
+    next.reset();
+    EXPECT_FALSE(mu.locked());
+}
+
+// Takes `mu`, lets it go, then runs `then`. Resumed by a hand-off, so the hand-off its own release makes is deferred.
+sisl::async::task< void > take_release_then(AsyncMutex& mu, std::function< void() > then) {
+    auto lock = co_await mu.lock();
+    lock.reset();
+    then();
+}
+
+// A waiter destroyed after it was handed the mutex but before its deferred resume is skipped, and the mutex passes on:
+// W1 releases to W2, then destroys W2's frame; W3 gets the mutex and W2 never resumes.
+TEST(AsyncMutexTest, WaiterDestroyedBeforeItsDeferredResumeIsSkipped) {
+    AsyncMutex mu;
+    auto holder = mu.try_lock();
+    ASSERT_TRUE(holder.has_value());
+    bool w2_completed = false;
+    auto connect_w2 = [&] {
+        return stdexec::connect(
+            stdexec::write_env(mu.lock(), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+            DropReceiver{&w2_completed});
+    };
+    std::unique_ptr< decltype(connect_w2()) > w2;
+
+    homeblocks::detail::detach(take_release_then(mu, [&w2] { w2.reset(); })); // W1
+    w2.reset(new decltype(connect_w2())(connect_w2()));
+    stdexec::start(*w2); // W2
+    std::vector< int > order;
+    std::optional< AsyncMutex::Lock > w3;
+    homeblocks::detail::detach(take_lock(mu, 3, order, w3));
+
+    holder.reset();
+
+    EXPECT_FALSE(w2);
+    EXPECT_FALSE(w2_completed);
+    EXPECT_EQ(order, (std::vector< int >{3}));
+    w3.reset();
+    EXPECT_FALSE(mu.locked());
+}
+
+// Takes `mu`, records the stack frame it runs on, and lets the mutex go at once.
+sisl::async::task< void > take_and_release(AsyncMutex& mu, std::vector< std::uintptr_t >& frames) {
+    auto lock = co_await mu.lock();
+    frames.push_back(reinterpret_cast< std::uintptr_t >(__builtin_frame_address(0)));
+}
+
+// Waiters that release as soon as they get the mutex resume one after another, not each inside the last one's
+// release(): a long queue of them (every queued Resolve failing its recheck when leadership goes) mustn't run the
+// releasing thread out of stack.
+TEST(AsyncMutexTest, WaitersThatReleaseAtOnceDontNest) {
+    AsyncMutex mu;
+    auto first = mu.try_lock();
+    ASSERT_TRUE(first.has_value());
+    constexpr size_t n = 10'000;
+    std::vector< std::uintptr_t > frames;
+    frames.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        homeblocks::detail::detach(take_and_release(mu, frames));
+
+    first.reset();
+
+    ASSERT_EQ(frames.size(), n);
+    auto const [lo, hi] = std::minmax_element(frames.begin(), frames.end());
+    EXPECT_LT(*hi - *lo, 64u * 1024) << "hand-offs nested: the stack grew by " << (*hi - *lo) << " bytes";
+    EXPECT_FALSE(mu.locked());
 }
 
 } // namespace

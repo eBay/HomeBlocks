@@ -57,6 +57,7 @@ public:
     bool time_out{false};
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
+    std::function< void() > on_propose; // runs first, whichever way the proposal ends
 
     bool is_leader() const override { return leader; }
     craft::peer_id_t my_id() const override { return self; }
@@ -69,6 +70,7 @@ public:
     }
 
     async_status propose(sisl::blob header, sisl::blob key) override {
+        if (on_propose) on_propose();
         if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         proposed.emplace_back(std::vector< uint8_t >(header.cbytes(), header.cbytes() + header.size()),
                               std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));

@@ -133,11 +133,17 @@ public:
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
+    // When set, the next fetch_from_quorum() (a round's pre-resolution) waits for quorum_gate: the round is held
+    // mid-flight.
+    bool hold_quorum_fetch{false};
+    sisl::async::value_awaitable< bool > quorum_gate;
+
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                         uint32_t timeout_ms) override {
         ++call_count;
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
+        if (std::exchange(hold_quorum_fetch, false)) co_await quorum_gate;
         if (on_fetch) on_fetch();
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         auto tagged = response; // an untagged reply is the i-th distinct member
@@ -176,6 +182,8 @@ protected:
     }
     // Runs within the device's current session, as a well-behaved caller does.
     auto do_pre_resolve(int64_t upto) { return do_pre_resolve(upto, dev_->term()); }
+    // The watermark mutex, which a login holds from its poll through its InternalLogin.
+    AsyncMutex& watermark_mu() { return dev_->watermark_mu_; }
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftQuorumFetcher fetcher_;
@@ -1629,6 +1637,109 @@ TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     EXPECT_EQ(decode(proposer_.proposed[0]).client_token, 99u);
+}
+
+// A Resolve that arrives while a round is running waits its turn, rather than failing operation_in_progress and
+// leaving the client's failed slot unresolved until its next failed write.
+TEST_F(CraftAppendTest, ResolveWaitsForARunningRound) {
+    dev_->seed_lsns(5, {3});
+    fetcher_.hold_quorum_fetch = true;
+    bool round_done = false, resolve_done = false;
+    std::error_condition round_outcome, resolve_outcome;
+    homeblocks::detail::detach(
+        [](std::shared_ptr< CraftReplDev > dev, bool& done, std::error_condition& outcome) -> async_status {
+            auto r = co_await dev->append(/*sync_to=*/5, /*client_token=*/0, /*term=*/0);
+            outcome = r ? std::error_condition{} : r.error();
+            done = true;
+            co_return ok();
+        }(dev_, round_done, round_outcome));
+    ASSERT_FALSE(round_done); // held in its quorum fetch
+
+    homeblocks::detail::detach(
+        [](std::shared_ptr< CraftReplDev > dev, bool& done, std::error_condition& outcome) -> async_status {
+            auto r = co_await dev->request_resolution(craft::client_hdr{0, -1, -1}, /*upto=*/5);
+            outcome = r ? std::error_condition{} : r.error();
+            done = true;
+            co_return ok();
+        }(dev_, resolve_done, resolve_outcome));
+    EXPECT_FALSE(resolve_done); // waits for the round
+
+    fetcher_.quorum_gate.complete(true);
+
+    ASSERT_TRUE(round_done);
+    EXPECT_EQ(round_outcome, std::error_condition{});
+    ASSERT_TRUE(resolve_done);
+    EXPECT_EQ(resolve_outcome, std::error_condition{}) << resolve_outcome.message();
+}
+
+// A Resolve that waited re-checks before it runs: the round it waited out may have changed things. Here this member
+// lost its leadership meanwhile, so it neither fetches nor proposes.
+TEST_F(CraftAppendTest, ResolveRechecksAfterWaiting) {
+    dev_->seed_lsns(5, {3});
+    std::optional< AsyncMutex::Lock > holder = homeblocks::detail::sync_get(watermark_mu().lock());
+    bool done = false;
+    std::error_condition outcome;
+    homeblocks::detail::detach(
+        [](std::shared_ptr< CraftReplDev > dev, bool& done, std::error_condition& outcome) -> async_status {
+            auto r = co_await dev->request_resolution(craft::client_hdr{0, -1, -1}, /*upto=*/5);
+            outcome = r ? std::error_condition{} : r.error();
+            done = true;
+            co_return ok();
+        }(dev_, done, outcome));
+    ASSERT_FALSE(done);
+
+    proposer_.leader = false;
+    holder.reset();
+
+    ASSERT_TRUE(done);
+    EXPECT_EQ(outcome, craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// ── the watermark mutex against a login (SDSTOR-22891) ─────────────────────────
+
+// While a login holds the watermark, no round runs: append() fails operation_in_progress, and the periodic trigger
+// skips.
+TEST_F(CraftAppendTest, RoundsDontRunWhileALoginHoldsTheWatermark) {
+    dev_->seed_lsns(5, {3});
+    dev_->set_sync_lsn_interval(1);
+    auto login = homeblocks::detail::sync_get(watermark_mu().lock());
+
+    auto r = do_append(5);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::operation_in_progress));
+    ASSERT_TRUE(do_write(6, 0, /*commit_lsn=*/5).has_value()); // would trigger a periodic round
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// A login that arrives during a round waits it out, then holds the watermark.
+TEST_F(CraftAppendTest, LoginWaitsOutARunningRound) {
+    dev_->seed_lsns(5, {3});
+    fetcher_.hold_quorum_fetch = true;
+    bool round_done = false;
+    std::error_condition round_outcome;
+    homeblocks::detail::detach(
+        [](std::shared_ptr< CraftReplDev > dev, bool& done, std::error_condition& outcome) -> async_status {
+            auto r = co_await dev->append(/*sync_to=*/5, /*client_token=*/0, /*term=*/0);
+            outcome = r ? std::error_condition{} : r.error();
+            done = true;
+            co_return ok();
+        }(dev_, round_done, round_outcome));
+    std::optional< AsyncMutex::Lock > login;
+    homeblocks::detail::detach(
+        [](AsyncMutex& mu, std::optional< AsyncMutex::Lock >& held) -> sisl::async::task< void > {
+            held = co_await mu.lock();
+        }(watermark_mu(), login));
+    EXPECT_FALSE(login.has_value()); // the round holds it
+
+    fetcher_.quorum_gate.complete(true);
+
+    ASSERT_TRUE(round_done);
+    EXPECT_EQ(round_outcome, std::error_condition{});
+    ASSERT_TRUE(login.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 5); // the round's Sync landed before the login holds the watermark
 }
 
 // ── a committed login fences the old session (SDSTOR-26655) ───────────────────

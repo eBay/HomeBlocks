@@ -173,7 +173,9 @@ itself. The response lists every `Empty` verdict ≤ `resolved_upto` (including 
 client whose previous reply was lost still learns them); every other formerly-unresolved slot was
 filled and is durable — the failed write completed late. A slot verdicted `Empty` is a permanent no-op
 hole: a replica **rejects** a late write into it (reconciliation: Empty beats data), so a write the
-round voided fails deterministically on its own ack path. Term-fenced.
+round voided fails deterministically on its own ack path. Term-fenced. The leader runs one
+`SyncRSCommitLSN` round at a time; a Resolve that arrives while another round or a login holds it waits
+its turn rather than failing.
 
 HomeBlocks handler: `CraftReplDev::request_resolution()`
 
