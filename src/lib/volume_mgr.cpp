@@ -642,10 +642,11 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
 }
 
 // A member whose local create failed stays in the group without a replica, reported, until a partition move replaces
-// it; RAFT may still elect it, as it has the whole log. So may a member whose replica faulted, or whose device never
-// came back at a restart: it can't serve the partition either, also when that happens while it leads. Not while a
-// create of the volume runs here (that create needs this member to lead), nor while its device is being reattached
-// (checked again once it is), nor when alone in the group: there is nobody to hand leadership to.
+// it; RAFT may still elect it, as it has the whole log. So may a member whose replica can't serve the partition: its
+// device faulted, or never came back at a restart. Not while a create of the volume runs here (that create needs this
+// member to lead), nor while its device is being reattached, nor when alone in the group: there is nobody to hand
+// leadership to. A replica can also stop serving after the election (its device faults while it leads, or fails its
+// recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
 void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
     if (is_shutting_down()) { return; }
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
@@ -701,11 +702,6 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     (*rd)->yield_leadership(false /* immediate_yield */, boost::uuids::nil_uuid() /* nuraft picks the member */);
 }
 
-void HomeBlocksImpl::on_craft_replica_faulted(volume_id_t const& id) {
-    std::lock_guard lk{craft_handoff_mu_};
-    craft_faulted_since_.insert(id);
-}
-
 void HomeBlocksImpl::retry_craft_handoffs() {
     auto const now = std::chrono::steady_clock::now();
     auto const backoff = std::chrono::milliseconds{HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms)};
@@ -715,8 +711,9 @@ void HomeBlocksImpl::retry_craft_handoffs() {
         for (auto const& [id, at] : craft_handed_off_at_) {
             if (now - at >= backoff) { due.push_back(id); }
         }
-        due.insert(due.end(), craft_faulted_since_.begin(), craft_faulted_since_.end());
-        craft_faulted_since_.clear();
+    }
+    for (auto const& vol : craft_volumes()) {
+        if (!vol->serves_craft()) { due.push_back(vol->id()); }
     }
     for (auto const& id : due) {
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });

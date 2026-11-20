@@ -638,7 +638,6 @@ sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vo
 #endif
     if (auto const r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid()); !r) {
         COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
-        on_craft_group_leader(vol->id()); // published faulted: an election meanwhile left leadership alone
     }
     end_craft_reattach();
 }
@@ -697,7 +696,6 @@ void HomeBlocksImpl::finish_craft_reattach() {
         if (auto const vol = get_volume(id)) {
             COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
             (*vol)->fault_unreplayed_craft();
-            on_craft_group_leader(id); // as for a recovery that failed
         }
         end_craft_reattach();
     }

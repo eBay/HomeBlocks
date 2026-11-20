@@ -624,10 +624,6 @@ public:
     // inject a mock.
     void set_checkpoint_trigger(checkpoint_trigger_fn_t fn) { checkpoint_trigger_ = std::move(fn); }
 
-    // Runs once, in the fault that makes the partition faulted (see faulted_), possibly with state_mu_ held: it only
-    // hands work off. HomeBlocks hands the group's RAFT leadership to a member that can serve. Set before any use.
-    void set_on_fault(std::function< void() > fn) { on_fault_ = std::move(fn); }
-
     // Overrides the commit_lsn delta between checkpoint triggers (default matches
     // sync_rs_commit_lsn_interval's own default of 128, tying checkpoint cadence to the periodic
     // SyncRSCommitLSN cadence). Production sets this from HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval)
@@ -1236,7 +1232,6 @@ private:
     // nothing is persisted.
     std::atomic< bool > faulted_{false};
     void fault();
-    std::function< void() > on_fault_; // set_on_fault()
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()

@@ -2957,7 +2957,6 @@ void mark_craft_state_faulted(volume_id_t vol_id, homestore::superblk< craft_sta
 void CraftReplDev::fault() {
     if (faulted_.exchange(true, std::memory_order_acq_rel)) return;
     if (state_store_) state_store_->mark_faulted();
-    if (on_fault_) on_fault_();
 }
 
 async_status CraftReplDev::save_state() {

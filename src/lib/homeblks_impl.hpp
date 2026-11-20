@@ -139,7 +139,6 @@ private:
     // CRAFT: when this member last handed off each group's leadership, while it leads it without a replica.
     std::mutex craft_handoff_mu_;
     std::unordered_map< volume_id_t, std::chrono::steady_clock::time_point > craft_handed_off_at_;
-    std::unordered_set< volume_id_t > craft_faulted_since_; // on_craft_replica_faulted() since the timer last ran
 
     HomeBlocksMetrics metrics_;
 
@@ -199,13 +198,10 @@ public:
     // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
     // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
     void on_craft_group_destroyed(volume_id_t const& id);
-    // CRAFT: this member was elected leader of a volume's RAFT group, or its replica stopped serving the volume.
-    // Without a replica here that serves, it would fail every CRAFT op of the volume, so it hands leadership to another
-    // member. The hand-off runs on a worker, inline if called on one: never with a lock held.
+    // CRAFT: this member was elected leader of a volume's RAFT group. Without a replica here that serves, it would fail
+    // every CRAFT op of the volume, so it hands leadership to another member. The hand-off runs on a worker, inline if
+    // called on one: never with a lock held.
     void on_craft_group_leader(volume_id_t const& id);
-    // CRAFT: a volume's replica faulted here, maybe with its device's locks held: only noted. HomeBlocks' timer checks
-    // within a second, as on_craft_group_leader() does.
-    void on_craft_replica_faulted(volume_id_t const& id);
     // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
     // leaves one), other than those of a create in flight here and those being destroyed.
     int64_t craft_groups_without_replica() const;
@@ -249,7 +245,7 @@ public:
     // tries again).
     void hand_off_craft_leadership(volume_id_t const& id);
     // CRAFT, every second from the same timer: hands off again the groups whose backoff is over, and checks those whose
-    // replica faulted meanwhile.
+    // replica here doesn't serve: it may have stopped after the election.
     void retry_craft_handoffs();
     std::vector< volume_handle > craft_volumes() const;
 
