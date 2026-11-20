@@ -1096,8 +1096,8 @@ request for `r | 0` by restarting region `r`.
    that a session-8 login truncated at 100), and those truncations will never replay. The certified prefix stays;
    `(commit_lsn, max(own last_append_lsn, S)]` minus the shipped Empty verdicts is marked missing; and reads stay
    gated, as in requirement 7, until `commit_lsn` reaches the pre-install `last_append_lsn` `P`. So any write the
-   member acknowledged in that tail is fetched back before it serves a read again. No HomeStore change is needed; a recipient-aware callback would only let the donor skip the
-   object-0 round trip.
+   member acknowledged in that tail is fetched back before it serves a read again. No HomeStore change is needed;
+   a recipient-aware callback would only let the donor skip the object-0 round trip.
 5. **An exclusive install barrier.** nuraft pauses the receiver's RAFT apply, but that alone leaves work already
    running (client writes, the commit path, the catch-up runner) free to change the journal or index during range
    replacement. A write could even be acknowledged mid-install and then dropped at completion, so UBD's record of
