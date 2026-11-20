@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../hb_internal.hpp"
+#include "async_mutex.hpp"
 #include "craft_raft_entries.hpp"
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
@@ -534,15 +535,17 @@ public:
     // identical problem and force-flushes before removing its superblock for exactly this reason.
     async_status truncate(int64_t lsn);
 
-    // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The single proposer
-    // behind every trigger: periodic, watchdog , client-requested,
-    // and login. Runs pre_resolve_slots(sync_to) first and never proposes
+    // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The proposer behind the
+    // periodic, watchdog and client-requested triggers (login proposes through login_sync()). Runs
+    // pre_resolve_slots(sync_to) first and never proposes
     // past a slot it could not resolve -- the proposed watermark is clamped to just below the first one,
     // and that achieved watermark is what comes back as resolved_upto, alongside every Empty verdict
-    // <= it (earlier rounds' included). At most one append() runs at a time.
+    // <= it (earlier rounds' included). It holds watermark_mu_ throughout: if that's held, it fails
+    // operation_in_progress, or with wait_turn (a client's Resolve) queues for it.
     // term is the session term the caller validated; the round runs only within that session and fails
     // with STALE_TERM if InternalLogin has moved state_.term past it.
-    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token, uint64_t term);
+    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token, uint64_t term,
+                                                    bool wait_turn = false);
 
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
@@ -712,6 +715,9 @@ public:
 
     // Overrides the missing_lsns_ capacity, so tests can reach it without millions of entries.
     void set_max_missing_lsns(size_t n) { max_missing_lsns_ = n; }
+
+    // The watermark mutex, so a test that isn't a friend can hold it the way a login does.
+    AsyncMutex& watermark_mutex() { return watermark_mu_; }
 
     // Highest watermark a committed append() proposed, or -1.
     int64_t last_proposed_sync_lsn() const {
@@ -890,6 +896,20 @@ private:
     // faulted fails INTERNAL_ERROR. Returns the Empty verdicts the login's SyncRSCommitLSN carries.
     async_result< std::vector< int64_t > > login_resolve(int64_t rs_commit_lsn, uint64_t term,
                                                          std::vector< craft::peer_id_t > quiesced);
+
+    // Login step 3, leader-only, under watermark_mu_ (`lock` is the proof): proposes SyncRSCommitLSN{rs_commit_lsn,
+    // the new client's token, the step-2 verdicts} and waits for the leader to apply it, then checks the leader is
+    // exactly at rs_commit_lsn. Always proposes, even if rs_commit_lsn is already covered. Fails NO_QUORUM if
+    // commit_lsn isn't rs_commit_lsn afterwards (a late Sync past it, or a slot still missing), STALE_TERM if a login
+    // replaced the session meanwhile, and INTERNAL_ERROR if the partition is or becomes faulted.
+    async_status login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                            std::vector< int64_t > empty_slots, uint64_t term);
+
+    // Proposes SyncRSCommitLSN{rs_commit_lsn, client_token, empty_slots} and waits for it to commit and apply,
+    // re-checking leadership and the session first; raises last_proposed_sync_lsn_ once it has. The caller holds
+    // watermark_mu_ (`lock`): append() and login_sync().
+    async_status propose_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                              std::vector< int64_t > const& empty_slots, uint64_t term);
 
     // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
     // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
@@ -1174,9 +1194,13 @@ private:
     // (set_raft_proposer). Null: nothing is proposed.
     unique< CraftRaftProposer > owned_raft_proposer_;
     CraftRaftProposer* raft_proposer_{nullptr};
-    std::atomic< bool > sync_in_flight_{false};           // single-flight gate for append()
+    // Held by whoever may propose a SyncRSCommitLSN, i.e. move the replica-set watermark: one append() round, or a
+    // login from its poll through its InternalLogin. Background rounds try_lock() and skip; login and Resolve lock()
+    // and wait their turn.
+    AsyncMutex watermark_mu_;
     std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
-    int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
+    int64_t last_proposed_sync_lsn_{-1}; // highest SyncRSCommitLSN this leader committed: append()'s or a login's
+                                         // (guarded by state_mu_)
     int64_t applied_sync_lsn_{-1};       // highest SyncRSCommitLSN watermark applied here (guarded by state_mu_)
     int64_t last_periodic_sync_lsn_{-1}; // last_append_lsn at the last periodic trigger (guarded by state_mu_)
     // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
