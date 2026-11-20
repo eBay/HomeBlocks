@@ -681,7 +681,9 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     }
     if (vol && vol->serves_craft()) { return forget(); }
     auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
-    if (!rd || !(*rd)->is_leader() || is_going_away(**rd) || (*rd)->get_replication_quorum().size() < 2) {
+    // Its stage before its RAFT server: once a destroyed group's reaper has run, the server is freed, and is_leader()
+    // would read freed memory.
+    if (!rd || is_going_away(**rd) || !(*rd)->is_leader() || (*rd)->get_replication_quorum().size() < 2) {
         return forget();
     }
     // nuraft nominates the responsive member of the highest priority, deterministically: with the member holding the
@@ -712,8 +714,9 @@ void HomeBlocksImpl::retry_craft_handoffs() {
             if (now - at >= backoff) { due.push_back(id); }
         }
     }
+    // Not one being destroyed: its group is going away too.
     for (auto const& vol : craft_volumes()) {
-        if (!vol->serves_craft()) { due.push_back(vol->id()); }
+        if (!vol->is_destroying() && !vol->serves_craft()) { due.push_back(vol->id()); }
     }
     for (auto const& id : due) {
         iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
