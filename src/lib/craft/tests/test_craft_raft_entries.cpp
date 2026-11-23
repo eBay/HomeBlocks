@@ -629,7 +629,8 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
-        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4}, JournalSlot{.lsn = 2, .is_empty = true},
+        JournalSlot{.lsn = 1, .lba_off_bytes = 10, .len_bytes = 4},
+        JournalSlot{.lsn = 2, .is_empty = true},
         JournalSlot{.lsn = 99, .is_empty = true}, // never requested -- only 1 and 2 were
     };
 
@@ -1687,6 +1688,31 @@ TEST(CraftDurableStateCodec, RoundTrips) {
         ASSERT_TRUE(d.has_value());
         EXPECT_EQ(*d, s);
     }
+}
+
+// Version 3 carries a snapshot install's journal floor and read gate; a version 2 image (no such fields) still decodes,
+// with both at -1.
+TEST(CraftDurableStateCodec, SnapshotFieldsAndTheOlderVersion) {
+    auto s = sample_state();
+    s.journal_floor = 1;
+    s.read_gate = 9;
+    auto const bytes = encode_durable_state(s);
+    auto const d = decode_durable_state(bytes.data(), bytes.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, s);
+
+    // The same image as version 2 wrote it: the two fields cut out of the header, version 2.
+    constexpr size_t k_v2_header = 60; // magic, version, three counts and five watermarks
+    auto v2 = bytes;
+    v2.erase(v2.begin() + k_v2_header, v2.begin() + k_v2_header + 2 * sizeof(int64_t));
+    uint32_t const two = 2;
+    std::memcpy(v2.data() + sizeof(uint64_t), &two, sizeof(two));
+    auto const old = decode_durable_state(v2.data(), v2.size());
+    ASSERT_TRUE(old.has_value());
+    auto expected = s;
+    expected.journal_floor = -1;
+    expected.read_gate = -1;
+    EXPECT_EQ(*old, expected);
 }
 
 TEST(CraftDurableStateCodec, RejectsMalformedImages) {

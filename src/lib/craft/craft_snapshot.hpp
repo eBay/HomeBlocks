@@ -167,6 +167,29 @@ struct snapshot_record_sb_t {
 #pragma pack(pop)
 inline const std::string snapshot_record_meta_name{"CraftSnapshot"};
 
+// One meta blk record per CRAFT group on a receiver: the transfer it is installing (requirement 6). Written after the
+// barrier is up and at every region boundary (after a checkpoint, so the cursor never runs ahead of durable data). A
+// restart resumes after next_region only if the snapshot's object 0 | 0 carries the same transfer identity
+// {raft_idx, digest}. Followed by meta_len bytes: the encoded object 0 | 0.
+#pragma pack(push, 1)
+struct snapshot_receive_sb_t {
+    static constexpr uint64_t k_magic = 0x5643'5250'4e53'4643ull; // "CFSNPRCV" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    boost::uuids::uuid group_id{};
+    int64_t raft_idx{-1};    // L
+    int64_t p{-1};           // the receiver's last_append_lsn when the barrier went up
+    int64_t w_hi{-1};        // from the trailer, once received
+    uint64_t next_region{1}; // regions before it are installed and durable
+    uint8_t control_only{0};
+    uint8_t completed{0}; // completion is durable; apply_snapshot is still to come
+    uint32_t meta_len{0};
+};
+#pragma pack(pop)
+inline const std::string snapshot_receive_meta_name{"CraftSnapshotRecv"};
+
 // ── region geometry ─────────────────────────────────────────────────────────
 
 // Regions of region_lbas LBAs each over total_lbas (the last one may be shorter). Zero if either is zero.

@@ -24,6 +24,7 @@
 #include <homestore/blkdata_service.hpp>    // data_service(), async_alloc_write, blk_alloc_hints
 #include <homestore/crc.hpp>                // crc16_t10dif -- same routine and seed volume.cpp uses
 #include <homestore/checkpoint/cp_mgr.hpp>  // cp_mgr(), CPManager::trigger_cp_flush()
+#include <thread>                           // snapshot install: the barrier drain polls
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t, log_write_comp_cb_t
 #include <iomgr/iomgr.hpp>                  // iomanager singleton, reactor_regex
 #include <iomgr/timer.hpp>                  // iomgr::schedule_recurring -- the watchdog's RAII timer
@@ -691,6 +692,10 @@ CraftReplDev::~CraftReplDev() {
 // write() which updates state_ under the same lock.
 
 async_result< RsCommitLsnReply > CraftReplDev::get_rs_commit_lsn(uint64_t term, bool is_login) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     // Same as fetch_data(): a faulted member answers nothing, so it can't count toward anyone's quorum.
     if (faulted_.load(std::memory_order_acquire)) {
         LOGE("get_rs_commit_lsn rejected: partition permanently faulted");
@@ -978,6 +983,10 @@ async_status CraftReplDev::logout(craft::client_hdr /* hdr */) {
 
 async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                                     sisl::sg_list data) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
     // try again shortly" condition -- see faulted_'s doc comment.
     if (faulted_.load(std::memory_order_acquire)) {
@@ -1667,6 +1676,18 @@ void CraftReplDev::populate_overlay_from_slot(int64_t lsn, JournalSlot const& sl
 
 async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int64_t read_lsn, uint64_t addr,
                                                       uint64_t len, sisl::sg_list dest) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
+    // After a snapshot install, reads wait until commit_lsn reaches the gate: below the trailer's W_hi a fuzzy region
+    // may hold a version newer than the read horizon, and up to P this member may have acked writes it dropped.
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_.commit_lsn < read_gate_) {
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_ELIGIBLE));
+        }
+    }
     // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
     // try again shortly" condition -- see faulted_'s doc comment.
     if (faulted_.load(std::memory_order_acquire)) {
@@ -1902,6 +1923,10 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
 }
 
 async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     // Checked ahead of recovering_: a faulted partition is permanent, not a "still starting up,
     // try again shortly" condition -- see faulted_'s doc comment.
     if (faulted_.load(std::memory_order_acquire)) {
@@ -2136,6 +2161,10 @@ void CraftReplDev::maybe_trigger_periodic_sync() {
 }
 
 async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr hdr, int64_t upto) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     if (faulted_.load(std::memory_order_acquire)) {
         LOGE("request_resolution rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
@@ -2308,6 +2337,10 @@ async_status CraftReplDev::propose_sync([[maybe_unused]] AsyncMutex::Lock const&
 // the journal reclaim has dropped (see the classification below).
 
 async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector< int64_t > lsns) {
+    // A snapshot install drains every op in progress and admits none until it completes (see
+    // begin_snapshot_install()).
+    auto const admission = admit_op();
+    if (!admission) co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     // A faulted partition's slots no longer match the replica set's, so they can't be evidence for anyone's
     // resolution. Failing makes it a non-responder, which only makes other members' rounds more cautious.
     if (faulted_.load(std::memory_order_acquire)) {
@@ -2817,9 +2850,10 @@ void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
 
 namespace {
 constexpr uint64_t k_durable_magic = 0x31425354'46415243ull; // "CRAFTSB1" little-endian
-constexpr uint32_t k_durable_version = 2;
+constexpr uint32_t k_durable_version = 3;                    // 3: journal_floor and read_gate (snapshot install)
+constexpr uint32_t k_durable_version_v2 = 2;                 // still read: both fields -1
 #pragma pack(push, 1)
-struct DurableHeader {
+struct DurableHeaderV2 {
     uint64_t magic;
     uint32_t version;
     uint32_t n_empty;
@@ -2829,6 +2863,10 @@ struct DurableHeader {
     int64_t last_applied_raft_idx;
     int64_t durable_commit_lsn;
     int64_t sync_watermark;
+};
+struct DurableHeader : DurableHeaderV2 {
+    int64_t journal_floor;
+    int64_t read_gate;
 };
 struct PendingRecord { // followed by n_free int64_t: CraftPendingEntry::to_free
     int64_t raft_idx;
@@ -2849,15 +2887,11 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
     size_t frees = 0;
     for (auto const& p : s.pending)
         frees += p.to_free.size();
-    DurableHeader const h{k_durable_magic,
-                          k_durable_version,
-                          static_cast< uint32_t >(s.empty_lsns.size()),
-                          static_cast< uint32_t >(s.pending.size()),
-                          s.term,
-                          s.client_token,
-                          s.last_applied_raft_idx,
-                          s.durable_commit_lsn,
-                          s.sync_watermark};
+    DurableHeader const h{{k_durable_magic, k_durable_version, static_cast< uint32_t >(s.empty_lsns.size()),
+                           static_cast< uint32_t >(s.pending.size()), s.term, s.client_token, s.last_applied_raft_idx,
+                           s.durable_commit_lsn, s.sync_watermark},
+                          s.journal_floor,
+                          s.read_gate};
     std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t) +
                                s.pending.size() * sizeof(PendingRecord) + frees * sizeof(int64_t));
     std::memcpy(out.data(), &h, sizeof(h));
@@ -2884,26 +2918,39 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
 }
 
 std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len) {
-    if (buf == nullptr || len < sizeof(DurableHeader)) return std::nullopt;
+    if (buf == nullptr || len < sizeof(DurableHeaderV2)) return std::nullopt;
     DurableHeader h;
-    std::memcpy(&h, buf, sizeof(h));
-    if (h.magic != k_durable_magic || h.version != k_durable_version) return std::nullopt;
+    std::memcpy(static_cast< DurableHeaderV2* >(&h), buf, sizeof(DurableHeaderV2));
+    if (h.magic != k_durable_magic) return std::nullopt;
+    size_t hdr_len = sizeof(DurableHeaderV2);
+    if (h.version == k_durable_version) {
+        if (len < sizeof(DurableHeader)) return std::nullopt;
+        std::memcpy(&h, buf, sizeof(DurableHeader));
+        hdr_len = sizeof(DurableHeader);
+    } else if (h.version == k_durable_version_v2) {
+        h.journal_floor = -1;
+        h.read_gate = -1;
+    } else {
+        return std::nullopt;
+    }
     // The pending records are of variable size: checked one by one below, and that they end the image exactly.
-    if ((len - sizeof(h)) / sizeof(int64_t) < h.n_empty) return std::nullopt;
+    if ((len - hdr_len) / sizeof(int64_t) < h.n_empty) return std::nullopt;
     CraftDurableState s{.term = h.term,
                         .client_token = h.client_token,
                         .last_applied_raft_idx = h.last_applied_raft_idx,
                         .durable_commit_lsn = h.durable_commit_lsn,
-                        .sync_watermark = h.sync_watermark};
+                        .sync_watermark = h.sync_watermark,
+                        .journal_floor = h.journal_floor,
+                        .read_gate = h.read_gate};
     int64_t prev = -1;
     for (uint32_t i = 0; i < h.n_empty; ++i) {
         int64_t lsn;
-        std::memcpy(&lsn, buf + sizeof(h) + i * sizeof(int64_t), sizeof(lsn));
+        std::memcpy(&lsn, buf + hdr_len + i * sizeof(int64_t), sizeof(lsn));
         if (lsn <= prev) return std::nullopt; // strictly ascending, and not negative
         s.empty_lsns.insert(s.empty_lsns.end(), lsn);
         prev = lsn;
     }
-    size_t off = sizeof(h) + static_cast< size_t >(h.n_empty) * sizeof(int64_t);
+    size_t off = hdr_len + static_cast< size_t >(h.n_empty) * sizeof(int64_t);
     int64_t prev_idx = -1;
     for (uint32_t i = 0; i < h.n_pending; ++i) {
         PendingRecord r;
@@ -3131,8 +3178,15 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
         missing_lsns_.clear(); // rebuild_overlay() marks every slot above commit_lsn that the journal doesn't hold
         replay_upto_ = std::max(*tail, d.durable_commit_lsn);
         last_checkpoint_lsn_ = d.durable_commit_lsn;
-        reclaimed_upto_ = journal_->reclaimed_upto();
+        reclaimed_upto_ = std::max(journal_->reclaimed_upto(), d.journal_floor);
         persisted_durable_commit_ = d.durable_commit_lsn;
+        read_gate_ = d.read_gate;
+    }
+    if (d.read_gate == k_install_in_progress) {
+        // A snapshot install was in progress: the journal and the index are partly replaced, so the partition takes
+        // no op until the install (the snapshot nuraft sends again) completes.
+        installing_.store(true);
+        LOGW("restore_state: a snapshot install was in progress: the partition stays offline until it completes");
     }
     {
         std::lock_guard lk{apply_mu_};
@@ -3157,7 +3211,8 @@ int64_t CraftReplDev::reclaim_floor_locked() const {
 void CraftReplDev::request_reclaim() {
     {
         std::lock_guard lk{state_mu_};
-        if (reclaim_running_ || reclaim_unsupported_ || reclaim_stopped_ || reclaim_floor_locked() <= reclaimed_upto_)
+        if (reclaim_running_ || reclaim_unsupported_ || reclaim_stopped_ || reclaim_floor_locked() <= reclaimed_upto_ ||
+            installing_.load())
             return;
         reclaim_running_ = true;
     }
@@ -3873,6 +3928,230 @@ bool CraftReplDev::snapshot_read_blocks(homestore::blk_id const& blocks, uint8_t
     }
     std::memcpy(buf, aligned.cbytes(), size);
     return true;
+}
+
+// ─── snapshot install, the receiver's side (resync.md 4.9) ──────────────────
+
+bool CraftReplDev::snapshot_drained() {
+    if (active_ops_.load() != 0) return false;
+    {
+        std::lock_guard lk{apply_mu_};
+        if (apply_running_) return false;
+    }
+    std::lock_guard lk{state_mu_};
+    return !commit_running_ && !reclaim_running_ && checkpoints_running_ == 0;
+}
+
+result< int64_t > CraftReplDev::begin_snapshot_install(std::chrono::milliseconds timeout) {
+    if (installing_.exchange(true)) {
+        std::lock_guard lk{state_mu_};
+        return state_.last_append_lsn; // already up: a transfer restarted, or a restart found one in progress
+    }
+    {
+        std::lock_guard lk{apply_mu_};
+        apply_paused_ = true; // nuraft delivers nothing during an install; what is queued waits
+    }
+    // Wait out what was admitted before the barrier: client and peer ops, the commit runner, the entry being applied
+    // (its catch-up included), a reclaim round and checkpoint rounds.
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (!snapshot_drained()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOGW("snapshot install: the partition didn't drain within {}ms; barrier lowered", timeout.count());
+            {
+                std::lock_guard lk{apply_mu_};
+                apply_paused_ = false;
+            }
+            installing_.store(false);
+            resume_apply_if_queued();
+            return std::unexpected(make_error_condition(std::errc::timed_out));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    int64_t p;
+    {
+        std::lock_guard lk{state_mu_};
+        p = state_.last_append_lsn;
+        durable_.read_gate = k_install_in_progress;
+    }
+    // Durable before any range is replaced: a restart from here on comes back behind the barrier.
+    if (auto r = detail::sync_get(persist_state()); !r) {
+        LOGE("snapshot install: persisting the barrier failed: {}", r.error().message());
+        return std::unexpected(r.error());
+    }
+    LOGI("snapshot install: barrier up, P={}", p);
+    return p;
+}
+
+status CraftReplDev::install_snapshot_batch(craft_snapshot::region_batch const& b) {
+    if (!indx_tbl_) return std::unexpected(make_error_condition(std::errc::not_supported));
+    if (!installing_.load()) return std::unexpected(make_error_condition(std::errc::operation_not_permitted));
+    if (b.lba_size != lba_size_ || b.data.size() != b.lbas.size() * lba_size_) {
+        return std::unexpected(make_error_condition(std::errc::invalid_argument));
+    }
+    for (size_t i = 0; i < b.lbas.size(); ++i) {
+        if (crc16_t10dif(k_craft_crc16_seed, b.data.data() + i * lba_size_, lba_size_) != b.lbas[i].csum) {
+            LOGW("snapshot install: lba {} of region {} batch {} fails its checksum", b.lbas[i].lba, b.region, b.batch);
+            return std::unexpected(make_error_condition(volume_error::CRC_MISMATCH));
+        }
+    }
+    // The range becomes exactly the batch: its old mappings go first (a resend, a resume or a new leader replaces
+    // whatever an earlier attempt installed).
+    std::vector< homestore::blk_id > replaced;
+    if (b.end > b.start) {
+        if (auto r = indx_tbl_->delete_lba_range(b.start, b.end - 1, replaced); !r) {
+            return std::unexpected(make_error_condition(volume_error::INDEX_ERROR));
+        }
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        snapshot_frees_.insert(snapshot_frees_.end(), replaced.begin(), replaced.end());
+    }
+    for (size_t i = 0; i < b.lbas.size();) {
+        size_t j = i + 1;
+        while (j < b.lbas.size() && b.lbas[j].lba == b.lbas[j - 1].lba + 1)
+            ++j;
+        auto const n = static_cast< uint32_t >(j - i);
+        sisl::io_blob_safe buf{n * lba_size_, 512}; // HomeStore writes from an aligned buffer only
+        std::memcpy(buf.bytes(), b.data.data() + i * lba_size_, static_cast< size_t >(n) * lba_size_);
+        sisl::sg_list sg{.size = static_cast< uint64_t >(n) * lba_size_, .iovs = {iovec{buf.bytes(), buf.size()}}};
+        auto bid = detail::sync_get(journal_->alloc_write_data(sg, static_cast< lba_count_t >(n)));
+        if (!bid) {
+            LOGW("snapshot install: writing lbas [{}, {}) failed: {}", b.lbas[i].lba, b.lbas[i].lba + n,
+                 bid.error().message());
+            return std::unexpected(bid.error());
+        }
+        if (auto r = journal_->commit_data(*bid, false); !r) return std::unexpected(r.error());
+        std::unordered_map< lba_t, BlockInfo > blocks;
+        lba_t lba = b.lbas[i].lba;
+        size_t k = i;
+        auto pieces = bid->iterate();
+        while (auto piece = pieces.next()) {
+            for (homestore::blk_count_t c = 0; c < piece->blk_count(); ++c, ++lba, ++k) {
+                homestore::blk_id const one{static_cast< homestore::blk_num_t >(piece->blk_num() + c), 1,
+                                            piece->chunk_num()};
+                blocks.emplace(lba, BlockInfo{one, homestore::blk_id{}, b.lbas[k].csum});
+            }
+        }
+        if (auto r = indx_tbl_->write_to_index(b.lbas[i].lba, b.lbas[i].lba + n - 1, blocks); !r) {
+            return std::unexpected(make_error_condition(volume_error::INDEX_ERROR));
+        }
+        i = j;
+    }
+    return ok();
+}
+
+void CraftReplDev::release_snapshot_frees() {
+    std::vector< homestore::blk_id > frees;
+    {
+        std::lock_guard lk{state_mu_};
+        frees.swap(snapshot_frees_);
+    }
+    for (auto const& blk : frees) {
+        homestore::multi_blk_id const m{blk.blk_num(), blk.blk_count(), blk.chunk_num()};
+        if (auto r = detail::sync_get(journal_->free_data(m)); !r)
+            LOGW("snapshot install: freeing replaced block {} failed (leaked): {}", blk.to_string(),
+                 r.error().message());
+    }
+}
+
+status CraftReplDev::complete_snapshot_install(craft_snapshot::snapshot_meta const& meta, int64_t w_hi, int64_t p,
+                                               bool control_only) {
+    if (!installing_.load()) return std::unexpected(make_error_condition(std::errc::operation_not_permitted));
+    auto const& t = meta.tuple;
+    int64_t own_commit;
+    {
+        std::lock_guard lk{state_mu_};
+        own_commit = state_.commit_lsn;
+    }
+    // Drop the whole journal. Above this member's own commit_lsn: truncate() frees those slots' blocks (nothing indexed
+    // them). At or below: the records go, the blocks stay with whatever the index still maps.
+    if (auto r = detail::sync_get(truncate(own_commit)); !r) return std::unexpected(r.error());
+    if (auto r = detail::sync_get(journal_->reclaim_upto(own_commit));
+        !r && r.error() != std::errc::operation_not_supported) {
+        return std::unexpected(r.error());
+    }
+    // The regions' index must be durable before the state says the volume is the snapshot's.
+    if (!control_only) {
+        if (auto r = detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true)); !r) {
+            LOGE("snapshot install: the checkpoint before completion failed");
+            return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
+        release_snapshot_frees();
+    }
+    int64_t commit, last_append, gate;
+    uint64_t term;
+    {
+        std::lock_guard al{apply_mu_};
+        std::lock_guard sl{state_mu_};
+        commit = control_only ? own_commit : t.data_watermark;
+        last_append = control_only ? std::max({p, t.sync_watermark, own_commit}) : std::max(commit, t.sync_watermark);
+        gate = control_only ? p : std::max(w_hi, p);
+        // The Empty verdicts: this member's at or below the new commit_lsn (indexed history), and the shipped ones.
+        std::unordered_set< int64_t > empties;
+        for (int64_t e : empty_lsns_)
+            if (e <= commit) empties.insert(e);
+        empties.insert(t.empty_lsns.begin(), t.empty_lsns.end());
+        empty_lsns_ = std::move(empties);
+        state_.commit_lsn = commit;
+        indexing_lsn_ = commit;
+        state_.last_append_lsn = last_append;
+        missing_lsns_.clear();
+        for (int64_t l = commit + 1; l <= last_append; ++l)
+            if (!empty_lsns_.contains(l)) missing_lsns_.insert(l);
+        applied_sync_lsn_ = std::max(applied_sync_lsn_, t.sync_watermark);
+        // Control state: merged, not adopted.
+        if (t.session_term > state_.term) {
+            state_.term = t.session_term;
+            state_.client_token = t.client_token;
+        }
+        login_fence_term_ = std::max(login_fence_term_, t.fence_term);
+        if (login_fence_term_ <= std::max< uint64_t >(state_.term, t.aborted_upto)) login_fence_term_ = state_.term;
+        reclaimed_upto_ = std::max(reclaimed_upto_, commit); // a fetch at or below gets reclaimed_below
+        read_gate_ = gate;
+        last_periodic_sync_lsn_ = std::min(last_periodic_sync_lsn_, last_append);
+        last_checkpoint_lsn_ = commit;
+        persisted_durable_commit_ = commit;
+        replay_upto_ = std::max(replay_upto_, commit);
+        durable_.term = state_.term;
+        durable_.client_token = state_.client_token;
+        durable_.durable_commit_lsn = commit;
+        durable_.sync_watermark = std::max(durable_.sync_watermark, t.sync_watermark);
+        durable_.empty_lsns = std::set< int64_t >(empty_lsns_.begin(), empty_lsns_.end());
+        durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, meta.raft_idx);
+        durable_.journal_floor = commit;
+        durable_.read_gate = gate;
+        // The RAFT entries at or below L are the snapshot's: applying a queued one again would replay it twice.
+        restored_raft_idx_ = std::max(restored_raft_idx_, meta.raft_idx);
+        std::erase_if(apply_queue_, [&meta](PendingApply const& e) { return e.lsn <= meta.raft_idx; });
+        term = state_.term;
+    }
+    {
+        std::lock_guard lk{overlay_mu_};
+        overlay_.clear();
+        overlay_extent_.clear();
+    }
+    if (auto r = detail::sync_get(persist_state()); !r) {
+        LOGE("snapshot install: persisting the completed state failed: {}", r.error().message());
+        return std::unexpected(r.error());
+    }
+    {
+        std::lock_guard lk{apply_mu_};
+        apply_paused_ = false;
+    }
+    installing_.store(false);
+    resume_apply_if_queued();
+    LOGI("snapshot install complete at raft lsn {}: {} commit_lsn={} last_append_lsn={} read gate={} term={}",
+         meta.raft_idx, control_only ? "control only," : "data and control,", commit, last_append, gate, term);
+    return ok();
+}
+
+void CraftReplDev::resume_apply_if_queued() {
+    bool start;
+    {
+        std::lock_guard lk{apply_mu_};
+        start = !apply_queue_.empty() && !apply_paused_ && !apply_stopped_ && !std::exchange(apply_running_, true);
+    }
+    if (start) detail::detach(drain_apply());
 }
 
 } // namespace homeblocks

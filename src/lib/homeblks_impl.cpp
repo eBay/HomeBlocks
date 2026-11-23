@@ -503,6 +503,12 @@ void HomeBlocksImpl::register_metablk_cb() {
             on_craft_snapshot_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
+    homestore::hs()->meta_service().register_handler(
+        craft_snapshot::snapshot_receive_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_snapshot_receive_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
 }
 
 void HomeBlocksImpl::on_init_complete() {

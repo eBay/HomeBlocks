@@ -175,6 +175,52 @@ void HomeBlocksImpl::remove_craft_snapshot(volume_id_t const& group) {
     }
 }
 
+void HomeBlocksImpl::on_craft_snapshot_receive_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    using craft_snapshot::snapshot_receive_sb_t;
+    superblk< snapshot_receive_sb_t > sb{craft_snapshot::snapshot_receive_meta_name};
+    sb.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // The CRC passed, so a bad header is a format bug: a half-installed partition must not lose its cursor silently.
+    RELEASE_ASSERT(sb.size() >= sizeof(snapshot_receive_sb_t) && sb->magic == snapshot_receive_sb_t::k_magic &&
+                       sb->version == snapshot_receive_sb_t::k_version &&
+                       sb.size() - sizeof(snapshot_receive_sb_t) >= sb->meta_len,
+                   "CRAFT snapshot receive record of {} bytes: unknown format", sb.size());
+    volume_id_t const id = sb->group_id;
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto const [it, added] = craft_snapshot_recv_sbs_.try_emplace(id, std::move(sb));
+    RELEASE_ASSERT(added, "two CRAFT snapshot receive records for group {}", boost::uuids::to_string(id));
+}
+
+void HomeBlocksImpl::save_craft_snapshot_receive(craft_snapshot_receive const& rec) {
+    using craft_snapshot::snapshot_receive_sb_t;
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto [it, added] = craft_snapshot_recv_sbs_.try_emplace(
+        rec.hdr.group_id, superblk< snapshot_receive_sb_t >{craft_snapshot::snapshot_receive_meta_name});
+    auto& sb = it->second;
+    sb.create(static_cast< uint32_t >(sizeof(snapshot_receive_sb_t) + rec.meta.size()));
+    *sb.get() = rec.hdr;
+    sb->meta_len = static_cast< uint32_t >(rec.meta.size());
+    std::memcpy(sb.raw_buf()->bytes() + sizeof(snapshot_receive_sb_t), rec.meta.data(), rec.meta.size());
+    sb.write();
+}
+
+std::optional< HomeBlocksImpl::craft_snapshot_receive >
+HomeBlocksImpl::craft_snapshot_receive_record(volume_id_t const& group) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto const it = craft_snapshot_recv_sbs_.find(group);
+    if (it == craft_snapshot_recv_sbs_.end()) { return std::nullopt; }
+    auto& sb = it->second;
+    auto const* const tail = sb.raw_buf()->cbytes() + sizeof(craft_snapshot::snapshot_receive_sb_t);
+    return craft_snapshot_receive{.hdr = *sb.get(), .meta = std::vector< uint8_t >(tail, tail + sb->meta_len)};
+}
+
+void HomeBlocksImpl::remove_craft_snapshot_receive(volume_id_t const& group) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    if (auto it = craft_snapshot_recv_sbs_.find(group); it != craft_snapshot_recv_sbs_.end()) {
+        it->second.destroy();
+        craft_snapshot_recv_sbs_.erase(it);
+    }
+}
+
 shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
     auto pid_str = boost::uuids::to_string(sb->parent_uuid); // parent_uuid is the volume id
     {
@@ -696,6 +742,7 @@ bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
 
 void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
     remove_craft_snapshot(id);
+    remove_craft_snapshot_receive(id);
     auto const vol = get_volume(id);
     if (!vol) { return; } // never created here, or already removed
     LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));

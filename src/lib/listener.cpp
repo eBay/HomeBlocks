@@ -25,6 +25,8 @@
 #include "craft/craft_snapshot.hpp"
 #include "craft/craft_snapshot_reader.hpp"
 #include "home_blks_config.hpp"
+#include "coro_helpers.hpp"
+#include <homestore/checkpoint/cp_mgr.hpp>
 
 namespace homeblocks {
 
@@ -276,12 +278,176 @@ void CraftGroupListener::free_user_snp_ctx(void*& user_snp_ctx) {
     user_snp_ctx = nullptr;
 }
 
+// ── the receiver ──
+
+namespace {
+// How long the install barrier waits for ops already running to finish.
+constexpr std::chrono::seconds k_install_drain_timeout{30};
+
+uint64_t id_of(uint64_t region, uint32_t batch) {
+    return *craft_snapshot::obj_id{.region = region, .batch = batch}.pack();
+}
+
+// The object after region `r` is fully installed: the next region's first batch, or the trailer.
+uint64_t after_region(uint64_t r, uint64_t regions) { return r < regions ? id_of(r + 1, 1) : id_of(regions + 1, 0); }
+} // namespace
+
+bool CraftGroupListener::load_receive_state() {
+    if (recv_) { return true; }
+    auto const rec = hb_->craft_snapshot_receive_record(group_id_);
+    if (!rec) { return false; }
+    auto obj = craft_snapshot::decode(rec->meta.data(), rec->meta.size());
+    if (!obj || !std::holds_alternative< craft_snapshot::snapshot_meta >(*obj)) { return false; }
+    recv_ = receive_state{.hdr = rec->hdr, .meta = std::get< craft_snapshot::snapshot_meta >(std::move(*obj))};
+    return true;
+}
+
+void CraftGroupListener::save_receive_state() {
+    hb_->save_craft_snapshot_receive(
+        HomeBlocksImpl::craft_snapshot_receive{.hdr = recv_->hdr, .meta = craft_snapshot::encode(recv_->meta)});
+}
+
+void CraftGroupListener::write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                                            std::shared_ptr< homestore::snapshot_obj > snp_obj) {
+    // Leaving snp_obj->offset as it came asks the leader for the same object again.
+    auto const lsn = context->get_lsn();
+    auto const group = boost::uuids::to_string(group_id_);
+    load_receive_state();
+
+    if (snp_obj->is_last_obj) {
+        if (!recv_ || recv_->hdr.raft_idx != lsn) {
+            LOGE("group={}: snapshot at raft lsn {} ended with no install of it in progress", group, lsn);
+            return;
+        }
+        if (recv_->hdr.completed) { return; }
+        auto const dev = craft_device();
+        if (!dev) { return; }
+        if (auto r = dev->complete_snapshot_install(recv_->meta, recv_->hdr.w_hi, recv_->hdr.p,
+                                                    recv_->hdr.control_only != 0);
+            !r) {
+            LOGE("group={}: completing the snapshot install at raft lsn {} failed: {}", group, lsn,
+                 r.error().message());
+            return; // apply_snapshot refuses it, which stops this process: never serve a half-installed volume
+        }
+        recv_->hdr.completed = 1;
+        save_receive_state();
+        return;
+    }
+
+    auto const obj = craft_snapshot::decode(snp_obj->blob.cbytes(), snp_obj->blob.size());
+    if (!obj) {
+        LOGW("group={}: snapshot object {:#x} corrupt: asked again", group, snp_obj->offset);
+        return;
+    }
+
+    if (std::holds_alternative< craft_snapshot::snapshot_meta >(*obj)) {
+        auto const& meta = std::get< craft_snapshot::snapshot_meta >(*obj);
+        auto dev = craft_device();
+        if (!dev) {
+            // No replica here: a learner, or a member that lost it. The snapshot compacted the CreateVolume entry away.
+            auto info = parse_create_volume(sisl::blob{const_cast< uint8_t* >(meta.volume_def.data()),
+                                                       static_cast< uint32_t >(meta.volume_def.size())});
+            if (!info) {
+                LOGE("group={}: the snapshot's volume definition doesn't parse", group);
+                return;
+            }
+            if (auto r = hb_->create_craft_volume_from_snapshot(std::move(*info)); !r) {
+                LOGE("group={}: creating the volume for the snapshot failed: {}", group, r.error().message());
+                return;
+            }
+            dev = craft_device();
+            if (!dev) { return; }
+            LOGI("group={}: volume created from the snapshot at raft lsn {}", group, lsn);
+        }
+        auto const regions = meta.region_count;
+        // Resume (requirement 6): the same transfer identity continues after the cursor.
+        if (recv_ && !recv_->hdr.completed && recv_->hdr.raft_idx == lsn && recv_->meta.digest == meta.digest &&
+            dev->snapshot_installing()) {
+            snp_obj->offset = recv_->hdr.control_only ? craft_snapshot::LAST_OBJ_ID
+                : recv_->hdr.next_region <= regions   ? id_of(recv_->hdr.next_region, 1)
+                                                      : id_of(regions + 1, 0);
+            LOGI("group={}: resuming the snapshot at raft lsn {} from region {}", group, lsn, recv_->hdr.next_region);
+            return;
+        }
+        auto const was_installing = dev->snapshot_installing();
+        auto const p = dev->begin_snapshot_install(k_install_drain_timeout);
+        if (!p) { return; } // asked again
+        craft_snapshot::snapshot_receive_sb_t hdr{};
+        hdr.group_id = group_id_;
+        hdr.raft_idx = lsn;
+        // A transfer restarted on a member already behind the barrier keeps the P taken when it went up.
+        hdr.p = was_installing && recv_ ? recv_->hdr.p : *p;
+        // Never roll back data this member certified (requirement 4): below its commit_lsn, control only.
+        hdr.control_only = meta.tuple.data_watermark < dev->commit_lsn() ? 1 : 0;
+        recv_ = receive_state{.hdr = hdr, .meta = meta};
+        save_receive_state();
+        snp_obj->offset = hdr.control_only ? craft_snapshot::LAST_OBJ_ID : regions > 0 ? id_of(1, 1) : id_of(1, 0);
+        LOGI("group={}: installing the snapshot at raft lsn {}: W={} S={} P={} {}", group, lsn,
+             meta.tuple.data_watermark, meta.tuple.sync_watermark, hdr.p,
+             hdr.control_only ? "control only" : "with data");
+        return;
+    }
+
+    if (!recv_ || recv_->hdr.raft_idx != lsn || recv_->hdr.completed) {
+        snp_obj->offset = id_of(0, 0); // no install of this snapshot in progress: start over
+        return;
+    }
+    auto const regions = recv_->meta.region_count;
+
+    if (std::holds_alternative< craft_snapshot::region_batch >(*obj)) {
+        auto const& b = std::get< craft_snapshot::region_batch >(*obj);
+        if (b.region != recv_->hdr.next_region) {
+            snp_obj->offset =
+                recv_->hdr.next_region <= regions ? id_of(recv_->hdr.next_region, 1) : id_of(regions + 1, 0);
+            return;
+        }
+        auto const dev = craft_device();
+        if (!dev) { return; }
+        if (auto r = dev->install_snapshot_batch(b); !r) {
+            LOGW("group={}: installing region {} batch {} failed: {}; asked again", group, b.region, b.batch,
+                 r.error().message());
+            return;
+        }
+        if (!b.last_in_region) {
+            snp_obj->offset = id_of(b.region, b.batch + 1);
+            return;
+        }
+        // Region boundary: the new index durable first, then the blocks it replaced freed, then the cursor.
+        if (!detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true))) {
+            LOGW("group={}: checkpoint at the end of region {} failed: the region is asked again", group, b.region);
+            snp_obj->offset = id_of(b.region, 1);
+            return;
+        }
+        dev->release_snapshot_frees();
+        recv_->hdr.next_region = b.region + 1;
+        save_receive_state();
+        snp_obj->offset = after_region(b.region, regions);
+        return;
+    }
+
+    auto const& t = std::get< craft_snapshot::snapshot_trailer >(*obj);
+    recv_->hdr.w_hi = t.w_hi;
+    save_receive_state();
+    snp_obj->offset = craft_snapshot::LAST_OBJ_ID;
+}
+
 bool CraftGroupListener::apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) {
-    // The receiver's side isn't implemented yet. Applying one would leave this replica without the entries the
-    // snapshot covers; failing it makes nuraft stop this process instead.
-    LOGE("group={}: a RAFT snapshot up to lsn {} arrived, which CRAFT can't apply yet",
-         boost::uuids::to_string(group_id_), context->get_lsn());
-    return false;
+    auto const lsn = context->get_lsn();
+    load_receive_state();
+    if (!recv_ || recv_->hdr.raft_idx != lsn || !recv_->hdr.completed) {
+        // Applying one not installed would leave this replica without the entries it covers; failing makes nuraft
+        // stop this process instead.
+        LOGE("group={}: the RAFT snapshot up to lsn {} isn't installed here", boost::uuids::to_string(group_id_), lsn);
+        return false;
+    }
+    hb_->remove_craft_snapshot_receive(group_id_);
+    recv_.reset();
+    {
+        std::lock_guard lk{snapshot_mu_};
+        if (!last_snapshot_ || lsn > last_snapshot_->get_lsn()) { last_snapshot_ = context; }
+    }
+    LOGI("group={}: RAFT snapshot up to lsn {} applied", boost::uuids::to_string(group_id_), lsn);
+    return true;
 }
 
 void CraftGroupListener::on_error(homestore::ReplServiceError error, sisl::blob const& header, sisl::blob const& key,

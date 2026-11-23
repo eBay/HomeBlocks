@@ -29,6 +29,7 @@
 #include <deque>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -350,6 +351,10 @@ struct CraftDurableState {
     int64_t durable_commit_lsn{-1};    // commit frontier covered by a completed checkpoint
     int64_t sync_watermark{-1};        // highest SyncRSCommitLSN rs_commit_lsn applied; last_append_lsn >= this
     std::set< int64_t > empty_lsns{};  // every Empty verdict, as empty_lsns_ (a late write or a resolution retry asks)
+    // Set by a snapshot install (resync.md 4.9). journal_floor: the journal holds nothing at or below it (the install
+    // dropped it), whatever the log store reports. read_gate: reads are refused until commit_lsn reaches it.
+    int64_t journal_floor{-1};
+    int64_t read_gate{-1};
     // The RAFT entries committed but not yet applied when the image was taken, in log order. The RAFT log replay after
     // a restart starts above the last checkpoint, which may cover them: a restart applies those above
     // last_applied_raft_idx again from here. Taken by every persist; the in-memory image leaves it empty.
@@ -694,6 +699,40 @@ public:
         return reclaimed_upto_;
     }
     uint32_t lba_size() const { return lba_size_; }
+    // ── snapshot install, the receiver's side (resync.md 4.9) ──
+    //
+    // Called by the group's listener from nuraft's snapshot thread, so they block (sync_get) and never run on a
+    // reactor.
+
+    // The exclusive install barrier (requirement 5): admits no new op (write, read, keep_alive, fetch, resolution,
+    // poll: OFFLINE), pauses the apply queue, then waits out every op, commit, apply, reclaim and checkpoint already
+    // running. Then persists the barrier (durable read_gate = k_install_in_progress), so a restart comes back behind
+    // it. Returns P, the last_append_lsn after the drain; timed_out (the barrier lowered again) if the drain doesn't
+    // finish in time. Raising it again while it is up (a transfer restarted) only returns the current last_append_lsn.
+    result< int64_t > begin_snapshot_install(std::chrono::milliseconds timeout);
+    // Installs one region batch: the volume over [start, end) becomes exactly the batch (requirement 2). Verifies the
+    // data against its checksums, deletes the range's index entries (their blocks are freed by
+    // release_snapshot_frees(), after the region's checkpoint), writes the data to new blocks, commits them and
+    // indexes them.
+    status install_snapshot_batch(craft_snapshot::region_batch const& b);
+    // Frees the blocks the batches installed since the last call replaced. Called after a checkpoint made the new index
+    // durable, so a restart can never find the old index pointing at a reused block.
+    void release_snapshot_frees();
+    // Completes the install (requirement 7). Drops the whole journal, rebases the watermarks on the snapshot's (or, for
+    // a control-only install, keeps this member's certified prefix), merges the control state, flushes a checkpoint,
+    // persists the state with the read gate G (max(W_hi, P), or P for a control-only install), and lifts the barrier.
+    status complete_snapshot_install(craft_snapshot::snapshot_meta const& meta, int64_t w_hi, int64_t p,
+                                     bool control_only);
+    // Whether the install barrier is up (also after a restart that found one in progress).
+    bool snapshot_installing() const { return installing_.load(std::memory_order_acquire); }
+    // The read gate: reads are NOT_ELIGIBLE while commit_lsn is below it.
+    int64_t read_gate() const {
+        std::lock_guard lk{state_mu_};
+        return read_gate_;
+    }
+    // The durable read_gate while an install is in progress.
+    static constexpr int64_t k_install_in_progress = std::numeric_limits< int64_t >::max();
+
     // What CraftReplDevSnapshotSource reads (see make_snapshot_source()).
     int64_t snapshot_last_append_lsn() const;
     std::optional< std::vector< craft_snapshot::index_entry > > snapshot_read_index(lba_t start, lba_t end);
@@ -1334,6 +1373,39 @@ private:
     // Blocks an index write superseded, each with the slot that replaced it, until the durable commit frontier reaches
     // that slot. Lost on a crash: a bounded leak. Guarded by state_mu_.
     std::vector< std::pair< int64_t, homestore::blk_id > > deferred_frees_;
+
+    // ── snapshot install ──
+    // Ops in progress, counted by admit_op(); installing_ refuses new ones. Both seq_cst: an op either sees the
+    // barrier, or the barrier's drain sees the op.
+    std::atomic< int64_t > active_ops_{0};
+    std::atomic< bool > installing_{false};
+    int64_t read_gate_{-1};                           // guarded by state_mu_
+    std::vector< homestore::blk_id > snapshot_frees_; // guarded by state_mu_
+    class OpAdmission {
+    public:
+        explicit OpAdmission(CraftReplDev* dev) : dev_{dev} {}
+        OpAdmission(OpAdmission const&) = delete;
+        OpAdmission& operator=(OpAdmission const&) = delete;
+        ~OpAdmission() {
+            if (dev_) dev_->active_ops_.fetch_sub(1);
+        }
+        explicit operator bool() const { return dev_ != nullptr; }
+
+    private:
+        CraftReplDev* dev_;
+    };
+    OpAdmission admit_op() {
+        active_ops_.fetch_add(1);
+        if (installing_.load()) {
+            active_ops_.fetch_sub(1);
+            return OpAdmission{nullptr};
+        }
+        return OpAdmission{this};
+    }
+    // Nothing runs that could change the journal, the index or the state: the install barrier's drain waits for it.
+    bool snapshot_drained();
+    // Starts the apply drainer if entries wait and nothing pauses or stops it.
+    void resume_apply_if_queued();
 
     // ── journal reclaim (S8), all guarded by state_mu_ ──
     int64_t reclaimed_upto_{-1};           // journal entries at or below this are gone

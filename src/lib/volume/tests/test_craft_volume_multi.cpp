@@ -343,9 +343,9 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
 }
 #endif
 
-// HomeStore compacts a group's RAFT log. A member that falls behind the compaction needs a RAFT snapshot, which CRAFT
-// can't serve yet: the leader refuses to send it, and the member stays behind, its replica untouched.
-TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
+// HomeStore compacts a group's RAFT log. A member that falls behind the compaction catches up through a RAFT snapshot
+// (resync.md 4.9): the leader serves it, the member installs it, and it ends with the group's commit and session.
+TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionCatchesUpThroughASnapshot) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(5);
     if (me() == 0) {
@@ -382,18 +382,21 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
     if (me() == 2) { g_helper->start(); }
     ASSERT_TRUE(sync());
 
-    if (me() == 0) {
-        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
-        EXPECT_TRUE(wait_until([&impl] {
-            using namespace sisl; // the metric's name literal
-            return COUNTER_VALUE(impl->metrics(), craft_snapshot_transfers_refused) > 0;
-        }));
+    if (me() == 2) {
+        EXPECT_TRUE(wait_until([&id] { return group(id)->get_last_commit_lsn() >= g_barrier->published(); }))
+            << "caught up past the compaction";
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        EXPECT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 10; }))
+            << "the session the snapshot carried (logins 1..10, compacted away)";
+        EXPECT_FALSE((*vol)->craft_dev()->snapshot_installing());
     }
     ASSERT_TRUE(sync());
 
-    if (me() == 2) {
-        EXPECT_TRUE(hb()->get_volume(id));
-        EXPECT_LT(group(id)->get_last_commit_lsn(), g_barrier->published());
+    if (me() == 0) {
+        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+        using namespace sisl; // the metric's name literal
+        EXPECT_GT(COUNTER_VALUE(impl->metrics(), craft_snapshot_objects_sent), 0);
     }
     ASSERT_TRUE(sync());
 }

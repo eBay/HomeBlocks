@@ -120,6 +120,7 @@ private:
     // nuraft asks a group's listener for its last snapshot during that recovery.
     mutable std::mutex craft_snapshot_mu_;
     std::unordered_map< volume_id_t, superblk< craft_snapshot::snapshot_record_sb_t > > craft_snapshot_sbs_;
+    std::unordered_map< volume_id_t, superblk< craft_snapshot::snapshot_receive_sb_t > > craft_snapshot_recv_sbs_;
 
     // CRAFT reattaches started and not done yet, and what their waiters await: completed when the count drops to 0.
     std::mutex craft_reattach_mu_;
@@ -226,6 +227,17 @@ public:
                              sisl::io_blob_safe const& ctx);
     std::optional< craft_snapshot_record > craft_snapshot(volume_id_t const& group);
     void remove_craft_snapshot(volume_id_t const& group);
+    // CRAFT: the transfer a receiver is installing for a group (snapshot_receive_sb_t + its encoded object 0 | 0).
+    struct craft_snapshot_receive {
+        craft_snapshot::snapshot_receive_sb_t hdr{};
+        std::vector< uint8_t > meta{};
+    };
+    void save_craft_snapshot_receive(craft_snapshot_receive const& rec);
+    std::optional< craft_snapshot_receive > craft_snapshot_receive_record(volume_id_t const& group);
+    void remove_craft_snapshot_receive(volume_id_t const& group);
+    // CRAFT: creates a group's volume on this member from a snapshot's definition (a learner, or a member that lost
+    // it): what applying the CreateVolume entry would have done, which the snapshot compacted away.
+    status create_craft_volume_from_snapshot(volume_info&& info) { return create_craft_volume_local(std::move(info)); }
     // CRAFT: the checkpoint step. Persists every CRAFT partition's durable state, with the RAFT entries it has not
     // applied yet; stops the process if one can't be.
     sisl::async::task< void > save_craft_states();
@@ -330,6 +342,7 @@ private:
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_snapshot_receive_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 
     void vol_gc();
 

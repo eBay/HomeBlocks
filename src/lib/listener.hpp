@@ -123,6 +123,11 @@ public:
     int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
                           std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
     void free_user_snp_ctx(void*& user_snp_ctx) override;
+    // As a member behind the compaction: write_snapshot_obj installs the objects the leader sends (creating the volume
+    // first if this member has none), resuming a transfer interrupted by a restart; apply_snapshot succeeds once the
+    // install's completion is durable.
+    void write_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                            std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
     bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
 
 private:
@@ -138,5 +143,14 @@ private:
     std::atomic_flag entries_dropped_logged_{};
     std::mutex snapshot_mu_;
     std::shared_ptr< homestore::snapshot_context > last_snapshot_; // guarded by snapshot_mu_
+    // The transfer this member is installing, as its receive record holds it (loaded from it after a restart). Only
+    // nuraft's snapshot thread touches it.
+    struct receive_state {
+        craft_snapshot::snapshot_receive_sb_t hdr{};
+        craft_snapshot::snapshot_meta meta{};
+    };
+    std::optional< receive_state > recv_;
+    bool load_receive_state();
+    void save_receive_state();
 };
 } // namespace homeblocks

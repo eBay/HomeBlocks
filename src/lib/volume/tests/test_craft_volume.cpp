@@ -600,6 +600,131 @@ TEST_F(CraftVolumeTest, SnapshotCarriesTheCommittedVolume) {
     EXPECT_FALSE(impl->craft_snapshot(id)) << "removed with its group";
 }
 
+// The receiver's side of a snapshot (resync.md 4.9) on real partitions: a donor volume's snapshot, served by its
+// reader, installed into a fresh volume through the install barrier. The receiver ends with the donor's committed
+// data and session; IO is refused while the barrier is up, and a restart in the middle of an install comes back behind
+// it.
+TEST_F(CraftVolumeTest, ASnapshotInstallsIntoAnotherPartition) {
+    using namespace homeblocks::craft_snapshot;
+    auto donor_info = craft_vol_info("craft_vol_snap_donor");
+    auto const donor_id = donor_info.id;
+    auto const size_bytes = donor_info.size_bytes;
+    auto donor = create(std::move(donor_info));
+    ASSERT_TRUE(donor);
+    commit_login(*donor, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&donor] { return (*donor)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 6; ++dlsn) {
+        auto const w = write_slot(*donor, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    commit_sync(*donor, 3 /* rs_commit_lsn */, 42 /* client_token */, 1001 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&donor] { return (*donor)->craft_dev()->commit_lsn() == 3; }));
+
+    auto const donor_dev = (*donor)->craft_dev_ref();
+    snapshot_meta meta{.raft_idx = 1001, .tuple = donor_dev->capture_snapshot_tuple(), .lba_size = k_page};
+    meta.digest = tuple_digest(meta.tuple);
+    meta.total_lbas = size_bytes / k_page;
+    meta.region_lbas = meta.total_lbas / 2;
+    meta.region_count = region_count(meta.total_lbas, meta.region_lbas);
+
+    auto recv_info = craft_vol_info("craft_vol_snap_receiver");
+    auto const recv_id = recv_info.id;
+    auto receiver = create(std::move(recv_info));
+    ASSERT_TRUE(receiver);
+    auto const dev = (*receiver)->craft_dev_ref();
+
+    auto const p = dev->begin_snapshot_install(std::chrono::seconds(10));
+    ASSERT_TRUE(p) << p.error().message();
+    EXPECT_TRUE(dev->snapshot_installing());
+    EXPECT_FALSE(write_slot(*receiver, craft::client_hdr{0, -1, -1}, 0)) << "the barrier admits no write";
+
+    auto source = CraftReplDev::make_snapshot_source(donor_dev, meta.total_lbas);
+    snapshot_reader rd{meta, *source, 2 * k_page, 0x8005};
+    int64_t w_hi = -1;
+    uint64_t next = *obj_id{.region = 1, .batch = 1}.pack();
+    for (int i = 0; i < 100 && next != LAST_OBJ_ID; ++i) {
+        auto const r = rd.serve(next);
+        ASSERT_EQ(r.st, snapshot_reader::status::ok);
+        auto const obj = decode(r.blob.data(), r.blob.size());
+        ASSERT_TRUE(obj);
+        if (std::holds_alternative< region_batch >(*obj)) {
+            auto const& b = std::get< region_batch >(*obj);
+            auto const st = dev->install_snapshot_batch(b);
+            ASSERT_TRUE(st) << st.error().message();
+            if (b.last_in_region) dev->release_snapshot_frees();
+            next = !b.last_in_region           ? *obj_id{.region = b.region, .batch = b.batch + 1}.pack()
+                : b.region < meta.region_count ? *obj_id{.region = b.region + 1, .batch = 1}.pack()
+                                               : *obj_id{.region = meta.region_count + 1}.pack();
+        } else {
+            w_hi = std::get< snapshot_trailer >(*obj).w_hi;
+            next = LAST_OBJ_ID;
+        }
+    }
+    EXPECT_EQ(w_hi, 5);
+    // Completed against W_hi = W, so the gate is the committed prefix itself and the data reads back at once; the
+    // trailer's real W_hi (5) gates reads until slots 4 and 5 are fetched and committed.
+    auto const st = dev->complete_snapshot_install(meta, meta.tuple.data_watermark, *p, false /* control_only */);
+    ASSERT_TRUE(st) << st.error().message();
+    EXPECT_FALSE(dev->snapshot_installing());
+    EXPECT_EQ(dev->commit_lsn(), 3);
+    EXPECT_EQ(dev->last_append_lsn(), std::max< int64_t >(3, meta.tuple.sync_watermark));
+    EXPECT_EQ(dev->term(), 7u) << "the donor's session, merged";
+    EXPECT_EQ(dev->read_gate(), 3);
+    for (int64_t dlsn = 0; dlsn < 4; ++dlsn) {
+        EXPECT_TRUE(reads_back(*receiver, hdr, 3 /* read_lsn */, dlsn)) << "slot " << dlsn;
+    }
+
+    // A restart in the middle of an install comes back behind the barrier.
+    ASSERT_TRUE(dev->begin_snapshot_install(std::chrono::seconds(10)));
+    g_helper->restart();
+    auto again = hb()->get_volume(recv_id);
+    ASSERT_TRUE(again);
+    ASSERT_TRUE(wait_until([&again] { return (*again)->craft_dev() != nullptr; }));
+    EXPECT_TRUE((*again)->craft_dev()->snapshot_installing()) << "offline until the install completes";
+    EXPECT_FALSE(reads_back(*again, hdr, 3, 0));
+    remove(recv_id);
+    remove(donor_id);
+}
+
+// A snapshot whose W is below the receiver's own commit_lsn installs control only (resync.md 4.9, requirement 4): the
+// receiver keeps its certified data and commit_lsn, merges the newer session, drops its journal above the commit and
+// gates reads up to its own pre-install last_append_lsn P.
+TEST_F(CraftVolumeTest, AnOlderSnapshotInstallsControlOnly) {
+    using namespace homeblocks::craft_snapshot;
+    auto info = craft_vol_info("craft_vol_snap_control_only");
+    auto const id = info.id;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 6; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    commit_sync(*vol, 3 /* rs_commit_lsn */, 42 /* client_token */, 1001 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->commit_lsn() == 3; }));
+    auto const dev = (*vol)->craft_dev_ref();
+
+    // A donor whose data trails this member's: W = 1, with a newer session.
+    snapshot_meta meta{.raft_idx = 2000, .lba_size = k_page};
+    meta.tuple = control_tuple{.session_term = 9, .client_token = 77, .data_watermark = 1, .sync_watermark = 1};
+    meta.digest = tuple_digest(meta.tuple);
+    auto const p = dev->begin_snapshot_install(std::chrono::seconds(10));
+    ASSERT_TRUE(p);
+    EXPECT_EQ(*p, 5);
+    auto const st = dev->complete_snapshot_install(meta, -1, *p, true /* control_only */);
+    ASSERT_TRUE(st) << st.error().message();
+    EXPECT_EQ(dev->commit_lsn(), 3) << "certified data is never rolled back";
+    EXPECT_EQ(dev->last_append_lsn(), 5);
+    EXPECT_EQ(dev->term(), 9u) << "the newer session, merged";
+    EXPECT_EQ(dev->read_gate(), 5) << "gated up to P: slots 4 and 5 were acked here and dropped";
+    craft::client_hdr const hdr9{9, -1, -1};
+    EXPECT_FALSE(reads_back(*vol, hdr9, 3, 0)) << "not readable until commit_lsn reaches the gate";
+    remove(id);
+}
+
 // The device proposes through its own RAFT group, and again after a restart: a resolution the client asks for commits a
 // SyncRSCommitLSN, which the partition has applied, its slots committed to the index, when the resolution returns.
 TEST_F(CraftVolumeTest, RequestResolutionCommitsThroughTheGroup) {
