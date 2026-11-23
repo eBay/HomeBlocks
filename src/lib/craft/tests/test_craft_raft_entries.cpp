@@ -1214,17 +1214,24 @@ std::vector< uint8_t > unversioned_sync_key(int64_t rs_commit_lsn, uint64_t clie
     return buf;
 }
 
-// Neither earlier layout parses as this one, even when its first byte happens to equal the version: their sizes
-// (20 + 8n bytes before SDSTOR-22892 added term, 28 + 8n after) never equal this layout's 29 + 8m. The first key is the
-// review's example (#216, r4670501472), which the previous layout misread as term 0x700000001 with no Empty slot.
+// Neither earlier layout parses as this one: their sizes (20 + 8n bytes before SDSTOR-22892 added term, 28 + 8n after)
+// are 4 more than a multiple of 8, this layout's 29 + 8m 5 more. Each key is built to get past the minimum size and the
+// version check (rs_commit_lsn's low byte is the version), so only the exact-size check is left to reject it.
 TEST(SyncRSCommitLSNCodecTest, RejectsTheUnversionedLayouts) {
-    auto before_term = unversioned_sync_key(/*rs_commit_lsn=*/9, /*client_token=*/42, std::nullopt, {7});
-    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(before_term)));
-    auto with_term = unversioned_sync_key(/*rs_commit_lsn=*/9, /*client_token=*/42, /*term=*/3, {7});
-    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(with_term)));
-    auto version_lookalike = unversioned_sync_key(/*rs_commit_lsn=*/SyncRSCommitLSNPayload::VERSION, 42, 3, {});
-    ASSERT_EQ(version_lookalike[0], SyncRSCommitLSNPayload::VERSION);
-    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(version_lookalike)));
+    int64_t const lookalike_rs = SyncRSCommitLSNPayload::VERSION;
+    for (auto key : {unversioned_sync_key(lookalike_rs, /*client_token=*/42, std::nullopt, {7, 8}),
+                     unversioned_sync_key(lookalike_rs, /*client_token=*/42, /*term=*/3, {7})}) {
+        ASSERT_GE(key.size(), sizeof(SyncRSCommitLSNPayload));
+        ASSERT_EQ(key[0], SyncRSCommitLSNPayload::VERSION);
+        EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(key))) << key.size() << "-byte key";
+    }
+}
+
+// The review's example (#216, r4670501472): the layout before SDSTOR-22892 added term, which that change's parser
+// misread as term 0x700000001 with no Empty slot.
+TEST(SyncRSCommitLSNCodecTest, RejectsTheReviewsMisparsedKey) {
+    auto key = unversioned_sync_key(/*rs_commit_lsn=*/9, /*client_token=*/42, std::nullopt, {7});
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(key)));
 }
 
 // ── CreateVolume codec (SDSTOR-22894) ─────────────────────────────────────────
