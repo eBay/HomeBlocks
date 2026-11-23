@@ -2491,6 +2491,28 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         entry.term = login_payload->term;
         break;
     }
+    case CraftEntryType::RetainFrom: {
+        // Pinned at pre-commit already (CraftGroupListener::on_pre_commit); again here for a member that had no device
+        // then. Nothing to apply in order.
+        if (key.size() != sizeof(RetainFromPayload)) {
+            LOGE("on_commit lsn={} RetainFrom key wrong size ({} bytes)", lsn, key.size());
+            return invalid();
+        }
+        auto const* r = reinterpret_cast< const RetainFromPayload* >(key.cbytes());
+        owner_->pin_retain(r->raft_idx, r->digest, r->w);
+        complete_proposal(ctx, ok());
+        return;
+    }
+    case CraftEntryType::ReleaseRetain: {
+        if (key.size() != sizeof(ReleaseRetainPayload)) {
+            LOGE("on_commit lsn={} ReleaseRetain key wrong size ({} bytes)", lsn, key.size());
+            return invalid();
+        }
+        auto const* r = reinterpret_cast< const ReleaseRetainPayload* >(key.cbytes());
+        owner_->unpin_retain(r->raft_idx, r->digest);
+        complete_proposal(ctx, ok());
+        return;
+    }
     default:
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry.type));
         return invalid();
@@ -2742,10 +2764,16 @@ void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, 
                                           : make_error_condition(volume_error::INTERNAL_ERROR)));
 }
 
-void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const& /* header */,
-                                                  sisl::blob const& /* key */,
+void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                                                   cintrusive< homestore::repl_req_ctx >& ctx) {
     LOGW("on_rollback lsn={}", lsn);
+    // A RetainFrom pinned at pre-commit and never committed holds nothing.
+    if (header.size() >= sizeof(CraftEntryHeader) &&
+        reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type == CraftEntryType::RetainFrom &&
+        key.size() == sizeof(RetainFromPayload)) {
+        auto const* r = reinterpret_cast< const RetainFromPayload* >(key.cbytes());
+        owner_->unpin_retain(r->raft_idx, r->digest);
+    }
     complete_proposal(ctx, std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER)));
 }
 
@@ -2850,8 +2878,9 @@ void CraftReplDev::requeue_pending(std::vector< CraftPendingEntry > pending) {
 
 namespace {
 constexpr uint64_t k_durable_magic = 0x31425354'46415243ull; // "CRAFTSB1" little-endian
-constexpr uint32_t k_durable_version = 3;                    // 3: journal_floor and read_gate (snapshot install)
-constexpr uint32_t k_durable_version_v2 = 2;                 // still read: both fields -1
+constexpr uint32_t k_durable_version = 4;                    // 4: RetainFrom pins
+constexpr uint32_t k_durable_version_v3 = 3; // still read: no pins (3 added journal_floor and read_gate)
+constexpr uint32_t k_durable_version_v2 = 2; // still read: no pins, journal_floor and read_gate -1
 #pragma pack(push, 1)
 struct DurableHeaderV2 {
     uint64_t magic;
@@ -2864,9 +2893,17 @@ struct DurableHeaderV2 {
     int64_t durable_commit_lsn;
     int64_t sync_watermark;
 };
-struct DurableHeader : DurableHeaderV2 {
+struct DurableHeaderV3 : DurableHeaderV2 {
     int64_t journal_floor;
     int64_t read_gate;
+};
+struct DurableHeader : DurableHeaderV3 {
+    uint32_t n_pins;
+};
+struct PinRecord {
+    int64_t raft_idx;
+    uint32_t digest;
+    int64_t w;
 };
 struct PendingRecord { // followed by n_free int64_t: CraftPendingEntry::to_free
     int64_t raft_idx;
@@ -2887,13 +2924,15 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
     size_t frees = 0;
     for (auto const& p : s.pending)
         frees += p.to_free.size();
-    DurableHeader const h{{k_durable_magic, k_durable_version, static_cast< uint32_t >(s.empty_lsns.size()),
-                           static_cast< uint32_t >(s.pending.size()), s.term, s.client_token, s.last_applied_raft_idx,
-                           s.durable_commit_lsn, s.sync_watermark},
-                          s.journal_floor,
-                          s.read_gate};
+    DurableHeader const h{{{k_durable_magic, k_durable_version, static_cast< uint32_t >(s.empty_lsns.size()),
+                            static_cast< uint32_t >(s.pending.size()), s.term, s.client_token, s.last_applied_raft_idx,
+                            s.durable_commit_lsn, s.sync_watermark},
+                           s.journal_floor,
+                           s.read_gate},
+                          static_cast< uint32_t >(s.retain_pins.size())};
     std::vector< uint8_t > out(sizeof(h) + s.empty_lsns.size() * sizeof(int64_t) +
-                               s.pending.size() * sizeof(PendingRecord) + frees * sizeof(int64_t));
+                               s.pending.size() * sizeof(PendingRecord) + frees * sizeof(int64_t) +
+                               s.retain_pins.size() * sizeof(PinRecord));
     std::memcpy(out.data(), &h, sizeof(h));
     size_t off = sizeof(h);
     for (int64_t lsn : s.empty_lsns) {
@@ -2914,6 +2953,11 @@ std::vector< uint8_t > encode_durable_state(CraftDurableState const& s) {
             off += sizeof(lsn);
         }
     }
+    for (auto const& pin : s.retain_pins) {
+        PinRecord const r{.raft_idx = pin.raft_idx, .digest = pin.digest, .w = pin.w};
+        std::memcpy(out.data() + off, &r, sizeof(r));
+        off += sizeof(r);
+    }
     return out;
 }
 
@@ -2927,9 +2971,15 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
         if (len < sizeof(DurableHeader)) return std::nullopt;
         std::memcpy(&h, buf, sizeof(DurableHeader));
         hdr_len = sizeof(DurableHeader);
+    } else if (h.version == k_durable_version_v3) {
+        if (len < sizeof(DurableHeaderV3)) return std::nullopt;
+        std::memcpy(static_cast< DurableHeaderV3* >(&h), buf, sizeof(DurableHeaderV3));
+        hdr_len = sizeof(DurableHeaderV3);
+        h.n_pins = 0;
     } else if (h.version == k_durable_version_v2) {
         h.journal_floor = -1;
         h.read_gate = -1;
+        h.n_pins = 0;
     } else {
         return std::nullopt;
     }
@@ -2971,6 +3021,13 @@ std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size
         off += r.n_free * sizeof(int64_t);
         s.pending.push_back(std::move(p));
         prev_idx = r.raft_idx;
+    }
+    if ((len - off) / sizeof(PinRecord) < h.n_pins) return std::nullopt;
+    for (uint32_t i = 0; i < h.n_pins; ++i) {
+        PinRecord r;
+        std::memcpy(&r, buf + off, sizeof(r));
+        off += sizeof(r);
+        s.retain_pins.push_back(CraftRetainPin{.raft_idx = r.raft_idx, .digest = r.digest, .w = r.w});
     }
     if (off != len) return std::nullopt;
     return s;
@@ -3181,6 +3238,9 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
         reclaimed_upto_ = std::max(journal_->reclaimed_upto(), d.journal_floor);
         persisted_durable_commit_ = d.durable_commit_lsn;
         read_gate_ = d.read_gate;
+        retain_pins_.clear();
+        for (auto const& pin : d.retain_pins)
+            retain_pins_[{pin.raft_idx, pin.digest}] = RetainPinState{pin.w, std::chrono::steady_clock::now()};
     }
     if (d.read_gate == k_install_in_progress) {
         // A snapshot install was in progress: the journal and the index are partly replaced, so the partition takes
@@ -3204,13 +3264,16 @@ async_result< std::vector< CraftPendingEntry > > CraftReplDev::restore_state() {
 // Without a state store nothing is persisted, so the persisted frontier stays -1 and nothing is ever reclaimed: the
 // journal is then the only copy.
 int64_t CraftReplDev::reclaim_floor_locked() const {
-    auto const floor = std::min(persisted_durable_commit_, state_.all_committed_lsn);
+    auto floor = std::min(persisted_durable_commit_, state_.all_committed_lsn);
+    for (auto const& [_, pin] : retain_pins_)
+        floor = std::min(floor, pin.w); // a snapshot receiver replays every slot above W from the journals
     return awaiting_free_.empty() ? floor : std::min(floor, *awaiting_free_.begin() - 1);
 }
 
 void CraftReplDev::request_reclaim() {
     {
         std::lock_guard lk{state_mu_};
+        prune_retain_pins_locked();
         if (reclaim_running_ || reclaim_unsupported_ || reclaim_stopped_ || reclaim_floor_locked() <= reclaimed_upto_ ||
             installing_.load())
             return;
@@ -4152,6 +4215,118 @@ void CraftReplDev::resume_apply_if_queued() {
         start = !apply_queue_.empty() && !apply_paused_ && !apply_stopped_ && !std::exchange(apply_running_, true);
     }
     if (start) detail::detach(drain_apply());
+}
+
+// ─── RetainFrom (resync.md 4.8) ──────────────────────────────────────────────
+
+void CraftReplDev::sync_durable_pins_locked() {
+    durable_.retain_pins.clear();
+    for (auto const& [key, pin] : retain_pins_)
+        durable_.retain_pins.push_back(CraftRetainPin{.raft_idx = key.first, .digest = key.second, .w = pin.w});
+}
+
+void CraftReplDev::pin_retain(int64_t raft_idx, uint32_t digest, int64_t w) {
+    std::lock_guard lk{state_mu_};
+    auto const [it, added] =
+        retain_pins_.try_emplace({raft_idx, digest}, RetainPinState{w, std::chrono::steady_clock::now()});
+    if (!added) return;
+    sync_durable_pins_locked();
+    LOGI("retain: pinned W={} for the snapshot at raft lsn {} (journal reclaimed up to {})", w, raft_idx,
+         reclaimed_upto_);
+}
+
+void CraftReplDev::unpin_retain(int64_t raft_idx, uint32_t digest) {
+    std::lock_guard lk{state_mu_};
+    if (retain_pins_.erase({raft_idx, digest}) == 0) return;
+    sync_durable_pins_locked();
+    LOGI("retain: released the pin of the snapshot at raft lsn {}", raft_idx);
+}
+
+std::vector< CraftRetainPin > CraftReplDev::retain_pins() const {
+    std::lock_guard lk{state_mu_};
+    std::vector< CraftRetainPin > out;
+    for (auto const& [key, pin] : retain_pins_)
+        out.push_back(CraftRetainPin{.raft_idx = key.first, .digest = key.second, .w = pin.w});
+    return out;
+}
+
+void CraftReplDev::prune_retain_pins_locked() {
+    if (retain_pins_.empty()) return;
+    auto const timeout = std::chrono::seconds{HB_DYNAMIC_CONFIG(craft_retain_timeout_s)};
+    auto const max_slots = static_cast< int64_t >(HB_DYNAMIC_CONFIG(craft_retain_max_slots));
+    auto const now = std::chrono::steady_clock::now();
+    bool changed = false;
+    for (auto it = retain_pins_.begin(); it != retain_pins_.end();) {
+        auto const& pin = it->second;
+        char const* why = nullptr;
+        if (timeout.count() > 0 && now - pin.since > timeout) {
+            why = "it is older than craft_retain_timeout_s";
+        } else if (max_slots > 0 && state_.last_append_lsn - pin.w > max_slots) {
+            why = "it holds more than craft_retain_max_slots journal slots";
+        }
+        if (!why) {
+            ++it;
+            continue;
+        }
+        LOGW("retain: dropped the pin W={} of the snapshot at raft lsn {}: {}; that transfer may not complete", pin.w,
+             it->first.first, why);
+        it = retain_pins_.erase(it);
+        changed = true;
+    }
+    if (changed) sync_durable_pins_locked();
+}
+
+async_status CraftReplDev::propose_retain(int64_t raft_idx, uint32_t digest, int64_t w) {
+    if (!raft_proposer_) co_return std::unexpected(make_error_condition(std::errc::not_supported));
+    CraftEntryHeader hdr{CraftEntryType::RetainFrom};
+    RetainFromPayload key{.raft_idx = raft_idx, .digest = digest, .w = w};
+    co_return co_await raft_proposer_->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
+                                               sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)});
+}
+
+async_status CraftReplDev::propose_release_retain(int64_t raft_idx, uint32_t digest) {
+    if (!raft_proposer_) co_return std::unexpected(make_error_condition(std::errc::not_supported));
+    CraftEntryHeader hdr{CraftEntryType::ReleaseRetain};
+    ReleaseRetainPayload key{.raft_idx = raft_idx, .digest = digest};
+    co_return co_await raft_proposer_->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
+                                               sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)});
+}
+
+async_result< std::vector< QuorumLsnResponse > > CraftReplDev::poll_members(uint32_t timeout_ms) {
+    if (!peer_fetcher_) co_return std::vector< QuorumLsnResponse >{};
+    uint64_t term;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+    }
+    co_return co_await peer_fetcher_->poll_quorum_lsns(term, false /* not a login: no fence */, timeout_ms);
+}
+
+async_result< bool > CraftReplDev::sources_hold_above(int64_t w, uint32_t timeout_ms) {
+    {
+        std::lock_guard lk{state_mu_};
+        if (reclaimed_upto_ > w) co_return false;
+    }
+    if (!peer_fetcher_) {
+        LOGW("retain: no peer plane here: only this member's journal is checked against W={}", w);
+        co_return true;
+    }
+    // Reachable members, then the ones still holding w + 1: a member that answers the poll but fails the fetch has
+    // reclaimed past w (fetch_data refuses a reclaimed slot outright).
+    auto polled = co_await poll_members(timeout_ms);
+    if (!polled) co_return std::unexpected(polled.error());
+    auto fetched = co_await peer_fetcher_->fetch_from_quorum({w + 1}, timeout_ms);
+    if (!fetched) co_return std::unexpected(fetched.error());
+    for (auto const& p : *polled) {
+        auto const held = std::any_of(fetched->begin(), fetched->end(),
+                                      [&p](QuorumSlotResponse const& f) { return f.member == p.member; });
+        if (!held) {
+            LOGW("retain: member {} answers but no longer holds slot {}: reclaimed past W",
+                 boost::uuids::to_string(p.member), w + 1);
+            co_return false;
+        }
+    }
+    co_return true;
 }
 
 } // namespace homeblocks

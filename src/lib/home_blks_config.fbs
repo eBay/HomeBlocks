@@ -72,6 +72,11 @@ table HomeBlksSettings{
     // move replaces it.
     craft_snapshot_enabled: bool = true;
     craft_snapshot_region_mb: uint32 = 1024;
+    // RetainFrom (resync.md 4.8): a pin a snapshot transfer holds on every member's journal is dropped by the member
+    // once older than this many seconds, or once it keeps more than this many journal slots, so journal space is never
+    // traded for a transfer (that transfer may then fail and start over). 0 = no limit.
+    craft_retain_timeout_s: uint32 = 3600;
+    craft_retain_max_slots: uint64 = 10000000;
 }
 
 root_type HomeBlksSettings;

@@ -1704,7 +1704,7 @@ TEST(CraftDurableStateCodec, SnapshotFieldsAndTheOlderVersion) {
     // The same image as version 2 wrote it: the two fields cut out of the header, version 2.
     constexpr size_t k_v2_header = 60; // magic, version, three counts and five watermarks
     auto v2 = bytes;
-    v2.erase(v2.begin() + k_v2_header, v2.begin() + k_v2_header + 2 * sizeof(int64_t));
+    v2.erase(v2.begin() + k_v2_header, v2.begin() + k_v2_header + 2 * sizeof(int64_t) + sizeof(uint32_t));
     uint32_t const two = 2;
     std::memcpy(v2.data() + sizeof(uint64_t), &two, sizeof(two));
     auto const old = decode_durable_state(v2.data(), v2.size());
@@ -1713,6 +1713,18 @@ TEST(CraftDurableStateCodec, SnapshotFieldsAndTheOlderVersion) {
     expected.journal_floor = -1;
     expected.read_gate = -1;
     EXPECT_EQ(*old, expected);
+}
+
+// Version 4 carries the RetainFrom pins.
+TEST(CraftDurableStateCodec, RetainPinsRoundTrip) {
+    auto s = sample_state();
+    s.retain_pins = {CraftRetainPin{.raft_idx = 40, .digest = 0xabcd, .w = 3},
+                     CraftRetainPin{.raft_idx = 90, .digest = 7, .w = 5}};
+    auto const bytes = encode_durable_state(s);
+    auto const d = decode_durable_state(bytes.data(), bytes.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(*d, s);
+    EXPECT_FALSE(decode_durable_state(bytes.data(), bytes.size() - 1).has_value()) << "a pin cut short";
 }
 
 TEST(CraftDurableStateCodec, RejectsMalformedImages) {
@@ -2393,6 +2405,91 @@ TEST_F(CraftRaftEntriesTest, ReclaimFollowsTheLowerOfTheDurableCommitAndAllCommi
 
     ASSERT_TRUE(keep_alive_with(*dev_, 20).has_value());
     EXPECT_EQ(dev_->reclaimed_upto(), 10) << "past the durable commit frontier";
+}
+
+// ── RetainFrom (resync.md 4.8) ──
+
+std::vector< uint8_t > retain_header(CraftEntryType type) {
+    CraftEntryHeader h{type};
+    auto const* p = reinterpret_cast< uint8_t const* >(&h);
+    return std::vector< uint8_t >(p, p + sizeof(h));
+}
+std::vector< uint8_t > retain_key(int64_t raft_idx, uint32_t digest, int64_t w) {
+    RetainFromPayload k{.raft_idx = raft_idx, .digest = digest, .w = w};
+    auto const* p = reinterpret_cast< uint8_t const* >(&k);
+    return std::vector< uint8_t >(p, p + sizeof(k));
+}
+std::vector< uint8_t > release_key(int64_t raft_idx, uint32_t digest) {
+    ReleaseRetainPayload k{.raft_idx = raft_idx, .digest = digest};
+    auto const* p = reinterpret_cast< uint8_t const* >(&k);
+    return std::vector< uint8_t >(p, p + sizeof(k));
+}
+
+// A pin holds the reclaim floor at its W, whatever the client reports, until it is released.
+TEST_F(CraftRaftEntriesTest, APinHoldsTheReclaimFloorUntilReleased) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    dev_->pin_retain(100 /* L */, 7 /* digest */, 4 /* W */);
+    ASSERT_TRUE(keep_alive_with(*dev_, 20).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 4) << "a receiver replays everything above W";
+    EXPECT_EQ(dev_->durable_state().retain_pins.size(), 1u);
+
+    dev_->unpin_retain(100, 7);
+    ASSERT_TRUE(keep_alive_with(*dev_, 20).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+    EXPECT_TRUE(dev_->durable_state().retain_pins.empty());
+}
+
+// A pin that would keep more journal slots than craft_retain_max_slots is dropped: space is never traded for a
+// transfer.
+TEST_F(CraftRaftEntriesTest, APinPastItsSlotCapIsDropped) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(10, 0).has_value());
+    auto const cap = HB_DYNAMIC_CONFIG(craft_retain_max_slots);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_retain_max_slots = 3; });
+    dev_->pin_retain(100, 7, 2); // holds slots 3..10: 8 > 3
+    ASSERT_TRUE(keep_alive_with(*dev_, 20).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 10);
+    EXPECT_TRUE(dev_->retain_pins().empty());
+    HB_SETTINGS_FACTORY().modifiable_settings([cap](auto& s) { s.craft_retain_max_slots = cap; });
+}
+
+// RetainFrom pins at commit (a member that had no device at pre-commit) and ReleaseRetain unpins; a RetainFrom rolled
+// back unpins; both complete their proposals without the apply queue.
+TEST_F(CraftRaftEntriesTest, RetainEntriesPinAndUnpin) {
+    commit(50, retain_header(CraftEntryType::RetainFrom), retain_key(40, 9, 3));
+    ASSERT_EQ(dev_->retain_pins().size(), 1u);
+    EXPECT_EQ(dev_->retain_pins().front(), (CraftRetainPin{.raft_idx = 40, .digest = 9, .w = 3}));
+    commit(51, retain_header(CraftEntryType::RetainFrom), retain_key(40, 9, 3));
+    EXPECT_EQ(dev_->retain_pins().size(), 1u) << "idempotent";
+    commit(52, retain_header(CraftEntryType::ReleaseRetain), release_key(40, 9));
+    EXPECT_TRUE(dev_->retain_pins().empty());
+
+    dev_->pin_retain(41, 1, 5); // as pre-commit does
+    auto const h = retain_header(CraftEntryType::RetainFrom);
+    auto const k = retain_key(41, 1, 5);
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->raft_listener().on_rollback(53, sisl::blob{h.data(), static_cast< uint32_t >(h.size())},
+                                      sisl::blob{k.data(), static_cast< uint32_t >(k.size())}, ctx);
+    EXPECT_TRUE(dev_->retain_pins().empty()) << "never committed: holds nothing";
+}
+
+// The pins in the durable image are held again after a restart.
+TEST_F(CraftRaftEntriesTest, PinsSurviveARestart) {
+    auto image = sample_state();
+    image.retain_pins = {CraftRetainPin{.raft_idx = 40, .digest = 9, .w = 1}};
+    restart(std::move(image), page_slots({2, 3})); // completes inline
+    ASSERT_FALSE(dev_->is_recovering());
+    ASSERT_EQ(dev_->retain_pins().size(), 1u);
+    EXPECT_EQ(dev_->retain_pins().front().w, 1);
 }
 
 // Without a state store the journal is the only copy: never reclaimed.

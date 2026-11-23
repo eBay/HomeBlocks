@@ -16,6 +16,7 @@
 #include "listener.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <cstring>
 
 #include <homestore/replication_service.hpp>
@@ -144,6 +145,7 @@ constexpr homestore::csum_t k_craft_crc16_seed = 0x8005; // CraftReplDev's check
 // One transfer, held in nuraft's user_ctx from its first object until free_user_snp_ctx.
 struct snapshot_transfer {
     int64_t lsn;
+    shared< void > pin; // the RetainFrom round (CraftGroupListener::pin_round), shared with its thread
     unique< craft_snapshot::snapshot_source > source; // declared before the reader, which reads through it
     craft_snapshot::snapshot_reader reader;
 };
@@ -234,16 +236,23 @@ int CraftGroupListener::read_snapshot_obj(std::shared_ptr< homestore::snapshot_c
             return refuse_snapshot(lsn, "its record doesn't decode");
         }
         auto meta = std::get< craft_snapshot::snapshot_meta >(std::move(*obj));
-        // The receiver replays every slot above W from the members' journals; this one's must still hold them.
-        // TODO(RetainFrom, resync.md 4.8): pin W on every journal source, then validate, instead of this local check.
+        // The receiver replays every slot above W from the members' journals: no object goes out before W is pinned
+        // on every journal source and validated (resync.md 4.8). Until then nuraft asks again.
         if (dev->journal_reclaimed_upto() > meta.tuple.data_watermark) {
             return refuse_snapshot(lsn, "this member's journal is reclaimed past its W");
+        }
+        auto const round = start_pin_round(dev, lsn, meta.digest, meta.tuple.data_watermark);
+        if (round->st.load() != pin_round::state::pinned) {
+            if (round->st.load() == pin_round::state::failed) {
+                return refuse_snapshot(lsn, "a journal source reclaimed past its W; a newer snapshot is coming");
+            }
+            return -1; // still pinning
         }
         auto source = CraftReplDev::make_snapshot_source(dev, meta.total_lbas);
         auto& src = *source;
         auto const batch_bytes = HB_DYNAMIC_CONFIG(craft_snapshot_batch_mb) * k_mib;
         t = new snapshot_transfer{
-            lsn, std::move(source),
+            lsn, round, std::move(source),
             craft_snapshot::snapshot_reader{std::move(meta), src, batch_bytes, k_craft_crc16_seed}};
         slot = t;
         LOGI("group={}: serving the snapshot at raft lsn {}", boost::uuids::to_string(group_id_), lsn);
@@ -259,6 +268,9 @@ int CraftGroupListener::read_snapshot_obj(std::shared_ptr< homestore::snapshot_c
         return 0;
     case st::last:
         snp_obj->is_last_obj = true;
+        if (auto const dev = craft_device()) {
+            std::static_pointer_cast< pin_round >(t->pin)->w_hi.store(dev->snapshot_last_append_lsn());
+        }
         LOGI("group={}: snapshot at raft lsn {} sent (resends {}, checksum retries {})",
              boost::uuids::to_string(group_id_), lsn, t->reader.resends(), t->reader.checksum_retries());
         return 0;
@@ -276,6 +288,133 @@ int CraftGroupListener::read_snapshot_obj(std::shared_ptr< homestore::snapshot_c
 void CraftGroupListener::free_user_snp_ctx(void*& user_snp_ctx) {
     delete static_cast< snapshot_transfer* >(user_snp_ctx);
     user_snp_ctx = nullptr;
+}
+
+// ── RetainFrom (resync.md 4.8) ──
+
+bool CraftGroupListener::on_pre_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                                       cintrusive< homestore::repl_req_ctx >&) {
+    if (header.size() >= sizeof(CraftEntryHeader) &&
+        reinterpret_cast< const CraftEntryHeader* >(header.cbytes())->type == CraftEntryType::RetainFrom &&
+        key.size() == sizeof(RetainFromPayload)) {
+        if (auto const dev = craft_device()) {
+            auto const* r = reinterpret_cast< const RetainFromPayload* >(key.cbytes());
+            dev->pin_retain(r->raft_idx, r->digest, r->w);
+        }
+    }
+    return true;
+}
+
+shared< CraftGroupListener::pin_round > CraftGroupListener::start_pin_round(shared< CraftReplDev > const& dev,
+                                                                            int64_t lsn, uint32_t digest, int64_t w) {
+    std::lock_guard lk{pins_->mu};
+    auto& slot = pins_->rounds[{lsn, digest}];
+    if (slot) { return slot; } // in progress, pinned, or failed (refused until nuraft serves a newer snapshot)
+    slot = std::make_shared< pin_round >();
+    std::thread{[hb = hb_, group = group_id_, pins = pins_, round = slot, dev, lsn, digest, w] {
+        run_pin_round(hb, group, pins, round, dev, lsn, digest, w);
+    }}.detach();
+    return slot;
+}
+
+void CraftGroupListener::run_pin_round(HomeBlocksImpl* hb_, homestore::group_id_t group_id_,
+                                       shared< pin_registry > pins, shared< pin_round > round,
+                                       shared< CraftReplDev > dev, int64_t lsn, uint32_t digest, int64_t w) {
+    auto const group = boost::uuids::to_string(group_id_);
+    auto const rd_res = homestore::hs()->repl_service().get_repl_dev(group_id_);
+    if (!rd_res) {
+        round->st.store(pin_round::state::failed);
+        return;
+    }
+    auto const rd = *rd_res;
+    auto const forget = [&] {
+        std::lock_guard lk{pins->mu};
+        if (auto it = pins->rounds.find({lsn, digest}); it != pins->rounds.end() && it->second == round) {
+            pins->rounds.erase(it);
+        }
+    };
+    auto const release = [&] {
+        if (auto r = detail::sync_get(dev->propose_release_retain(lsn, digest)); !r) {
+            LOGW("group={}: releasing the pin of the snapshot at raft lsn {} failed ({}): it expires on its own", group,
+                 lsn, r.error().message());
+        }
+        forget();
+    };
+    auto const fail = [&](char const* why) {
+        LOGW("group={}: the snapshot at raft lsn {} can't be served: {}; asking for a newer one", group, lsn, why);
+        if (auto r = detail::sync_get(dev->propose_release_retain(lsn, digest)); !r) {
+            LOGW("group={}: releasing the pin failed ({}): it expires on its own", group, r.error().message());
+        }
+        round->st.store(pin_round::state::failed); // kept in the registry: this snapshot stays refused
+        rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), false /* wait_for_commit */);
+    };
+
+    // 1. Pin: every member takes it as soon as the entry is in its log.
+    if (auto r = detail::sync_get(dev->propose_retain(lsn, digest, w)); !r) {
+        LOGW("group={}: proposing RetainFrom for the snapshot at raft lsn {} failed: {}", group, lsn,
+             r.error().message());
+        round->st.store(pin_round::state::failed);
+        forget(); // nothing pinned: the next request tries again
+        return;
+    }
+    auto const pin_idx = rd->get_last_commit_lsn();
+    auto const me = rd->get_leader_id();
+
+    // 2. Wait until every journal source has the entry. A member behind L is a snapshot recipient, not a source: it
+    // couldn't take the pin before its install, and every durable slot is on another member as well.
+    std::vector< homestore::replica_id_t > receivers;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (;;) {
+        receivers.clear();
+        bool all = true;
+        for (auto const& p : rd->get_replication_status()) {
+            if (p.id_ == me) continue;
+            if (static_cast< int64_t >(p.replication_idx_) < lsn) {
+                receivers.push_back(p.id_);
+            } else if (static_cast< int64_t >(p.replication_idx_) < pin_idx) {
+                all = false;
+            }
+        }
+        if (all) break;
+        if (std::chrono::steady_clock::now() >= deadline) return fail("a journal source didn't take the pin in time");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // 3. Validate, now that no source can reclaim past W any more.
+    auto const held = detail::sync_get(dev->sources_hold_above(w, 5000));
+    if (!held || !*held) return fail("a journal source reclaimed past W before it had the pin");
+    round->st.store(pin_round::state::pinned);
+    LOGI("group={}: W={} pinned on every journal source for the snapshot at raft lsn {} ({} receiver(s))", group, w,
+         lsn, receivers.size());
+
+    // 4. Release once every receiver installed the snapshot and committed past its W_hi; or at the pin's timeout. A
+    // member that stops leading leaves it: every member's pin expires on its own.
+    auto const timeout = std::chrono::seconds{HB_DYNAMIC_CONFIG(craft_retain_timeout_s)};
+    auto const until = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (hb_->is_shutting_down() || !rd->is_leader() || !hb_->get_volume(group_id_)) return forget();
+        if (timeout.count() > 0 && std::chrono::steady_clock::now() >= until) return release();
+        auto const w_hi = round->w_hi.load();
+        if (w_hi < 0) continue; // the transfer hasn't ended yet
+        bool installed = true;
+        for (auto const& p : rd->get_replication_status()) {
+            if (std::find(receivers.begin(), receivers.end(), p.id_) != receivers.end() &&
+                static_cast< int64_t >(p.replication_idx_) < lsn)
+                installed = false;
+        }
+        if (!installed) continue;
+        auto const polled = detail::sync_get(dev->poll_members(5000));
+        // Without a peer plane nothing reports the receivers' progress: the pin is held to its timeout.
+        if (!polled || polled->empty()) continue;
+        bool caught_up = true;
+        for (auto const& resp : *polled) {
+            if (std::find(receivers.begin(), receivers.end(), resp.member) != receivers.end() &&
+                resp.reply.lsns.commit_lsn < w_hi)
+                caught_up = false;
+        }
+        if (caught_up) return release();
+    }
 }
 
 // ── the receiver ──

@@ -30,6 +30,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -344,6 +345,15 @@ struct CraftPendingEntry {
     bool operator==(CraftPendingEntry const&) const = default;
 };
 
+// A RetainFrom pin (resync.md 4.8): the journal keeps every slot above w while it holds. Named by its snapshot
+// transfer's identity.
+struct CraftRetainPin {
+    int64_t raft_idx{-1};
+    uint32_t digest{0};
+    int64_t w{-1};
+    bool operator==(CraftRetainPin const&) const = default;
+};
+
 struct CraftDurableState {
     uint64_t term{0};                  // session term of the last InternalLogin applied
     uint64_t client_token{0};          // and its client token
@@ -355,6 +365,9 @@ struct CraftDurableState {
     // dropped it), whatever the log store reports. read_gate: reads are refused until commit_lsn reaches it.
     int64_t journal_floor{-1};
     int64_t read_gate{-1};
+    // The RetainFrom pins held (version 4). A restart replays the log above the checkpoint, which pins again what it
+    // still holds.
+    std::vector< CraftRetainPin > retain_pins{};
     // The RAFT entries committed but not yet applied when the image was taken, in log order. The RAFT log replay after
     // a restart starts above the last checkpoint, which may cover them: a restart applies those above
     // last_applied_raft_idx again from here. Taken by every persist; the in-memory image leaves it empty.
@@ -699,6 +712,23 @@ public:
         return reclaimed_upto_;
     }
     uint32_t lba_size() const { return lba_size_; }
+
+    // ── RetainFrom (resync.md 4.8) ──
+    // Pins a transfer's W on this member's journal: nothing at or above it is reclaimed until unpin_retain(), or until
+    // the pin is older than craft_retain_timeout_s or holds more than craft_retain_max_slots slots (then it is dropped
+    // here, logged, and that transfer may fail: journal space is never traded for it). Idempotent.
+    void pin_retain(int64_t raft_idx, uint32_t digest, int64_t w);
+    void unpin_retain(int64_t raft_idx, uint32_t digest);
+    std::vector< CraftRetainPin > retain_pins() const;
+    // The leader's side of the round (resync.md 4.8): propose RetainFrom / ReleaseRetain through the group.
+    async_status propose_retain(int64_t raft_idx, uint32_t digest, int64_t w);
+    async_status propose_release_retain(int64_t raft_idx, uint32_t digest);
+    // Validation, after the pin is on every source: false if a member that answers a poll no longer holds slot w + 1
+    // (it reclaimed past w before it had the pin), or if this member's journal did. Without a peer fetcher (the peer
+    // plane, S9, not wired) only this member's journal is checked.
+    async_result< bool > sources_hold_above(int64_t w, uint32_t timeout_ms);
+    // The members' watermarks, as a non-fencing poll reports them; empty without a peer fetcher.
+    async_result< std::vector< QuorumLsnResponse > > poll_members(uint32_t timeout_ms);
     // ── snapshot install, the receiver's side (resync.md 4.9) ──
     //
     // Called by the group's listener from nuraft's snapshot thread, so they block (sync_get) and never run on a
@@ -1406,6 +1436,16 @@ private:
     bool snapshot_drained();
     // Starts the apply drainer if entries wait and nothing pauses or stops it.
     void resume_apply_if_queued();
+
+    // RetainFrom pins and when each was taken here, by transfer identity (guarded by state_mu_).
+    struct RetainPinState {
+        int64_t w{-1};
+        std::chrono::steady_clock::time_point since{};
+    };
+    std::map< std::pair< int64_t, uint32_t >, RetainPinState > retain_pins_;
+    // Drops the pins past their age or slot cap; refreshes durable_.retain_pins. Under state_mu_.
+    void prune_retain_pins_locked();
+    void sync_durable_pins_locked();
 
     // ── journal reclaim (S8), all guarded by state_mu_ ──
     int64_t reclaimed_upto_{-1};           // journal entries at or below this are gone

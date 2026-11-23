@@ -55,7 +55,7 @@
 
 namespace homeblocks {
 
-ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, CreateVolume);
+ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, CreateVolume, RetainFrom, ReleaseRetain);
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
@@ -78,6 +78,21 @@ struct SyncRSCommitLSNPayload {
 struct InternalLoginPayload {
     uint64_t client_token;
     uint64_t term;
+};
+
+// ─── key blob: RetainFrom / ReleaseRetain ─────────────────────────────────────
+
+// RetainFrom pins a snapshot transfer's data watermark on every member's journal (resync.md 4.8): a member that has the
+// entry in its log (pre-commit) reclaims nothing at or above W until the pin is released, expires, or would hold more
+// than the member's cap. The transfer is named by its identity {raft_idx (L), digest}. ReleaseRetain removes it.
+struct RetainFromPayload {
+    int64_t raft_idx; // L
+    uint32_t digest;  // the snapshot's tuple digest
+    int64_t w;        // W
+};
+struct ReleaseRetainPayload {
+    int64_t raft_idx;
+    uint32_t digest;
 };
 
 // ─── key blob: CreateVolume ───────────────────────────────────────────────────

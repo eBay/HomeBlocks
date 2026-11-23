@@ -15,6 +15,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <map>
 #include <homestore/replication/repl_dev.hpp>
 #include "homeblks_impl.hpp"
 
@@ -110,6 +111,10 @@ public:
                                       homestore::replica_member_info const& member_in,
                                       homestore::trace_id_t tid) override;
     void on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t tid) override;
+    // A RetainFrom pins its W on this member's journal as soon as the entry is in the log (resync.md 4.8): the leader
+    // knows a member holds the pin once that member's replicated index passes the entry.
+    bool on_pre_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+                       cintrusive< homestore::repl_req_ctx >& ctx) override;
 
     // Snapshots (docs/craft/resync.md 4.9). nuraft snapshots the group every snapshot_freq_distance entries and
     // compacts its log behind them; a member that falls behind the compaction is sent one.
@@ -150,6 +155,23 @@ private:
         craft_snapshot::snapshot_meta meta{};
     };
     std::optional< receive_state > recv_;
+    // The leader's RetainFrom rounds, by transfer identity {L, digest}: pin, wait for every journal source, validate,
+    // then release once the receiver caught up (or the pin times out). Each runs on its own thread.
+    struct pin_round {
+        enum class state : uint8_t { pinning, pinned, failed };
+        std::atomic< state > st{state::pinning};
+        std::atomic< int64_t > w_hi{-1}; // the transfer's W_hi, once its last object was served
+    };
+    // Shared with the rounds' threads, which can outlive this listener (a group destroyed mid-round).
+    struct pin_registry {
+        std::mutex mu;
+        std::map< std::pair< int64_t, uint32_t >, shared< pin_round > > rounds; // guarded by mu
+    };
+    shared< pin_registry > pins_{std::make_shared< pin_registry >()};
+    shared< pin_round > start_pin_round(shared< CraftReplDev > const& dev, int64_t lsn, uint32_t digest, int64_t w);
+    static void run_pin_round(HomeBlocksImpl* hb, homestore::group_id_t group_id, shared< pin_registry > pins,
+                              shared< pin_round > round, shared< CraftReplDev > dev, int64_t lsn, uint32_t digest,
+                              int64_t w);
     bool load_receive_state();
     void save_receive_state();
 };

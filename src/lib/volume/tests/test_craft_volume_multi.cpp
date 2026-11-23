@@ -398,6 +398,13 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionCatchesUpThroughASnapshot)
         using namespace sisl; // the metric's name literal
         EXPECT_GT(COUNTER_VALUE(impl->metrics(), craft_snapshot_objects_sent), 0);
     }
+    // The leader pinned the snapshot's W on every journal source before it sent anything (resync.md 4.8). This test
+    // has no peer plane, so nothing reports the receiver's progress: the pin is held until it times out.
+    if (me() != 2) {
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        EXPECT_EQ((*vol)->craft_dev()->retain_pins().size(), 1u);
+    }
     ASSERT_TRUE(sync());
 }
 
