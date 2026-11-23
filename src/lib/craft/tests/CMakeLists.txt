@@ -219,3 +219,18 @@ target_link_libraries(test_craft_commit_hs
 )
 
 add_test(NAME CraftCommitHsTest COMMAND test_craft_commit_hs --index_chunk_size_mb=128 --data_chunk_size_mb=128)
+
+# The CRAFT snapshot's wire format (craft_snapshot.cpp): pure encode/decode and id packing, no HomeStore runtime.
+add_executable(test_craft_snapshot)
+target_sources(test_craft_snapshot PRIVATE
+    test_craft_snapshot.cpp
+    ../craft_snapshot.cpp
+    ../craft_snapshot_reader.cpp
+)
+target_link_libraries(test_craft_snapshot
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+add_dependencies(test_craft_snapshot ${PROJECT_NAME}_core)
+
+add_test(NAME CraftSnapshotTest COMMAND test_craft_snapshot)

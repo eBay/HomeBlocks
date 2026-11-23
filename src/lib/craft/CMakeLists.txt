@@ -4,6 +4,8 @@ add_library(${PROJECT_NAME}_craft OBJECT)
 target_sources(${PROJECT_NAME}_craft PRIVATE
     craft_repl_dev.cpp
     craft_api.cpp
+    craft_snapshot.cpp
+    craft_snapshot_reader.cpp
 )
 target_link_libraries(${PROJECT_NAME}_craft
     ${COMMON_DEPS}
