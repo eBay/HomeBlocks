@@ -64,6 +64,14 @@ table HomeBlksSettings{
     // within this many milliseconds of its last hand-off: two such members would hand it to each other at once,
     // forever, while the member with the replica doesn't answer. It retries once the time is over.
     craft_leadership_handoff_backoff_ms: uint32 = 10000;
+
+    // CRAFT snapshot (docs/craft/resync.md 4.9): the data one object carries at most (a batch holds at least one LBA),
+    // and the size of a region, the unit a receiver resumes from after a restart. A region must fit in 32767 batches.
+    craft_snapshot_batch_mb: uint32 = 16;
+    // Whether a leader serves snapshots at all. Off until members can install one: a member sent a snapshot it can't
+    // apply stops its process, while one refused stays behind until a partition move replaces it.
+    craft_snapshot_enabled: bool = false;
+    craft_snapshot_region_mb: uint32 = 1024;
 }
 
 root_type HomeBlksSettings;

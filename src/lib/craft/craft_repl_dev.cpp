@@ -3784,4 +3784,95 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
     co_return ok();
 }
 
+// ─── snapshot (resync.md 4.9) ────────────────────────────────────────────────
+
+craft_snapshot::control_tuple CraftReplDev::capture_snapshot_tuple() {
+    craft_snapshot::control_tuple t;
+    std::lock_guard al{apply_mu_}; // lock order: apply_mu_ before state_mu_ (as enqueue_apply)
+    std::lock_guard sl{state_mu_};
+    t.session_term = state_.term;
+    t.client_token = state_.client_token;
+    // A login committed at or below L but not applied yet: its session is L's.
+    auto const take_login = [&t](CraftEntryType type, uint64_t term, uint64_t token) {
+        if (type != CraftEntryType::InternalLogin) return;
+        t.session_term = term;
+        t.client_token = token;
+    };
+    if (applying_) take_login(applying_->type, applying_->term, applying_->client_token);
+    for (auto const& e : apply_queue_)
+        take_login(e.type, e.term, e.client_token);
+    t.fence_term = login_fence_term_;
+    t.data_watermark = state_.commit_lsn;
+    t.sync_watermark = std::max(applied_sync_lsn_, state_.commit_lsn);
+    for (int64_t lsn : empty_lsns_)
+        if (lsn > t.data_watermark && lsn <= t.sync_watermark) t.empty_lsns.push_back(lsn);
+    std::sort(t.empty_lsns.begin(), t.empty_lsns.end());
+    return t;
+}
+
+namespace {
+// The real snapshot_source: the partition's own index and blocks. Its calls block on the device's coroutines, which
+// is safe off a reactor, where nuraft reads snapshot objects.
+class CraftReplDevSnapshotSource : public craft_snapshot::snapshot_source {
+public:
+    CraftReplDevSnapshotSource(shared< CraftReplDev > dev, uint64_t total_lbas) :
+            dev_{std::move(dev)}, total_lbas_{total_lbas} {}
+
+    uint32_t lba_size() const override { return dev_->lba_size(); }
+    uint64_t total_lbas() const override { return total_lbas_; }
+    int64_t last_append_lsn() const override { return dev_->snapshot_last_append_lsn(); }
+    std::optional< std::vector< craft_snapshot::index_entry > > read_index(lba_t start, lba_t end) override {
+        return dev_->snapshot_read_index(start, end);
+    }
+    bool read_blocks(homestore::blk_id const& blocks, uint8_t* buf) override {
+        return dev_->snapshot_read_blocks(blocks, buf);
+    }
+
+private:
+    shared< CraftReplDev > dev_;
+    uint64_t total_lbas_;
+};
+} // namespace
+
+unique< craft_snapshot::snapshot_source > CraftReplDev::make_snapshot_source(shared< CraftReplDev > dev,
+                                                                             uint64_t total_lbas) {
+    return std::make_unique< CraftReplDevSnapshotSource >(std::move(dev), total_lbas);
+}
+
+int64_t CraftReplDev::snapshot_last_append_lsn() const {
+    std::lock_guard lk{state_mu_};
+    return state_.last_append_lsn;
+}
+
+std::optional< std::vector< craft_snapshot::index_entry > > CraftReplDev::snapshot_read_index(lba_t start, lba_t end) {
+    if (!indx_tbl_) return std::nullopt;
+    std::vector< craft_snapshot::index_entry > out;
+    if (start >= end) return out;
+    index_kv_list_t kvs;
+    if (auto r = indx_tbl_->read_from_index(start, end - 1, kvs); !r) { // the index range is inclusive
+        LOGW("snapshot: index read [{}, {}) failed: {}", start, end, r.error().message());
+        return std::nullopt;
+    }
+    out.reserve(kvs.size());
+    for (auto const& [k, v] : kvs)
+        out.push_back(craft_snapshot::index_entry{.lba = k.lba(), .blkid = v.blkid(), .csum = v.checksum()});
+    return out;
+}
+
+bool CraftReplDev::snapshot_read_blocks(homestore::blk_id const& blocks, uint8_t* buf) {
+    // HomeStore reads into an aligned buffer only; the reader's isn't.
+    auto const size = static_cast< uint32_t >(blocks.blk_count()) * lba_size_;
+    sisl::io_blob_safe aligned{size, 512};
+    sisl::sg_list sg;
+    sg.size = size;
+    sg.iovs.push_back(iovec{aligned.bytes(), size});
+    homestore::multi_blk_id const run{blocks.blk_num(), blocks.blk_count(), blocks.chunk_num()};
+    if (auto r = detail::sync_get(journal_->read_data(run, sg)); !r) {
+        LOGW("snapshot: block read {} failed: {}", run.to_string(), r.error().message());
+        return false;
+    }
+    std::memcpy(buf, aligned.cbytes(), size);
+    return true;
+}
+
 } // namespace homeblocks

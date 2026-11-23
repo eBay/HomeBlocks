@@ -111,17 +111,19 @@ public:
                                       homestore::trace_id_t tid) override;
     void on_remove_member(homestore::replica_id_t const& member, homestore::trace_id_t tid) override;
 
-    // CRAFT has no snapshots yet, while HomeStore compacts the group's RAFT log: a member that falls behind the
-    // compaction needs one. As its leader, this member refuses to send it (nuraft asks again later), and that member
-    // stays behind until a partition move replaces it. As a member, it never applies one.
-    int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
-                          std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
-    bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
-    // Each snapshot nuraft takes (every snapshot_freq_distance entries) holds its position alone: nuraft reads it back
-    // through last_snapshot() to compact the log, and dereferences it. Kept in memory: after a restart there is none
-    // until the next one, which nuraft tolerates.
+    // Snapshots (docs/craft/resync.md 4.9). nuraft snapshots the group every snapshot_freq_distance entries and
+    // compacts its log behind them; a member that falls behind the compaction is sent one.
+    // create_snapshot captures the volume's control tuple at L and keeps it as this group's record (it survives
+    // restarts); last_snapshot returns that context. As the group's leader, read_snapshot_obj serves the snapshot's
+    // objects from a craft_snapshot::snapshot_reader kept in nuraft's user_ctx for the transfer, freed by
+    // free_user_snp_ctx. As a member, apply_snapshot still refuses one (the receiver's side comes next), which makes
+    // nuraft stop this process rather than leave the replica without the entries the snapshot covers.
     homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
     std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
+    int read_snapshot_obj(std::shared_ptr< homestore::snapshot_context > context,
+                          std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
+    void free_user_snp_ctx(void*& user_snp_ctx) override;
+    bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
 
 private:
     // The published CraftReplDev this group's entries go to, or null; held, it outlives a destroy's reset.
@@ -131,6 +133,8 @@ private:
     homestore::group_id_t group_id_;
     std::atomic< bool > replaying_;
     std::atomic_flag snapshot_refusal_logged_{};
+    // Refuses a transfer: counted, logged once (nuraft asks again at every heartbeat).
+    int refuse_snapshot(int64_t lsn, char const* why);
     std::atomic_flag entries_dropped_logged_{};
     std::mutex snapshot_mu_;
     std::shared_ptr< homestore::snapshot_context > last_snapshot_; // guarded by snapshot_mu_

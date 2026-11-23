@@ -18,7 +18,9 @@
 // guards, the range of CRAFT IO, the journal reattach at restart, the rollback of a failed create, and a replica's
 // teardown when its group is destroyed. test_craft_volume_multi covers a group with several members.
 
+#include <algorithm>
 #include <csignal>
+#include <map>
 #include <filesystem>
 #include <limits>
 #include <set>
@@ -36,6 +38,8 @@
 #include "home_blks_config.hpp"
 #include "test_common.hpp"
 #include <volume/volume.hpp>
+#include "craft/craft_snapshot.hpp"
+#include "craft/craft_snapshot_reader.hpp"
 
 SISL_LOGGING_INIT(HOMEBLOCKS_LOG_MODS)
 SISL_OPTION_GROUP(test_craft_volume_setup,
@@ -495,6 +499,105 @@ TEST_F(CraftVolumeTest, CommittedSlotsSurviveARestart) {
         EXPECT_TRUE(reads_back(*again, hdr, 3 /* read_lsn */, dlsn)) << "slot " << dlsn;
     }
     remove(id);
+}
+
+// The donor's side of a snapshot (resync.md 4.9) on a real partition: the tuple captured at L is the committed state,
+// and a whole transfer through the device's own index and blocks carries exactly the slots up to W, each with its data.
+// The record a snapshot leaves survives a restart.
+TEST_F(CraftVolumeTest, SnapshotCarriesTheCommittedVolume) {
+    auto info = craft_vol_info("craft_vol_snapshot");
+    auto const id = info.id;
+    auto const size_bytes = info.size_bytes;
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    commit_login(*vol, 42 /* client_token */, 7 /* term */, 1000 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    for (int64_t dlsn = 0; dlsn < 6; ++dlsn) {
+        auto const w = write_slot(*vol, hdr, dlsn);
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    commit_sync(*vol, 3 /* rs_commit_lsn */, 42 /* client_token */, 1001 /* raft_lsn */);
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->commit_lsn() == 3; }));
+
+    auto const dev = (*vol)->craft_dev_ref();
+    auto const tuple = dev->capture_snapshot_tuple();
+    EXPECT_EQ(tuple.session_term, 7u);
+    EXPECT_EQ(tuple.client_token, 42u);
+    EXPECT_EQ(tuple.data_watermark, 3);
+    EXPECT_GE(tuple.sync_watermark, 3);
+    EXPECT_TRUE(tuple.empty_lsns.empty());
+
+    using namespace homeblocks::craft_snapshot;
+    snapshot_meta meta{.raft_idx = 1001, .digest = tuple_digest(tuple), .tuple = tuple, .lba_size = k_page};
+    meta.total_lbas = size_bytes / k_page;
+    meta.region_lbas = meta.total_lbas / 4;
+    meta.region_count = region_count(meta.total_lbas, meta.region_lbas);
+    auto source = CraftReplDev::make_snapshot_source(dev, meta.total_lbas);
+    snapshot_reader rd{meta, *source, 2 * k_page /* two LBAs a batch */, 0x8005};
+
+    std::map< lba_t, std::vector< uint8_t > > carried;
+    uint64_t next = *obj_id{}.pack();
+    size_t objects = 0;
+    bool trailer = false;
+    while (objects < 100) {
+        auto const r = rd.serve(next);
+        if (r.st == snapshot_reader::status::last) break;
+        ASSERT_EQ(r.st, snapshot_reader::status::ok) << "object " << std::hex << next;
+        auto const obj = decode(r.blob.data(), r.blob.size());
+        ASSERT_TRUE(obj);
+        ++objects;
+        if (std::holds_alternative< snapshot_meta >(*obj)) {
+            EXPECT_EQ(std::get< snapshot_meta >(*obj), meta);
+            next = *obj_id{.region = 1, .batch = 1}.pack();
+        } else if (std::holds_alternative< region_batch >(*obj)) {
+            auto const& b = std::get< region_batch >(*obj);
+            EXPECT_LE(b.lbas.size(), 2u);
+            for (size_t i = 0; i < b.lbas.size(); ++i)
+                carried[b.lbas[i].lba] =
+                    std::vector< uint8_t >(b.data.begin() + i * k_page, b.data.begin() + (i + 1) * k_page);
+            next = !b.last_in_region           ? *obj_id{.region = b.region, .batch = b.batch + 1}.pack()
+                : b.region < meta.region_count ? *obj_id{.region = b.region + 1, .batch = 1}.pack()
+                                               : *obj_id{.region = meta.region_count + 1}.pack();
+        } else {
+            EXPECT_EQ(std::get< snapshot_trailer >(*obj).w_hi, 5) << "the member's last_append_lsn";
+            trailer = true;
+            next = LAST_OBJ_ID;
+        }
+    }
+    EXPECT_TRUE(trailer);
+    ASSERT_EQ(carried.size(), 4u) << "the slots up to W are indexed; 4 and 5 aren't committed yet";
+    for (lba_t lba = 0; lba < 4; ++lba) {
+        EXPECT_TRUE(std::all_of(carried[lba].begin(), carried[lba].end(),
+                                [lba](uint8_t b) { return b == 'a' + static_cast< int >(lba); }))
+            << "lba " << lba;
+    }
+
+    // A real snapshot of the group: HomeStore calls create_snapshot(), which keeps its record, and it survives a
+    // restart (nuraft reads it back through last_snapshot() while the group recovers).
+    source.reset();
+    auto const raft = group(id);
+    ASSERT_TRUE(raft);
+    raft->trigger_snapshot_creation(raft->get_last_commit_lsn(), true /* wait_for_commit */);
+    auto impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+    auto const before = impl->craft_snapshot(id);
+    ASSERT_TRUE(before) << "create_snapshot keeps a record";
+    auto const decoded = decode(before->meta.data(), before->meta.size());
+    ASSERT_TRUE(decoded && std::holds_alternative< snapshot_meta >(*decoded));
+    auto const& kept = std::get< snapshot_meta >(*decoded);
+    EXPECT_EQ(kept.raft_idx, before->raft_idx);
+    EXPECT_EQ(kept.tuple, tuple) << "the tuple captured at L";
+    EXPECT_EQ(kept.total_lbas, size_bytes / k_page);
+    EXPECT_FALSE(before->ctx.empty());
+    g_helper->restart();
+    impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+    auto const after = impl->craft_snapshot(id);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->raft_idx, before->raft_idx);
+    EXPECT_EQ(after->meta, before->meta);
+    EXPECT_EQ(after->ctx, before->ctx);
+    remove(id);
+    EXPECT_FALSE(impl->craft_snapshot(id)) << "removed with its group";
 }
 
 // The device proposes through its own RAFT group, and again after a restart: a resolution the client asks for commits a

@@ -13,6 +13,8 @@ namespace {
 // A block whose checksum is wrong is looked up again this many times: a concurrent overwrite may have freed and reused
 // it after the index was read. One that stays wrong under the same block id is corruption.
 constexpr int k_reread_attempts = 3;
+// The fewest LBAs one index read covers while a batch is collected.
+constexpr uint64_t k_min_window = 16 * 1024;
 } // namespace
 
 snapshot_reader::snapshot_reader(snapshot_meta meta, snapshot_source& source, uint64_t batch_bytes,
@@ -85,11 +87,13 @@ std::optional< region_batch > snapshot_reader::build_batch(uint64_t region, uint
     uint64_t max_lbas = std::max< uint64_t >(batch_bytes_ / lba_size, 1);
     if (batch >= k_max_batch) max_lbas = std::numeric_limits< uint64_t >::max();
 
-    // Read the index in windows of max_lbas LBAs, so a batch costs what it carries, not the rest of its region.
+    // Read the index in windows, so a batch costs about what it carries, not the rest of its region; at least
+    // k_min_window LBAs each, so a sparse region isn't swept a few LBAs at a time.
     std::vector< index_entry > entries;
     lba_t cursor = start;
+    auto const window = std::max< uint64_t >(std::min< uint64_t >(max_lbas, region_end), k_min_window);
     while (entries.size() <= max_lbas && cursor < region_end) {
-        auto const window_end = std::min< lba_t >(region_end, cursor + std::min< uint64_t >(max_lbas, region_end));
+        auto const window_end = std::min< lba_t >(region_end, cursor + window);
         auto found = source_.read_index(cursor, window_end);
         if (!found) return std::nullopt;
         entries.insert(entries.end(), found->begin(), found->end());

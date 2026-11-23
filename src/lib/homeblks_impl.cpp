@@ -494,6 +494,15 @@ void HomeBlocksImpl::register_metablk_cb() {
             on_hb_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
         },
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
+
+    // CRAFT snapshot records: before HomeStore recovers the RAFT groups, whose listeners nuraft asks for their last
+    // snapshot during that recovery.
+    homestore::hs()->meta_service().register_handler(
+        craft_snapshot::snapshot_record_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_snapshot_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
 }
 
 void HomeBlocksImpl::on_init_complete() {

@@ -35,6 +35,7 @@
 #include "hb_internal.hpp"
 #include "volume/volume.hpp"
 #include "volume/volume_chunk_selector.hpp"
+#include "craft/craft_snapshot.hpp"
 
 namespace homeblocks {
 
@@ -50,7 +51,11 @@ class HomeBlocksMetrics : public sisl::MetricsGroup {
 public:
     HomeBlocksMetrics() : sisl::MetricsGroup("homeblocks", "node") {
         REGISTER_COUNTER(craft_snapshot_transfers_refused,
-                         "RAFT snapshot transfers this node refused to send: CRAFT has no snapshots yet");
+                         "RAFT snapshot transfers this node couldn't serve (no record for the context, no replica, or "
+                         "its journal reclaimed past the snapshot's W)");
+        REGISTER_COUNTER(craft_snapshot_objects_sent, "CRAFT snapshot objects this node sent");
+        REGISTER_COUNTER(craft_snapshot_bytes_sent, "CRAFT snapshot object bytes this node sent");
+        REGISTER_COUNTER(craft_snapshot_read_errors, "CRAFT snapshot objects this node failed to read (retried)");
         REGISTER_GAUGE(craft_groups_without_replica,
                        "CRAFT groups this node is a member of without a replica here, until a partition move "
                        "replaces this member");
@@ -110,6 +115,11 @@ private:
     // CRAFT durable state records read at boot, by volume id, until their volumes take them. Only on_init_complete()
     // uses it, reading the records and then the volumes on one thread.
     std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > craft_state_sbs_;
+
+    // CRAFT snapshot records (snapshot_record_sb_t), by group: loaded before HomeStore recovers the groups, since
+    // nuraft asks a group's listener for its last snapshot during that recovery.
+    mutable std::mutex craft_snapshot_mu_;
+    std::unordered_map< volume_id_t, superblk< craft_snapshot::snapshot_record_sb_t > > craft_snapshot_sbs_;
 
     // CRAFT reattaches started and not done yet, and what their waiters await: completed when the count drops to 0.
     std::mutex craft_reattach_mu_;
@@ -205,6 +215,17 @@ public:
     // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
     // leaves one), other than those of a create in flight here and those being destroyed.
     int64_t craft_groups_without_replica() const;
+    // CRAFT: the last snapshot this member created for a group (resync.md 4.9): L, its encoded object 0 | 0, and
+    // nuraft's serialized context. save replaces the group's record (it survives restarts); remove deletes it.
+    struct craft_snapshot_record {
+        int64_t raft_idx{-1};
+        std::vector< uint8_t > meta{};
+        std::vector< uint8_t > ctx{};
+    };
+    void save_craft_snapshot(volume_id_t const& group, int64_t raft_idx, std::vector< uint8_t > const& meta,
+                             sisl::io_blob_safe const& ctx);
+    std::optional< craft_snapshot_record > craft_snapshot(volume_id_t const& group);
+    void remove_craft_snapshot(volume_id_t const& group);
     // CRAFT: the checkpoint step. Persists every CRAFT partition's durable state, with the RAFT entries it has not
     // applied yet; stops the process if one can't be.
     sisl::async::task< void > save_craft_states();
@@ -308,6 +329,7 @@ private:
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 
     void vol_gc();
 

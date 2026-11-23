@@ -115,6 +115,66 @@ void HomeBlocksImpl::on_craft_state_meta_blk_found(sisl::byte_view const& buf, v
     RELEASE_ASSERT(added, "two CRAFT state records for volume {}", boost::uuids::to_string(id));
 }
 
+void HomeBlocksImpl::on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    using craft_snapshot::snapshot_record_sb_t;
+    superblk< snapshot_record_sb_t > sb{craft_snapshot::snapshot_record_meta_name};
+    sb.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    if (sb.size() < sizeof(snapshot_record_sb_t) || sb->magic != snapshot_record_sb_t::k_magic ||
+        sb->version != snapshot_record_sb_t::k_version ||
+        sb.size() - sizeof(snapshot_record_sb_t) < uint64_t{sb->meta_len} + sb->ctx_len) {
+        // Only an optimization is lost: nuraft creates the next snapshot at its usual distance.
+        LOGW("CRAFT snapshot record of {} bytes in an unknown format: removed", sb.size());
+        sb.destroy();
+        return;
+    }
+    volume_id_t const id = sb->group_id;
+    std::lock_guard lk{craft_snapshot_mu_};
+    if (auto const [it, added] = craft_snapshot_sbs_.try_emplace(id, std::move(sb)); !added) {
+        // Two for one group: the newer one stays.
+        if (it->second->raft_idx < sb->raft_idx) { std::swap(it->second, sb); }
+        sb.destroy();
+    }
+}
+
+void HomeBlocksImpl::save_craft_snapshot(volume_id_t const& group, int64_t raft_idx, std::vector< uint8_t > const& meta,
+                                         sisl::io_blob_safe const& ctx) {
+    using craft_snapshot::snapshot_record_sb_t;
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto [it, added] = craft_snapshot_sbs_.try_emplace(
+        group, superblk< snapshot_record_sb_t >{craft_snapshot::snapshot_record_meta_name});
+    auto& sb = it->second;
+    if (!added && sb->raft_idx >= raft_idx) { return; } // nuraft never goes back; a late duplicate changes nothing
+    // A new buffer each time, sized to this record; the record keeps its meta blk.
+    sb.create(static_cast< uint32_t >(sizeof(snapshot_record_sb_t) + meta.size() + ctx.size()));
+    sb->group_id = group;
+    sb->raft_idx = raft_idx;
+    sb->meta_len = static_cast< uint32_t >(meta.size());
+    sb->ctx_len = static_cast< uint32_t >(ctx.size());
+    auto* const tail = sb.raw_buf()->bytes() + sizeof(snapshot_record_sb_t);
+    std::memcpy(tail, meta.data(), meta.size());
+    std::memcpy(tail + meta.size(), ctx.cbytes(), ctx.size());
+    sb.write();
+}
+
+std::optional< HomeBlocksImpl::craft_snapshot_record > HomeBlocksImpl::craft_snapshot(volume_id_t const& group) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto const it = craft_snapshot_sbs_.find(group);
+    if (it == craft_snapshot_sbs_.end()) { return std::nullopt; }
+    auto& sb = it->second; // raw_buf() isn't const
+    auto const* const tail = sb.raw_buf()->cbytes() + sizeof(craft_snapshot::snapshot_record_sb_t);
+    return craft_snapshot_record{.raft_idx = sb->raft_idx,
+                                 .meta = std::vector< uint8_t >(tail, tail + sb->meta_len),
+                                 .ctx = std::vector< uint8_t >(tail + sb->meta_len, tail + sb->meta_len + sb->ctx_len)};
+}
+
+void HomeBlocksImpl::remove_craft_snapshot(volume_id_t const& group) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    if (auto it = craft_snapshot_sbs_.find(group); it != craft_snapshot_sbs_.end()) {
+        it->second.destroy();
+        craft_snapshot_sbs_.erase(it);
+    }
+}
+
 shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
     auto pid_str = boost::uuids::to_string(sb->parent_uuid); // parent_uuid is the volume id
     {
@@ -635,6 +695,7 @@ bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
 }
 
 void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
+    remove_craft_snapshot(id);
     auto const vol = get_volume(id);
     if (!vol) { return; } // never created here, or already removed
     LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));

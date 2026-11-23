@@ -17,6 +17,7 @@
 #include "../hb_internal.hpp"
 #include "async_mutex.hpp"
 #include "craft_raft_entries.hpp"
+#include "craft_snapshot_reader.hpp"
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
 #include <iomgr/timer.hpp>                 // iomgr::timer_token -- RAII recurring timer used by the watchdog
@@ -671,6 +672,32 @@ public:
     void destroy_state() {
         if (state_store_) state_store_->destroy();
     }
+
+    // ── snapshot (docs/craft/resync.md, section 4.9) ──
+
+    // The control tuple as of the RAFT entry nuraft is snapshotting, L. nuraft calls create_snapshot() right after
+    // committing L, before L + 1. A SyncRSCommitLSN's verdicts and watermark take effect at commit, so S and the Empty
+    // verdicts are exactly L's; an InternalLogin applies in queue order, so the session is taken from the last login
+    // still queued or being applied, else from the applied state. W is commit_lsn: commit() advances it only once the
+    // slots up to it are in the index. Doesn't wait for anything (nuraft's commit thread is blocked meanwhile).
+    craft_snapshot::control_tuple capture_snapshot_tuple();
+
+    // A snapshot reader's view of this partition: its LBA index and its blocks, read synchronously (nuraft's snapshot
+    // thread, never a reactor). The source holds the device. total_lbas: the volume's size in LBAs.
+    static unique< craft_snapshot::snapshot_source > make_snapshot_source(shared< CraftReplDev > dev,
+                                                                          uint64_t total_lbas);
+
+    // The journal is reclaimed up to here: a snapshot whose W is below it can't be completed from this member's
+    // journal (resync.md 4.9, "A stored context can go stale").
+    int64_t journal_reclaimed_upto() const {
+        std::lock_guard lk{state_mu_};
+        return reclaimed_upto_;
+    }
+    uint32_t lba_size() const { return lba_size_; }
+    // What CraftReplDevSnapshotSource reads (see make_snapshot_source()).
+    int64_t snapshot_last_append_lsn() const;
+    std::optional< std::vector< craft_snapshot::index_entry > > snapshot_read_index(lba_t start, lba_t end);
+    bool snapshot_read_blocks(homestore::blk_id const& blocks, uint8_t* buf);
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().

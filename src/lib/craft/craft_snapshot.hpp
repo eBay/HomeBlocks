@@ -25,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include <boost/uuid/uuid.hpp>
 #include <homestore/homestore_decl.hpp> // csum_t
 
 namespace homeblocks::craft_snapshot {
@@ -144,6 +145,27 @@ std::vector< uint8_t > encode(snapshot_trailer const& t);
 // outside (W, S] or not ascending, a digest that doesn't match its tuple). A receiver that gets nullopt asks for the
 // same object again.
 std::optional< snapshot_object > decode(uint8_t const* buf, size_t len);
+
+// ── the donor's record of its last snapshot ────────────────────────────────
+
+// One meta blk record per CRAFT group: the last snapshot this member created, as create_snapshot() captured it. Its
+// object 0 | 0 is served from here on every retry and after a restart, so a receiver always sees the tuple of L, not
+// one sampled when the object is read. Followed by meta_len bytes (the encoded object 0 | 0) and ctx_len bytes
+// (nuraft's serialized snapshot context).
+#pragma pack(push, 1)
+struct snapshot_record_sb_t {
+    static constexpr uint64_t k_magic = 0x5243'5350'4e53'4643ull; // "CFSNPSCR" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    boost::uuids::uuid group_id{}; // the CRAFT volume (and RAFT group) id
+    int64_t raft_idx{-1};          // L
+    uint32_t meta_len{0};
+    uint32_t ctx_len{0};
+};
+#pragma pack(pop)
+inline const std::string snapshot_record_meta_name{"CraftSnapshot"};
 
 // ── region geometry ─────────────────────────────────────────────────────────
 
