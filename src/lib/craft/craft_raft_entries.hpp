@@ -14,6 +14,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -116,12 +117,26 @@ struct CreateVolumeHeader {
     uint16_t name_len;
 };
 #pragma pack(pop)
+static_assert(sizeof(boost::uuids::uuid) == 16, "CreateVolumeHeader persists a volume id as 16 raw bytes");
 static_assert(sizeof(SyncRSCommitLSNPayload) == 1 + 3 * sizeof(uint64_t) + sizeof(uint32_t),
               "SyncRSCommitLSNPayload must stay packed");
 static_assert(sizeof(InternalLoginPayload) == 1 + 3 * sizeof(uint64_t), "InternalLoginPayload must stay packed");
 static_assert(sizeof(CreateVolumeHeader) ==
                   1 + sizeof(boost::uuids::uuid) + sizeof(uint64_t) + sizeof(uint32_t) + 2 * sizeof(uint16_t),
               "CreateVolumeHeader must stay packed");
+// Each field's place too, not just the size: a reorder keeps the size, yet changes what an entry already in the log
+// means. Serialization and parsing share these structs, so a round-trip test can't catch it.
+static_assert(offsetof(SyncRSCommitLSNPayload, version) == 0 && offsetof(SyncRSCommitLSNPayload, rs_commit_lsn) == 1 &&
+                  offsetof(SyncRSCommitLSNPayload, client_token) == 9 && offsetof(SyncRSCommitLSNPayload, term) == 17 &&
+                  offsetof(SyncRSCommitLSNPayload, num_empty_slots) == 25,
+              "SyncRSCommitLSNPayload's fields are persisted in this order: reordering them is a format change");
+static_assert(offsetof(InternalLoginPayload, version) == 0 && offsetof(InternalLoginPayload, client_token) == 1 &&
+                  offsetof(InternalLoginPayload, term) == 9 && offsetof(InternalLoginPayload, rs_commit_lsn) == 17,
+              "InternalLoginPayload's fields are persisted in this order: reordering them is a format change");
+static_assert(offsetof(CreateVolumeHeader, version) == 0 && offsetof(CreateVolumeHeader, id) == 1 &&
+                  offsetof(CreateVolumeHeader, size_bytes) == 17 && offsetof(CreateVolumeHeader, page_size) == 25 &&
+                  offsetof(CreateVolumeHeader, num_members) == 29 && offsetof(CreateVolumeHeader, name_len) == 31,
+              "CreateVolumeHeader's fields are persisted in this order: reordering them is a format change");
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -157,12 +172,13 @@ struct SyncRSCommitLSNEntry {
 
 // `key` is persisted RAFT log data replayed on apply -- a truncated or corrupt entry must not be trusted, so its
 // version and its declared num_empty_slots are validated against key's actual size before anything is read. The
-// earlier, unversioned layouts never match in size. Returns std::nullopt if the entry doesn't parse.
+// earlier, unversioned layouts never match in size. Returns std::nullopt if the entry doesn't parse, or if its
+// rs_commit_lsn is below -1 (an empty volume's watermark); the apply range-checks the Empty slots against it.
 inline std::optional< SyncRSCommitLSNEntry > parse_sync_rs_commit_lsn(sisl::blob const& key) {
     if (key.size() < sizeof(SyncRSCommitLSNPayload)) { return std::nullopt; }
     SyncRSCommitLSNPayload p;
     std::memcpy(&p, key.cbytes(), sizeof(p));
-    if (p.version != SyncRSCommitLSNPayload::VERSION) { return std::nullopt; }
+    if (p.version != SyncRSCommitLSNPayload::VERSION || p.rs_commit_lsn < -1) { return std::nullopt; }
     // The size needs to match exactly. This restriction can be lifted later
     if (key.size() != sync_rs_commit_lsn_key_size(p.num_empty_slots)) { return std::nullopt; }
 
