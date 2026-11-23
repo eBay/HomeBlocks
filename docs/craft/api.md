@@ -269,8 +269,8 @@ from the result means not-present-here.
 
 ### RAFT state machine entries
 
-`SyncRSCommitLSN { rs_commit_lsn, client_token, empty_slots[] }` and
-`InternalLogin { client_token, term, rs_commit_lsn }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
+`SyncRSCommitLSN { rs_commit_lsn, client_token, term, empty_slots[] }` and
+`InternalLogin { version, client_token, term, rs_commit_lsn }` — see [rpcs.md](rpcs.md) and the wiki for apply semantics
 (unchanged by the client-surface reshaping above). `CreateVolume { version, id, size, page_size, members[], name }`
 is a partition's first entry, applied by the volume layer (below); an entry of another `version` is rejected.
 

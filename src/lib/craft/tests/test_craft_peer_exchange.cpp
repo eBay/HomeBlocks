@@ -118,12 +118,13 @@ protected:
         return homeblocks::detail::sync_get(
             dev_->write(craft::client_hdr{term, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
     }
-    // Commits an InternalLogin at term, as RAFT would on this member; it applies unless the apply queue is paused.
+    // Commits an InternalLogin at term, as RAFT would on this member; it applies unless the apply queue is paused. Its
+    // watermark is this member's last_append, where a login's poll would settle: never below a committed Sync's.
     void commit_login(uint64_t term) {
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
         reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
         cintrusive< homestore::repl_req_ctx > ctx{};
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
