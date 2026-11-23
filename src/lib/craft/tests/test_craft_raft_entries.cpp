@@ -772,12 +772,13 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMalformedSyncRSCommitLSNKey) {
 
     dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(short_key), {}, ctx);
 
-    EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
+    EXPECT_EQ(dev_->commit_lsn(), -1);      // untouched
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // an applied Sync would have raised it
 }
 
 // Distinct from the too-short case above: this key is large enough for the fixed prefix (and even
-// carries 2 real trailing slots), but lies about how many follow -- parse_empty_slots's exact-size
-// check (not on_commit's coarser size check) is what rejects it.
+// carries 2 real trailing slots), but lies about how many follow -- parse_sync_rs_commit_lsn's
+// exact-size check is what rejects it.
 TEST_F(CraftRaftEntriesTest, OnCommitRejectsMismatchedEmptySlotsCount) {
     auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
     auto key_buf = make_sync_rs_commit_lsn_key(7, 0, {10, 20});
@@ -786,7 +787,25 @@ TEST_F(CraftRaftEntriesTest, OnCommitRejectsMismatchedEmptySlotsCount) {
 
     dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
 
-    EXPECT_EQ(dev_->commit_lsn(), -1); // untouched
+    EXPECT_EQ(dev_->commit_lsn(), -1);      // untouched
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // an applied Sync would have raised it
+}
+
+// A Sync key of another version is rejected rather than misread, and its proposal fails.
+TEST_F(CraftRaftEntriesTest, OnCommitRejectsSyncRSCommitLSNOfAnotherVersion) {
+    auto header_buf = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key_buf = make_sync_rs_commit_lsn_key(7, 0, {});
+    reinterpret_cast< SyncRSCommitLSNPayload* >(key_buf.data())->version =
+        static_cast< uint8_t >(SyncRSCommitLSNPayload::VERSION + 1);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(header_buf), as_blob(key_buf), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INVALID_ENTRY));
+    EXPECT_EQ(dev_->last_append_lsn(), -1); // untouched
 }
 
 TEST_F(CraftRaftEntriesTest, OnCommitIgnoresUnrecognizedEntryType) {
@@ -1134,6 +1153,78 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// ── SyncRSCommitLSN codec (SDSTOR-26801) ──────────────────────────────────────
+
+TEST(SyncRSCommitLSNCodecTest, RoundTrip) {
+    auto buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/9, /*client_token=*/42, {3, 7}, /*term=*/5);
+    EXPECT_EQ(reinterpret_cast< SyncRSCommitLSNPayload const* >(buf.data())->version, SyncRSCommitLSNPayload::VERSION);
+
+    auto const out = parse_sync_rs_commit_lsn(as_blob(buf));
+
+    ASSERT_TRUE(out);
+    EXPECT_EQ(out->rs_commit_lsn, 9);
+    EXPECT_EQ(out->client_token, 42u);
+    EXPECT_EQ(out->term, 5u);
+    EXPECT_EQ(out->empty_slots, (std::vector< int64_t >{3, 7}));
+}
+
+TEST(SyncRSCommitLSNCodecTest, RoundTripsNoEmptySlots) {
+    auto buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/9, /*client_token=*/42, {}, /*term=*/5);
+    auto const out = parse_sync_rs_commit_lsn(as_blob(buf));
+    ASSERT_TRUE(out);
+    EXPECT_TRUE(out->empty_slots.empty());
+}
+
+TEST(SyncRSCommitLSNCodecTest, RejectsAKeyWhoseSizeDisagreesWithItsCount) {
+    auto buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/9, /*client_token=*/42, {3, 7}, /*term=*/5);
+    auto truncated = std::vector< uint8_t >(buf.begin(), buf.end() - 1);
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(truncated)));
+    auto padded = buf;
+    padded.push_back(0);
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(padded)));
+    auto prefix_only = std::vector< uint8_t >(buf.begin(), buf.begin() + sizeof(SyncRSCommitLSNPayload) - 1);
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(prefix_only)));
+}
+
+TEST(SyncRSCommitLSNCodecTest, RejectsAnotherVersion) {
+    auto buf = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/9, /*client_token=*/42, {7}, /*term=*/5);
+    for (int const version : {0, SyncRSCommitLSNPayload::VERSION + 1}) {
+        reinterpret_cast< SyncRSCommitLSNPayload* >(buf.data())->version = static_cast< uint8_t >(version);
+        EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(buf))) << "version " << version;
+    }
+}
+
+// A Sync key in one of the earlier, unversioned layouts, built byte for byte: {rs_commit_lsn, client_token, [term,]
+// num_empty_slots} and the slots.
+std::vector< uint8_t > unversioned_sync_key(int64_t rs_commit_lsn, uint64_t client_token,
+                                            std::optional< uint64_t > term, std::vector< int64_t > const& empty_slots) {
+    std::vector< uint8_t > buf;
+    auto const put = [&buf](auto v) {
+        auto const* bytes = reinterpret_cast< uint8_t const* >(&v);
+        buf.insert(buf.end(), bytes, bytes + sizeof(v));
+    };
+    put(rs_commit_lsn);
+    put(client_token);
+    if (term) put(*term);
+    put(static_cast< uint32_t >(empty_slots.size()));
+    for (int64_t lsn : empty_slots)
+        put(lsn);
+    return buf;
+}
+
+// Neither earlier layout parses as this one, even when its first byte happens to equal the version: their sizes
+// (20 + 8n bytes before SDSTOR-22892 added term, 28 + 8n after) never equal this layout's 29 + 8m. The first key is the
+// review's example (#216, r4670501472), which the previous layout misread as term 0x700000001 with no Empty slot.
+TEST(SyncRSCommitLSNCodecTest, RejectsTheUnversionedLayouts) {
+    auto before_term = unversioned_sync_key(/*rs_commit_lsn=*/9, /*client_token=*/42, std::nullopt, {7});
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(before_term)));
+    auto with_term = unversioned_sync_key(/*rs_commit_lsn=*/9, /*client_token=*/42, /*term=*/3, {7});
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(with_term)));
+    auto version_lookalike = unversioned_sync_key(/*rs_commit_lsn=*/SyncRSCommitLSNPayload::VERSION, 42, 3, {});
+    ASSERT_EQ(version_lookalike[0], SyncRSCommitLSNPayload::VERSION);
+    EXPECT_FALSE(parse_sync_rs_commit_lsn(as_blob(version_lookalike)));
 }
 
 // ── CreateVolume codec (SDSTOR-22894) ─────────────────────────────────────────

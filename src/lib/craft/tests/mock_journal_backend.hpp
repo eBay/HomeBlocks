@@ -103,12 +103,13 @@ struct ProposedSync {
     std::vector< int64_t > empty_slots;
 };
 
+// A key that isn't a well-formed Sync decodes as {rs_commit_lsn = -1}, with only its type.
 inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
-    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
-    auto empties = parse_empty_slots(
+    auto const type = reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type;
+    auto sync = parse_sync_rs_commit_lsn(
         sisl::blob{const_cast< uint8_t* >(entry.second.data()), static_cast< uint32_t >(entry.second.size())});
-    return {reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, p->rs_commit_lsn, p->client_token,
-            p->term, empties.value_or(std::vector< int64_t >{})};
+    if (!sync) return {type, -1, 0, 0, {}};
+    return {type, sync->rs_commit_lsn, sync->client_token, sync->term, std::move(sync->empty_slots)};
 }
 
 template < typename Mock >
