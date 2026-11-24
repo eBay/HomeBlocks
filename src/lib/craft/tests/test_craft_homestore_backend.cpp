@@ -475,8 +475,8 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
 // first of several concurrent trigger_cp_flush(false) calls holds it for the duration of the real
 // flush, so every other concurrent call observes it already set and gets HomeStore's synchronous
 // false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to false
-// (coalesced) when force=false; every one of these concurrent calls must succeed, and the one that
-// actually flushed reports true.
+// (coalesced) when force=false; every one of these concurrent calls must succeed. None of them has to
+// flush: HomeStore's own timer checkpoint may hold the gate for the whole batch.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFails) {
     auto trigger = make_homestore_checkpoint_trigger_fn();
 
@@ -488,12 +488,9 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFail
     }
 
     auto const results = homeblocks::detail::sync_get(sisl::async::when_all(std::move(futs)));
-    int flushed = 0;
     for (auto const& r : results) {
-        ASSERT_TRUE(r.has_value());
-        flushed += *r ? 1 : 0;
+        EXPECT_TRUE(r.has_value());
     }
-    EXPECT_GE(flushed, 1);
 }
 
 #ifdef _PRERELEASE
