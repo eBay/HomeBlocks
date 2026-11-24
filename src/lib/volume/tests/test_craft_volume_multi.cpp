@@ -534,7 +534,8 @@ TEST_F(CraftVolumeMultiTest, ShutdownEndsAProposalWithoutADeadline) {
         HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_raft_propose_timeout_ms = 0; });
         auto vol = hb()->get_volume(id);
         ASSERT_TRUE(vol);
-        auto* const dev = (*vol)->craft_dev();
+        // Not held: the device must not outlive the shutdown, which may free it. Only the fallback below uses it.
+        std::weak_ptr< CraftReplDev > const dev = (*vol)->craft_dev_ref();
         std::weak_ptr< volume > const watched = *vol;
         // The request holds the volume until it ends, which is before the shutdown ends: no handle outlives that.
         auto resolved = std::async(std::launch::async, [vol = std::move(*vol), hdr]() mutable {
@@ -550,7 +551,9 @@ TEST_F(CraftVolumeMultiTest, ShutdownEndsAProposalWithoutADeadline) {
         auto stopped = std::async(std::launch::async, [] { g_helper->stop(); });
         bool const in_time = stopped.wait_for(std::chrono::seconds{30}) == std::future_status::ready;
         EXPECT_TRUE(in_time) << "the shutdown waited on a proposal without a deadline";
-        if (!in_time) { dev->stop_proposing(); } // what the shutdown should have done: it ends now
+        if (!in_time) { // what the shutdown should have done: it ends now
+            if (auto const d = dev.lock()) { d->stop_proposing(); }
+        }
         stopped.wait();
         auto const r = resolved.get();
         HB_SETTINGS_FACTORY().modifiable_settings(
