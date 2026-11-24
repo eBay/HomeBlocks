@@ -592,8 +592,9 @@ void HomeBlocksImpl::init_cp() {
     }
 }
 
-// ponytail: one meta blk write per CRAFT volume per checkpoint, in turn (the meta service serializes them anyway); skip
-// the unchanged ones if checkpoints get slow with many partitions.
+// Every CRAFT volume's state, in turn (the meta service serializes the writes anyway). A volume's store writes its
+// record only when the image changed since it last wrote it, so a checkpoint costs a write per changed partition, not
+// one per partition.
 sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
     // A volume being reattached holds the entries committed meanwhile, which this checkpoint may cover: they reach its
     // device, whose state is saved below with them, first.

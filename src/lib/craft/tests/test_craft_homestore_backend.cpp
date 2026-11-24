@@ -521,7 +521,8 @@ TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
         large.pending.push_back(CraftPendingEntry{
             .raft_idx = 11 + i, .type = CraftEntryType::SyncRSCommitLSN, .rs_commit_lsn = i, .client_token = 42});
     }
-    for (auto const& image : {small, large, small}) {
+    // The same image twice: the second write is skipped, the record unchanged; a changed one is written again.
+    for (auto const& image : {small, small, large, small}) {
         ASSERT_TRUE(homeblocks::detail::sync_get(store->persist(image)));
         auto const back = store->load();
         ASSERT_TRUE(back && *back);
