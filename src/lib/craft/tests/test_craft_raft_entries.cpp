@@ -2463,6 +2463,25 @@ TEST_F(CraftRaftEntriesTest, AFaultDuringACheckpointSaveFailsNoCheckpoint) {
     EXPECT_TRUE(store->faulted);
 }
 
+// Same, but the save's own write wins the race with the fault's mark: the save still completes only once the mark is
+// durable, which it makes sure of itself (the real store's mark waits for the write in flight, under the same lock).
+TEST_F(CraftRaftEntriesTest, ACheckpointSaveWhoseWriteWonTheRaceWaitsForTheFaultsMark) {
+    auto* store = with_store();
+    store->hold = true;
+    store->write_through_fault = true;
+    std::optional< status > saved;
+    homeblocks::detail::detach([](CraftReplDev* dev, std::optional< status >& out) -> async_status {
+        out = co_await dev->save_state();
+        co_return ok();
+    }(dev_.get(), saved));
+    fault();
+    ASSERT_EQ(store->mark_calls, 1);
+    store->gate.complete(true);
+    ASSERT_TRUE(saved);
+    EXPECT_TRUE(saved->has_value());
+    EXPECT_EQ(store->mark_calls, 2) << "completed without making sure of the mark";
+}
+
 // A record marked faulted faults the next restart at once.
 TEST_F(CraftRaftEntriesTest, RestartFaultsOnAFaultedRecord) {
     auto* store = with_store();

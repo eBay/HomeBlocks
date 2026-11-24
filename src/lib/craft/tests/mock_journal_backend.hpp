@@ -133,8 +133,12 @@ public:
     bool fail_load{false};
     bool hold{false};
     sisl::async::value_awaitable< bool > gate;
+    // The next persist() writes even if the partition faults while it is held, as the real store's write does when
+    // it holds its lock first: a concurrent mark_faulted() waits for it.
+    bool write_through_fault{false};
 
     bool faulted{false}; // mark_faulted()
+    int mark_calls{0};
 
     result< std::optional< CraftDurableState > > load() override {
         if (fail_load) return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -148,14 +152,19 @@ public:
 
     async_status persist(CraftDurableState const& s) override {
         ++persist_calls;
+        bool const through = std::exchange(write_through_fault, false) && !fail_persist && !faulted;
         if (std::exchange(hold, false)) co_await gate;
-        if (fail_persist || faulted) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (!through && (fail_persist || faulted))
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         saved = s;
         co_return ok();
     }
 
     void destroy() override { saved.reset(); }
-    void mark_faulted() override { faulted = true; }
+    void mark_faulted() override {
+        ++mark_calls;
+        faulted = true;
+    }
 };
 
 template < typename Mock >

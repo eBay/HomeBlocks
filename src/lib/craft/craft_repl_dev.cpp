@@ -3119,9 +3119,10 @@ void CraftReplDev::fault() {
 async_status CraftReplDev::save_state() {
     if (!faulted_.load(std::memory_order_acquire)) {
         auto r = co_await persist_state();
-        if (r || !faulted_.load(std::memory_order_acquire)) co_return r;
+        if (!faulted_.load(std::memory_order_acquire)) co_return r;
     }
-    // Only once the mark is durable, whoever makes it: the checkpoint may cover entries this record lacks.
+    // Faulted before, during or right after the save (its own write may have won the race with the mark): only once
+    // the mark is durable, whoever makes it, as the checkpoint may cover entries this record lacks.
     if (state_store_) state_store_->mark_faulted();
     co_return ok();
 }
