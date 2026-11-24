@@ -288,6 +288,10 @@ private:
     // class" lookup context and so must already be visible at the point of each declaration below.
     using write_index_fn_t = std::function< status(lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) >;
     using delete_index_fn_t = std::function< status(lba_t, lba_t, std::vector< homestore::blk_id >&) >;
+    struct IndexOps {
+        write_index_fn_t write;
+        delete_index_fn_t del;
+    };
     // Same shape as VolumeIndexTable::read_from_index -- read_impl() (and its test seam, read_with())
     // are parameterized over it for the same reason commit_impl()/commit_with() are.
     using index_kv_list_t = std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >;
@@ -506,6 +510,9 @@ public:
     // logic (in-order apply, stall at a gap, Empty-slot skip, overlay retirement) against a fake
     // index instead of a real VolumeIndexTable.
     async_result< int64_t > commit_with(int64_t upto_lsn, write_index_fn_t write_fn, delete_index_fn_t delete_fn);
+    // Has the device's own commits (a Sync's advance, write()'s piggyback) apply to these index operations, as they
+    // would to a volume's index, in a fixture that has none.
+    void use_test_index(write_index_fn_t write_fn, delete_index_fn_t delete_fn);
 
     // Test seam for read(): runs the same read algorithm, but the index read operation is injected
     // rather than routed through indx_tbl_, so tests can exercise read()'s logic (index/overlay merge,
@@ -789,18 +796,26 @@ private:
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
     // (returns without reaching upto_lsn) at the first gap in missing_lsns_ -- not an error, just the
-    // achieved commit_lsn. At most one run is ever active at a time (commit_running_); a concurrent
+    // achieved commit_lsn. At most one run is ever active at a time (commit_mu_); a concurrent
     // caller is a safe no-op since the in-flight run covers the same ground and every subsequent
     // write()/keep_alive() retries the advance. Callers: write()'s post-flight piggyback (best-effort,
     // every outcome including real errors is ignored) and keep_alive() (propagates real errors, since
     // advancing the frontier is its entire purpose -- a stall is still not an error there either).
+    // Without an index (write-path-only tests) it applies nothing and leaves commit_lsn where it is.
     async_result< int64_t > commit(int64_t upto_lsn);
 
-    // Core apply-one-slot algorithm behind commit(), parameterized by the index write/delete
-    // operations (write_index_fn_t / delete_index_fn_t, declared at the top of this class) so tests
-    // can exercise it against a fake index instead of a real VolumeIndexTable. commit() binds these
-    // to indx_tbl_'s real methods; commit_with() (test-only) binds test doubles.
-    async_result< int64_t > commit_impl(int64_t upto_lsn, write_index_fn_t write_fn, delete_index_fn_t delete_fn);
+    // A SyncRSCommitLSN apply's commit advance up to rs_commit_lsn: waits for a running commit (commit_mu_), then runs
+    // its own through commit_impl(), so each slot it steps over reaches the index. Best effort: an indexing failure
+    // stops it just below the failing slot, logged, and the apply still succeeds.
+    async_status advance_commit_for_sync(int64_t rs_commit_lsn);
+
+    // Core apply-one-slot algorithm behind every commit_lsn advance, under commit_mu_ (`lock`); only its run writes
+    // commit_lsn. `index` is the index to apply each slot to: the volume's (commit(), a Sync's advance), a test
+    // double (commit_with(), use_test_index()), or null with no index (write-path-only tests), where it only steps
+    // over each slot and retires its overlay entry.
+    async_result< int64_t > commit_impl(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index);
+    // The index commits apply to: indx_tbl_'s, else the test double use_test_index() set, else none.
+    std::optional< IndexOps > index_ops() const;
 
     // Must be called with state_mu_ held. Returns true if commit_lsn_snapshot has crossed
     // checkpoint_lsn_interval_ since last_checkpoint_lsn_ -- and if so, updates last_checkpoint_lsn_ to
@@ -811,9 +826,8 @@ private:
 
     // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
     // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
-    // same commit_lsn_snapshot. Safe without state_mu_ held. Shared by every commit_lsn-advance path:
-    // commit_impl() (covers write()'s piggyback and keep_alive()) and apply_sync_rs_commit_lsn()'s own
-    // walk-forward loop.
+    // same commit_lsn_snapshot. Safe without state_mu_ held. Run at the end of every commit_impl() run,
+    // which every commit_lsn advance goes through.
     void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
 
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
@@ -903,15 +917,18 @@ private:
     std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
     size_t max_missing_lsns_{2'000'000};       // see missing_at_capacity_locked(); overridden only by tests
     std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
-    bool commit_running_{false}; // at most one commit_impl() run active at a time -- see commit()'s doc comment
+    // Held by the one commit_impl() run allowed at a time, the only writer of commit_lsn: a piggybacked commit
+    // try_lock()s and skips, a Sync's advance lock()s and waits its turn.
+    AsyncMutex commit_mu_;
+    std::optional< IndexOps > test_index_; // set by use_test_index(); used only when indx_tbl_ is null
     // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
     // to commit_lsn when the run ends. Guarded by state_mu_.
     int64_t indexing_lsn_{-1};
     // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
-    mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
-                                  // in_flight_write_dlsns_, last_checkpoint_lsn_, and client_commit_lsn_
+    mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, in_flight_write_dlsns_,
+                                  // last_checkpoint_lsn_, and client_commit_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
