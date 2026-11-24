@@ -1343,15 +1343,32 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
             ~done_t() { dev->checkpoint_done(); }
         } const done{self.get()}; // on every way out
         auto cp = co_await self->checkpoint_trigger_(false);
-        if (!cp) {
-            LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
-            co_return ok();
+        if (!cp) LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
+        if (cp && *cp) co_return co_await self->advance_durable_commit(commit_lsn_snapshot);
+        // Failed, coalesced into a flush that was already running (it may predate some of the slots applied up to
+        // commit_lsn_snapshot, so it proves nothing about them), or skipped while HomeStore started: the sweep tries
+        // again (retry_checkpoint()), even if no more slots commit.
+        {
+            std::lock_guard lk{self->state_mu_};
+            self->checkpoint_retry_lsn_ = std::max(self->checkpoint_retry_lsn_, commit_lsn_snapshot);
         }
-        // Coalesced into a flush that was already running: that flush may predate some of the slots applied up to
-        // commit_lsn_snapshot, so it proves nothing about them. A later trigger will.
-        if (!*cp) co_return ok();
-        co_return co_await self->advance_durable_commit(commit_lsn_snapshot);
+        co_return ok();
     }(shared_from_this(), commit_lsn_snapshot));
+}
+
+// Not while a trigger runs, and not once a later one covered the frontier.
+void CraftReplDev::retry_checkpoint() {
+    int64_t lsn;
+    {
+        std::lock_guard lk{state_mu_};
+        if (checkpoint_retry_lsn_ <= durable_.durable_commit_lsn) {
+            checkpoint_retry_lsn_ = -1;
+            return;
+        }
+        if (checkpoints_running_ > 0) return;
+        lsn = std::exchange(checkpoint_retry_lsn_, -1);
+    }
+    fire_checkpoint_trigger(lsn);
 }
 
 void CraftReplDev::checkpoint_done() {

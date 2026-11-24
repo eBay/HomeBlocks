@@ -2226,6 +2226,30 @@ TEST_F(CraftRaftEntriesTest, CoalescedCheckpointDoesNotRecordTheDurableCommit) {
     EXPECT_EQ(dev_->durable_state().durable_commit_lsn, -1);
 }
 
+// A trigger that didn't checkpoint (coalesced, failed, or while HomeStore started) is tried again by HomeBlocks' sweep,
+// so the frontier moves even if no more slots commit; once it has, the sweep leaves it.
+TEST_F(CraftRaftEntriesTest, ACheckpointThatDidNotHappenIsTriedAgain) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(5);
+    trigger_.flushed = false;
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    ASSERT_EQ(dev_->durable_state().durable_commit_lsn, -1);
+
+    trigger_.fail_next = true;
+    dev_->expire_overdue();
+    EXPECT_EQ(trigger_.call_count, 2);
+    EXPECT_EQ(dev_->durable_state().durable_commit_lsn, -1);
+
+    trigger_.flushed = true;
+    dev_->expire_overdue();
+    EXPECT_EQ(trigger_.call_count, 3);
+    EXPECT_EQ(dev_->durable_state().durable_commit_lsn, 10);
+    dev_->expire_overdue();
+    EXPECT_EQ(trigger_.call_count, 3) << "tried again with nothing left to cover";
+}
+
 // The frontier never moves back, and a failed persist leaves it recorded in memory for the next one.
 TEST_F(CraftRaftEntriesTest, DurableCommitNeverRegressesAndSurvivesAPersistFailure) {
     auto* store = with_store();

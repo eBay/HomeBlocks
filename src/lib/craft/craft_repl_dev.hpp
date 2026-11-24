@@ -624,10 +624,12 @@ public:
     // Test seam: a proposer the device doesn't own (a mock the test keeps), in place of create()'s.
     void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
     // HomeBlocks' timer, every second: the proposals (CraftRaftProposer::expire_overdue()) and the journal writes
-    // (CraftJournalBackend::expire_overdue()) past their deadline fail.
+    // (CraftJournalBackend::expire_overdue()) past their deadline fail, and a checkpoint trigger that didn't checkpoint
+    // is tried again (retry_checkpoint()).
     void expire_overdue() {
         if (raft_proposer_) raft_proposer_->expire_overdue();
         journal_->expire_overdue();
+        retry_checkpoint();
     }
     // Ends the proposals in flight (timed_out: they may still commit) and fails every later one, as stop() does. A
     // shutdown calls it before it waits for the requests in flight: one waiting on a proposal without a deadline
@@ -1051,6 +1053,9 @@ private:
     // commit_impl() (covers write()'s piggyback, keep_alive() and the SyncRSCommitLSN apply) and
     // finish_sync_rs_commit_lsn()'s walk-forward loop, which runs only without an index.
     void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
+    // Fires the trigger again for the frontier of one that didn't checkpoint (checkpoint_retry_lsn_), from
+    // expire_overdue(): a partition that goes idle would otherwise pin its journal and superseded blocks.
+    void retry_checkpoint();
 
     // ── durable state (S8) ──
     // Makes the in-memory image (durable_) durable. Callers update durable_ under state_mu_, await this, then make the
@@ -1320,8 +1325,10 @@ private:
     checkpoint_trigger_fn_t checkpoint_trigger_{}; // empty until production wiring; unit tests inject a mock
     int64_t checkpoint_lsn_interval_{128};         // commit_lsn delta between checkpoint triggers; see
                                                    // set_checkpoint_lsn_interval()
-    int64_t last_checkpoint_lsn_{-1}; // commit_lsn as of the last triggered checkpoint (guarded by state_mu_);
-                                      // restore_state() seeds it with the restored commit_lsn
+    int64_t last_checkpoint_lsn_{-1};  // commit_lsn as of the last triggered checkpoint (guarded by state_mu_);
+                                       // restore_state() seeds it with the restored commit_lsn
+    int64_t checkpoint_retry_lsn_{-1}; // a trigger's frontier that didn't checkpoint, for retry_checkpoint() (guarded
+                                       // by state_mu_)
 
     // ── durable state (S8) ──
     unique< CraftStateStore > state_store_; // null: nothing persisted, nothing restored
