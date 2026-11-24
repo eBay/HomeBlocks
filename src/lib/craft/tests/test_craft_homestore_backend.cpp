@@ -536,6 +536,23 @@ TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
         EXPECT_EQ(**reread, image) << "the record a boot reads";
     }
 
+    // After a restart, a store made from the record a boot reads counts its image as written; a changed image is still
+    // written.
+    {
+        auto const boot_id = boost::uuids::random_generator()();
+        auto first =
+            make_homestore_state_store(boot_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+        ASSERT_TRUE(homeblocks::detail::sync_get(first->persist(small)));
+        first.reset(); // stopped: the record stays
+        auto booted = make_homestore_state_store(boot_id, std::move(read_state_records().at(boot_id)));
+        ASSERT_TRUE(homeblocks::detail::sync_get(booted->persist(small)));
+        ASSERT_TRUE(homeblocks::detail::sync_get(booted->persist(large)));
+        auto const reread = make_homestore_state_store(boot_id, std::move(read_state_records().at(boot_id)))->load();
+        ASSERT_TRUE(reread && *reread);
+        EXPECT_EQ(**reread, large);
+        booted->destroy();
+    }
+
     auto records = read_state_records();
     ASSERT_TRUE(records.contains(vol_id));
     EXPECT_FALSE(make_homestore_state_store(boost::uuids::random_generator()(), std::move(records.at(vol_id)))->load())

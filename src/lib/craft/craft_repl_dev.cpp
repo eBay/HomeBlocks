@@ -3056,7 +3056,14 @@ bool valid_state_record(volume_id_t const& vol_id, homestore::superblk< craft_st
 class HomeStoreCraftStateStore : public CraftStateStore {
 public:
     HomeStoreCraftStateStore(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb) :
-            vol_id_{vol_id}, sb_{std::move(sb)} {}
+            vol_id_{vol_id}, sb_{std::move(sb)} {
+        // The image a boot found in the record counts as written: the first checkpoint after a restart doesn't
+        // rewrite every partition's record.
+        if (valid_state_record(vol_id_, sb_) && !sb_.get()->faulted) {
+            auto const* const image = sb_.raw_buf()->cbytes() + sizeof(craft_state_sb_t);
+            written_.assign(image, image + sb_.get()->image_len);
+        }
+    }
 
     result< std::optional< CraftDurableState > > load() override {
         std::lock_guard lk{mu_};
