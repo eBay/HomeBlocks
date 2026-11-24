@@ -141,6 +141,17 @@ static peer_id_t member_id(uint32_t i) {
 static std::string test_volume_name(uint32_t n) { return fmt::format("craft_multi_{}", n); }
 static volume_id_t test_volume_id(uint32_t n) { return craft_volume_id(test_volume_name(n)); }
 
+// An InternalLogin's key: a new session with this token and term, on a volume no Sync has committed to (an empty
+// watermark).
+static std::vector< uint8_t > login_key(uint64_t client_token, uint64_t term) {
+    std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+    serialize_internal_login(key.data(), client_token, term, /*rs_commit_lsn=*/-1);
+    return key;
+}
+static sisl::blob as_blob(std::vector< uint8_t >& bytes) {
+    return sisl::blob{bytes.data(), static_cast< uint32_t >(bytes.size())};
+}
+
 class CraftVolumeMultiTest : public ::testing::Test {
 protected:
     static bool sync() { return g_barrier->sync(num_members(), wait_timeout_sec()); }
@@ -368,10 +379,9 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
         auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
         for (uint64_t i = 1; i <= 10; ++i) {
             CraftEntryHeader hdr{CraftEntryType::InternalLogin};
-            InternalLoginPayload login{.client_token = i, .term = i};
+            auto login = login_key(i /* client_token */, i /* term */);
             auto const st = homeblocks::detail::sync_get(
-                proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
-                                  sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+                proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)}, as_blob(login)));
             ASSERT_TRUE(st) << st.error().message();
         }
         rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), true /* wait_for_commit */);
@@ -441,11 +451,10 @@ TEST_F(CraftVolumeMultiTest, ProposalWithoutQuorumTimesOut) {
         auto const rd = group(id);
         ASSERT_TRUE(rd->is_leader());
         CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
-        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
         auto const st = homeblocks::detail::sync_get(
             make_homestore_raft_proposer(rd, member_id(0))
-                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)},
-                          sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)}, as_blob(login)));
         ASSERT_TRUE(st) << st.error().message();
         ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
         auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
@@ -489,11 +498,10 @@ TEST_F(CraftVolumeMultiTest, ShutdownEndsAProposalWithoutADeadline) {
         auto const rd = group(id);
         ASSERT_TRUE(rd->is_leader());
         CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
-        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
         auto const st = homeblocks::detail::sync_get(
             make_homestore_raft_proposer(rd, member_id(0))
-                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)},
-                          sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)}, as_blob(login)));
         ASSERT_TRUE(st) << st.error().message();
         ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
         auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
@@ -568,10 +576,9 @@ TEST_F(CraftVolumeMultiTest, EntriesCommittedBeforeTheReattachAreHeld) {
         ASSERT_TRUE(rd->is_leader());
         auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
         CraftEntryHeader hdr{CraftEntryType::InternalLogin};
-        InternalLoginPayload login{.client_token = 42, .term = 7};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
         auto const st = homeblocks::detail::sync_get(
-            proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)},
-                              sisl::blob{reinterpret_cast< uint8_t* >(&login), sizeof(login)}));
+            proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)}, as_blob(login)));
         ASSERT_TRUE(st) << st.error().message();
     }
     ASSERT_TRUE(sync());

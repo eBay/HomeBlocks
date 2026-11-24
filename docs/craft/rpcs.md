@@ -253,8 +253,11 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 ### 9. SyncRSCommitLSN (RAFT proposal, from leader)
 
 ```
-RAFT entry payload: { rs_commit_lsn: int64, client_token: uint64, empty_slots: [int64] }
+RAFT entry payload: { version: uint8, rs_commit_lsn: int64, client_token: uint64, term: uint64, empty_slots: [int64] }
 ```
+
+`term` is the session the entry was proposed in: the caller's session for a background or Resolve round, the
+session being replaced for a login's. A replica rejects a key of another `version` rather than misreading it.
 
 Proposed by the leader via `CraftReplDev::append()` — triggered by login, the watchdog, the periodic
 checkpoint, or the client-requested **Resolve** RPC (#5). **Before proposing**, the leader resolves
@@ -270,12 +273,18 @@ ordering plus the term fence on subsequent IO provide exclusivity instead. Repli
 `Empty` unilaterally. This is the primary recovery mechanism — it carries no write data, only the
 watermark and verdicts.
 
+A Sync whose `term` a committed `InternalLogin` has since replaced (one ahead of it in the log) is
+rejected when it commits: it installs nothing, and its proposer gets `STALE_TERM`. The new session starts
+at that login's `rs_commit_lsn`, so an old-session Sync (another leader's round after a leadership change,
+or one proposed behind a timed-out login) mustn't settle slots past it. Decided at commit, in log order, so
+every replica rejects the same ones.
+
 ---
 
 ### 10. InternalLogin (RAFT proposal, from leader during login)
 
 ```
-RAFT entry payload: { client_token: uint64, term: uint64, rs_commit_lsn: int64 }
+RAFT entry payload: { version: uint8, client_token: uint64, term: uint64, rs_commit_lsn: int64 }
 ```
 
 Proposed immediately after the login's `SyncRSCommitLSN` commits. On apply each replica first fences
@@ -283,6 +292,15 @@ prior-session writes and waits for any already in flight to finish (a replica th
 never quiesced), then truncates its journal to `rs_commit_lsn` if its `last_append_lsn` is above it, then
 stores `client_token` and `term`, rejecting any subsequent IO from a different term. Until a replica has applied the entry, it
 rejects IO and HELO at the new term, so no new-session write can land before its truncation.
+
+Two entries are turned away, each decided in log order so every replica agrees:
+- **Not newer.** An entry whose `term` isn't newer than the session's is ignored when it applies, token
+  included: a replay, or a second login that proposed the same term after the first one took it. Its
+  proposer gets `STALE_TERM`.
+- **Below a committed watermark.** A newer entry whose `rs_commit_lsn` is below the watermark of a
+  `SyncRSCommitLSN` committed ahead of it is rejected when it commits: only another leader can have moved
+  the watermark (a leadership change mid-login), and the session would start below committed slots. It
+  doesn't fence the old session it no longer replaces, and its proposer gets `NO_QUORUM`.
 
 ---
 

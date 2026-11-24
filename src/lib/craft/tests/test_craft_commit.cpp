@@ -244,7 +244,7 @@ protected:
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
         reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, {});
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), {});
         intrusive< homestore::repl_req_ctx > const no_ctx;
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, no_ctx);

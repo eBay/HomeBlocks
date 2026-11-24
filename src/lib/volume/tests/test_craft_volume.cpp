@@ -120,46 +120,57 @@ public:
         ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     }
 
+    // An InternalLogin's key: a new session with this token and term, at the watermark a login settles, the device's
+    // last_append_lsn (a committed Sync's never passes it).
+    static std::vector< uint8_t > login_key(volume_handle const& vol, uint64_t client_token, uint64_t term) {
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        serialize_internal_login(key.data(), client_token, term, vol->craft_dev()->last_append_lsn());
+        return key;
+    }
+
     // An InternalLogin the volume's group committed at raft_lsn, handed to its device as HomeStore does, without a RAFT
     // round.
     static void commit_login(volume_handle const& vol, uint64_t client_token, uint64_t term, int64_t raft_lsn) {
         CraftEntryHeader header{CraftEntryType::InternalLogin};
-        InternalLoginPayload key{client_token, term};
+        auto key = login_key(vol, client_token, term);
         cintrusive< homestore::repl_req_ctx > ctx{};
         vol->craft_dev()->raft_listener().on_commit(
             raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
-            sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}, {}, ctx);
+            sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
 
     // An InternalLogin through the volume's group, as a login commits it: at a RAFT index the device's entries after a
     // restart follow, unlike commit_login()'s.
     static status propose_login(volume_id_t const& id, uint64_t client_token, uint64_t term) {
+        auto const vol = g_helper->inst()->get_volume(id);
+        if (!vol) return std::unexpected(std::make_error_condition(std::errc::no_such_device));
         CraftEntryHeader header{CraftEntryType::InternalLogin};
-        InternalLoginPayload key{client_token, term};
-        return homeblocks::detail::sync_get(
-            make_homestore_raft_proposer(group(id), peer_id_t{})
-                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
-                          sisl::blob{reinterpret_cast< uint8_t* >(&key), sizeof(key)}));
-    }
-
-    // A SyncRSCommitLSN through the volume's group, voiding the slots `voided`.
-    static status propose_sync(volume_id_t const& id, int64_t rs_commit_lsn, uint64_t client_token,
-                               std::vector< int64_t > const& voided) {
-        CraftEntryHeader header{CraftEntryType::SyncRSCommitLSN};
-        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(voided.size()));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, voided);
+        auto key = login_key(*vol, client_token, term);
         return homeblocks::detail::sync_get(
             make_homestore_raft_proposer(group(id), peer_id_t{})
                 ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
                           sisl::blob{key.data(), static_cast< uint32_t >(key.size())}));
     }
 
-    // A SyncRSCommitLSN the volume's group committed at raft_lsn, without Empty verdicts, handed to its device as
-    // HomeStore does.
-    static void commit_sync(volume_handle const& vol, int64_t rs_commit_lsn, uint64_t client_token, int64_t raft_lsn) {
+    // A SyncRSCommitLSN through the volume's group, proposed in session `term`, voiding the slots `voided`.
+    static status propose_sync(volume_id_t const& id, int64_t rs_commit_lsn, uint64_t client_token, uint64_t term,
+                               std::vector< int64_t > const& voided) {
+        CraftEntryHeader header{CraftEntryType::SyncRSCommitLSN};
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(voided.size()));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, term, voided);
+        return homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(group(id), peer_id_t{})
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
+                          sisl::blob{key.data(), static_cast< uint32_t >(key.size())}));
+    }
+
+    // A SyncRSCommitLSN the volume's group committed at raft_lsn in session `term`, without Empty verdicts, handed to
+    // its device as HomeStore does.
+    static void commit_sync(volume_handle const& vol, int64_t rs_commit_lsn, uint64_t client_token, uint64_t term,
+                            int64_t raft_lsn) {
         CraftEntryHeader header{CraftEntryType::SyncRSCommitLSN};
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, {});
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, term, {});
         cintrusive< homestore::repl_req_ctx > ctx{};
         vol->craft_dev()->raft_listener().on_commit(
             raft_lsn, sisl::blob{reinterpret_cast< uint8_t* >(&header), sizeof(header)},
@@ -483,7 +494,7 @@ TEST_F(CraftVolumeTest, CommittedSlotsSurviveARestart) {
         auto const w = write_slot(*vol, hdr, dlsn);
         ASSERT_TRUE(w) << w.error().message();
     }
-    commit_sync(*vol, 2 /* rs_commit_lsn */, 42 /* client_token */, 1001 /* raft_lsn */);
+    commit_sync(*vol, 2 /* rs_commit_lsn */, 42 /* client_token */, 7 /* term */, 1001 /* raft_lsn */);
     ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->commit_lsn() == 2; }));
 
     g_helper->restart();
@@ -910,7 +921,7 @@ TEST_F(CraftVolumeTest, DISABLED_CrashBefore) {
     }
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::cp_mgr().trigger_cp_flush(true /* force */)));
 
-    auto const voiding = propose_sync(id, 3 /* rs_commit_lsn */, 42 /* client_token */, {2});
+    auto const voiding = propose_sync(id, 3 /* rs_commit_lsn */, 42 /* client_token */, 7 /* term */, {2});
     ASSERT_TRUE(voiding) << voiding.error().message();
     ASSERT_TRUE(wait_until([dev] { return dev->commit_lsn() == 3; }));
     auto const relogin = propose_login(id, 44 /* client_token */, 9 /* term */);
@@ -923,7 +934,9 @@ TEST_F(CraftVolumeTest, DISABLED_CrashBefore) {
     // proposal waits for the apply: a thread of its own makes it, which the kill ends. Committed, it raised the
     // watermark.
     dev->pause_apply();
-    std::thread([id] { (void)propose_sync(id, 4 /* rs_commit_lsn */, 44 /* client_token */, {}); }).detach();
+    std::thread([id] {
+        (void)propose_sync(id, 4 /* rs_commit_lsn */, 44 /* client_token */, 9 /* term */, {});
+    }).detach();
     ASSERT_TRUE(wait_until([dev] { return dev->durable_state().sync_watermark == 4; }));
     std::raise(SIGKILL);
 }

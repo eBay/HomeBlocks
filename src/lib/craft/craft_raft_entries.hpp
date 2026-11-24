@@ -14,6 +14,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -31,12 +32,14 @@
 // and is journalled locally. These entries carry only control-plane metadata:
 //
 //   SyncRSCommitLSN — advances the replica-set commit watermark and carries
-//     the Empty verdicts (slots the leader declared unreachable by quorum).
-//     Proposed by the leader; applied by every replica.
+//     the Empty verdicts (slots the leader declared unreachable by quorum), and
+//     the session it was proposed in. Proposed by the leader; applied by every
+//     replica.
 //
-//   InternalLogin — establishes a new client session (token + term). Proposed
-//     by the leader as step 4 of the login sequence; applied by every replica.
-//     All subsequent IO with a mismatched term is rejected STALE_TERM.
+//   InternalLogin — establishes a new client session (token + term), starting at
+//     the login's watermark rs_commit_lsn. Proposed by the leader as the last step
+//     of the login sequence; applied by every replica. All subsequent IO with a
+//     mismatched term is rejected STALE_TERM.
 //
 //   CreateVolume — the partition's first entry: proposed by the member that formed
 //     the RAFT group; every member creates its local volume when it commits.
@@ -50,34 +53,53 @@
 // SyncRSCommitLSNPayload struct is followed immediately by
 // payload.num_empty_slots × int64_t (the Empty-verdicted LSNs).
 //
-// Parsing: reinterpret_cast<const T*>(blob.cbytes()) — same pattern as
-// MsgHeader / VolJournalEntry in volume.hpp.
+// Each key starts with its own version byte, so a key written in another layout is
+// rejected rather than misread; the header carries only the entry type, whose values
+// are fixed (append new types, never reorder them). All of these are persisted in the
+// RAFT log: a layout change is a format change.
+//
+// Parsing: parse_sync_rs_commit_lsn, parse_internal_login and parse_create_volume
+// below, which validate the persisted key before trusting it.
 
 namespace homeblocks {
 
 ENUM(CraftEntryType, uint8_t, SyncRSCommitLSN, InternalLogin, CreateVolume);
+static_assert(static_cast< uint8_t >(CraftEntryType::SyncRSCommitLSN) == 0 &&
+                  static_cast< uint8_t >(CraftEntryType::InternalLogin) == 1 &&
+                  static_cast< uint8_t >(CraftEntryType::CreateVolume) == 2,
+              "CraftEntryType values are persisted in the RAFT log: append new types, never reorder them");
 
 // ─── header blob ─────────────────────────────────────────────────────────────
 
 struct CraftEntryHeader {
     CraftEntryType type;
 };
+static_assert(sizeof(CraftEntryHeader) == 1, "CraftEntryHeader is persisted in the RAFT log");
 
 // ─── key blob: SyncRSCommitLSN ───────────────────────────────────────────────
 
-// Fixed prefix. Immediately followed by num_empty_slots × int64_t.
+// Fixed prefix. Immediately followed by num_empty_slots × int64_t. `version` comes first, as in InternalLoginPayload.
+// term is the session the entry was proposed in: one that commits behind a newer InternalLogin is rejected.
 #pragma pack(push, 1)
 struct SyncRSCommitLSNPayload {
+    static constexpr uint8_t VERSION{1};
+    uint8_t version;
     int64_t rs_commit_lsn;
     uint64_t client_token;
+    uint64_t term;
     uint32_t num_empty_slots;
 };
 
 // ─── key blob: InternalLogin ──────────────────────────────────────────────────
 
+// `version` comes first, as in CreateVolumeHeader. rs_commit_lsn is the watermark the login settled, -1 on an empty
+// volume.
 struct InternalLoginPayload {
+    static constexpr uint8_t VERSION{1};
+    uint8_t version;
     uint64_t client_token;
     uint64_t term;
+    int64_t rs_commit_lsn;
 };
 
 // ─── key blob: CreateVolume ───────────────────────────────────────────────────
@@ -95,6 +117,26 @@ struct CreateVolumeHeader {
     uint16_t name_len;
 };
 #pragma pack(pop)
+static_assert(sizeof(boost::uuids::uuid) == 16, "CreateVolumeHeader persists a volume id as 16 raw bytes");
+static_assert(sizeof(SyncRSCommitLSNPayload) == 1 + 3 * sizeof(uint64_t) + sizeof(uint32_t),
+              "SyncRSCommitLSNPayload must stay packed");
+static_assert(sizeof(InternalLoginPayload) == 1 + 3 * sizeof(uint64_t), "InternalLoginPayload must stay packed");
+static_assert(sizeof(CreateVolumeHeader) ==
+                  1 + sizeof(boost::uuids::uuid) + sizeof(uint64_t) + sizeof(uint32_t) + 2 * sizeof(uint16_t),
+              "CreateVolumeHeader must stay packed");
+// Each field's place too, not just the size: a reorder keeps the size, yet changes what an entry already in the log
+// means. Serialization and parsing share these structs, so a round-trip test can't catch it.
+static_assert(offsetof(SyncRSCommitLSNPayload, version) == 0 && offsetof(SyncRSCommitLSNPayload, rs_commit_lsn) == 1 &&
+                  offsetof(SyncRSCommitLSNPayload, client_token) == 9 && offsetof(SyncRSCommitLSNPayload, term) == 17 &&
+                  offsetof(SyncRSCommitLSNPayload, num_empty_slots) == 25,
+              "SyncRSCommitLSNPayload's fields are persisted in this order: reordering them is a format change");
+static_assert(offsetof(InternalLoginPayload, version) == 0 && offsetof(InternalLoginPayload, client_token) == 1 &&
+                  offsetof(InternalLoginPayload, term) == 9 && offsetof(InternalLoginPayload, rs_commit_lsn) == 17,
+              "InternalLoginPayload's fields are persisted in this order: reordering them is a format change");
+static_assert(offsetof(CreateVolumeHeader, version) == 0 && offsetof(CreateVolumeHeader, id) == 1 &&
+                  offsetof(CreateVolumeHeader, size_bytes) == 17 && offsetof(CreateVolumeHeader, page_size) == 25 &&
+                  offsetof(CreateVolumeHeader, num_members) == 29 && offsetof(CreateVolumeHeader, name_len) == 31,
+              "CreateVolumeHeader's fields are persisted in this order: reordering them is a format change");
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -104,39 +146,74 @@ inline size_t sync_rs_commit_lsn_key_size(size_t num_empty) {
 
 // Writes the fixed payload followed by a packed int64_t array into buf. Caller must size buf via
 // sync_rs_commit_lsn_key_size(empty_slots.size()) first.
-inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, uint64_t client_token,
+inline void serialize_sync_rs_commit_lsn(uint8_t* buf, int64_t rs_commit_lsn, uint64_t client_token, uint64_t term,
                                          const std::vector< int64_t >& empty_slots) {
-    // SyncRSCommitLSNPayload's 3 members total 20 bytes but sizeof rounds to 24 (8-byte alignment) --
-    // zero the whole fixed prefix first so that trailing padding, which rides along as part of the
-    // persisted/replicated entry, doesn't leak prior buffer contents or make equivalent entries
-    // byte-different.
+    // Zero the whole fixed prefix first so that any padding, which rides along as part of the persisted/replicated
+    // entry, doesn't leak prior buffer contents or make equivalent entries byte-different.
     std::memset(buf, 0, sizeof(SyncRSCommitLSNPayload));
 
     auto* p = reinterpret_cast< SyncRSCommitLSNPayload* >(buf);
+    p->version = SyncRSCommitLSNPayload::VERSION;
     p->rs_commit_lsn = rs_commit_lsn;
     p->client_token = client_token;
+    p->term = term;
     p->num_empty_slots = static_cast< uint32_t >(empty_slots.size());
     // empty_slots.data() may be null when empty; memcpy(dest, nullptr, 0) is UB regardless of count.
     if (!empty_slots.empty()) { std::memcpy(p + 1, empty_slots.data(), empty_slots.size() * sizeof(int64_t)); }
 }
 
-// Reads the packed int64_t array immediately following the fixed prefix in `key` (the trailing data
-// serialize_sync_rs_commit_lsn wrote). `key` is persisted RAFT log data replayed on apply -- a truncated or
-// corrupt entry must not be trusted, so the fixed prefix and the declared num_empty_slots are validated
-// against key's actual size before the vector is ever constructed. Returns std::nullopt if the entry
-// doesn't parse.
-inline std::optional< std::vector< int64_t > > parse_empty_slots(sisl::blob const& key) {
+// A parsed SyncRSCommitLSN: the payload's fields, unpacked, and its Empty verdicts.
+struct SyncRSCommitLSNEntry {
+    int64_t rs_commit_lsn;
+    uint64_t client_token;
+    uint64_t term;
+    std::vector< int64_t > empty_slots;
+};
+
+// `key` is persisted RAFT log data replayed on apply -- a truncated or corrupt entry must not be trusted, so its
+// version and its declared num_empty_slots are validated against key's actual size before anything is read. The
+// earlier, unversioned layouts never match in size. Returns std::nullopt if the entry doesn't parse, or if its
+// rs_commit_lsn is below -1 (an empty volume's watermark); the apply range-checks the Empty slots against it.
+inline std::optional< SyncRSCommitLSNEntry > parse_sync_rs_commit_lsn(sisl::blob const& key) {
     if (key.size() < sizeof(SyncRSCommitLSNPayload)) { return std::nullopt; }
-
-    const auto* p = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
-
-    const size_t empty_count = p->num_empty_slots;
-    const size_t expected_size = sizeof(SyncRSCommitLSNPayload) + empty_count * sizeof(int64_t);
+    SyncRSCommitLSNPayload p;
+    std::memcpy(&p, key.cbytes(), sizeof(p));
+    if (p.version != SyncRSCommitLSNPayload::VERSION || p.rs_commit_lsn < -1) { return std::nullopt; }
     // The size needs to match exactly. This restriction can be lifted later
-    if (key.size() != expected_size) { return std::nullopt; }
+    if (key.size() != sync_rs_commit_lsn_key_size(p.num_empty_slots)) { return std::nullopt; }
 
-    const auto* src = reinterpret_cast< const int64_t* >(p + 1);
-    return std::vector< int64_t >(src, src + empty_count);
+    // Copied rather than cast: the slots follow an odd-sized prefix, so they aren't int64_t-aligned.
+    std::vector< int64_t > empty_slots(p.num_empty_slots);
+    if (!empty_slots.empty()) {
+        std::memcpy(empty_slots.data(), key.cbytes() + sizeof(p), empty_slots.size() * sizeof(int64_t));
+    }
+    return SyncRSCommitLSNEntry{p.rs_commit_lsn, p.client_token, p.term, std::move(empty_slots)};
+}
+
+// Writes an InternalLogin key into buf, which must hold sizeof(InternalLoginPayload) bytes.
+inline void serialize_internal_login(uint8_t* buf, uint64_t client_token, uint64_t term, int64_t rs_commit_lsn) {
+    auto* p = reinterpret_cast< InternalLoginPayload* >(buf);
+    p->version = InternalLoginPayload::VERSION;
+    p->client_token = client_token;
+    p->term = term;
+    p->rs_commit_lsn = rs_commit_lsn;
+}
+
+// A parsed InternalLogin: the payload's fields, unpacked so callers can bind references to them.
+struct InternalLoginEntry {
+    uint64_t client_token;
+    uint64_t term;
+    int64_t rs_commit_lsn;
+};
+
+// `key` is persisted RAFT log data replayed on apply, like parse_create_volume's. Returns std::nullopt if its size or
+// version is wrong or its rs_commit_lsn is below -1.
+inline std::optional< InternalLoginEntry > parse_internal_login(sisl::blob const& key) {
+    if (key.size() != sizeof(InternalLoginPayload)) { return std::nullopt; }
+    InternalLoginPayload p;
+    std::memcpy(&p, key.cbytes(), sizeof(p));
+    if (p.version != InternalLoginPayload::VERSION || p.rs_commit_lsn < -1) { return std::nullopt; }
+    return InternalLoginEntry{p.client_token, p.term, p.rs_commit_lsn};
 }
 
 inline size_t create_volume_key_size(size_t num_members, size_t name_len) {
@@ -163,8 +240,8 @@ inline void serialize_create_volume(uint8_t* buf, volume_info const& v) {
 }
 
 // `key` is persisted RAFT log data replayed on apply: validated against its version and declared counts before anything
-// is trusted, like parse_empty_slots. Returns the CRAFT volume it defines, without an ordinal (each node assigns its
-// own), or std::nullopt if the entry doesn't parse.
+// is trusted, like parse_sync_rs_commit_lsn. Returns the CRAFT volume it defines, without an ordinal (each node assigns
+// its own), or std::nullopt if the entry doesn't parse.
 inline std::optional< volume_info > parse_create_volume(sisl::blob const& key) {
     if (key.size() < sizeof(CreateVolumeHeader)) { return std::nullopt; }
     const auto* p = reinterpret_cast< const CreateVolumeHeader* >(key.cbytes());

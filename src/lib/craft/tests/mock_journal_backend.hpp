@@ -15,6 +15,10 @@
 #pragma once
 
 #include <functional>
+#include <optional>
+#include <utility>
+
+#include <gtest/gtest.h>
 
 #include "craft/craft_repl_dev.hpp"
 
@@ -58,6 +62,9 @@ public:
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
     std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
     std::function< void() > on_propose; // runs first, whichever way the proposal ends
+    // What a committed proposal returns, as the adapter returns its apply's outcome: on_commit sets it through
+    // loop_back(); ok if it doesn't.
+    std::optional< status > commit_outcome;
 
     bool is_leader() const override { return leader; }
     craft::peer_id_t my_id() const override { return self; }
@@ -76,24 +83,44 @@ public:
                               std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
         if (time_out) co_return std::unexpected(std::make_error_condition(std::errc::timed_out));
         if (on_commit) on_commit(header, key);
-        co_return ok();
+        co_return std::exchange(commit_outcome, std::nullopt).value_or(ok());
     }
 };
 
-// Decodes one entry MockCraftRaftProposer recorded.
+// Commits a proposed entry on `dev` as RAFT would, and hands the proposer its apply's outcome to return. An apply
+// still waiting in a paused queue has none yet, so the proposal returns ok.
+inline void loop_back(MockCraftRaftProposer& proposer, CraftReplDev& dev, sisl::blob const& header,
+                      sisl::blob const& key) {
+    auto const ctx = make_test_proposal_ctx();
+    dev.raft_listener().on_commit(1, header, key, {}, ctx);
+    proposer.commit_outcome = take_test_proposal_outcome(ctx);
+}
+
+// A SyncRSCommitLSN entry MockCraftRaftProposer recorded, decoded.
 struct ProposedSync {
     CraftEntryType type;
     int64_t rs_commit_lsn;
     uint64_t client_token;
+    uint64_t term;
     std::vector< int64_t > empty_slots;
 };
 
+// A header or key that doesn't parse fails the test, so an assertion on what it returns ({rs_commit_lsn = -1, no Empty
+// slots}) can't pass on a malformed entry.
 inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
-    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
-    auto empties = parse_empty_slots(
+    if (entry.first.size() < sizeof(CraftEntryHeader)) {
+        ADD_FAILURE() << "proposed entry's header is " << entry.first.size() << " bytes";
+        return {CraftEntryType{}, -1, 0, 0, {}};
+    }
+    auto const type = reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type;
+    auto sync = parse_sync_rs_commit_lsn(
         sisl::blob{const_cast< uint8_t* >(entry.second.data()), static_cast< uint32_t >(entry.second.size())});
-    return {reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, p->rs_commit_lsn, p->client_token,
-            empties.value_or(std::vector< int64_t >{})};
+    if (!sync) {
+        ADD_FAILURE() << "proposed entry's key isn't a well-formed SyncRSCommitLSN (" << entry.second.size()
+                      << " bytes)";
+        return {type, -1, 0, 0, {}};
+    }
+    return {type, sync->rs_commit_lsn, sync->client_token, sync->term, std::move(sync->empty_slots)};
 }
 
 // In-memory CraftStateStore. Keeps the last image persisted and hands it back through the real codec on load(), so

@@ -119,6 +119,19 @@ private:
     std::set< craft::peer_id_t > seen_;
     size_t counted_{0};
 };
+
+// Logs a proposal of `what` that didn't apply. A timeout's outcome is unknown, and losing leadership or the session
+// (an InternalLogin that lost its term included) is part of normal operation; anything else is an error.
+void log_unapplied_proposal(std::string const& what, std::error_condition const& e) {
+    if (e == std::errc::timed_out) {
+        LOGW("{} proposal timed out -- outcome unknown, it may still commit", what);
+    } else if (e == craft::make_error_condition(craft::craft_error::NOT_LEADER) ||
+               e == craft::make_error_condition(craft::craft_error::STALE_TERM)) {
+        LOGW("{} not applied: {}", what, e.message());
+    } else {
+        LOGE("{} proposal failed: {}", what, e.message());
+    }
+}
 } // namespace
 
 // ─── HomeStore journal backend ────────────────────────────────────────────────
@@ -847,6 +860,40 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
         LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {} (first missing {}) -- login fails",
              state_.commit_lsn, rs_commit_lsn, missing_lsns_.empty() ? -1 : *missing_lsns_.begin());
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    co_return ok();
+}
+
+async_status CraftReplDev::login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                                         uint64_t term) {
+    DEBUG_ASSERT(static_cast< bool >(lock), "login_install without holding watermark_mu_");
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_install rejected: partition permanently faulted");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    auto self = shared_from_this();
+    std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+    serialize_internal_login(key.data(), client_token, term + 1, rs_commit_lsn);
+
+    // The proposal completes once the entry has applied here: ok means the new session is installed, and STALE_TERM
+    // that an earlier InternalLogin for the same term applied first, so this one was ignored.
+    auto const proposed = co_await propose_entry(lock, CraftEntryType::InternalLogin, key, term);
+    // Checked whatever the outcome: a fault during the proposal outranks its failure or timeout.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_install: partition faulted during InternalLogin(term={})", term + 1);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (!proposed) {
+        log_unapplied_proposal(fmt::format("InternalLogin(term={})", term + 1), proposed.error());
+        co_return proposed;
+    }
+    // Installed, but a newer login (another leader's, after a leadership change) may have committed behind it while it
+    // waited in the apply queue: that fenced the new session already.
+    std::lock_guard lk{state_mu_};
+    if (!session_current_locked(term + 1)) {
+        LOGW("login_install: session {} was replaced as it was installed (login fence {})", term + 1,
+             login_fence_term_);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
     }
     co_return ok();
 }
@@ -2253,10 +2300,24 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     co_return result;
 }
 
-async_status CraftReplDev::propose_sync([[maybe_unused]] AsyncMutex::Lock const& lock, int64_t rs_commit_lsn,
-                                        uint64_t client_token, std::vector< int64_t > const& empty_slots,
-                                        uint64_t term) {
-    DEBUG_ASSERT(static_cast< bool >(lock), "propose_sync without holding watermark_mu_");
+async_status CraftReplDev::propose_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
+                                        std::vector< int64_t > const& empty_slots, uint64_t term) {
+    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
+    serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, term, empty_slots);
+
+    if (auto r = co_await propose_entry(lock, CraftEntryType::SyncRSCommitLSN, key, term); !r) {
+        log_unapplied_proposal(fmt::format("SyncRSCommitLSN({})", rs_commit_lsn), r.error());
+        co_return std::unexpected(r.error());
+    }
+    // The entry committed whichever session is current now, so the watermark moves either way.
+    std::lock_guard lk{state_mu_};
+    last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, rs_commit_lsn);
+    co_return ok();
+}
+
+async_status CraftReplDev::propose_entry([[maybe_unused]] AsyncMutex::Lock const& lock, CraftEntryType type,
+                                         std::vector< uint8_t >& key, uint64_t term) {
+    DEBUG_ASSERT(static_cast< bool >(lock), "proposing without holding watermark_mu_");
     // The caller awaited (pre-resolution at least): re-check right before proposing.
     if (!raft_proposer_->is_leader())
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
@@ -2267,24 +2328,9 @@ async_status CraftReplDev::propose_sync([[maybe_unused]] AsyncMutex::Lock const&
     }
 
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
-    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
-    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-    serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, client_token, empty_slots);
-
-    if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
-                                                  sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
-        !r) {
-        if (r.error() == std::errc::timed_out) {
-            LOGW("SyncRSCommitLSN({}) proposal timed out -- outcome unknown, it may still commit", rs_commit_lsn);
-        } else {
-            LOGE("SyncRSCommitLSN({}) proposal failed: {}", rs_commit_lsn, r.error().message());
-        }
-        co_return std::unexpected(r.error());
-    }
-    // The entry committed whichever session is current now, so the watermark moves either way.
-    std::lock_guard lk{state_mu_};
-    last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, rs_commit_lsn);
-    co_return ok();
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = type;
+    co_return co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                               sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
 }
 
 // ─── fetch_data (S6) ──────────────────────────────────────────────────────────
@@ -2432,30 +2478,26 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 
     switch (entry.type) {
     case CraftEntryType::SyncRSCommitLSN: {
-        if (key.size() < sizeof(SyncRSCommitLSNPayload)) {
-            LOGE("on_commit lsn={} SyncRSCommitLSN key too small ({} bytes)", lsn, key.size());
+        auto sync = parse_sync_rs_commit_lsn(key);
+        if (!sync) {
+            LOGE("on_commit lsn={} SyncRSCommitLSN key malformed ({} bytes)", lsn, key.size());
             return invalid();
         }
-        auto parsed = parse_empty_slots(key);
-        if (!parsed) {
-            LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
-            return invalid();
-        }
-        const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
-        entry.rs_commit_lsn = payload->rs_commit_lsn;
-        entry.client_token = payload->client_token;
-        empty_slots = std::move(*parsed);
+        entry.rs_commit_lsn = sync->rs_commit_lsn;
+        entry.client_token = sync->client_token;
+        entry.term = sync->term;
+        empty_slots = std::move(sync->empty_slots);
         break;
     }
     case CraftEntryType::InternalLogin: {
-        // Fixed-size payload, no variable trailing data (unlike SyncRSCommitLSN) -- exact-size check.
-        if (key.size() != sizeof(InternalLoginPayload)) {
-            LOGE("on_commit lsn={} InternalLogin key wrong size ({} bytes)", lsn, key.size());
+        auto const login = parse_internal_login(key);
+        if (!login) {
+            LOGE("on_commit lsn={} InternalLogin key malformed ({} bytes)", lsn, key.size());
             return invalid();
         }
-        const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
-        entry.client_token = login_payload->client_token;
-        entry.term = login_payload->term;
+        entry.client_token = login->client_token;
+        entry.term = login->term;
+        entry.rs_commit_lsn = login->rs_commit_lsn;
         break;
     }
     default:
@@ -2480,18 +2522,42 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
             // the blocks of a slot it voided a second time.
             applied_before_restart = restored_raft_idx_;
         } else {
-            // Fences take effect at commit; only I/O waits for the queue.
+            // Fences take effect at commit; only I/O waits for the queue. Both session rules below are decided here,
+            // in log order, so every replica decides them the same way.
             if (entry.type == CraftEntryType::SyncRSCommitLSN) {
-                // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
-                if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                bool replaced;
+                {
+                    std::lock_guard sl{state_mu_};
+                    replaced = entry.term < login_fence_term_;
+                }
+                if (replaced) {
+                    // Proposed in a session that a committed InternalLogin has since replaced (another leader's round
+                    // after a leadership change, or one behind a timed-out login): the new session starts at that
+                    // login's watermark, so this entry mustn't settle slots past it.
+                    LOGW("SyncRSCommitLSN({}) lsn={}: session {} was replaced by a committed login -- rejected",
+                         entry.rs_commit_lsn, entry.lsn, entry.term);
+                    rejected = craft::make_error_condition(craft::craft_error::STALE_TERM);
+                } else if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                    // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
                     entry.to_free = std::move(*to_free);
                 } else {
                     rejected = to_free.error();
                 }
             } else if (entry.type == CraftEntryType::InternalLogin) {
-                // The old session can't write while the login waits for its turn; the login itself applies in order.
                 std::lock_guard sl{state_mu_};
-                login_fence_term_ = std::max(login_fence_term_, entry.term);
+                // A login that isn't newer than one committed ahead of it is ignored when it applies (STALE_TERM), so
+                // only a newer one is checked here.
+                if (entry.term > login_fence_term_ && entry.rs_commit_lsn < applied_sync_lsn_) {
+                    // A Sync committed ahead of it moved the watermark past this login's, which only another leader
+                    // can do (a leadership change mid-login): the session would start below committed slots. It
+                    // doesn't fence the old session it no longer replaces.
+                    LOGW("InternalLogin(term={}) lsn={}: its watermark {} is below a committed Sync's {} -- rejected",
+                         entry.term, entry.lsn, entry.rs_commit_lsn, applied_sync_lsn_);
+                    rejected = craft::make_error_condition(craft::craft_error::NO_QUORUM);
+                } else {
+                    // The old session can't write while the login waits for its turn; the login applies in order.
+                    login_fence_term_ = std::max(login_fence_term_, entry.term);
+                }
             }
             if (!rejected) {
                 apply_queue_.push_back(std::move(entry));
@@ -2580,6 +2646,7 @@ async_status CraftReplDev::apply_one(PendingApply const& entry) {
     case CraftEntryType::SyncRSCommitLSN: // its state change was made at commit
         co_return co_await finish_sync_rs_commit_lsn(entry.rs_commit_lsn, entry.client_token, entry.to_free);
     case CraftEntryType::InternalLogin:
+        // An ignored login fails STALE_TERM, which tells its proposer that it lost the term.
         co_return co_await apply_internal_login(entry.client_token, entry.term);
     default: // on_commit() queues only the types above
         co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
@@ -3757,30 +3824,39 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 // check (STALE_TERM on mismatch) already does that. Overwriting state_.term is what invalidates any
 // existing session -- a caller still presenting the old term is fenced out on its very next call.
 //
-// The new session is made durable before it is admitted: once a write of it is acked, a restart must come back with
+// An entry whose term isn't newer than the session's is ignored outright, token included: a replay, or a second login
+// that proposed the same term after the first one took it. Entries apply in log order, so every replica ignores the
+// same ones.
+//
+// A newer session is made durable before it is admitted: once a write of it is acked, a restart must come back with
 // its term, or the old session's writes would be admitted again. If persisting fails the session isn't admitted (the
 // login fence raised at commit keeps the old one out), the apply fails, and a restart applies this entry again.
 
 async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
+    bool newer;
     {
         std::lock_guard lk{state_mu_};
-        durable_.term = std::max(durable_.term, term);
-        durable_.client_token = client_token;
+        newer = term > state_.term;
+        if (newer) {
+            durable_.term = std::max(durable_.term, term);
+            durable_.client_token = client_token;
+        } else {
+            LOGI("apply_internal_login: term {} isn't newer than the session's {} -- ignored (client_token={})", term,
+                 state_.term, client_token);
+        }
     }
+    if (!newer) co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
     if (auto r = co_await persist_state(); !r) {
         LOGE("apply_internal_login: persisting session term={} failed: {} -- new session NOT admitted", term,
              r.error().message());
         co_return r;
     }
     std::lock_guard lk{state_mu_};
-    state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
-    // A new session starts with no confirmed prefix of its own.
-    if (term > state_.term) client_commit_lsn_ = -1;
-    // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
-    // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting
-    // log order blindly.
-    state_.term = std::max(state_.term, term);
-    LOGD("apply_internal_login client_token={} term={}", client_token, state_.term);
+    // Still newer: the session changes only here, one entry at a time, and at restore before the queue runs.
+    state_.client_token = client_token;
+    state_.term = term;
+    client_commit_lsn_ = -1; // a new session starts with no confirmed prefix of its own
+    LOGD("apply_internal_login client_token={} term={}", client_token, term);
     co_return ok();
 }
 

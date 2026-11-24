@@ -1046,10 +1046,7 @@ protected:
         CraftPreResolutionTest::SetUp();
         dev_->set_peer_fetcher(&fetcher_);
         fetcher_.response = {QuorumSlotResponse{}}; // one responder holding nothing
-        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
-            cintrusive< homestore::repl_req_ctx > ctx{};
-            dev_->raft_listener().on_commit(1, h, k, {}, ctx);
-        };
+        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) { loop_back(proposer_, *dev_, h, k); };
     }
 
     auto do_append(int64_t sync_to, uint64_t token = 0) {
@@ -1079,14 +1076,16 @@ protected:
         dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
+    // A Sync from this member's current session.
     void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, empty_slots);
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
+    // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
     void commit_login(uint64_t term) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 7, .term = term};
+        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
         commit_entry(CraftEntryType::InternalLogin, key);
     }
 };
@@ -1142,8 +1141,7 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     dev_->seed_term(1);
     dev_->seed_lsns(5, {});
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
-        cintrusive< homestore::repl_req_ctx > ctx{};
-        dev_->raft_listener().on_commit(1, h, k, {}, ctx);
+        loop_back(proposer_, *dev_, h, k);
         dev_->seed_term(2);
     };
 
@@ -1152,6 +1150,35 @@ TEST_F(CraftAppendTest, LoginDuringProposalFailsWithStaleTerm) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
+}
+
+// The entry carries the session it was proposed in, so a login committed ahead of it can reject it.
+TEST_F(CraftAppendTest, AppendProposesTheCallersSessionTerm) {
+    dev_->seed_term(2);
+    dev_->seed_lsns(5, {});
+
+    auto r = do_append(5);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).term, 2u);
+}
+
+// Unlike a login that commits behind the round's Sync (above), one that commits ahead of it replaces the session the
+// Sync was proposed in: the Sync is rejected, and the watermark doesn't move.
+TEST_F(CraftAppendTest, LoginCommittedAheadOfTheRoundsSyncRejectsIt) {
+    dev_->seed_lsns(5, {});
+    proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+        commit_login(/*term=*/1);
+        loop_back(proposer_, *dev_, h, k);
+    };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), -1);
+    EXPECT_EQ(dev_->term(), 1u);
 }
 
 // An allocation failure lets pre-resolution return without noticing the term moved; with nothing to propose,
@@ -1324,7 +1351,7 @@ TEST_F(CraftAppendTest, NoFreshEmptyAtOrBelowAppliedWatermark) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
-    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, {});
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/5, /*client_token=*/0, /*term=*/0, {});
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
@@ -1367,7 +1394,7 @@ TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsRejectedAndFreed) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
-    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, {0});
+    serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, /*term=*/0, {0});
     journal_->on_write = [&](int64_t lsn) {
         if (lsn != 0) return;
         cintrusive< homestore::repl_req_ctx > ctx{};
@@ -1393,7 +1420,7 @@ TEST_F(CraftAppendTest, WriteVotedEmptyWhileInFlightIsFreedOnlyOnceTheVerdictIsD
         std::vector< uint8_t > header(sizeof(CraftEntryHeader));
         reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(1));
-        serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, {0});
+        serialize_sync_rs_commit_lsn(key.data(), /*rs_commit_lsn=*/0, /*client_token=*/0, /*term=*/0, {0});
         journal_->on_write = [&](int64_t lsn) {
             if (lsn != 0) return;
             cintrusive< homestore::repl_req_ctx > ctx{};
@@ -1631,7 +1658,7 @@ TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 9, .term = 2};
+    serialize_internal_login(key.data(), /*client_token=*/9, /*term=*/2, /*rs_commit_lsn=*/-1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
@@ -1687,7 +1714,7 @@ TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 99, .term = 4};
+    serialize_internal_login(key.data(), /*client_token=*/99, /*term=*/4, /*rs_commit_lsn=*/-1);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
@@ -1891,7 +1918,7 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
     fetcher_.on_fetch = nullptr;
 }
 
-// ── fence matrix (SDSTOR-26655, SDSTOR-22889) ─────────────────────────────────
+// ── fence matrix (SDSTOR-26655, SDSTOR-22889, SDSTOR-22892) ───────────────────
 //
 // What each entry point does while a fence is up, and once it has settled. Each cell raises one fence and calls one
 // entry point, then settles the fence and calls it again. A new fence or entry point adds its cells here, so a change
@@ -1902,12 +1929,17 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
 //   queued_login  InternalLogin(term=5), committed with the apply queue paused; settles when it applies
 //   quiesce       a login poll (GetRSCommitLSN, is_login) at term 0; settles when the login's InternalLogin applies
 //   plain_poll    a watchdog poll (GetRSCommitLSN, not is_login), which fences nothing
+//   stale_login   InternalLogin(term=0), not newer than the session, committed with the apply queue paused; its apply
+//                 ignores it, so it fences nothing
 // Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
 // (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
+// A cell that proposes (resolve, append) tests the entry point's checks up to its proposal: with the apply queue
+// paused, the mock returns the proposal once its entry commits. That a proposal waits for its apply is tested in
+// test_craft_raft_entries.cpp (InternalLoginWaitsForSuspendedSyncApply).
 
 constexpr uint64_t k_new_term{5}; // the login's term
 
-enum class Fence { queued_sync, queued_login, quiesce, plain_poll };
+enum class Fence { queued_sync, queued_login, quiesce, plain_poll, stale_login };
 enum class Call { write, write_voided_slot, write_new_term, read, keep_alive, resolve, append, pre_resolve };
 
 struct FenceCell {
@@ -1947,6 +1979,14 @@ std::vector< FenceCell > fence_cells() {
         {"Quiesce_PreResolve", Fence::quiesce, Call::pre_resolve, {}, stale},
         // A watchdog poll never quiesces.
         {"Poll_Write", Fence::plain_poll, Call::write, {}, {}},
+        // A login that isn't newer neither fences the session at commit nor replaces it at apply. The entry points
+        // can't see the token it leaves alone: test_craft_raft_entries.cpp checks that.
+        {"StaleLogin_Write", Fence::stale_login, Call::write, {}, {}},
+        {"StaleLogin_Read", Fence::stale_login, Call::read, no_index, no_index},
+        {"StaleLogin_KeepAlive", Fence::stale_login, Call::keep_alive, {}, {}},
+        {"StaleLogin_Resolve", Fence::stale_login, Call::resolve, {}, {}},
+        {"StaleLogin_Append", Fence::stale_login, Call::append, {}, {}},
+        {"StaleLogin_PreResolve", Fence::stale_login, Call::pre_resolve, {}, {}},
     };
 }
 
@@ -1962,6 +2002,10 @@ protected:
             dev_->pause_apply();
             commit_login(k_new_term);
             break;
+        case Fence::stale_login:
+            dev_->pause_apply();
+            commit_login(/*term=*/0);
+            break;
         case Fence::quiesce:
         case Fence::plain_poll:
             ASSERT_TRUE(homeblocks::detail::sync_get(
@@ -1975,6 +2019,7 @@ protected:
         switch (GetParam().fence) {
         case Fence::queued_sync:
         case Fence::queued_login:
+        case Fence::stale_login:
             dev_->resume_apply();
             break;
         case Fence::quiesce:
