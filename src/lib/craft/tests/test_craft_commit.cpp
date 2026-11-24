@@ -60,6 +60,7 @@ public:
     int free_data_calls{0};
     homestore::blk_num_t next_blk_num{1000};
     std::optional< int64_t > fail_on_read; // if set, read_slot for that lsn returns an error
+    std::vector< int64_t > read_lsns;      // every lsn read_slot() was asked for, in order
     // Opt-in blocking gate for read_slot(), default open (no blocking) -- lets a test create a real,
     // observable window during rebuild_overlay()'s walk (e.g. to verify recovering_'s client-I/O gate
     // actually holds while a restart-triggered rebuild is still in flight), since this mock's other
@@ -109,6 +110,7 @@ public:
             std::unique_lock lk{read_gate_mu};
             read_gate_cv.wait(lk, [this] { return read_gate_open; });
         }
+        read_lsns.push_back(lsn);
         if (fail_on_read && *fail_on_read == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         auto it = slots.find(lsn);
@@ -346,6 +348,8 @@ TEST_F(CraftCommitTest, EmptySlotSkip) {
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_TRUE(index_.entries.count(0));
     EXPECT_TRUE(index_.entries.count(2));
+    // An Empty slot is stepped over without a journal read: its overlay extent, if any, says what to retire.
+    EXPECT_EQ(journal_->read_lsns, (std::vector< int64_t >{0, 2}));
 }
 
 // szmyd (PR #175 review, on the record but not filed inline): commit_impl's is_empty branch skips

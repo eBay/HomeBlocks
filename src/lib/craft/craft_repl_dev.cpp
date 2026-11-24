@@ -1407,18 +1407,11 @@ async_result< int64_t > CraftReplDev::commit_impl([[maybe_unused]] AsyncMutex::L
             // successfully using this replica as a holder. If that happened, write()'s post-flight
             // already created a real overlay entry for it that would otherwise never get retired
             // (permanently stale, and -- worse -- still SERVED on reads, since the overlay wins over
-            // the index within the horizon, directly contradicting the Empty verdict). read_slot()
-            // here is purely to discover the LBA range to retire, not to apply anything to the index.
-            // A read_slot() failure just means this replica never had this lsn locally either (the
-            // ordinary case: this lsn was this replica's OWN gap, resolved as empty because no
-            // replica anywhere held it) -- nothing to retire, not an error.
-            if (auto slot_r = co_await journal_->read_slot(lsn); slot_r) {
-                auto& slot = *slot_r;
-                if (uint32_t const nlbas = static_cast< uint32_t >(slot.len_bytes / lba_size_); nlbas > 0) {
-                    lba_t const start_lba = static_cast< lba_t >(slot.lba_off_bytes) / lba_size_;
-                    retire_overlay_range(start_lba, start_lba + nlbas - 1, lsn);
-                }
-            }
+            // the index within the horizon, directly contradicting the Empty verdict). The overlay's
+            // own extent for this lsn gives the range to retire, so the journal isn't read: usually this
+            // lsn was this replica's OWN gap, resolved as empty because no replica anywhere held it, and
+            // there's nothing to retire.
+            retire_overlay_slot(lsn);
         }
 
         final_commit_lsn = lsn; // no lock -- see final_commit_lsn's own doc comment above
