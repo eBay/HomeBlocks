@@ -254,6 +254,29 @@ protected:
         journal_->seed_block(blk_num, std::move(data));
     }
 
+    // Routes the device's own commits (a Sync's commit advance, write()'s piggyback) through index_, as a volume's
+    // index would be.
+    void use_fake_index() {
+        dev_->use_test_index(
+            [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+                return index_.write_to_index(s, e, info);
+            },
+            [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+                return index_.delete_lba_range(s, e, freed);
+            });
+    }
+
+    // Commits a SyncRSCommitLSN from this member's current session, as RAFT would; it applies unless the apply queue is
+    // busy.
+    void commit_sync(int64_t rs_commit_lsn, intrusive< homestore::repl_req_ctx > const& ctx = {}) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), {});
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    }
+
     auto do_read(int64_t read_lsn, lba_t lba, uint32_t nlbas) {
         dest_buf_.assign(nlbas * k_page_size, 0xFF); // non-zero filler so hole-zeroing is actually observable
         sisl::sg_list dest;
@@ -450,7 +473,7 @@ TEST_F(CraftCommitTest, DataApplyDecomposesMultiPieceBlkid) {
 }
 
 // A concurrent (here: reentrant, called synchronously from inside the outer commit's own write_fn
-// callback -- so commit_running_ is still true) commit invocation must be a safe no-op, not a
+// callback -- so commit_mu_ is still held) commit invocation must be a safe no-op, not a
 // second, overlapping application of the same range.
 TEST_F(CraftCommitTest, ConcurrentCommitIsNoOp) {
     dev_->seed_lsns(0, {});
@@ -1427,6 +1450,108 @@ TEST_F(CraftCommitTest, ReadMaxIoLenEnforced) {
         }));
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(std::errc::invalid_argument));
+}
+
+// ── a Sync's commit advance (SDSTOR-26759) ────────────────────────────────────
+
+// Two acked writes the client never piggybacked a commit for: a Sync that moves commit_lsn past them indexes them, so
+// they read back from the index once the read path stops serving them from the overlay.
+TEST_F(CraftCommitTest, SyncAdvanceIndexesTheSlotsItPasses) {
+    use_fake_index();
+    dev_->seed_lsns(-1, {});
+    ASSERT_TRUE(do_write_data(0, /*dlsn=*/0, /*lba=*/0, /*nlbas=*/1).has_value());
+    ASSERT_TRUE(do_write_data(0, /*dlsn=*/1, /*lba=*/1, /*nlbas=*/1).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), -1);
+
+    commit_sync(/*rs_commit_lsn=*/1);
+
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_TRUE(index_.entries.count(0));
+    EXPECT_TRUE(index_.entries.count(1));
+    EXPECT_EQ(dev_->overlay_lsn_for(1), -1);
+    auto r = do_read(/*read_lsn=*/1, /*lba=*/1, /*nlbas=*/1);
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_FALSE(r->extents[0].hole);
+    EXPECT_EQ(dest_buf_, std::vector< uint8_t >(k_page_size, 0xAB));
+}
+
+// A Sync applied while a commit run is still indexing waits for it, then advances commit_lsn itself: the run
+// finishing afterwards can't lower it.
+TEST_F(CraftCommitTest, SyncAdvanceWaitsOutARunningCommit) {
+    use_fake_index();
+    dev_->seed_lsns(5, {});
+    for (int64_t lsn = 0; lsn <= 5; ++lsn)
+        journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
+                                /*blk_num=*/static_cast< homestore::blk_num_t >(100 + lsn),
+                                {static_cast< homestore::csum_t >(lsn)});
+    bool synced = false;
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        4,
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            if (s == 2 && !synced) {
+                synced = true;
+                commit_sync(/*rs_commit_lsn=*/5);
+                EXPECT_LT(dev_->commit_lsn(), 5); // it waits for this run
+            }
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_TRUE(index_.entries.count(5));
+}
+
+// An index failure stops a Sync's advance just below the failing slot, as it does a piggybacked commit's. The apply
+// itself still succeeds: the advance is best effort, and a login sees commit_lsn short of its watermark.
+TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAnIndexFailure) {
+    dev_->use_test_index(
+        [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
+            if (s == 3) return std::unexpected(volume_error::INDEX_ERROR);
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        });
+    dev_->seed_lsns(5, {});
+    for (int64_t lsn = 0; lsn <= 5; ++lsn)
+        journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
+                                /*blk_num=*/static_cast< homestore::blk_num_t >(100 + lsn),
+                                {static_cast< homestore::csum_t >(lsn)});
+    auto const ctx = make_test_proposal_ctx();
+
+    commit_sync(/*rs_commit_lsn=*/5, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_TRUE(index_.entries.count(2));
+    EXPECT_FALSE(index_.entries.count(3));
+}
+
+// Same for a slot that can't be read back from the journal.
+TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAJournalReadFailure) {
+    use_fake_index();
+    dev_->seed_lsns(5, {});
+    for (int64_t lsn = 0; lsn <= 5; ++lsn)
+        journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
+                                /*blk_num=*/static_cast< homestore::blk_num_t >(100 + lsn),
+                                {static_cast< homestore::csum_t >(lsn)});
+    journal_->fail_on_read = 3;
+    auto const ctx = make_test_proposal_ctx();
+
+    commit_sync(/*rs_commit_lsn=*/5, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    EXPECT_TRUE(outcome->has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_TRUE(index_.entries.count(2));
+    EXPECT_FALSE(index_.entries.count(3));
 }
 
 } // namespace
