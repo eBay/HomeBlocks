@@ -355,7 +355,8 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
 #endif
 
 // HomeStore compacts a group's RAFT log. A member that falls behind the compaction needs a RAFT snapshot, which CRAFT
-// can't serve yet: the leader refuses to send it, and the member stays behind, its replica untouched.
+// can't serve yet: the leader refuses to send it, and the member stays behind, its replica untouched. So does a leader
+// that restarted since the compaction.
 TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(5);
@@ -386,6 +387,18 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
         }
         rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), true /* wait_for_commit */);
         g_barrier->publish(rd->get_last_commit_lsn());
+    }
+    ASSERT_TRUE(sync());
+
+    // The leader restarts, and is elected again (it created the group: the highest priority). The snapshot its log was
+    // compacted on comes back with it: without it, its nuraft would stop the process as member 2 asks for what the
+    // compaction dropped.
+    if (me() == 0) {
+        g_helper->restart();
+        ASSERT_TRUE(wait_until([&id] {
+            auto const rd = group(id);
+            return rd && rd->is_leader();
+        }));
     }
     ASSERT_TRUE(sync());
 

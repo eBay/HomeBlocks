@@ -87,7 +87,10 @@ void CraftGroupListener::on_rollback(int64_t lsn, sisl::blob const& header, sisl
     }
 }
 
-void CraftGroupListener::on_destroy(homestore::group_id_t const& group_id) { hb_->on_craft_group_destroyed(group_id); }
+void CraftGroupListener::on_destroy(homestore::group_id_t const& group_id) {
+    hb_->remove_craft_snapshot(group_id);
+    hb_->on_craft_group_destroyed(group_id);
+}
 
 static void log_member_change(homestore::group_id_t const& group_id, char const* event, std::string const& task_id,
                               homestore::replica_member_info const& out, homestore::replica_member_info const& in) {
@@ -136,12 +139,27 @@ int CraftGroupListener::read_snapshot_obj(std::shared_ptr< homestore::snapshot_c
 
 homestore::async_status CraftGroupListener::create_snapshot(std::shared_ptr< homestore::snapshot_context > context) {
     std::lock_guard lk{snapshot_mu_};
-    if (!last_snapshot_ || context->get_lsn() > last_snapshot_->get_lsn()) { last_snapshot_ = std::move(context); }
+    if (auto const last = last_snapshot_locked(); last && context->get_lsn() <= last->get_lsn()) {
+        co_return homestore::ok();
+    }
+    // Durable before nuraft compacts the log on it.
+    hb_->save_craft_snapshot(group_id_, *context);
+    last_snapshot_ = std::move(context);
     co_return homestore::ok();
 }
 
 std::shared_ptr< homestore::snapshot_context > CraftGroupListener::last_snapshot() {
     std::lock_guard lk{snapshot_mu_};
+    return last_snapshot_locked();
+}
+
+// After a restart, the one the group's record kept, until nuraft takes the next.
+std::shared_ptr< homestore::snapshot_context > CraftGroupListener::last_snapshot_locked() {
+    if (!last_snapshot_) {
+        if (auto ctx = hb_->craft_snapshot(group_id_); ctx.size() > 0) {
+            if (auto const rd = device()) { last_snapshot_ = rd->deserialize_snapshot_context(ctx); }
+        }
+    }
     return last_snapshot_;
 }
 

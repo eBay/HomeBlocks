@@ -115,6 +115,51 @@ void HomeBlocksImpl::on_craft_state_meta_blk_found(sisl::byte_view const& buf, v
     RELEASE_ASSERT(added, "two CRAFT state records for volume {}", boost::uuids::to_string(id));
 }
 
+void HomeBlocksImpl::on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie) {
+    superblk< craft_snapshot_sb_t > sb{craft_snapshot_meta_name};
+    sb.load(buf, static_cast< homestore::meta_blk* >(cookie));
+    // The CRC passed, so a bad header is a format bug: never rejoin a group without its snapshot.
+    RELEASE_ASSERT(
+        sb.size() >= sizeof(craft_snapshot_sb_t) && sb->magic == craft_snapshot_sb_t::k_magic &&
+            sb->version == craft_snapshot_sb_t::k_version && sb->ctx_len <= sb.size() - sizeof(craft_snapshot_sb_t),
+        "CRAFT snapshot record of {} bytes, magic {:#x} version {}: unknown format", sb.size(), sb->magic, sb->version);
+    volume_id_t const id = sb->group_id;
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto const [it, added] = craft_snapshot_sbs_.try_emplace(id, std::move(sb));
+    RELEASE_ASSERT(added, "two CRAFT snapshot records for group {}", boost::uuids::to_string(id));
+}
+
+sisl::io_blob_safe HomeBlocksImpl::craft_snapshot(volume_id_t const& group_id) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto const it = craft_snapshot_sbs_.find(group_id);
+    if (it == craft_snapshot_sbs_.end() || it->second->ctx_len == 0) { return {}; }
+    auto& sb = it->second;
+    sisl::io_blob_safe ctx{sb->ctx_len};
+    std::memcpy(ctx.bytes(), sb.raw_buf()->cbytes() + sizeof(craft_snapshot_sb_t), sb->ctx_len);
+    return ctx;
+}
+
+void HomeBlocksImpl::save_craft_snapshot(volume_id_t const& group_id, homestore::snapshot_context& ctx) {
+    auto const data = ctx.serialize();
+    std::lock_guard lk{craft_snapshot_mu_};
+    auto& sb = craft_snapshot_sbs_.try_emplace(group_id, craft_snapshot_meta_name).first->second;
+    // A new buffer each time, sized to this snapshot; the record keeps its meta blk.
+    sb.create(static_cast< uint32_t >(sizeof(craft_snapshot_sb_t) + data.size()));
+    sb->group_id = group_id;
+    sb->lsn = ctx.get_lsn();
+    sb->ctx_len = static_cast< uint32_t >(data.size());
+    std::memcpy(sb.raw_buf()->bytes() + sizeof(craft_snapshot_sb_t), data.cbytes(), data.size());
+    sb.write();
+}
+
+void HomeBlocksImpl::remove_craft_snapshot(volume_id_t const& group_id) {
+    std::lock_guard lk{craft_snapshot_mu_};
+    if (auto const it = craft_snapshot_sbs_.find(group_id); it != craft_snapshot_sbs_.end()) {
+        it->second.destroy();
+        craft_snapshot_sbs_.erase(it);
+    }
+}
+
 shared< hs_index_table_t > HomeBlocksImpl::recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb) {
     auto pid_str = boost::uuids::to_string(sb->parent_uuid); // parent_uuid is the volume id
     {

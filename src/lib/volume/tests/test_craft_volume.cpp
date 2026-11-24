@@ -733,6 +733,37 @@ TEST_F(CraftVolumeTest, GroupDestroyedAcrossRestartRemovesReplica) {
 #endif
 }
 
+// The group's last RAFT snapshot outlives a restart: nuraft reads it back as the group rejoins, and as a leader needs
+// it for a member behind the log compaction. Its record goes with the group.
+TEST_F(CraftVolumeTest, TheGroupsSnapshotSurvivesARestart) {
+    auto info = craft_vol_info("craft_vol_snapshot");
+    auto const id = info.id;
+    ASSERT_TRUE(create(std::move(info)));
+    ASSERT_TRUE(wait_until([&id] {
+        auto const rd = group(id);
+        return rd && rd->is_leader();
+    }));
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    int64_t lsn;
+    {
+        auto const rd = group(id);
+        rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), true /* wait_for_commit */);
+        ASSERT_TRUE(wait_until([&rd] { return rd->get_listener()->last_snapshot() != nullptr; }));
+        lsn = rd->get_listener()->last_snapshot()->get_lsn();
+    }
+
+    g_helper->restart();
+    auto const again = group(id);
+    ASSERT_NE(again, nullptr);
+    auto const restored = again->get_listener()->last_snapshot();
+    ASSERT_NE(restored, nullptr);
+    EXPECT_EQ(restored->get_lsn(), lsn);
+
+    remove(id);
+    EXPECT_EQ(std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->craft_snapshot(id).size(), 0u);
+}
+
 // After the group's destroy commits, its replica stays until HomeStore's reaper runs on_destroy (a minute in
 // production, a second here). A create retry in that window must not return it as created.
 TEST_F(CraftVolumeTest, CreateRetryWhileGroupIsDestroyedIsInProgress) {

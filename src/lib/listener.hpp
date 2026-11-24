@@ -118,14 +118,16 @@ public:
                           std::shared_ptr< homestore::snapshot_obj > snp_obj) override;
     bool apply_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
     // Each snapshot nuraft takes (every snapshot_freq_distance entries) holds its position alone: nuraft reads it back
-    // through last_snapshot() to compact the log, and dereferences it. Kept in memory: after a restart there is none
-    // until the next one, which nuraft tolerates.
+    // through last_snapshot() to compact the log, and as a leader to answer a member behind the compaction, where it
+    // stops the process if there is none. So it is kept in the group's record too, and read back from there after a
+    // restart: nuraft reads it once, as it starts the group's server, after HomeBlocks has read the records.
     homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context > context) override;
     std::shared_ptr< homestore::snapshot_context > last_snapshot() override;
 
 private:
     // The published CraftReplDev this group's entries go to, or null; held, it outlives a destroy's reset.
     shared< CraftReplDev > craft_device() const;
+    std::shared_ptr< homestore::snapshot_context > last_snapshot_locked();
 
     HomeBlocksImpl* hb_;
     homestore::group_id_t group_id_;

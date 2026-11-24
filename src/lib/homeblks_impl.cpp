@@ -514,6 +514,26 @@ void HomeBlocksImpl::on_init_complete() {
         nullptr /*recovery_comp_cb*/, true /* do_crc */);
     homestore::hs()->meta_service().read_sub_sb(craft_state_meta_name);
 
+    // CRAFT groups' last snapshots, before the groups rejoin: nuraft reads a group's once, as it starts its server. A
+    // group HomeStore dropped at this boot without calling on_destroy (its destroy pending at a crash) leaves its
+    // record: removed, or a group created again under that id would start from its snapshot.
+    homestore::hs()->meta_service().register_handler(
+        craft_snapshot_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_snapshot_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
+    homestore::hs()->meta_service().read_sub_sb(craft_snapshot_meta_name);
+    {
+        std::lock_guard lk{craft_snapshot_mu_};
+        std::erase_if(craft_snapshot_sbs_, [](auto& entry) {
+            if (homestore::hs()->repl_service().get_repl_dev(entry.first)) { return false; }
+            LOGI("CRAFT snapshot record of group {}, which is gone: removed", boost::uuids::to_string(entry.first));
+            entry.second.destroy();
+            return true;
+        });
+    }
+
     // volume SB
     homestore::hs()->meta_service().register_handler(
         volume::VOL_META_NAME,

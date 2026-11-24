@@ -45,6 +45,22 @@ struct hs_chunk_size_cfg_t {
     uint64_t data;
 };
 
+// The meta blk record holding a CRAFT RAFT group's last snapshot as HomeStore serializes it: this header, then ctx_len
+// bytes. One per group, removed with it.
+#pragma pack(push, 1)
+struct craft_snapshot_sb_t {
+    static constexpr uint64_t k_magic = 0x50414E53'54465243ull; // "CRFTSNAP" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    volume_id_t group_id{};
+    int64_t lsn{-1}; // the last RAFT entry it covers
+    uint32_t ctx_len{0};
+};
+#pragma pack(pop)
+inline const std::string craft_snapshot_meta_name{"CraftSnapshot"};
+
 // This node's metrics; each volume has its own (VolumeMetrics).
 class HomeBlocksMetrics : public sisl::MetricsGroup {
 public:
@@ -110,6 +126,10 @@ private:
     // CRAFT durable state records read at boot, by volume id, until their volumes take them. Only on_init_complete()
     // uses it, reading the records and then the volumes on one thread.
     std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > craft_state_sbs_;
+
+    // CRAFT RAFT groups' last snapshots, by group: read at boot, kept up to date by their listeners.
+    std::mutex craft_snapshot_mu_;
+    std::unordered_map< volume_id_t, superblk< craft_snapshot_sb_t > > craft_snapshot_sbs_; // guarded by the same
 
     // CRAFT reattaches started and not done yet, and what their waiters await: completed when the count drops to 0.
     std::mutex craft_reattach_mu_;
@@ -198,6 +218,11 @@ public:
     // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
     // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
     void on_craft_group_destroyed(volume_id_t const& id);
+    // CRAFT: a RAFT group's last snapshot, in its own record: nuraft takes one every snapshot_freq_distance entries and
+    // compacts the log on it, and needs it back after a restart. Empty if the group has none.
+    sisl::io_blob_safe craft_snapshot(volume_id_t const& group_id);
+    void save_craft_snapshot(volume_id_t const& group_id, homestore::snapshot_context& ctx);
+    void remove_craft_snapshot(volume_id_t const& group_id);
     // CRAFT: this member was elected leader of a volume's RAFT group. Without a replica here that serves, it would fail
     // every CRAFT op of the volume, so it hands leadership to another member. The hand-off runs on a worker, inline if
     // called on one: never with a lock held.
@@ -308,6 +333,7 @@ private:
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 
     void vol_gc();
 
