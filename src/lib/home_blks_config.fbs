@@ -57,7 +57,7 @@ table HomeBlksSettings{
 
     // CRAFT: deadline (in milliseconds) for a journal write to complete. HomeStore never completes one whose device
     // write failed (SDSTOR-24993): it fails timed_out instead, and the partition faults, as the write may still land.
-    // 0 = no deadline.
+    // Always a deadline: without one, such a write would hold what awaits it, and a shutdown, forever. 0 = the default.
     craft_journal_write_timeout_ms: uint32 = 30000;
 
     // CRAFT: a member without a volume's replica hands the group's RAFT leadership off when elected, but not again

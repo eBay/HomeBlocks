@@ -305,8 +305,10 @@ public:
             LOGE("write_async rejected lsn={}: log store or logdev is stopping; callback will not fire", lsn);
             co_return std::unexpected(make_error_condition(std::errc::operation_not_supported));
         }
-        if (auto const ms = HB_DYNAMIC_CONFIG(craft_journal_write_timeout_ms); ms > 0)
-            deadlines_.add(w, JournalWriteDeadlines::clock::now() + std::chrono::milliseconds{ms});
+        // Never without one: a write HomeStore never completes would hold what awaits it, and a shutdown, forever.
+        auto ms = HB_DYNAMIC_CONFIG(craft_journal_write_timeout_ms);
+        if (ms == 0) ms = homeblkscfg::HomeBlksSettingsT{}.craft_journal_write_timeout_ms;
+        deadlines_.add(w, JournalWriteDeadlines::clock::now() + std::chrono::milliseconds{ms});
         if (!co_await w->done) {
             LOGE("journal write lsn={} not completed within its deadline -- it may still land", lsn);
             co_return std::unexpected(std::make_error_condition(std::errc::timed_out));
