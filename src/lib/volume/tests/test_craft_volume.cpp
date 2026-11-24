@@ -691,15 +691,22 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
     auto alive = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_TRUE(alive) << alive.error().message();
+    auto const proposer = make_homestore_raft_proposer(group(id), g_helper->svc_id());
+    ASSERT_TRUE(wait_until([&proposer] { return proposer->is_leader(); }));
 
     ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
     // From the destroy on, not only once the reaper removes the replica, its CRAFT ops are refused.
     auto early = homeblocks::detail::sync_get(homeblocks::keep_alive(*vol, hdr));
     ASSERT_FALSE(early);
     EXPECT_EQ(early.error(), std::errc::operation_not_supported);
+    // Nor does a proposer read the group's RAFT server anymore, which the reaper frees: the device's watchdog, or a
+    // resolution resuming from an await, still asks until the volume's destroy stops it.
+    EXPECT_FALSE(proposer->is_leader());
+    EXPECT_TRUE(proposer->voters().empty());
 
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     ASSERT_TRUE(wait_for_group_gone(id));
+    EXPECT_FALSE(proposer->is_leader()) << "after the reaper";
 
     // The replica's CRAFT device went with it: a CRAFT op through a handle kept from before is refused.
     EXPECT_EQ((*vol)->craft_dev(), nullptr);

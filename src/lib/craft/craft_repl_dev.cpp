@@ -612,11 +612,15 @@ public:
     HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id) :
             rd_{std::move(rd)}, my_id_{replica_id} {}
 
-    bool is_leader() const override { return rd_->is_leader(); }
+    // The group's stage before its RAFT server, which the reaper frees a while after the destroy commits.
+    // ponytail: the check and the access aren't atomic; a guard needs HomeStore's accessors to count themselves in the
+    // drain its teardown waits for (protected today).
+    bool is_leader() const override { return !is_going_away(*rd_) && rd_->is_leader(); }
     craft::peer_id_t my_id() const override { return my_id_; }
     // get_replication_quorum() lists every config member, learners included; get_replication_status() (complete
     // only on the leader) says which of them can vote.
     std::vector< craft::peer_id_t > voters() const override {
+        if (is_going_away(*rd_)) return {};
         auto ids = rd_->get_replication_quorum();
         for (auto const& p : rd_->get_replication_status())
             if (!p.can_vote) std::erase(ids, p.id_);

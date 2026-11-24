@@ -241,9 +241,20 @@ public:
     virtual ~CraftRaftProposer() = default;
 };
 
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
+// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+inline bool is_going_away(homestore::repl_dev const& group) {
+    auto const stage = group.get_stage();
+    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
+        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
+}
+
 // Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
 // replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
+// Once the group is going away it answers not leader and no voters: the reaper frees the group's RAFT server
+// repl_dev_cleanup_interval_sec later, while the device (its watchdog's ticks, a resolution resuming from an await)
+// may still ask until the volume's destroy stops it, which follows the reaper.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
 
 // The deadlines (craft_journal_write_timeout_ms) of a journal's writes in flight. HomeStore never completes a journal
