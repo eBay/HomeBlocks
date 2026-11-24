@@ -586,7 +586,17 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
         sync_lsn_interval_{static_cast< int64_t >(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval))},
-        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
+        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {
+    // Built once: every write's piggybacked commit uses them.
+    if (indx_tbl_) {
+        index_ops_ = IndexOps{[this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+                                  return indx_tbl_->write_to_index(s, e, info);
+                              },
+                              [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+                                  return indx_tbl_->delete_lba_range(s, e, freed);
+                              }};
+    }
+}
 
 CraftReplDev::~CraftReplDev() {
     // iomgr::timer_token::cancel(wait=true) is a no-op if the watchdog was never armed (watchdog disabled
@@ -1233,12 +1243,12 @@ async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
     // A run already active covers the same ground. With no index configured (write-path-only tests), there's nothing
     // to apply.
     auto lock = commit_mu_.try_lock();
-    auto const index = lock ? index_ops() : std::nullopt;
+    auto const* index = lock ? index_ops() : nullptr;
     if (!index) {
         std::lock_guard lk{state_mu_};
         co_return state_.commit_lsn;
     }
-    co_return co_await commit_impl(*lock, upto_lsn, &*index);
+    co_return co_await commit_impl(*lock, upto_lsn, index);
 }
 
 #ifdef _PRERELEASE
@@ -1254,21 +1264,9 @@ async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_
 }
 
 void CraftReplDev::use_test_index(write_index_fn_t write_fn, delete_index_fn_t delete_fn) {
-    test_index_ = IndexOps{std::move(write_fn), std::move(delete_fn)};
+    index_ops_ = IndexOps{std::move(write_fn), std::move(delete_fn)};
 }
 #endif
-
-std::optional< CraftReplDev::IndexOps > CraftReplDev::index_ops() const {
-    if (indx_tbl_) {
-        return IndexOps{[tbl = indx_tbl_](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
-                            return tbl->write_to_index(s, e, info);
-                        },
-                        [tbl = indx_tbl_](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
-                            return tbl->delete_lba_range(s, e, freed);
-                        }};
-    }
-    return test_index_;
-}
 
 // A Sync's commit advance: waits for a running commit, then runs its own, so each slot it steps over reaches the index
 // and nothing can lower commit_lsn afterwards. Best effort, like the catch-up before it: a slot that can't be indexed
@@ -1276,8 +1274,7 @@ std::optional< CraftReplDev::IndexOps > CraftReplDev::index_ops() const {
 async_status CraftReplDev::advance_commit_for_sync(int64_t rs_commit_lsn) {
     auto self = shared_from_this();
     auto const lock = co_await commit_mu_.lock();
-    auto const index = index_ops();
-    if (auto r = co_await commit_impl(lock, rs_commit_lsn, index ? &*index : nullptr); !r)
+    if (auto r = co_await commit_impl(lock, rs_commit_lsn, index_ops()); !r)
         LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped: {}", rs_commit_lsn, r.error().message());
     co_return ok();
 }

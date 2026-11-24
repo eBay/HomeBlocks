@@ -814,8 +814,8 @@ private:
     // double (commit_with(), use_test_index()), or null with no index (write-path-only tests), where it only steps
     // over each slot and retires its overlay entry.
     async_result< int64_t > commit_impl(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index);
-    // The index commits apply to: indx_tbl_'s, else the test double use_test_index() set, else none.
-    std::optional< IndexOps > index_ops() const;
+    // The index commits apply to, or null with none.
+    IndexOps const* index_ops() const { return index_ops_ ? &*index_ops_ : nullptr; }
 
     // Must be called with state_mu_ held. Returns true if commit_lsn_snapshot has crossed
     // checkpoint_lsn_interval_ since last_checkpoint_lsn_ -- and if so, updates last_checkpoint_lsn_ to
@@ -920,7 +920,9 @@ private:
     // Held by the one commit_impl() run allowed at a time, the only writer of commit_lsn: a piggybacked commit
     // try_lock()s and skips, a Sync's advance lock()s and waits its turn.
     AsyncMutex commit_mu_;
-    std::optional< IndexOps > test_index_; // set by use_test_index(); used only when indx_tbl_ is null
+    // indx_tbl_'s operations, built once in the constructor; or the test double use_test_index() set; or none
+    // (write-path-only tests).
+    std::optional< IndexOps > index_ops_;
     // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
     // to commit_lsn when the run ends. Guarded by state_mu_.
     int64_t indexing_lsn_{-1};
