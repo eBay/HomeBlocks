@@ -309,7 +309,8 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
 //
 // The result is true only when a checkpoint that started during the call has completed: everything applied to the
 // index before the call is then durable. false means the request coalesced with a flush already running (force=false),
-// which may not cover the index as of the call. The durable commit frontier moves only on true.
+// which may not cover the index as of the call, or that HomeStore hasn't finished starting, so a checkpoint wouldn't
+// cover the blocks' allocations. The durable commit frontier moves only on true.
 using checkpoint_trigger_fn_t = std::function< async_result< bool >(bool force) >;
 
 // Factory that wraps homestore::cp_mgr() (there is exactly one CPManager per HomeStore instance,

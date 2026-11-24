@@ -491,6 +491,11 @@ unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::
 // Thin wrapper over homestore::cp_mgr(). One instance is shared by every volume's CraftReplDev.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
     return [](bool force) -> async_result< bool > {
+        // None while HomeStore starts: its data service registers for checkpoints only after the log replay, and a
+        // partition reattached once its journal replays may already apply slots by then. Such a checkpoint wouldn't
+        // persist their blocks' allocations, yet the durable commit frontier it advanced would keep a restart from
+        // committing them again. As if coalesced: a later trigger moves the frontier.
+        if (homestore::hs()->is_initializing()) co_return false;
         // true: this call switched over a new checkpoint and its flush completed.
         if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return true;
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
