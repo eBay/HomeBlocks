@@ -659,9 +659,16 @@ sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vo
         co_await *held;
     }
 #endif
-    if (auto const r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid()); !r) {
-        COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
-    }
+    // A recovery that throws fails as any other, its fault durable (CraftReplDev::recover()). Anything else escaping
+    // here would leave the partition without a device and the entries held for it unsaved: the process stops rather
+    // than release the count, which would let a checkpoint cover them. Its restart recovers the partition again.
+    status r;
+    try {
+        r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid());
+    } catch (std::exception const& e) {
+        RELEASE_ASSERT(false, "CRAFT volume {}: its reattach threw: {}", vol->id_str(), e.what());
+    } catch (...) { RELEASE_ASSERT(false, "CRAFT volume {}: its reattach threw", vol->id_str()); }
+    if (!r) { COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1); }
     end_craft_reattach();
 }
 

@@ -2528,6 +2528,26 @@ TEST_F(CraftRaftEntriesTest, RestartFaultsOnAJournalReadError) {
     EXPECT_TRUE(dev_->is_faulted());
 }
 
+// A journal read that throws fails the recovery as one that returns an error does, the fault durable: escaping
+// recover(), the exception would leave the volume's reattach, and with it init and every checkpoint, waiting forever.
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnAJournalReadThatThrows) {
+    struct ThrowingReadJournal : MockCraftJournalBackend {
+        async_result< JournalSlot > read_slot(int64_t) override {
+            throw std::runtime_error("read_slot threw");
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        }
+    };
+    auto journal = std::make_unique< ThrowingReadJournal >();
+    journal->slots = page_slots({0, 1, 2, 3});
+    auto store = std::make_unique< MockCraftStateStore >();
+    store->saved = sample_state();
+    auto const* const s = store.get();
+    dev_ = CraftReplDev::create(volume_id_t{}, std::move(journal), k_page_size, nullptr, std::move(store));
+    dev_->trigger_on_restart();
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(s->faulted) << "the state record carries the fault";
+}
+
 // Applying a slot journalled before the restart again must not free the block it replaces in the index: the index may
 // already hold a NEWER slot's block there (a checkpoint ran past the recorded frontier). A slot above the replay window
 // frees as usual (here deferred: there is a store).

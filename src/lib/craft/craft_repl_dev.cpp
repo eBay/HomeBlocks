@@ -2851,26 +2851,37 @@ void CraftReplDev::CraftRaftListener::on_restart() {
 // decision (or a future re-sync-from-peer mechanism) is required.
 async_status CraftReplDev::recover() {
     recovering_.store(true, std::memory_order_release);
-    // An image or journal tail that can't be read faults the partition just as a failed rebuild does: restarting it
-    // empty would forget its session and verdicts.
-    auto pending = co_await restore_state();
+    result< std::vector< CraftPendingEntry > > pending;
     status r;
-    if (!pending) {
-        r = std::unexpected(pending.error());
-    } else {
-        r = co_await rebuild_overlay();
-    }
-    // A Sync still queued frees, when it applies, the slots its verdicts voided: their blocks stay the allocator's
-    // until then (rebuild_overlay() skips Empty slots).
-    if (r) {
-        for (auto const& p : *pending) {
-            for (int64_t lsn : p.to_free) {
-                auto const slot = co_await journal_->read_slot(lsn);
-                if (!slot || slot->all_zeros) continue; // nothing held: nothing to free either
-                if (r = journal_->commit_data(slot->blkid, /* recovering = */ true); !r) break;
-            }
-            if (!r) break;
+    // A recovery that throws (a journal read HomeStore fails with an exception) fails like any other: escaping, the
+    // exception would leave the volume's reattach, and with it init and every checkpoint, waiting forever.
+    try {
+        // An image or journal tail that can't be read faults the partition just as a failed rebuild does: restarting
+        // it empty would forget its session and verdicts.
+        pending = co_await restore_state();
+        if (!pending) {
+            r = std::unexpected(pending.error());
+        } else {
+            r = co_await rebuild_overlay();
         }
+        // A Sync still queued frees, when it applies, the slots its verdicts voided: their blocks stay the
+        // allocator's until then (rebuild_overlay() skips Empty slots).
+        if (r) {
+            for (auto const& p : *pending) {
+                for (int64_t lsn : p.to_free) {
+                    auto const slot = co_await journal_->read_slot(lsn);
+                    if (!slot || slot->all_zeros) continue; // nothing held: nothing to free either
+                    if (r = journal_->commit_data(slot->blkid, /* recovering = */ true); !r) break;
+                }
+                if (!r) break;
+            }
+        }
+    } catch (std::exception const& e) {
+        LOGE("restart recovery threw: {}", e.what());
+        r = std::unexpected(std::make_error_condition(std::errc::io_error));
+    } catch (...) {
+        LOGE("restart recovery threw an unknown exception");
+        r = std::unexpected(std::make_error_condition(std::errc::io_error));
     }
     if (!r) {
         LOGE("restart recovery failed: {} -- partition permanently faulted, will "
