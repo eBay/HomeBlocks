@@ -293,7 +293,7 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
 
     {
         auto lg = std::scoped_lock(vol_lock_);
-        creating_vols_.erase(id);
+        creating_vols_.erase(creating_vols_.find(id));
     }
     // Failed, it leaves no replica here, while the group may live on (a create retried on a member without one): an
     // election while it ran left leadership alone, so whether to hand it off is checked again.
@@ -494,24 +494,21 @@ void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
     if (is_shutting_down()) {
         LOGW("vol={} lsn={}: HomeBlocks is shutting down, no replica created here", vol_str, lsn);
     } else {
-        // In flight like a create, on every member (the one that received the create marked it already): until the
-        // replica is published, its group isn't one without a replica, a leadership won meanwhile stays here, and a
-        // create of the volume sent here waits.
+        // In flight like a create, on every member, with an entry of its own beside a create of the volume running
+        // here: until the replica is published, its group isn't one without a replica, a leadership won meanwhile stays
+        // here, and a create of the volume sent here waits.
         auto const id = entry->id;
-        bool marked;
         {
             auto lg = std::scoped_lock(vol_lock_);
-            marked = creating_vols_.insert(id).second;
+            creating_vols_.insert(id);
         }
         st = create_craft_volume_local(std::move(*entry));
-        if (marked) {
-            {
-                auto lg = std::scoped_lock(vol_lock_);
-                creating_vols_.erase(id);
-            }
-            // Failed, it leaves no replica here: an election meanwhile left leadership alone, so it is checked again.
-            if (!st) on_craft_group_leader(id);
+        {
+            auto lg = std::scoped_lock(vol_lock_);
+            creating_vols_.erase(creating_vols_.find(id));
         }
+        // Failed, it leaves no replica here: an election meanwhile left leadership alone, so it is checked again.
+        if (!st) on_craft_group_leader(id);
     }
     dec_ref();
     if (!st) { LOGE("vol={} lsn={}: failed to create the volume locally: {}", vol_str, lsn, st.error().message()); }

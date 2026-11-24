@@ -115,8 +115,9 @@ private:
     /// volume management
     mutable std::shared_mutex vol_lock_;
     std::unordered_map< volume_id_t, volume_handle > vol_map_;
-    // CRAFT creates, and CreateVolume applies, in flight on this node (guarded by vol_lock_)
-    std::unordered_set< volume_id_t > creating_vols_;
+    // CRAFT creates, and CreateVolume applies, in flight on this node: an entry each, so one that ends never clears
+    // another's (guarded by vol_lock_)
+    std::unordered_multiset< volume_id_t > creating_vols_;
 
     // Index tables recovered and not yet installed in a volume: volume id -> {table, its ordinal}. A volume takes its
     // table at load; one left by a create that crashed stays, holding its ordinal, until that volume's next create
