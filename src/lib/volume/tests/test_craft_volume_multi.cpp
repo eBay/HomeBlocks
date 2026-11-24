@@ -401,13 +401,15 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
 
     // The leader restarts and takes leadership back: nuraft may elect member 1 meanwhile, as it weighs priorities only
     // to start an election. The snapshot its log was compacted on comes back with it: without it, its nuraft would stop
-    // the process as member 2 asks for what the compaction dropped.
+    // the process as member 2 asks for what the compaction dropped. Asked until it leads: become_leader() fails when
+    // nuraft elects this member while it asks, which then asks in vain until its deadline.
     if (me() == 0) {
         g_helper->restart();
         auto const rd = group(id);
         ASSERT_NE(rd, nullptr);
-        ASSERT_TRUE(homeblocks::detail::sync_get(rd->become_leader()));
-        ASSERT_TRUE(rd->is_leader());
+        ASSERT_TRUE(wait_until([&rd] {
+            return rd->is_leader() || (homeblocks::detail::sync_get(rd->become_leader()) && rd->is_leader());
+        }));
     }
     ASSERT_TRUE(sync());
 
