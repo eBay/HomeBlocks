@@ -321,7 +321,8 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
 // The result is true only when a checkpoint that started during the call has completed: everything applied to the
 // index before the call is then durable. false means the request coalesced with a flush already running (force=false),
 // which may not cover the index as of the call, or that HomeStore hasn't finished starting, so a checkpoint wouldn't
-// cover the blocks' allocations. The durable commit frontier moves only on true.
+// cover the blocks' allocations. The durable commit frontier moves only on true. Forced, a call that finds a flush
+// running waits for the one checkpoint HomeStore runs after it, shared by every forced call meanwhile.
 using checkpoint_trigger_fn_t = std::function< async_result< bool >(bool force) >;
 
 // Factory that wraps homestore::cp_mgr() (there is exactly one CPManager per HomeStore instance,
@@ -1047,14 +1048,17 @@ private:
     // awaits (via detail::detach) and must not run with the lock held.
     bool checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot);
 
-    // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
-    // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
-    // same commit_lsn_snapshot. Safe without state_mu_ held. Shared by every commit_lsn-advance path:
-    // commit_impl() (covers write()'s piggyback, keep_alive() and the SyncRSCommitLSN apply) and
-    // finish_sync_rs_commit_lsn()'s walk-forward loop, which runs only without an index.
-    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
-    // Fires the trigger again for the frontier of one that didn't checkpoint (checkpoint_retry_lsn_), from
-    // expire_overdue(): a partition that goes idle would otherwise pin its journal and superseded blocks.
+    // Fires checkpoint_trigger_ detached (fire-and-forget); unforced, it coalesces with any flush already in
+    // flight. Call only when checkpoint_interval_crossed_locked() just returned true for the same
+    // commit_lsn_snapshot, or from retry_checkpoint(). Safe without state_mu_ held. Shared by every
+    // commit_lsn-advance path: commit_impl() (covers write()'s piggyback, keep_alive() and the SyncRSCommitLSN
+    // apply) and finish_sync_rs_commit_lsn()'s walk-forward loop, which runs only without an index.
+    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot, bool force = false);
+    // Fires the trigger again, forced, for the frontier of one that didn't checkpoint (checkpoint_retry_lsn_), from
+    // expire_overdue(): a partition that goes idle would otherwise pin its journal and superseded blocks. HomeBlocks'
+    // sweep retries every partition in one pass, and the forced triggers that find a flush running share the one
+    // checkpoint HomeStore runs after it: partitions whose triggers coalesced together don't take one checkpoint each,
+    // every one saving every partition's state.
     void retry_checkpoint();
 
     // ── durable state (S8) ──

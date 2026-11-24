@@ -2227,7 +2227,8 @@ TEST_F(CraftRaftEntriesTest, CoalescedCheckpointDoesNotRecordTheDurableCommit) {
 }
 
 // A trigger that didn't checkpoint (coalesced, failed, or while HomeStore started) is tried again by HomeBlocks' sweep,
-// so the frontier moves even if no more slots commit; once it has, the sweep leaves it.
+// so the frontier moves even if no more slots commit; once it has, the sweep leaves it. The retry is forced: the
+// partitions retried in one sweep share the checkpoint HomeStore runs after the one in flight.
 TEST_F(CraftRaftEntriesTest, ACheckpointThatDidNotHappenIsTriedAgain) {
     with_store();
     dev_->set_checkpoint_trigger(std::ref(trigger_));
@@ -2236,10 +2237,12 @@ TEST_F(CraftRaftEntriesTest, ACheckpointThatDidNotHappenIsTriedAgain) {
     dev_->seed_lsns(10, {});
     ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
     ASSERT_EQ(dev_->durable_state().durable_commit_lsn, -1);
+    EXPECT_FALSE(trigger_.last_force) << "crossing the interval coalesces with a checkpoint in flight";
 
     trigger_.fail_next = true;
     dev_->expire_overdue();
     EXPECT_EQ(trigger_.call_count, 2);
+    EXPECT_TRUE(trigger_.last_force);
     EXPECT_EQ(dev_->durable_state().durable_commit_lsn, -1);
 
     trigger_.flushed = true;

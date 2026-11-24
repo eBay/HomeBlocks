@@ -502,8 +502,8 @@ checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
         if (co_await homestore::cp_mgr().trigger_cp_flush(force)) co_return true;
         // cp_mgr().trigger_cp_flush() returns false, synchronously, when a flush is already in
         // progress (cp_mgr.cpp: m_in_flush_phase). That's expected and harmless when force=false
-        // (this trigger's only current caller, fire_checkpoint_trigger, coalesces with any in-flight
-        // flush on purpose). Only a force=true false return is a real failure worth surfacing.
+        // (fire_checkpoint_trigger coalesces with any in-flight flush on purpose). Only a force=true
+        // false return is a real failure worth surfacing.
         if (!force) co_return false;
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
     };
@@ -1320,16 +1320,16 @@ bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapsho
     return true;
 }
 
-void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
+void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot, bool force) {
     if (!checkpoint_trigger_) {
         LOGW("commit_lsn={} crossed checkpoint interval but no checkpoint_trigger_ wired -- skipping",
              commit_lsn_snapshot);
         return;
     }
-    // force=false: let this coalesce with any checkpoint already in flight rather than forcing
-    // back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment).
-    // Detached (fire-and-forget): nothing here depends on the flush completing. A failure is logged,
-    // not propagated, same posture as catch-up/fetch failures elsewhere in this class.
+    // Unforced (a commit crossing the interval): let this coalesce with any checkpoint already in flight rather
+    // than forcing back-to-back flushes under high commit throughput (see checkpoint_trigger_fn_t's doc comment);
+    // retry_checkpoint() forces. Detached (fire-and-forget): nothing here depends on the flush completing. A
+    // failure is logged, not propagated, same posture as catch-up/fetch failures elsewhere in this class.
     {
         std::lock_guard lk{state_mu_};
         if (checkpoints_stopped_) return; // stop(): nothing here touches HomeStore anymore
@@ -1337,12 +1337,12 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
     }
     // Parameters, not captures: a coroutine lambda's captures live in the temporary closure, which is gone by
     // the time the coroutine resumes.
-    detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot) -> async_status {
+    detail::detach([](shared< CraftReplDev > self, int64_t commit_lsn_snapshot, bool force) -> async_status {
         struct done_t {
             CraftReplDev* dev;
             ~done_t() { dev->checkpoint_done(); }
         } const done{self.get()}; // on every way out
-        auto cp = co_await self->checkpoint_trigger_(false);
+        auto cp = co_await self->checkpoint_trigger_(force);
         if (!cp) LOGE("checkpoint trigger failed at commit_lsn={}: {}", commit_lsn_snapshot, cp.error().message());
         if (cp && *cp) co_return co_await self->advance_durable_commit(commit_lsn_snapshot);
         // Failed, coalesced into a flush that was already running (it may predate some of the slots applied up to
@@ -1353,7 +1353,7 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
             self->checkpoint_retry_lsn_ = std::max(self->checkpoint_retry_lsn_, commit_lsn_snapshot);
         }
         co_return ok();
-    }(shared_from_this(), commit_lsn_snapshot));
+    }(shared_from_this(), commit_lsn_snapshot, force));
 }
 
 // Not while a trigger runs, and not once a later one covered the frontier.
@@ -1368,7 +1368,7 @@ void CraftReplDev::retry_checkpoint() {
         if (checkpoints_running_ > 0) return;
         lsn = std::exchange(checkpoint_retry_lsn_, -1);
     }
-    fire_checkpoint_trigger(lsn);
+    fire_checkpoint_trigger(lsn, /* force = */ true);
 }
 
 void CraftReplDev::checkpoint_done() {
