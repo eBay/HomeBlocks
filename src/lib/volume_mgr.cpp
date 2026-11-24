@@ -729,6 +729,10 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     auto const rd = homestore::hs()->repl_service().get_repl_dev(id);
     // Its stage before its RAFT server: once a destroyed group's reaper has run, the server is freed, and is_leader()
     // would read freed memory.
+    // ponytail: the check and the calls after it aren't atomic. The reaper frees the server
+    // repl_dev_cleanup_interval_sec (a minute) after the destroy commits, so this would have to stall that long in
+    // between; a guard needs HomeStore's is_leader() and yield_leadership() to count themselves in the drain its
+    // teardown waits for (protected today).
     if (!rd || is_going_away(**rd) || !(*rd)->is_leader() || (*rd)->get_replication_quorum().size() < 2) {
         return forget();
     }
