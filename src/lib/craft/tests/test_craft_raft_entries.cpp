@@ -2391,6 +2391,26 @@ TEST_F(CraftRaftEntriesTest, RestartSkipsEntriesAppliedBeforeIt) {
     EXPECT_EQ(dev_->term(), 8u);
 }
 
+// commit_lsn comes back from the durable commit frontier, but a checkpoint flushes the index whenever it runs: after a
+// restart the index may hold any slot the journal held. A read below them is stale, as below commit_lsn: the index may
+// answer it with a newer slot's block.
+TEST_F(CraftRaftEntriesTest, RestartRefusesReadsBelowWhatTheIndexMayHold) {
+    restart(sample_state(), page_slots({0, 1, 2, 3})); // durable commit frontier 1, journal tail 3
+    ASSERT_EQ(dev_->commit_lsn(), 1);
+    auto read_at = [this](int64_t read_lsn) {
+        std::vector< uint8_t > buf(k_page_size);
+        sisl::sg_list dest;
+        dest.size = buf.size();
+        dest.iovs.push_back(iovec{buf.data(), buf.size()});
+        return homeblocks::detail::sync_get(dev_->read_with(read_lsn, /*addr=*/100 * k_page_size, k_page_size,
+                                                            std::move(dest), [](lba_t, lba_t, auto&) { return ok(); }));
+    };
+    auto const stale = read_at(2);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), make_error_condition(volume_error::HORIZON_STALE));
+    EXPECT_TRUE(read_at(3).has_value());
+}
+
 // An image that can't be read, or a journal tail that can't be read, faults the partition: restarting it empty would
 // forget its session and verdicts.
 TEST_F(CraftRaftEntriesTest, RestartFaultsOnAnUnreadableImage) {

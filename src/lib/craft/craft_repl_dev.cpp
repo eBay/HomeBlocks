@@ -1825,9 +1825,13 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     lba_t const end_lba = start_lba + nlbas - 1;
 
     int64_t commit_lsn_snapshot;
+    int64_t index_horizon;
     {
         std::lock_guard lk{state_mu_};
         commit_lsn_snapshot = state_.commit_lsn;
+        // After a restart the index may also hold slots above commit_lsn, up to replay_upto_: a checkpoint flushes the
+        // index whenever it runs, while commit_lsn comes back from the durable commit frontier.
+        index_horizon = std::max(commit_lsn_snapshot, replay_upto_);
     }
     // read_lsn and hdr.commit_lsn arrive in the same frame with nothing coupling them: read()'s own
     // piggyback commit (or a concurrent write()/keep_alive()'s) can advance commit_lsn_snapshot past
@@ -1836,9 +1840,10 @@ async_result< craft::read_result > CraftReplDev::read_impl(int64_t read_lsn, uin
     // comment) -- so there is nothing left on this replica to serve read_lsn correctly. Reject rather
     // than silently returning the too-new index value (CRAFT-Design: "writes above H are ignored even
     // if the replica holds them").
-    if (read_lsn < commit_lsn_snapshot) {
-        LOGW("read rejected: read_lsn={} is below commit_lsn={} -- horizon already advanced, unanswerable", read_lsn,
-             commit_lsn_snapshot);
+    if (read_lsn < index_horizon) {
+        LOGW("read rejected: read_lsn={} is below what the index may hold ({}, commit_lsn={}) -- horizon already "
+             "advanced, unanswerable",
+             read_lsn, index_horizon, commit_lsn_snapshot);
         co_return std::unexpected(make_error_condition(volume_error::HORIZON_STALE));
     }
 
