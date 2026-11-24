@@ -2074,9 +2074,10 @@ TEST_F(CraftRaftEntriesTest, InternalLoginPersistsTheSessionBeforeAdmittingIt) {
     EXPECT_EQ(store->saved->last_applied_raft_idx, 1);
 }
 
-// A session that can't be made durable isn't admitted here. Later entries still apply, and the next image that is
-// written holds the committed login's session: a restart admits it.
-TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureDoesNotAdmit) {
+// A session the group committed that can't be made durable here isn't admitted, and the partition faults: deciding
+// later logins against the session the others moved past, it would admit a second login at that term, which every
+// other replica ignores.
+TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureFaultsThePartition) {
     auto* store = with_store();
     commit(1, make_header(CraftEntryType::InternalLogin), make_internal_login_key(42, 3));
     ASSERT_EQ(store->saved->last_applied_raft_idx, 1);
@@ -2084,14 +2085,13 @@ TEST_F(CraftRaftEntriesTest, InternalLoginPersistFailureDoesNotAdmit) {
     store->fail_persist = true;
     commit(2, make_header(CraftEntryType::InternalLogin), make_internal_login_key(43, 5));
     EXPECT_EQ(dev_->term(), 3u) << "admitted although not durable";
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(store->faulted);
 
     store->fail_persist = false;
-    commit(3, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {}, /*term=*/5));
-    EXPECT_EQ(dev_->last_append_lsn(), 2);
-    EXPECT_EQ(store->saved->sync_watermark, 2);
-    EXPECT_EQ(store->saved->last_applied_raft_idx, 3);
-    EXPECT_EQ(store->saved->term, 5u);
-    EXPECT_EQ(store->saved->client_token, 43u);
+    commit(3, make_header(CraftEntryType::InternalLogin), make_internal_login_key(44, 5));
+    EXPECT_EQ(dev_->term(), 3u) << "a second login at the same term admitted";
+    EXPECT_EQ(dev_->client_token(), 42u);
 }
 
 // A Sync's verdicts and watermark are durable before any block a verdict voids is freed.

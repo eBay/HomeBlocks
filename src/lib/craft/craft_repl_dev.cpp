@@ -3864,7 +3864,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 //
 // A newer session is made durable before it is admitted: once a write of it is acked, a restart must come back with
 // its term, or the old session's writes would be admitted again. If persisting fails the session isn't admitted (the
-// login fence raised at commit keeps the old one out), the apply fails, and a restart applies this entry again.
+// login fence raised at commit keeps the old one out), and the partition faults: deciding later logins against a
+// session the others moved past, it would admit one at this term that every other replica ignores.
 
 async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
     bool newer;
@@ -3881,8 +3882,10 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
     }
     if (!newer) co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
     if (auto r = co_await persist_state(); !r) {
-        LOGE("apply_internal_login: persisting session term={} failed: {} -- new session NOT admitted", term,
-             r.error().message());
+        LOGE("apply_internal_login: persisting session term={} failed: {} -- new session NOT admitted, partition "
+             "faulted",
+             term, r.error().message());
+        fault();
         co_return r;
     }
     std::lock_guard lk{state_mu_};
