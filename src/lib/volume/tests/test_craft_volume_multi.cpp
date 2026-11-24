@@ -390,15 +390,15 @@ TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
     }
     ASSERT_TRUE(sync());
 
-    // The leader restarts, and is elected again (it created the group: the highest priority). The snapshot its log was
-    // compacted on comes back with it: without it, its nuraft would stop the process as member 2 asks for what the
-    // compaction dropped.
+    // The leader restarts and takes leadership back: nuraft may elect member 1 meanwhile, as it weighs priorities only
+    // to start an election. The snapshot its log was compacted on comes back with it: without it, its nuraft would stop
+    // the process as member 2 asks for what the compaction dropped.
     if (me() == 0) {
         g_helper->restart();
-        ASSERT_TRUE(wait_until([&id] {
-            auto const rd = group(id);
-            return rd && rd->is_leader();
-        }));
+        auto const rd = group(id);
+        ASSERT_NE(rd, nullptr);
+        ASSERT_TRUE(homeblocks::detail::sync_get(rd->become_leader()));
+        ASSERT_TRUE(rd->is_leader());
     }
     ASSERT_TRUE(sync());
 
