@@ -200,6 +200,15 @@ TEST_F(CraftVolumeMultiTest, CreateReachesEveryMember) {
     auto rd = group(id);
     ASSERT_NE(rd, nullptr);
     EXPECT_EQ(rd->get_replication_quorum().size(), num_members());
+    // A follower's apply is in flight, as a create is, only until it has published the replica: a create retried
+    // there then hands that replica back.
+    if (me() != 0) {
+        EXPECT_TRUE(wait_until([&id] {
+            auto const again = homeblocks::detail::sync_get(hb()->create_volume(vol_info(1)));
+            auto const vol = hb()->get_volume(id);
+            return again && vol && *again == *vol;
+        }));
+    }
     ASSERT_TRUE(sync());
 }
 

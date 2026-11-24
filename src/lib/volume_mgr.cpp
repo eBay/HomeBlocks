@@ -262,7 +262,7 @@ async_result< volume_handle > HomeBlocksImpl::create_craft_volume(volume_info in
     {
         auto lg = std::scoped_lock(vol_lock_);
         // A create of this volume still in flight here decides it, even once its replica exists: it may yet time out
-        // and roll the group back.
+        // and roll the group back. So does its CreateVolume, while it applies here.
         if (creating_vols_.contains(id)) { co_return std::unexpected(std::errc::operation_in_progress); }
         if (auto it = vol_map_.find(id); it != vol_map_.end()) {
             // A replica whose group is gone or going is removed with it: e.g. a failed create whose CreateVolume still
@@ -494,7 +494,24 @@ void HomeBlocksImpl::on_create_volume_commit(int64_t lsn, sisl::blob const& key,
     if (is_shutting_down()) {
         LOGW("vol={} lsn={}: HomeBlocks is shutting down, no replica created here", vol_str, lsn);
     } else {
+        // In flight like a create, on every member (the one that received the create marked it already): until the
+        // replica is published, its group isn't one without a replica, a leadership won meanwhile stays here, and a
+        // create of the volume sent here waits.
+        auto const id = entry->id;
+        bool marked;
+        {
+            auto lg = std::scoped_lock(vol_lock_);
+            marked = creating_vols_.insert(id).second;
+        }
         st = create_craft_volume_local(std::move(*entry));
+        if (marked) {
+            {
+                auto lg = std::scoped_lock(vol_lock_);
+                creating_vols_.erase(id);
+            }
+            // Failed, it leaves no replica here: an election meanwhile left leadership alone, so it is checked again.
+            if (!st) on_craft_group_leader(id);
+        }
     }
     dec_ref();
     if (!st) { LOGE("vol={} lsn={}: failed to create the volume locally: {}", vol_str, lsn, st.error().message()); }
@@ -690,9 +707,9 @@ void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
 // it; RAFT may still elect it, as it has the whole log. So may a member whose replica can't serve the partition: its
 // device faulted, or never came back at a restart, or fault containment took the volume offline, or the whole node
 // (restricted: the CRAFT API refuses every op either way). Not while a create of the volume runs here (that create
-// needs this member to lead), nor while its device is being reattached, nor when alone in the group: there is nobody to
-// hand leadership to. A replica can also stop serving after the election (its device faults while it leads, or fails
-// its recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
+// needs this member to lead) or its CreateVolume applies here, nor while its device is being reattached, nor when alone
+// in the group: there is nobody to hand leadership to. A replica can also stop serving after the election (its device
+// faults while it leads, or fails its recovery): HomeBlocks' timer checks those every second (retry_craft_handoffs()).
 void HomeBlocksImpl::on_craft_group_leader(volume_id_t const& id) {
     if (is_shutting_down()) { return; }
     iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, id]() { hand_off_craft_leadership(id); });
