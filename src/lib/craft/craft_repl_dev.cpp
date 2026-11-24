@@ -2256,20 +2256,15 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 
     switch (entry.type) {
     case CraftEntryType::SyncRSCommitLSN: {
-        if (key.size() < sizeof(SyncRSCommitLSNPayload)) {
-            LOGE("on_commit lsn={} SyncRSCommitLSN key too small ({} bytes)", lsn, key.size());
+        auto sync = parse_sync_rs_commit_lsn(key);
+        if (!sync) {
+            LOGE("on_commit lsn={} SyncRSCommitLSN key malformed ({} bytes)", lsn, key.size());
             return invalid();
         }
-        auto parsed = parse_empty_slots(key);
-        if (!parsed) {
-            LOGE("on_commit lsn={} SyncRSCommitLSN malformed empty_slots", lsn);
-            return invalid();
-        }
-        const auto* payload = reinterpret_cast< const SyncRSCommitLSNPayload* >(key.cbytes());
-        entry.rs_commit_lsn = payload->rs_commit_lsn;
-        entry.client_token = payload->client_token;
-        entry.term = payload->term;
-        empty_slots = std::move(*parsed);
+        entry.rs_commit_lsn = sync->rs_commit_lsn;
+        entry.client_token = sync->client_token;
+        entry.term = sync->term;
+        empty_slots = std::move(sync->empty_slots);
         break;
     }
     case CraftEntryType::InternalLogin: {

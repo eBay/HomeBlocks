@@ -18,6 +18,8 @@
 #include <optional>
 #include <utility>
 
+#include <gtest/gtest.h>
+
 #include "craft/craft_repl_dev.hpp"
 
 // Shared free_slot body for CraftJournalBackend test mocks that record write_slot calls into a
@@ -94,7 +96,7 @@ inline void loop_back(MockCraftRaftProposer& proposer, CraftReplDev& dev, sisl::
     proposer.commit_outcome = take_test_proposal_outcome(ctx);
 }
 
-// Decodes one entry MockCraftRaftProposer recorded.
+// A SyncRSCommitLSN entry MockCraftRaftProposer recorded, decoded.
 struct ProposedSync {
     CraftEntryType type;
     int64_t rs_commit_lsn;
@@ -103,12 +105,22 @@ struct ProposedSync {
     std::vector< int64_t > empty_slots;
 };
 
+// A header or key that doesn't parse fails the test, so an assertion on what it returns ({rs_commit_lsn = -1, no Empty
+// slots}) can't pass on a malformed entry.
 inline ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
-    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
-    auto empties = parse_empty_slots(
+    if (entry.first.size() < sizeof(CraftEntryHeader)) {
+        ADD_FAILURE() << "proposed entry's header is " << entry.first.size() << " bytes";
+        return {CraftEntryType{}, -1, 0, 0, {}};
+    }
+    auto const type = reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type;
+    auto sync = parse_sync_rs_commit_lsn(
         sisl::blob{const_cast< uint8_t* >(entry.second.data()), static_cast< uint32_t >(entry.second.size())});
-    return {reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, p->rs_commit_lsn, p->client_token,
-            p->term, empties.value_or(std::vector< int64_t >{})};
+    if (!sync) {
+        ADD_FAILURE() << "proposed entry's key isn't a well-formed SyncRSCommitLSN (" << entry.second.size()
+                      << " bytes)";
+        return {type, -1, 0, 0, {}};
+    }
+    return {type, sync->rs_commit_lsn, sync->client_token, sync->term, std::move(sync->empty_slots)};
 }
 
 template < typename Mock >
