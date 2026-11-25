@@ -127,6 +127,14 @@ JournalSlot zeros(int64_t lsn) {
     return JournalSlot{.lsn = lsn, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size};
 }
 
+// Receives a coroutine's completion and drops it: lets a test start one and destroy it mid-await.
+struct DropReceiver {
+    using receiver_concept = stdexec::receiver_t;
+    void set_value(auto&&...) && noexcept {}
+    void set_error(auto&&) && noexcept {}
+    void set_stopped() && noexcept {}
+};
+
 } // namespace
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -203,6 +211,17 @@ protected:
                std::optional< result< std::vector< int64_t > > >& out) -> sisl::async::task< void > {
                 out = co_await dev->login_resolve(rs, /*term=*/0, std::move(quiesced));
             }(dev_, rs_commit_lsn, std::move(quiesced), outcome));
+    }
+    // Starts drain_writes() and destroys it while it waits, as a caller that gives up would.
+    void abandon_drain() {
+        auto op = stdexec::connect(
+            stdexec::write_env(dev_->drain_writes(), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+            DropReceiver{});
+        stdexec::start(op);
+    }
+    size_t drain_waiters() {
+        std::lock_guard lk{dev_->state_mu_};
+        return dev_->drain_waiters_.size();
     }
     // Faults the partition: a verdict for a slot it has already committed.
     void fault_partition() {
@@ -1029,6 +1048,41 @@ TEST_F(CraftLoginTest, AFillInFlightAtOrBelowTheWatermarkIsKept) {
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_FALSE(dev_->is_missing(4));
     EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
+}
+
+// ── the write drain ───────────────────────────────────────────────────────────
+
+// The leader's resolution and a login's apply both wait for the same write; when it lands, both go on. The login
+// fenced the resolution's session, so that round stops.
+TEST_F(CraftLoginTest, TwoDrainsWaitingOnTheSameWriteBothResume) {
+    dev_->seed_lsns(2, {});
+    journal_->hold_write = true;
+    std::optional< result< craft::lsn_pair > > w;
+    start_write(/*dlsn=*/3, /*term=*/0, w);
+    std::optional< result< std::vector< int64_t > > > resolved;
+    start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}, resolved);
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    EXPECT_EQ(drain_waiters(), 2u);
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(w.has_value());
+    ASSERT_TRUE(resolved.has_value());
+    ASSERT_FALSE(resolved->has_value());
+    EXPECT_EQ(resolved->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A drain whose caller gives up while it waits leaves the waiter list, so the write landing later resumes nothing.
+TEST_F(CraftLoginTest, AnAbandonedDrainLeavesTheWaiterList) {
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+
+    abandon_drain();
+    EXPECT_EQ(drain_waiters(), 0u);
+
+    dev_->release_in_flight(3); // would resume a destroyed frame if the waiter were still listed
 }
 
 } // namespace

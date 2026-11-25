@@ -277,6 +277,16 @@ protected:
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
 
+    // Commits an InternalLogin at term with watermark rs_commit_lsn, as RAFT would; it applies unless the queue's busy.
+    void commit_login(uint64_t term, int64_t rs_commit_lsn) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        serialize_internal_login(key.data(), /*client_token=*/7, term, rs_commit_lsn);
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, {});
+    }
+
     auto do_read(int64_t read_lsn, lba_t lba, uint32_t nlbas) {
         dest_buf_.assign(nlbas * k_page_size, 0xFF); // non-zero filler so hole-zeroing is actually observable
         sisl::sg_list dest;
@@ -1171,6 +1181,32 @@ TEST_F(CraftCommitTest, TruncateRemovesOverlayEntriesAboveLsn) {
 
     EXPECT_EQ(dev_->overlay_lsn_for(0), 3);  // survives: 3 <= truncation point 4
     EXPECT_EQ(dev_->overlay_lsn_for(1), -1); // pruned: 5 > truncation point 4, rolled back
+}
+
+// A login commits while a commit run is indexing slot 1, with that slot as its watermark: the run had planned to reach
+// slot 3, but stops at the slots the login dropped rather than index them.
+TEST_F(CraftCommitTest, CommitRunStopsAtSlotsALoginDropped) {
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(do_write_data(0, dlsn, /* lba = */ dlsn, /* nlbas = */ 1).has_value());
+    bool committed = false;
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        /* upto_lsn = */
+        3,
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            if (s == 1 && !std::exchange(committed, true)) commit_login(/*term=*/1, /*rs_commit_lsn=*/1);
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_TRUE(index_.entries.contains(1));
+    EXPECT_FALSE(index_.entries.contains(2));
+    EXPECT_FALSE(index_.entries.contains(3));
+    EXPECT_EQ(dev_->term(), 1u);
 }
 
 // ── commit() resume after a gap fills ─────────────────────────────────────────

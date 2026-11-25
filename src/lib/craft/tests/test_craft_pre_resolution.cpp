@@ -1051,9 +1051,10 @@ protected:
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
     // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
-    void commit_login(uint64_t term) {
+    void commit_login(uint64_t term) { commit_login(term, dev_->last_append_lsn()); }
+    void commit_login(uint64_t term, int64_t rs_commit_lsn) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
+        serialize_internal_login(key.data(), /*client_token=*/7, term, rs_commit_lsn);
         commit_entry(CraftEntryType::InternalLogin, key);
     }
 };
@@ -1870,6 +1871,8 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
 //   plain_poll    a watchdog poll (GetRSCommitLSN, not is_login), which fences nothing
 //   stale_login   InternalLogin(term=0), not newer than the session, committed with the apply queue paused; its apply
 //                 ignores it, so it fences nothing
+//   truncating_login  InternalLogin(term=5, rs=1), below this member's last_append, committed with the apply queue
+//                 paused: it also drops slot 2 at commit; settles when it applies
 // Outcomes that aren't errors are tested on their own: the voided slot's overlay entry
 // (QueuedSyncVerdictStopsServingVoidedSlotAtCommit) and the queued watermark (NoFreshEmptyAtOrBelowQueuedWatermark).
 // A cell that proposes (resolve, append) tests the entry point's checks up to its proposal: with the apply queue
@@ -1878,7 +1881,7 @@ TEST_F(CraftAppendTest, WriteWhoseSessionEndsBeforeItsAckIsNotAcked) {
 
 constexpr uint64_t k_new_term{5}; // the login's term
 
-enum class Fence { queued_sync, queued_login, quiesce, plain_poll, stale_login };
+enum class Fence { queued_sync, queued_login, quiesce, plain_poll, stale_login, truncating_login };
 enum class Call { write, write_voided_slot, write_new_term, read, keep_alive, resolve, append, pre_resolve };
 
 struct FenceCell {
@@ -1926,6 +1929,12 @@ std::vector< FenceCell > fence_cells() {
         {"StaleLogin_Resolve", Fence::stale_login, Call::resolve, {}, {}},
         {"StaleLogin_Append", Fence::stale_login, Call::append, {}, {}},
         {"StaleLogin_PreResolve", Fence::stale_login, Call::pre_resolve, {}, {}},
+        // A login that also truncates this member fences exactly as one that doesn't.
+        {"TruncatingLogin_Write", Fence::truncating_login, Call::write, stale, stale},
+        {"TruncatingLogin_WriteNewTerm", Fence::truncating_login, Call::write_new_term, stale, {}},
+        {"TruncatingLogin_Read", Fence::truncating_login, Call::read, no_index, stale},
+        {"TruncatingLogin_KeepAlive", Fence::truncating_login, Call::keep_alive, {}, stale},
+        {"TruncatingLogin_PreResolve", Fence::truncating_login, Call::pre_resolve, stale, stale},
     };
 }
 
@@ -1945,6 +1954,11 @@ protected:
             dev_->pause_apply();
             commit_login(/*term=*/0);
             break;
+        case Fence::truncating_login:
+            dev_->pause_apply();
+            commit_login(k_new_term, /*rs_commit_lsn=*/1);
+            EXPECT_EQ(dev_->last_append_lsn(), 1); // slot 2 dropped at commit
+            break;
         case Fence::quiesce:
         case Fence::plain_poll:
             ASSERT_TRUE(homeblocks::detail::sync_get(
@@ -1959,6 +1973,7 @@ protected:
         case Fence::queued_sync:
         case Fence::queued_login:
         case Fence::stale_login:
+        case Fence::truncating_login:
             dev_->resume_apply();
             break;
         case Fence::quiesce:

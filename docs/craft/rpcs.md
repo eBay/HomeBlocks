@@ -296,7 +296,7 @@ happens at commit, in log order, so a later `SyncRSCommitLSN` committing before 
 lagging replica) installs on top of the truncated tail rather than being undone by it. A replica that has
 already indexed past `rs_commit_lsn` can't truncate; it faults, and the proposer gets `INTERNAL_ERROR`. An
 old-session write still in flight then lands without an ack: dropped if its slot is above `rs_commit_lsn`,
-kept otherwise. On apply the replica waits for those writes to land, frees the dropped slots' blocks, then
+voided (`EMPTY_SLOT`) if its slot was voted `Empty`, kept otherwise. On apply the replica waits for those writes to land, frees the dropped slots' blocks, then
 stores `client_token` and `term`, rejecting any subsequent IO from a different term. Until a replica has
 applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its
 truncation.

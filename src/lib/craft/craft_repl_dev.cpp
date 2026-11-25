@@ -815,6 +815,9 @@ async_status CraftReplDev::login_install(AsyncMutex::Lock const& lock, int64_t r
 // arrive out of order. This replica's state stops pointing at them (last_append_lsn, the missing and Empty sets, the
 // overlay), so nothing reads them, and a new write to one of their dLSNs replaces the record. Their blocks are freed.
 // commit_lsn isn't touched: every slot at or below it is already indexed.
+//
+// InternalLogin runs it on the RAFT commit thread under apply_mu_ and state_mu_, so IO waits for it: it costs the
+// dropped range, plus a scan of empty_lsns_ and the overlay. A member with a long, sparse stale tail stalls that long.
 
 result< std::vector< int64_t > > CraftReplDev::truncate_tail_locked(int64_t lsn) {
     // Dropping an indexed slot, or one a running commit_impl() has started indexing, would leave the index pointing at
@@ -1446,6 +1449,17 @@ sisl::async::task< void > CraftReplDev::drain_writes() {
             if (in_flight_write_dlsns_.empty()) co_return;
             drain_waiters_.push_back(drained);
         }
+        // If this frame is destroyed while it waits (its caller gave up), the waiter leaves the list, so no release
+        // resumes it. Destroying it while another thread releases it is a race the caller must avoid, as for
+        // AsyncMutex.
+        struct AbandonGuard {
+            CraftReplDev* dev;
+            std::shared_ptr< sisl::async::value_awaitable< bool > > const& waiter;
+            ~AbandonGuard() {
+                std::lock_guard lk{dev->state_mu_};
+                std::erase(dev->drain_waiters_, waiter);
+            }
+        } const guard{this, drained};
         co_await *drained;
     }
 }
@@ -2150,9 +2164,10 @@ async_status CraftReplDev::propose_entry([[maybe_unused]] AsyncMutex::Lock const
 // (Empty beats data, the reconciliation invariant from S5).
 //
 // The state_mu_ lock is held only for the up-front classification pass below, dropped before any
-// co_await read_slot() call to avoid holding a mutex across a suspension point. Callers are
-// serialised by the login sequence (no concurrent writes while fetch_data runs), so the snapshot
-// taken under the lock is stable for the whole batch.
+// co_await read_slot() call to avoid holding a mutex across a suspension point. The snapshot can go
+// stale before the reads: a login committing meanwhile may drop a slot classified present, and free
+// its blocks once it applies. Only a leader racing that login asks for such a slot, and the login
+// fences its round, so its fill is dropped.
 //
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
 
@@ -2858,10 +2873,10 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
 // range check, every step is best-effort
 // forward progress: empty_slots are reconciled and the newly-spanned range is marked missing, catch-up
 // attempts to fill in what it can from a peer, and last_append_lsn advances regardless of whether catch-up
-// fully succeeded -- mirroring truncate()'s invariant that apply never reverts the watermark, only advances
-// it. commit_lsn is different: it's the local contiguous prefix (CRAFT-Design), so it only advances up to
-// the first still-unresolved Missing slot, skipping over Empty ones, even though rs_commit_lsn itself is a
-// watermark the whole replica set already agreed on. A peer's fetch_data response gets its own
+// fully succeeded: a Sync only ever raises it (only a login's truncation lowers it). commit_lsn is different:
+// it's the local contiguous prefix (CRAFT-Design), so it only advances up to the first still-unresolved Missing slot,
+// skipping over Empty ones, even though rs_commit_lsn itself is a watermark the whole replica set already agreed on.
+// A peer's fetch_data response gets its own
 // all-or-nothing check (validate_fetch_response): unlike the range check above, this one can't gate the
 // whole apply (gap marking and last_append_lsn already advanced by the time the response arrives), so a
 // malformed response is instead treated exactly like a failed fetch
