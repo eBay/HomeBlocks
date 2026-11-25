@@ -407,11 +407,11 @@ TEST_F(CraftRaftEntriesTest, ASyncThatFaultsAtCommitMarksTheRecordOutsideItsLock
     dev_->seed_lsns(5, {});
     dev_->seed_commit_lsn(5);
     journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
-    std::future< int64_t > other; // an op from another thread, kept until the device's locks are released
-    std::optional< bool > unlocked;
+    std::future< int64_t > other;   // an op from another thread, kept until the device's locks are released
+    std::optional< bool > unlocked; // false once any mark the store is asked for finds the lock held
     store->on_mark = [&] {
         other = std::async(std::launch::async, [this] { return dev_->all_committed_lsn(); });
-        unlocked = other.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+        unlocked = unlocked.value_or(true) && other.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
     };
     auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
     auto key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
