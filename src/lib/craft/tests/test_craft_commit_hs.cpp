@@ -293,7 +293,7 @@ TEST_F(CraftCommitHsTest, ConcurrentWritesToDisjointLbaRangesAllLand) {
 }
 
 // N real threads all call keep_alive() targeting the same commit_lsn concurrently against the real
-// index -- commit_running_ must serialize them so the apply loop runs to completion exactly once
+// index -- commit_mu_ must serialize them so the apply loop runs to completion exactly once
 // (from whichever thread wins), with every slot correctly committed and readable afterward.
 TEST_F(CraftCommitHsTest, ConcurrentKeepAliveSerializesCommitAgainstRealIndex) {
     constexpr lba_t k_base_lba = 300;

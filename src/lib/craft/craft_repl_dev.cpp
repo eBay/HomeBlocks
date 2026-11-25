@@ -586,7 +586,17 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
         sync_lsn_interval_{static_cast< int64_t >(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval))},
-        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
+        watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {
+    // Built once: every write's piggybacked commit uses them.
+    if (indx_tbl_) {
+        index_ops_ = IndexOps{[this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+                                  return indx_tbl_->write_to_index(s, e, info);
+                              },
+                              [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+                                  return indx_tbl_->delete_lba_range(s, e, freed);
+                              }};
+    }
+}
 
 CraftReplDev::~CraftReplDev() {
     // iomgr::timer_token::cancel(wait=true) is a no-op if the watchdog was never armed (watchdog disabled
@@ -1186,10 +1196,10 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
 
 // ─── proactive checkpoint trigger (SDSTOR-22888) ─────────────────────────────
 //
-// Shared by every commit_lsn-advance path (commit_impl() -- covering write()'s piggyback and
-// keep_alive() -- and apply_sync_rs_commit_lsn()'s own walk-forward loop) so a checkpoint fires
-// regardless of which path is driving commit_lsn forward. Split into a locked check and an unlocked
-// fire because the fire awaits (via detail::detach) and must not run with state_mu_ held.
+// Run at the end of every commit_impl() run, which every commit_lsn advance goes through (write()'s
+// piggyback, keep_alive(), and a SyncRSCommitLSN's apply), so a checkpoint fires regardless of which
+// path is driving commit_lsn forward. Split into a locked check and an unlocked fire because the fire
+// awaits (via detail::detach) and must not run with state_mu_ held.
 
 bool CraftReplDev::checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot) {
     // Interval reuses sync_rs_commit_lsn_interval (via checkpoint_lsn_interval_) rather than its own
@@ -1223,18 +1233,58 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 // ─── commit() (internal; never a wire op) ────────────────────────────────────
 //
 // Advances commit_lsn toward upto_lsn by applying each committable slot to the index. At most one
-// run is ever active at a time (commit_running_, guarded by state_mu_ and reset via RAII on every
-// exit path); a concurrent caller is a safe no-op -- the in-flight run covers the same ground, and
-// every subsequent write()/keep_alive() retries the advance. Never holds a lock across the co_await
-// read_slot() suspension point below (same rule fetch_data's doc comment already establishes).
+// run is ever active at a time, its caller holding commit_mu_; only that run writes commit_lsn. A
+// piggybacked caller that finds a run active is a safe no-op -- the in-flight run covers the same ground,
+// and every subsequent write()/keep_alive() retries the advance -- while a Sync's advance waits its turn.
+// Never holds state_mu_ across the co_await read_slot() suspension point below (same rule fetch_data's
+// doc comment already establishes).
 
-async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_fn_t write_fn,
+async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
+    // A run already active covers the same ground. With no index configured (write-path-only tests), there's nothing
+    // to apply.
+    auto lock = commit_mu_.try_lock();
+    auto const* index = lock ? index_ops() : nullptr;
+    if (!index) {
+        std::lock_guard lk{state_mu_};
+        co_return state_.commit_lsn;
+    }
+    co_return co_await commit_impl(*lock, upto_lsn, index);
+}
+
+#ifdef _PRERELEASE
+async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_fn_t write_fn,
                                                   delete_index_fn_t delete_fn) {
+    auto lock = commit_mu_.try_lock();
+    if (!lock) {
+        std::lock_guard lk{state_mu_};
+        co_return state_.commit_lsn;
+    }
+    IndexOps const index{std::move(write_fn), std::move(delete_fn)};
+    co_return co_await commit_impl(*lock, upto_lsn, &index);
+}
+
+void CraftReplDev::use_test_index(write_index_fn_t write_fn, delete_index_fn_t delete_fn) {
+    index_ops_ = IndexOps{std::move(write_fn), std::move(delete_fn)};
+}
+#endif
+
+// A Sync's commit advance: waits for a running commit, then runs its own, so each slot it steps over reaches the index
+// and nothing can lower commit_lsn afterwards. Best effort, like the catch-up before it: a slot that can't be indexed
+// stops the advance just below it.
+async_status CraftReplDev::advance_commit_for_sync(int64_t rs_commit_lsn) {
+    auto self = shared_from_this();
+    auto const lock = co_await commit_mu_.lock();
+    if (auto r = co_await commit_impl(lock, rs_commit_lsn, index_ops()); !r)
+        LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped: {}", rs_commit_lsn, r.error().message());
+    co_return ok();
+}
+
+async_result< int64_t > CraftReplDev::commit_impl([[maybe_unused]] AsyncMutex::Lock const& lock, int64_t upto_lsn,
+                                                  IndexOps const* index) {
+    DEBUG_ASSERT(static_cast< bool >(lock), "commit_impl without holding commit_mu_");
     int64_t commit_lsn, last_append_lsn;
     {
         std::lock_guard lk{state_mu_};
-        if (commit_running_) co_return state_.commit_lsn; // another run is already advancing
-        commit_running_ = true;
         commit_lsn = state_.commit_lsn;
         last_append_lsn = state_.last_append_lsn;
     }
@@ -1257,9 +1307,8 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             bool should_checkpoint;
             {
                 std::lock_guard lk{self->state_mu_};
-                self->state_.commit_lsn = *final_commit_lsn_ptr;
-                self->indexing_lsn_ = *final_commit_lsn_ptr; // drop a slot that failed before reaching the index
-                self->commit_running_ = false;
+                self->state_.commit_lsn = *final_commit_lsn_ptr; // only the commit_mu_ holder writes it
+                self->indexing_lsn_ = *final_commit_lsn_ptr;     // drop a slot that failed before reaching the index
                 should_checkpoint = self->checkpoint_interval_crossed_locked(*final_commit_lsn_ptr);
             }
             if (should_checkpoint) self->fire_checkpoint_trigger(*final_commit_lsn_ptr);
@@ -1277,6 +1326,12 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             if (!is_missing && !is_empty) indexing_lsn_ = lsn;
         }
         if (is_missing) break; // stall at the first hole -- not an error
+        if (!index) {
+            // No index to apply to (write-path-only tests): step over the slot, retiring its overlay entry.
+            retire_overlay_slot(lsn);
+            final_commit_lsn = lsn;
+            continue;
+        }
 
         if (!is_empty) {
             auto slot_r = co_await journal_->read_slot(lsn);
@@ -1298,7 +1353,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
 
             if (slot.all_zeros) {
                 std::vector< homestore::blk_id > freed;
-                if (auto r = delete_fn(start_lba, end_lba, freed); !r) co_return std::unexpected(r.error());
+                if (auto r = index->del(start_lba, end_lba, freed); !r) co_return std::unexpected(r.error());
                 // Reclaim inline, same as write()'s own free_data call sites -- free errors are
                 // logged but non-fatal (the block is merely leaked, not corrupted).
                 for (auto const& blk : freed) {
@@ -1330,7 +1385,7 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
                         blocks_info.emplace(lba, BlockInfo{single_bid, homestore::blk_id{}, slot.csums[csum_idx]});
                     }
                 }
-                if (auto r = write_fn(start_lba, end_lba, blocks_info); !r) co_return std::unexpected(r.error());
+                if (auto r = index->write(start_lba, end_lba, blocks_info); !r) co_return std::unexpected(r.error());
                 // Reclaim any superseded old blkid inline, same as write()'s own free_data call sites.
                 // old_blkid == new_blkid means this slot was already applied (crash-replay of an
                 // idempotent commit before commit_lsn was durably persisted): the index already holds
@@ -1352,18 +1407,11 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
             // successfully using this replica as a holder. If that happened, write()'s post-flight
             // already created a real overlay entry for it that would otherwise never get retired
             // (permanently stale, and -- worse -- still SERVED on reads, since the overlay wins over
-            // the index within the horizon, directly contradicting the Empty verdict). read_slot()
-            // here is purely to discover the LBA range to retire, not to apply anything to the index.
-            // A read_slot() failure just means this replica never had this lsn locally either (the
-            // ordinary case: this lsn was this replica's OWN gap, resolved as empty because no
-            // replica anywhere held it) -- nothing to retire, not an error.
-            if (auto slot_r = co_await journal_->read_slot(lsn); slot_r) {
-                auto& slot = *slot_r;
-                if (uint32_t const nlbas = static_cast< uint32_t >(slot.len_bytes / lba_size_); nlbas > 0) {
-                    lba_t const start_lba = static_cast< lba_t >(slot.lba_off_bytes) / lba_size_;
-                    retire_overlay_range(start_lba, start_lba + nlbas - 1, lsn);
-                }
-            }
+            // the index within the horizon, directly contradicting the Empty verdict). The overlay's
+            // own extent for this lsn gives the range to retire, so the journal isn't read: usually this
+            // lsn was this replica's OWN gap, resolved as empty because no replica anywhere held it, and
+            // there's nothing to retire.
+            retire_overlay_slot(lsn);
         }
 
         final_commit_lsn = lsn; // no lock -- see final_commit_lsn's own doc comment above
@@ -1371,30 +1419,6 @@ async_result< int64_t > CraftReplDev::commit_impl(int64_t upto_lsn, write_index_
 
     co_return final_commit_lsn;
 }
-
-async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
-    if (!indx_tbl_) {
-        // No index configured (write-path-only tests): nothing to apply, no-op safely.
-        std::lock_guard lk{state_mu_};
-        co_return state_.commit_lsn;
-    }
-    write_index_fn_t write_fn = [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
-        return indx_tbl_->write_to_index(s, e, info);
-    };
-    delete_index_fn_t delete_fn = [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
-        return indx_tbl_->delete_lba_range(s, e, freed);
-    };
-    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
-    co_return r;
-}
-
-#ifdef _PRERELEASE
-async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_fn_t write_fn,
-                                                  delete_index_fn_t delete_fn) {
-    auto r = co_await commit_impl(upto_lsn, std::move(write_fn), std::move(delete_fn));
-    co_return r;
-}
-#endif
 
 // ─── overlay population (shared by write() and rebuild_overlay()) ───────────
 
@@ -2455,6 +2479,10 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
     std::unordered_map< int64_t, uint32_t > owned; // overlay entries per lsn
     for (auto const& [lba, entry] : overlay_) {
         ++owned[entry.lsn];
+        // Every slot at or below commit_lsn is in the index, so the read path no longer serves it from here.
+        if (entry.lsn <= state_.commit_lsn && !empty_lsns_.contains(entry.lsn))
+            found.push_back(fmt::format("overlay lba {} (lsn {}) is at or below commit_lsn {}, so never indexed", lba,
+                                        entry.lsn, state_.commit_lsn));
         auto const extent = overlay_extent_.find(entry.lsn);
         if (extent == overlay_extent_.end()) {
             found.push_back(fmt::format("overlay lba {} (lsn {}) has no extent", lba, entry.lsn));
@@ -2997,25 +3025,9 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
     // commit_lsn (CRAFT-Design) is the LOCAL CONTIGUOUS prefix, distinct from rs_commit_lsn (the
     // replica-set-wide watermark RAFT already agreed on): it must skip over Empty slots but never
     // advance past an unresolved Missing one, even if catch-up above left holes below rs_commit_lsn.
-    // Mirrors craft_client's reference MemCraftReplica::apply_up_to.
-    int64_t commit_lsn_snapshot;
-    bool should_checkpoint;
-    {
-        std::lock_guard lk{state_mu_};
-        int64_t next = state_.commit_lsn + 1;
-        while (next <= rs_commit_lsn && !missing_lsns_.contains(next)) {
-            state_.commit_lsn = next; // resolved (present or Empty) -- Empty is skipped, not gated on
-            ++next;
-        }
-        commit_lsn_snapshot = state_.commit_lsn;
-        // SDSTOR-22888: nudge HomeStore to checkpoint proactively rather than waiting on its own
-        // timer, so the journal-reclaim / RAFT-log-compaction floor (docs/craft/subtasks.md's S8)
-        // doesn't lag arbitrarily far behind commit_lsn. Also invoked from commit_impl() so that
-        // write()'s piggyback and keep_alive() (which don't go through this function) advance the
-        // same checkpoint cadence -- see checkpoint_interval_crossed_locked()'s doc comment.
-        should_checkpoint = checkpoint_interval_crossed_locked(commit_lsn_snapshot);
-    }
-    if (should_checkpoint) fire_checkpoint_trigger(commit_lsn_snapshot);
+    // Mirrors craft_client's reference MemCraftReplica::apply_up_to. It goes through commit_impl(), like
+    // every other advance, so each slot it steps over reaches the index (and the checkpoint cadence).
+    co_await advance_commit_for_sync(rs_commit_lsn);
     LOGT("apply_sync_rs_commit_lsn ok rs_commit_lsn={} client_token={}", rs_commit_lsn, client_token);
     co_return ok();
 }

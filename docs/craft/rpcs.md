@@ -266,7 +266,9 @@ quorum-lacks evidence (at login, only from members its poll quiesced); it never 
 unresolved slot. On RAFT commit each replica: mark `empty_slots` as permanent no-op holes (discarding
 any local data there), fetch the remaining missing
 slots from peers, then advance `commit_lsn` to the contiguous prefix bounded by `rs_commit_lsn` --
-skipping `Empty` slots but never past an unresolved `Missing` one. `client_token` is carried on the
+skipping `Empty` slots but never past an unresolved `Missing` one, and applying each present slot it
+steps over to the LBA index, as the client's piggybacked commit does (one advance at a time, so
+`commit_lsn` always means "indexed up to here"). `client_token` is carried on the
 entry but not checked against local state at apply time: `SyncRSCommitLSN` applies before the
 `InternalLogin` that would establish it, so an equality-fence here would make login itself unreachable;
 ordering plus the term fence on subsequent IO provide exclusivity instead. Replicas never declare

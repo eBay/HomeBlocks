@@ -481,6 +481,31 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
     EXPECT_EQ(dev_->last_append_lsn(), 2);
 }
 
+// The slot a Sync's catch-up fills is indexed by the same apply's commit advance, which retires its overlay entry
+// (SDSTOR-26759).
+TEST_F(CraftRaftEntriesTest, CatchUpFilledSlotIsIndexedByTheSyncsAdvance) {
+    std::vector< lba_t > unmapped;
+    dev_->use_test_index([](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) { return ok(); },
+                         [&unmapped](lba_t s, lba_t e, std::vector< homestore::blk_id >&) {
+                             for (lba_t l = s; l <= e; ++l)
+                                 unmapped.push_back(l);
+                             return ok();
+                         });
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(1, {1});
+    dev_->seed_commit_lsn(0);
+    fetcher_.response = {
+        JournalSlot{.lsn = 1, .all_zeros = true, .lba_off_bytes = 2 * k_page_size, .len_bytes = k_page_size}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/1, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(journal_->has_slot(1));
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_EQ(unmapped, (std::vector< lba_t >{2})); // the filled all-zeros slot, applied to the index
+    EXPECT_EQ(dev_->overlay_lsn_for(2), -1);
+}
+
 // Catch-up leaves a slot whose write() is still in flight to that write, rather than journaling a peer's copy
 // alongside it (H1).
 TEST_F(CraftRaftEntriesTest, CatchUpSkipsSlotWithWriteInFlight) {
