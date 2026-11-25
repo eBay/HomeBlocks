@@ -988,6 +988,9 @@ async_status CraftReplDev::truncate(int64_t lsn) {
     {
         std::lock_guard lk{state_mu_};
         if (state_.last_append_lsn > lsn) state_.last_append_lsn = lsn;
+        // What is journalled again above lsn isn't a replay of what the index may hold from before a restart: lsn is at
+        // or above every slot this replica committed before it (a login's watermark is).
+        replay_upto_ = std::min(replay_upto_, std::max(lsn, state_.commit_lsn));
         missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
         // The periodic cadence counts from the append frontier, so its baseline can't sit above the new one.
         last_periodic_sync_lsn_ = std::min(last_periodic_sync_lsn_, lsn);

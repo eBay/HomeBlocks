@@ -2556,6 +2556,31 @@ TEST_F(CraftRaftEntriesTest, RestartRefusesReadsBelowWhatTheIndexMayHold) {
     EXPECT_TRUE(read_at(3).has_value());
 }
 
+// A login's truncate ends that window at its watermark: the slots journalled again above it are new, not ones the index
+// may hold. Left at the old tail, the window would keep them from freeing the blocks they replace, and keep refusing
+// reads below the old tail.
+TEST_F(CraftRaftEntriesTest, TruncateEndsTheReplayWindowAtItsLsn) {
+    auto image = sample_state(); // durable commit frontier 1
+    image.sync_watermark = 3;    // the login's watermark below
+    image.empty_lsns.clear();
+    restart(image, page_slots({0, 1, 2, 3, 4, 5, 6})); // journal tail 6
+    auto read_at = [this](int64_t read_lsn) {
+        std::vector< uint8_t > buf(k_page_size);
+        sisl::sg_list dest;
+        dest.size = buf.size();
+        dest.iovs.push_back(iovec{buf.data(), buf.size()});
+        return homeblocks::detail::sync_get(dev_->read_with(read_lsn, /*addr=*/100 * k_page_size, k_page_size,
+                                                            std::move(dest), [](lba_t, lba_t, auto&) { return ok(); }));
+    };
+    auto const stale = read_at(3);
+    ASSERT_FALSE(stale.has_value());
+    ASSERT_EQ(stale.error(), make_error_condition(volume_error::HORIZON_STALE));
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->truncate(3)).has_value());
+    auto const r = read_at(3);
+    EXPECT_TRUE(r.has_value()) << r.error().message();
+}
+
 // An image that can't be read, or a journal tail that can't be read, faults the partition: restarting it empty would
 // forget its session and verdicts.
 TEST_F(CraftRaftEntriesTest, RestartFaultsOnAnUnreadableImage) {
