@@ -2842,6 +2842,29 @@ TEST_F(CraftRaftEntriesTest, ReclaimFollowsTheLowerOfTheDurableCommitAndAllCommi
     EXPECT_EQ(dev_->reclaimed_upto(), 10) << "past the durable commit frontier";
 }
 
+// A write or a read that carries a higher set-wide committed prefix reclaims as well: a partition that only does I/O,
+// with no keep_alive, still frees its journal.
+TEST_F(CraftRaftEntriesTest, AWriteOrAReadAloneAdvancesTheReclaim) {
+    with_store();
+    dev_->set_checkpoint_trigger(std::ref(trigger_));
+    dev_->set_checkpoint_lsn_interval(1);
+    journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
+    dev_->seed_lsns(10, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(
+                    dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = 6}, /*dlsn=*/11,
+                                /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}))
+                    .has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), 6);
+
+    // The read itself needs an index this fixture doesn't have; its header is taken before that.
+    (void)homeblocks::detail::sync_get(
+        dev_->read(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = 8},
+                   /*read_lsn=*/0, /*addr=*/0, k_page_size, sisl::sg_list{}));
+    EXPECT_EQ(dev_->reclaimed_upto(), 8);
+}
+
 // Without a state store the journal is the only copy: never reclaimed.
 TEST_F(CraftRaftEntriesTest, NoReclaimWithoutAStore) {
     dev_->set_checkpoint_trigger(std::ref(trigger_));
