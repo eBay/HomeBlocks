@@ -330,6 +330,43 @@ TEST_F(CraftCommitHsTest, ConcurrentKeepAliveSerializesCommitAgainstRealIndex) {
     }
 }
 
+// A SyncRSCommitLSN committed through the RAFT listener indexes two writes acked with no piggybacked commit into the
+// real index: its advance reads each slot back with read_sync() and writes it with the real index ops.
+TEST_F(CraftCommitHsTest, SyncAdvanceIndexesWritesIntoTheRealIndex) {
+    constexpr lba_t k_base_lba = 400;
+    sisl::io_blob_safe content0{k_page_size, 512};
+    sisl::io_blob_safe content1{k_page_size, 512};
+    std::memset(content0.bytes(), 0x31, content0.size());
+    std::memset(content1.bytes(), 0x32, content1.size());
+    ASSERT_TRUE(do_write(/* dlsn = */ 0, k_base_lba, /* nlbas = */ 1, content0, /* commit_lsn = */ -1).has_value());
+    ASSERT_TRUE(do_write(/* dlsn = */ 1, k_base_lba + 1, /* nlbas = */ 1, content1, /* commit_lsn = */ -1).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), -1);
+
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+    std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+    serialize_sync_rs_commit_lsn(key.data(), /* rs_commit_lsn = */ 1, /* client_token = */ 0, dev_->term(), {});
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    // Nothing in this apply should suspend, but don't rely on it: give it a moment to finish.
+    for (int i = 0; i < 200 && dev_->commit_lsn() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_EQ(dev_->last_append_lsn(), 1);
+    EXPECT_EQ(dev_->missing_count(), 0u);
+    for (int i = 0; i < 2; ++i) {
+        sisl::io_blob_safe dest{k_page_size, 512};
+        auto r = do_read(/* read_lsn = */ 1, k_base_lba + i, /* nlbas = */ 1, dest);
+        ASSERT_TRUE(r.has_value()) << "i=" << i;
+        ASSERT_EQ(r->extents.size(), 1u);
+        EXPECT_FALSE(r->extents[0].hole) << "i=" << i;
+        auto const& content = i == 0 ? content0 : content1;
+        EXPECT_EQ(std::memcmp(dest.cbytes(), content.cbytes(), content.size()), 0) << "i=" << i;
+    }
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     char** orig_argv = argv;

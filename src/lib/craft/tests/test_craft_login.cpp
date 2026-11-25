@@ -261,7 +261,26 @@ protected:
         dev_->seed_commit_lsn(5);
         commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{3});
     }
+    // Backs the device's own commits with a test index that records each LBA it unmaps (every write here is
+    // all-zeros), and fails at fail_at.
+    void use_counting_index(std::optional< lba_t > fail_at = std::nullopt) {
+        dev_->use_test_index([](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); },
+                             [this, fail_at](lba_t s, lba_t e, std::vector< homestore::blk_id >&) -> status {
+                                 if (fail_at && s <= *fail_at && *fail_at <= e)
+                                     return std::unexpected(volume_error::INDEX_ERROR);
+                                 for (lba_t lba = s; lba <= e; ++lba)
+                                     unmapped_.push_back(lba);
+                                 return ok();
+                             });
+    }
+    // A one-block all-zeros write at dlsn, to LBA dlsn, with no piggybacked commit.
+    auto write_zeros(int64_t dlsn) {
+        return homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, dlsn,
+                                                        /*addr=*/static_cast< uint64_t >(dlsn) * k_page_size,
+                                                        k_page_size, sisl::sg_list{}));
+    }
 
+    std::vector< lba_t > unmapped_;
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftLsnPoller poller_;
     MockCraftRaftProposer proposer_;
@@ -784,6 +803,60 @@ TEST_F(CraftLoginTest, SyncFaultedDuringATimedOutProposalFailsInternalError) {
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+// ── login_sync over an index (SDSTOR-26853) ───────────────────────────────────
+//
+// The tests above run with no index, so the Sync's advance only steps over slots. These back it with one, as a
+// volume's would.
+
+// Writes acked with no piggybacked commit: the login's Sync indexes every slot up to its watermark before
+// login_sync() returns.
+TEST_F(CraftLoginTest, SyncIndexesEverySlotUpToTheWatermark) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), -1);
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(unmapped_, (std::vector< lba_t >{0, 1, 2}));
+}
+
+// A slot at or below the watermark that can't be indexed stops the advance below it: the login fails NO_QUORUM, with
+// commit_lsn just below that slot.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeIndexed) {
+    use_counting_index(/*fail_at=*/1);
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    auto const stop = dev_->last_commit_stop(); // the slot login_sync()'s failure names
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 1);
+}
+
+// The same for a slot that can't be read back from the journal.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeReadBack) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    journal_->fail_read = 1;
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
 }
 
 // ── login_install (SDSTOR-22892) ──────────────────────────────────────────────

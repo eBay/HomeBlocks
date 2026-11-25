@@ -638,6 +638,22 @@ TEST(AsyncMutexTest, LockOnAFreeMutexDoesNotWait) {
     EXPECT_FALSE(mu.locked());
 }
 
+// holds() is true only for a lock on this mutex that hasn't been released.
+TEST(AsyncMutexTest, HoldsOnlyItsOwnLock) {
+    AsyncMutex mu;
+    AsyncMutex other;
+    auto lock = mu.try_lock();
+    auto other_lock = other.try_lock();
+    ASSERT_TRUE(lock.has_value());
+    ASSERT_TRUE(other_lock.has_value());
+
+    EXPECT_TRUE(mu.holds(*lock));
+    EXPECT_FALSE(mu.holds(*other_lock));
+    EXPECT_FALSE(mu.holds(AsyncMutex::Lock{}));
+    lock->reset();
+    EXPECT_FALSE(mu.holds(*lock));
+}
+
 // Waiters get the mutex in arrival order, each straight from the last holder: it never goes free in between, so a
 // try_lock() can't slip in ahead of a waiter.
 TEST(AsyncMutexTest, ReleaseHandsTheMutexToTheLongestWaiter) {
