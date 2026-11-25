@@ -382,8 +382,9 @@ public:
     // Drops every slot above lsn: clamps last_append_lsn and the Sync baselines, clears the missing and Empty marks
     // above lsn, prunes the overlay above it, then frees the dropped slots' blocks. commit_lsn is not changed, and an
     // lsn below a slot already indexed fails with invalid_argument, changing nothing. The journal records stay, as
-    // HomeStore's rollback assumes in-order appends: nothing reads past last_append_lsn, a new write to the dLSN
-    // replaces the record, and recovery must skip them by term (S8). The caller fences writes first and keeps lsn at
+    // HomeStore's rollback assumes in-order appends: nothing reads past last_append_lsn, and a new write to the dLSN
+    // replaces the record. Recovery (S8) must skip them using every login's (term, rs_commit_lsn), as rpcs.md #10
+    // describes, and must not re-commit their freed blocks. The caller fences writes first and keeps lsn at
     // or above every committed Sync's watermark. InternalLogin truncates at its commit (truncate_tail_locked()) and
     // frees at its apply, where it also re-publishes an older surviving write for an LBA whose newest entry it dropped;
     // truncate() doesn't.
@@ -1012,9 +1013,9 @@ private:
     // resolved prefix, so nothing at or below it is still in flight.
     // Reset when InternalLogin starts a new session. Guarded by state_mu_.
     int64_t client_commit_lsn_{-1};
-    // The term of the latest committed InternalLogin, raised at commit ahead of its apply: writes and leader rounds at
-    // a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply queue.
-    // Guarded by state_mu_.
+    // The term of the latest committed InternalLogin, raised at commit ahead of its apply: writes, reads and leader
+    // rounds at a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply
+    // queue. keep_alive changes over at the apply. Guarded by state_mu_.
     uint64_t login_fence_term_{0};
     // Writes at or below this term are quiesced by a login poll (STALE_TERM); unset until the first poll. Only rises.
     // Fences writes only: reads, keep_alive and leader rounds go on. In memory only: a member that restarts before the

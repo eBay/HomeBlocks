@@ -55,6 +55,7 @@ public:
     // When set, the next write_slot() waits for write_gate before it lands: a journal write in flight.
     bool hold_write{false};
     sisl::async::value_awaitable< bool > write_gate;
+    std::optional< int64_t > fail_read; // read_slot() of this lsn fails with an I/O error
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -66,7 +67,10 @@ public:
             .lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .blkid = blkid, .csums = csums};
         co_return ok();
     }
-    async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
+    async_result< JournalSlot > read_slot(int64_t lsn) override {
+        if (fail_read && *fail_read == lsn) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        co_return co_await mock_read_slot(*this, lsn);
+    }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
@@ -1088,6 +1092,22 @@ TEST_F(CraftLoginTest, ALoginRepublishesTheWriteItsTruncationUncovered) {
     EXPECT_EQ(dev_->term(), 1u);
 }
 
+// The same login, but the journal read of slot 3 fails while it re-publishes: the overlay can't be trusted to hold an
+// LBA's surviving write, so the partition faults and the session isn't started.
+TEST_F(CraftLoginTest, ALoginWhoseRepublishFailsFaultsThePartition) {
+    for (int64_t dlsn : {0, 3, 5}) {
+        auto w = homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
+        ASSERT_TRUE(w.has_value());
+    }
+    journal_->fail_read = 3;
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
+
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 0u);
+}
+
 // ── the write drain ───────────────────────────────────────────────────────────
 
 // The leader's resolution and a login's apply both wait for the same write; when it lands, both go on. The login
@@ -1136,6 +1156,26 @@ TEST_F(CraftLoginTest, ADrainResumedFirstCanDestroyAnotherStillWaiting) {
     dev_->release_in_flight(3);
 
     EXPECT_FALSE(second);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// The drain resumed first starts another write before the second one resumes: the second keeps waiting, for that write.
+TEST_F(CraftLoginTest, ADrainWaitsForAWriteStartedByOneResumedAheadOfIt) {
+    dev_->seed_lsns(4, {3, 4});
+    dev_->seed_in_flight(3);
+    bool second_done = false;
+    start_drain_then([this] { dev_->seed_in_flight(4); });
+    start_drain_then([&] { second_done = true; });
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    dev_->release_in_flight(3);
+
+    EXPECT_FALSE(second_done);
+    EXPECT_EQ(drain_waiters(), 1u);
+
+    dev_->release_in_flight(4);
+
+    EXPECT_TRUE(second_done);
     EXPECT_EQ(drain_waiters(), 0u);
 }
 

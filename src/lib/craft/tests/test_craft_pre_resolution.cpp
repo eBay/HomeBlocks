@@ -614,9 +614,10 @@ TEST_F(CraftPreResolutionTest, TermChangedBeforeSlotWriteFreesBlocksAndStops) {
     EXPECT_TRUE(dev_->is_missing(4));
 }
 
-// Term bumps during slot 3's write_slot: the fill is dropped (its record stays, unread, and its blocks are freed),
-// missing_lsns_ is untouched and slot 4 is never written.
-TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) {
+// The round's session is fenced during slot 3's write_slot (seed_term() stands in for a login committing with a
+// watermark at or above 3): the fill is kept and published, like a write() caught the same way, and the round stops
+// before slot 4.
+TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteKeepsTheSlotAndStops) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_term(1);
     dev_->seed_lsns(5, {3, 4});
@@ -632,8 +633,8 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) 
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(journal_->has_slot(4));
-    EXPECT_EQ(journal_->free_data_calls, 1);
-    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_FALSE(dev_->is_missing(3));
     EXPECT_TRUE(dev_->is_missing(4));
 }
 
@@ -1901,11 +1902,12 @@ std::vector< FenceCell > fence_cells() {
         // A Sync doesn't fence the session; its verdicts fence the slots they void.
         {"Sync_Write", Fence::queued_sync, Call::write, {}, {}},
         {"Sync_WriteVoidedSlot", Fence::queued_sync, Call::write_voided_slot, empty_slot, empty_slot},
-        // A login fences the old session's writes and leader rounds at commit. Reads and keep_alive aren't fenced
-        // (quiesce blocks writes only): like the new term's writes, they change over when the login applies.
+        // A login fences the old session's writes, reads and leader rounds at commit: unlike a quiesce, it can't be
+        // undone, and its truncation may drop an LBA's newest version until the apply. keep_alive isn't fenced: like
+        // the new term's writes, it changes over when the login applies.
         {"Login_Write", Fence::queued_login, Call::write, stale, stale},
         {"Login_WriteNewTerm", Fence::queued_login, Call::write_new_term, stale, {}},
-        {"Login_Read", Fence::queued_login, Call::read, no_index, stale},
+        {"Login_Read", Fence::queued_login, Call::read, stale, stale},
         {"Login_KeepAlive", Fence::queued_login, Call::keep_alive, {}, stale},
         {"Login_Resolve", Fence::queued_login, Call::resolve, stale, stale},
         {"Login_Append", Fence::queued_login, Call::append, stale, stale},
@@ -1932,7 +1934,7 @@ std::vector< FenceCell > fence_cells() {
         // A login that also truncates this member fences exactly as one that doesn't.
         {"TruncatingLogin_Write", Fence::truncating_login, Call::write, stale, stale},
         {"TruncatingLogin_WriteNewTerm", Fence::truncating_login, Call::write_new_term, stale, {}},
-        {"TruncatingLogin_Read", Fence::truncating_login, Call::read, no_index, stale},
+        {"TruncatingLogin_Read", Fence::truncating_login, Call::read, stale, stale},
         {"TruncatingLogin_KeepAlive", Fence::truncating_login, Call::keep_alive, {}, stale},
         {"TruncatingLogin_PreResolve", Fence::truncating_login, Call::pre_resolve, stale, stale},
     };

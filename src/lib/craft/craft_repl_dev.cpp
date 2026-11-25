@@ -1097,8 +1097,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
 
     // Post-flight recheck: while write_slot was in flight, a login may have committed (fencing this session, and maybe
     // dropping this slot), a login poll may have quiesced this term, or the slot may have been voted Empty.
-    //   dropped: above a committed login's watermark, or the session moved on (not while a login's apply drains
-    //            first). Nothing reads the record, so this write frees its own blocks.
+    //   dropped: above a committed login's watermark. Nothing reads the record, so this write frees its own blocks.
+    //            (The session term itself can't have moved: the login's apply waits for this write first.)
     //   voided:  voted Empty. Apply found the slot still missing and freed nothing, so this write frees them.
     //   kept:    published, as a login's watermark may count the slot, but not acked if fenced or quiesced.
     bool dropped = false;
@@ -1107,7 +1107,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     craft::lsn_pair snapshot;
     {
         std::lock_guard lock{state_mu_};
-        if (hdr.term != state_.term || truncated_in_flight_.contains(dlsn)) {
+        if (truncated_in_flight_.contains(dlsn)) {
             LOGW("write discarded post-flight: slot dropped by a committed login dlsn={}", dlsn);
             dropped = true;
         } else if (empty_lsns_.contains(dlsn)) {
@@ -1568,6 +1568,12 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("read rejected: stale term want={} got={}", state_.term, hdr.term);
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+        }
+        // A committed login has replaced this session: its truncation may have dropped an LBA's newest version, and
+        // the older one isn't readable again until the login applies.
+        if (hdr.term < login_fence_term_) {
+            LOGW("read rejected: term={} fenced by a committed login (term {})", hdr.term, login_fence_term_);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
@@ -2849,11 +2855,10 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
         bool voided = false;
         bool fenced = false;
         {
-            // As in write()'s post-flight: a fill a committed login dropped (or whose session moved on) frees its own
-            // blocks, a voided one too, and any other is published, even if a login fenced the round meanwhile. The
-            // round stops either way.
+            // As in write()'s post-flight: a fill a committed login dropped frees its own blocks, a voided one too, and
+            // any other is published, even if a login fenced the round meanwhile. The round stops either way.
             std::lock_guard lk{state_mu_};
-            if (term != state_.term || truncated_in_flight_.contains(slot->lsn)) {
+            if (truncated_in_flight_.contains(slot->lsn)) {
                 dropped = true;
             } else if (empty_lsns_.contains(slot->lsn)) {
                 // An Empty verdict applied during write_slot found the slot still missing, so it freed nothing and had
@@ -3051,6 +3056,9 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                 bool voided;
                 {
                     std::lock_guard lk{state_mu_};
+                    // Unlike a write() or a pre-resolution fill, a login committing meanwhile can't have dropped this
+                    // slot: it's at or below this Sync's watermark, and a login below a committed Sync is rejected.
+                    DEBUG_ASSERT(!truncated_in_flight_.contains(slot.lsn), "catch-up fill dropped by a login");
                     // Same as pre_resolve_slots' fills: an Empty verdict applied during write_slot leaves this fill
                     // void; otherwise it's readable until commit indexes it.
                     voided = empty_lsns_.contains(slot.lsn);
