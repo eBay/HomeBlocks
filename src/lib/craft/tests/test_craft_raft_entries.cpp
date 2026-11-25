@@ -1524,6 +1524,22 @@ TEST_F(CraftRaftEntriesTest, OnErrorOtherFailsProposalWithInternalError) {
     EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
+// A group that isn't active, starting or being destroyed, fails a proposal as the replica not serving, which a client
+// may retry, not as an internal error.
+TEST_F(CraftRaftEntriesTest, OnErrorOfAGroupNotActiveFailsProposalAsOffline) {
+    for (auto const err : {homestore::ReplServiceError::SERVER_IS_JOINING, homestore::ReplServiceError::UNREADY_STATE,
+                           homestore::ReplServiceError::SERVER_IS_LEAVING}) {
+        auto const ctx = make_test_proposal_ctx();
+
+        dev_->raft_listener().on_error(err, {}, {}, ctx);
+
+        auto const outcome = take_test_proposal_outcome(ctx);
+        ASSERT_TRUE(outcome.has_value());
+        ASSERT_FALSE(outcome->has_value());
+        EXPECT_EQ(outcome->error(), make_error_condition(volume_error::OFFLINE)) << enum_name(err);
+    }
+}
+
 TEST_F(CraftRaftEntriesTest, OnRollbackFailsProposalWithNotLeader) {
     auto const ctx = make_test_proposal_ctx();
 

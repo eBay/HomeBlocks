@@ -2827,10 +2827,21 @@ void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, 
                                                sisl::blob const& /* key */,
                                                cintrusive< homestore::repl_req_ctx >& ctx) {
     LOGW("proposal failed to replicate: {}", enum_name(err));
-    complete_proposal(ctx,
-                      std::unexpected(err == homestore::ReplServiceError::NOT_LEADER
-                                          ? craft::make_error_condition(craft::craft_error::NOT_LEADER)
-                                          : make_error_condition(volume_error::INTERNAL_ERROR)));
+    std::error_condition ec;
+    switch (err) {
+    case homestore::ReplServiceError::NOT_LEADER:
+        ec = craft::make_error_condition(craft::craft_error::NOT_LEADER);
+        break;
+    // The group isn't active, starting or being destroyed: this replica doesn't serve now, as when it recovers.
+    case homestore::ReplServiceError::SERVER_IS_JOINING:
+    case homestore::ReplServiceError::UNREADY_STATE:
+    case homestore::ReplServiceError::SERVER_IS_LEAVING:
+        ec = make_error_condition(volume_error::OFFLINE);
+        break;
+    default:
+        ec = make_error_condition(volume_error::INTERNAL_ERROR);
+    }
+    complete_proposal(ctx, std::unexpected(ec));
 }
 
 void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const& /* header */,
