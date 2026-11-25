@@ -762,6 +762,12 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
     // already covers rs_commit_lsn, while a commit run that's going may still move commit_lsn when it ends: wait it
     // out, so the checks below see where it stops.
     auto const commit_lock = co_await commit_mu_.lock();
+    // Rechecked after the wait: a conflicting Empty verdict may have faulted the partition meanwhile.
+    if (faulted_.load(std::memory_order_acquire)) {
+        LOGE("login_sync: partition faulted while waiting for a commit run -- abandoning rs_commit_lsn={}",
+             rs_commit_lsn);
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
     // An earlier login's timed-out InternalLogin may have committed meanwhile, replacing the session without moving
     // commit_lsn.
     std::lock_guard lk{state_mu_};

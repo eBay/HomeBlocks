@@ -279,14 +279,16 @@ protected:
                                                         /*addr=*/static_cast< uint64_t >(dlsn) * k_page_size,
                                                         k_page_size, sisl::sg_list{}));
     }
-    // Starts login_sync() at term 0, holding the watermark as a login does, without waiting for it; `outcome` gets its
-    // result when it finishes.
-    void start_login_sync(int64_t rs_commit_lsn, std::optional< status >& outcome) {
+    // Starts login_sync() at term 0, holding the watermark as a login does, without waiting for it. The returned result
+    // is set when it finishes; the coroutine shares it, so one still suspended when a test returns writes live memory.
+    std::shared_ptr< std::optional< status > > start_login_sync(int64_t rs_commit_lsn) {
+        auto outcome = std::make_shared< std::optional< status > >();
         homeblocks::detail::detach([](std::shared_ptr< CraftReplDev > dev, int64_t rs,
-                                      std::optional< status >& out) -> sisl::async::task< void > {
+                                      std::shared_ptr< std::optional< status > > out) -> sisl::async::task< void > {
             auto lock = co_await dev->watermark_mu_.lock();
-            out = co_await dev->login_sync(lock, rs, /*client_token=*/42, {}, /*term=*/0);
+            *out = co_await dev->login_sync(lock, rs, /*client_token=*/42, {}, /*term=*/0);
         }(dev_, rs_commit_lsn, outcome));
+        return outcome;
     }
 
     std::vector< lba_t > unmapped_;
@@ -885,22 +887,50 @@ TEST_F(CraftLoginTest, SyncWaitsForARunningCommitBeforeItChecks) {
     ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(2, write_ok, del_ok)).has_value());
     ASSERT_EQ(dev_->commit_lsn(), 2);
     loop_back_proposals();
-    std::optional< status > outcome;
+    std::shared_ptr< std::optional< status > > outcome;
 
     auto r = homeblocks::detail::sync_get(
         dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
             if (s == 3 && !outcome) {
-                start_login_sync(/*rs_commit_lsn=*/2, outcome);
-                EXPECT_FALSE(outcome.has_value()); // it waits for this run
+                outcome = start_login_sync(/*rs_commit_lsn=*/2);
+                EXPECT_FALSE(outcome->has_value()); // it waits for this run
             }
             return ok();
         }));
 
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(dev_->commit_lsn(), 3);
-    ASSERT_TRUE(outcome.has_value());
-    ASSERT_FALSE(outcome->has_value());
-    EXPECT_EQ(outcome->error(), no_quorum()); // past the watermark: a late advance
+    ASSERT_TRUE(outcome && outcome->has_value());
+    ASSERT_FALSE((*outcome)->has_value());
+    EXPECT_EQ((*outcome)->error(), no_quorum()); // past the watermark: a late advance
+}
+
+// The partition faults while login_sync() waits for that run: a Sync votes Empty the slot the run is indexing. The
+// login fails INTERNAL_ERROR, rather than with whatever commit_lsn says once the run ends.
+TEST_F(CraftLoginTest, SyncFaultedWhileWaitingForACommitFailsInternalError) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    auto const del_ok = [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); };
+    auto const write_ok = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(2, write_ok, del_ok)).has_value());
+    loop_back_proposals();
+    std::shared_ptr< std::optional< status > > outcome;
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
+            if (s == 3 && !outcome) {
+                outcome = start_login_sync(/*rs_commit_lsn=*/2);
+                commit_sync(/*rs_commit_lsn=*/3, /*empty_slots=*/{3}); // slot 3 is being indexed: faults
+                EXPECT_TRUE(dev_->is_faulted());
+            }
+            return ok();
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(outcome && outcome->has_value());
+    ASSERT_FALSE((*outcome)->has_value());
+    EXPECT_EQ((*outcome)->error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
 // ── login_install (SDSTOR-22892) ──────────────────────────────────────────────
