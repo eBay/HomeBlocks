@@ -2562,6 +2562,7 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
     std::optional< std::error_condition > rejected;
     bool start = false;
     std::optional< int64_t > applied_before_restart;
+    bool fault_pending = false;
     {
         std::lock_guard lk{apply_mu_};
         if (apply_stopped_) {
@@ -2591,7 +2592,8 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
                     LOGW("SyncRSCommitLSN({}) lsn={}: session {} was replaced by a committed login -- rejected",
                          entry.rs_commit_lsn, entry.lsn, entry.term);
                     rejected = craft::make_error_condition(craft::craft_error::STALE_TERM);
-                } else if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots); to_free) {
+                } else if (auto to_free = install_sync_rs_commit_lsn(entry.rs_commit_lsn, empty_slots, fault_pending);
+                           to_free) {
                     // Its verdicts fence write() and its watermark fences pre_resolve_slots() from now on.
                     entry.to_free = std::move(*to_free);
                 } else {
@@ -2621,7 +2623,7 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
         }
     }
     if (rejected) {
-        if (faulted_.load(std::memory_order_acquire)) fault(); // marks the record, now outside the locks
+        if (fault_pending) fault(); // marks the record, now outside the locks
         LOGW("apply lsn={} not applied: {}", entry.lsn, rejected->message());
         complete_proposal(entry.ctx, std::unexpected(*rejected));
         return;
@@ -3687,7 +3689,8 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
 // malformed response is instead treated exactly like a failed fetch
 
 result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
-                                                                          std::vector< int64_t > const& empty_slots) {
+                                                                          std::vector< int64_t > const& empty_slots,
+                                                                          bool& fault_pending) {
     // Validated before any state is touched -- an out-of-range verdict means the entry itself cannot be
     // trusted, not that this one slot should be skipped, so it gates the entire apply.
     for (int64_t lsn : empty_slots) {
@@ -3719,6 +3722,7 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
             // Its caller marks the record (fault()) once its locks are released: the mark is a synchronous meta-blk
             // write, which every op waiting for state_mu_ would wait for too.
             faulted_.store(true, std::memory_order_release);
+            fault_pending = true;
             return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
     }
@@ -3899,9 +3903,10 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
-    auto to_free = install_sync_rs_commit_lsn(rs_commit_lsn, empty_slots);
+    bool fault_pending = false;
+    auto to_free = install_sync_rs_commit_lsn(rs_commit_lsn, empty_slots, fault_pending);
     if (!to_free) {
-        if (faulted_.load(std::memory_order_acquire)) fault(); // marks the record, outside the lock
+        if (fault_pending) fault(); // marks the record, outside the lock
         co_return std::unexpected(to_free.error());
     }
     co_return co_await finish_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(*to_free));

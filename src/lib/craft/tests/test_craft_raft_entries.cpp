@@ -423,6 +423,10 @@ TEST_F(CraftRaftEntriesTest, ASyncThatFaultsAtCommitMarksTheRecordOutsideItsLock
     EXPECT_TRUE(store->faulted) << "the state record carries the fault";
     ASSERT_TRUE(unlocked);
     EXPECT_TRUE(*unlocked) << "marked while holding the device's state lock";
+
+    // An entry refused later, the partition being faulted, doesn't ask for the mark again.
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key), {}, {});
+    EXPECT_EQ(store->mark_calls, 1);
 }
 
 // A slot commit_impl() has started indexing is covered too, though commit_lsn only moves when the run ends: a
