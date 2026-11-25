@@ -694,6 +694,11 @@ bool HomeBlocksImpl::start_volume_removal(volume_id_t const& id) {
 }
 
 void HomeBlocksImpl::on_craft_group_destroyed(volume_id_t const& id) {
+    {
+        // A volume created again gets a new group under this id, whose leader mustn't wait out this one's backoff.
+        std::lock_guard lk{craft_handoff_mu_};
+        craft_handed_off_at_.erase(id);
+    }
     auto const vol = get_volume(id);
     if (!vol) { return; } // never created here, or already removed
     LOGINFO("vol={}: its RAFT group was destroyed, removing the local replica", craft_vol_str(*(*vol)->info()));

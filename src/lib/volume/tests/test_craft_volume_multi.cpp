@@ -697,6 +697,55 @@ TEST_F(CraftVolumeMultiTest, AMemberWhoseVolumeGoesOfflineHandsLeadershipOff) {
     ASSERT_TRUE(sync());
 }
 
+// A hand-off is forgotten with its group: the volume, created again within the backoff, gets a new group, whose leader
+// hands off at once if it can't serve.
+TEST_F(CraftVolumeMultiTest, AHandOffIsForgottenWithItsGroup) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(12);
+    auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
+    for (int created = 0; created < 2; ++created) {
+        if (me() == 0) {
+            auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(12)));
+            ASSERT_TRUE(vol) << vol.error().message();
+        }
+        ASSERT_TRUE(wait_until([&id] {
+            auto vol = hb()->get_volume(id);
+            return vol && (*vol)->craft_dev() != nullptr;
+        }));
+        ASSERT_TRUE(sync());
+
+        if (me() == 1) {
+            auto const rd = group(id);
+            EXPECT_TRUE(wait_until([&rd] {
+                if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                    (void)homeblocks::detail::sync_get(rd->become_leader());
+                }
+                return rd->is_leader();
+            }));
+            auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+            auto vol = *hb()->get_volume(id);
+            auto const handed_off = g_helper->leaderships_handed_off();
+            impl->fault_containment(vol, "test");
+            EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }))
+                << "created " << created + 1 << " times";
+            impl->exit_fc(vol);
+        }
+        EXPECT_TRUE(wait_until([&id] {
+            auto const leader = group(id)->get_leader_id();
+            return !leader.is_nil() && leader != member_id(1);
+        }));
+        ASSERT_TRUE(sync());
+
+        if (group(id)->is_leader()) {
+            ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
+        }
+        EXPECT_TRUE(wait_until([&id] { return group(id) == nullptr && !hb()->get_volume(id); }));
+        ASSERT_TRUE(sync());
+    }
+    HB_SETTINGS_FACTORY().modifiable_settings([backoff](auto& s) { s.craft_leadership_handoff_backoff_ms = backoff; });
+}
+
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
 // settings directory each (they rewrite their settings files at startup).
 static std::vector< pid_t > start_members(std::vector< std::string > const& args, std::string const& shm_name) {
