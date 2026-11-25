@@ -60,6 +60,7 @@ public:
     std::map< int64_t, JournalSlot > slots;
     int free_data_calls{0};
     int free_slot_calls{0};
+    std::vector< homestore::multi_blk_id > freed_blkids; // every free_data() call, in order
     homestore::blk_num_t next_blk_num{1000};
     std::optional< int64_t > fail_on_read; // if set, read_slot for that lsn returns an error
     std::function< void() > on_read_data;  // if set, runs at the start of each read_data()
@@ -121,8 +122,9 @@ public:
             co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
         co_return it->second;
     }
-    async_status free_data(homestore::multi_blk_id) override {
+    async_status free_data(homestore::multi_blk_id blkid) override {
         ++free_data_calls;
+        freed_blkids.push_back(blkid);
         co_return ok();
     }
     async_status free_slot(int64_t) override {
@@ -1788,7 +1790,10 @@ TEST_F(CraftCommitTest, SyncAdvanceOverAMappedIndexServesNewDataAndFreesOldBlock
     commit_sync(/*rs_commit_lsn=*/1);
 
     EXPECT_EQ(dev_->commit_lsn(), 1);
-    EXPECT_EQ(journal_->free_data_calls, 2); // blocks 500 and 501
+    std::vector< homestore::blk_num_t > freed;
+    for (auto const& blkid : journal_->freed_blkids)
+        freed.push_back(blkid.blk_num());
+    EXPECT_EQ(freed, (std::vector< homestore::blk_num_t >{500, 501})); // the superseded blocks, not the new one
     auto r = do_read(/*read_lsn=*/1, /*lba=*/0, /*nlbas=*/2);
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(r->extents.size(), 2u);
