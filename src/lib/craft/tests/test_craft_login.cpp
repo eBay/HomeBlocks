@@ -61,11 +61,16 @@ public:
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
     }
-    async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
+    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                             bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
         if (std::exchange(hold_write, false)) co_await write_gate;
-        slots[lsn] = JournalSlot{
-            .lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .blkid = blkid, .csums = csums};
+        slots[lsn] = JournalSlot{.lsn = lsn,
+                                 .term = term,
+                                 .all_zeros = all_zeros,
+                                 .lba_off_bytes = lba,
+                                 .len_bytes = len,
+                                 .blkid = blkid,
+                                 .csums = csums};
         co_return ok();
     }
     async_result< JournalSlot > read_slot(int64_t lsn) override {
@@ -128,9 +133,9 @@ QuorumSlotResponse holding(uint32_t member, std::vector< JournalSlot > slots = {
     return QuorumSlotResponse{.member = test_member_id(member), .slots = std::move(slots)};
 }
 
-// A one-block all_zeros slot at lsn: a fill with no payload to allocate.
-JournalSlot zeros(int64_t lsn) {
-    return JournalSlot{.lsn = lsn, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size};
+// A one-block all_zeros slot at lsn, written at `term`: a fill with no payload to allocate.
+JournalSlot zeros(int64_t lsn, uint64_t term = 0, lba_t lba = 0) {
+    return JournalSlot{.lsn = lsn, .term = term, .all_zeros = true, .lba_off_bytes = lba, .len_bytes = k_page_size};
 }
 
 // Receives a coroutine's completion and drops it: lets a test start one and destroy it mid-await.
@@ -959,7 +964,7 @@ TEST_F(CraftLoginTest, InstallFailsStaleTermWhenANewerLoginCommittedBehindIt) {
     proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
         loop_back(proposer_, *dev_, h, k);
         dev_->pause_apply();
-        commit_login(/*term=*/2);
+        commit_login(/*term=*/2, /*rs_commit_lsn=*/5); // committed logins' watermarks never decrease
     };
 
     auto r = do_login_install(/*rs_commit_lsn=*/5, /*client_token=*/42);
@@ -1344,6 +1349,61 @@ TEST_F(CraftLoginTest, ResolveForAReplacedSessionDoesNotWaitForWrites) {
     ASSERT_TRUE(resolved->has_value());
     ASSERT_FALSE((*resolved)->has_value());
     EXPECT_EQ((*resolved)->error(), stale_term());
+}
+
+// ── stale tails (SDSTOR-26847) ────────────────────────────────────────────────
+//
+// Each test commits a login at term 1 with watermark 3 here, then resolves as the next login at term 1. A member that
+// missed that login can still hold a term-0 slot above 3: the login dropped it.
+
+// Member 1 holds only a slot the login dropped, so it lacks the slot: with member 2's lack, a quorum does, and the slot
+// is voted Empty rather than filled with the dropped write.
+TEST_F(CraftLoginTest, ResolveCountsASlotALoginDroppedAsLacking) {
+    dev_->seed_lsns(3, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    ASSERT_EQ(dev_->term(), 1u);
+    poller_.fetched = {holding(1, {zeros(4, /*term=*/0)}), holding(2)};
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/4, {test_member_id(1), test_member_id(2)}, /*term=*/1);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(*r, (std::vector< int64_t >{4}));
+    EXPECT_FALSE(journal_->slots.contains(4));
+}
+
+// Slots the login kept are filled, each journaled at the term it was written at: an old-session slot at the login's
+// watermark, and a current-session one above it.
+TEST_F(CraftLoginTest, ResolveFillsSlotsNoLoginDroppedAtTheirOwnTerms) {
+    dev_->seed_lsns(2, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    ASSERT_EQ(dev_->term(), 1u);
+    poller_.fetched = {holding(1, {zeros(3, /*term=*/0), zeros(4, /*term=*/1)}), holding(2)};
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/4, {test_member_id(1), test_member_id(2)}, /*term=*/1);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_TRUE(r->empty());
+    ASSERT_TRUE(journal_->slots.contains(3));
+    EXPECT_EQ(journal_->slots[3].term, 0u);
+    ASSERT_TRUE(journal_->slots.contains(4));
+    EXPECT_EQ(journal_->slots[4].term, 1u);
+}
+
+// One member holds the dropped write and another the current session's: the slot is filled with the current one,
+// whichever reply comes first.
+TEST_F(CraftLoginTest, ResolveFillsFromALiveCopyOverADroppedOne) {
+    dev_->seed_lsns(3, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    poller_.fetched = {holding(1, {zeros(4, /*term=*/0, /*lba=*/0)}),
+                       holding(2, {zeros(4, /*term=*/1, /*lba=*/k_page_size)})};
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/4, {test_member_id(1), test_member_id(2)}, /*term=*/1);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_TRUE(r->empty());
+    ASSERT_TRUE(journal_->slots.contains(4));
+    EXPECT_EQ(journal_->slots[4].lba_off_bytes, k_page_size);
+    EXPECT_EQ(journal_->slots[4].term, 1u);
 }
 
 } // namespace

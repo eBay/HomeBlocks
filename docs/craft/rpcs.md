@@ -233,7 +233,8 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ```
 Request:  { lsns: [int64] }
-Response: { slots: [{ lsn: int64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32, data: bytes }] }
+Response: { slots: [{ lsn: int64, term: uint64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32,
+                      data: bytes }] }
 ```
 
 Called by the leader during pre-resolution (before proposing a `SyncRSCommitLSN`), and by a replica that is
@@ -242,6 +243,16 @@ missing slots while applying one.
 (no data, applied as a range unmap); `is_empty=true` means the peer **positively** marked that slot
 `Empty` (leader-only verdict); a requested `lsn` **omitted** means *not-present-here*. A peer never
 returns `is_empty=true` for a slot it merely lacks.
+
+**A slot a login dropped.** `term` is the session term the slot was written at. A peer that missed a login
+still holds the old session's slots above that login's `rs_commit_lsn` (#10), so the requester checks each
+slot against the logins it has committed: a slot written at term s is dropped if the first login after s has
+`rs_commit_lsn` below it. That first login is enough, because committed logins' watermarks never decrease
+(a login below a committed `SyncRSCommitLSN` is rejected). Pre-resolution counts the peer as lacking such a
+slot, so a slot only stale tails hold resolves `Empty`; catch-up leaves it missing for a later fetch from a
+peer holding the live one. Each replica records every committed login's `(term, rs_commit_lsn)` when the
+`InternalLogin` commits. A fill journals a slot at its original term, not the current session's, so a dropped
+slot can't come back looking current.
 
 HomeBlocks handler: `CraftReplDev::fetch_data()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)

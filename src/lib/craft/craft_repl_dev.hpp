@@ -27,6 +27,7 @@
 #include <deque>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -80,9 +81,12 @@ struct CraftPartitionState {
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
 // data (is_empty=false, all_zeros=false), zero write (all_zeros=true, no data), Empty (is_empty=true), or
-// omitted from the response (not-present-here).
+// omitted from the response (not-present-here). A fetched slot must carry its real journal term: one left at 0 looks
+// written before every login, so after the first login a live copy counts as dropped. Don't wire a transport whose
+// wire has no term (craft_client's slot_desc today; craft-client-changes.md 3.6).
 struct JournalSlot {
     int64_t lsn{-1};
+    uint64_t term{0}; // session term the slot was written at; a requester rejects one a later login dropped
     bool is_empty{false};
     bool all_zeros{false};
     lba_t lba_off_bytes{0};
@@ -125,8 +129,8 @@ public:
     // Allocate blocks and write the data payload. Called BEFORE write_slot for non-zero writes.
     // all_zeros=true and empty data bypass this; write_slot receives an empty multi_blk_id.
     virtual async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const& data, lba_count_t len) = 0;
-    // term is the session term captured from state_.term at write() time — stored in
-    // CraftJournalEntry so recovery can skip stale-tail entries written under a deposed leader.
+    // term is the session term the slot was written at: write()'s session, or a fetched slot's own term for a fill.
+    // Stored in CraftJournalEntry, so recovery and peers can tell a slot a later login dropped.
     // csums is one crc16 per LBA in [lba, lba+len) (byte len / this device's lba_size), computed by
     // the caller while the data is still in memory; empty for all_zeros (no data, nothing to sum).
     virtual async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len,
@@ -178,6 +182,8 @@ public:
     // (S9) must treat a missed deadline as a hard failure, same as an unreachable peer -- this interface
     // only carries the contract; there's nothing to enforce yet since today's only implementations are
     // direct function calls (production is unwired, tests call synchronously).
+    // Each slot comes back with its journal term (see JournalSlot). A slot the peer holds but a login dropped stays
+    // missing here until a later catch-up reaches a member holding the live one, so don't keep asking the same peer.
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                   uint32_t timeout_ms) = 0;
     // Broadcasts fetch_data(lsns) to every OTHER responding replica-set member; a non-responding member
@@ -914,6 +920,13 @@ private:
     bool missing_at_capacity_locked(int64_t lsn) const;
     // True if term is the current session and no newer login has committed. Caller holds state_mu_.
     bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
+    // True if a committed login dropped slot lsn as written at term: the first one after term has a watermark below
+    // lsn. That one is enough, as committed logins' watermarks never decrease (a login below a committed Sync is
+    // rejected). Caller holds state_mu_.
+    bool dropped_by_login_locked(int64_t lsn, uint64_t term) const {
+        auto const first_after = login_rs_.upper_bound(term);
+        return first_after != login_rs_.end() && lsn > first_after->second;
+    }
     // True if a login poll has quiesced writes at term. Caller holds state_mu_.
     bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
     // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes the drain_writes() callers on
@@ -1049,6 +1062,10 @@ private:
     // rounds at a lower term are rejected (STALE_TERM), so the old session can't act while the login waits in the apply
     // queue. keep_alive changes over at the apply. Guarded by state_mu_.
     uint64_t login_fence_term_{0};
+    // Each committed login's watermark by term, recorded at its commit with its truncation; rejected and not-newer
+    // logins aren't. dropped_by_login_locked() reads it. In memory only: S8 must persist it, with empty_lsns_ (never
+    // pruned), so recovery can tell a dead journal record. Guarded by state_mu_.
+    std::map< uint64_t, int64_t > login_rs_;
     // Writes at or below this term are quiesced by a login poll (STALE_TERM); unset until the first poll. Only rises.
     // Fences writes only: reads, keep_alive and leader rounds go on. In memory only: a member that restarts before the
     // login finishes comes back unquiesced, a case left undefined. Guarded by state_mu_.

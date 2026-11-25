@@ -312,6 +312,7 @@ public:
 
         JournalSlot slot;
         slot.lsn = hdr.lsn;
+        slot.term = hdr.term;
         // Corruption / misplaced-record guard: hdr.lsn is a redundant copy of the seq_num this record
         // was written under. A mismatch means a corrupt on-disk blob (or, in principle, a misrouted
         // log-store sequence number) -- either way, trusting the record's other fields (lba/len/blkid)
@@ -2283,9 +2284,8 @@ async_status CraftReplDev::propose_entry([[maybe_unused]] AsyncMutex::Lock const
 // co_await read_slot() call to avoid holding a mutex across a suspension point. The snapshot can go
 // stale before the reads: a login committing meanwhile may drop a slot classified present, and free
 // its blocks once it applies. The requester then gets an old-session slot that login dropped, as it
-// does from a member that hasn't committed the login yet.
-// TODO(SDSTOR-26847): reply with each slot's journal term, so the requester can reject one a later
-// login dropped.
+// does from a member that hasn't committed the login yet. Each slot carries its journal term, so the
+// requester rejects one a login it committed dropped (dropped_by_login_locked()).
 //
 // A read_slot() I/O error aborts the batch immediately (fail-fast); the partial result is discarded.
 
@@ -2473,6 +2473,8 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
                         entry.republish = dropped->overlay_dropped;
                         // The old session can't write while the login waits for its turn; the login applies in order.
                         login_fence_term_ = entry.term;
+                        // A peer that missed this login can still hand over a slot it dropped.
+                        login_rs_.emplace(entry.term, entry.rs_commit_lsn);
                     } else {
                         // This member has indexed past the watermark: the session would start below data it serves.
                         LOGE("InternalLogin(term={}) lsn={}: can't truncate to {} -- faulting the partition",
@@ -2595,6 +2597,12 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
     std::lock_guard sl{state_mu_};
     if (login_fence_term_ < state_.term)
         found.push_back(fmt::format("login fence term {} below the session term {}", login_fence_term_, state_.term));
+    // dropped_by_login_locked() consults only the first login after a slot's term, which is enough only while
+    // committed logins' watermarks never decrease.
+    for (auto it = login_rs_.begin(); it != login_rs_.end() && std::next(it) != login_rs_.end(); ++it)
+        if (std::next(it)->second < it->second)
+            found.push_back(fmt::format("login at term {} has watermark {}, below term {}'s {}", std::next(it)->first,
+                                        std::next(it)->second, it->first, it->second));
     for (int64_t lsn : empty_lsns_)
         if (missing_lsns_.contains(lsn)) found.push_back(fmt::format("lsn {} is both missing and Empty", lsn));
     for (int64_t lsn : truncated_in_flight_)
@@ -2829,15 +2837,31 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
         }
         if (tally.add(reply.member) == VoterTally::Reply::drop) continue;
         ++valid_member_count;
+        size_t dropped_count = 0;
+        JournalSlot const* first_dropped = nullptr;
         for (auto& slot : reply.slots) {
             if (slot.is_empty) {
                 empty_by_quorum.insert(slot.lsn);
                 data_by_lsn.erase(slot.lsn);
                 continue;
             }
+            // A slot a login dropped, from a member that missed it: the member doesn't hold a live one, so it lacks it.
+            bool dropped;
+            {
+                std::lock_guard lk{state_mu_};
+                dropped = dropped_by_login_locked(slot.lsn, slot.term);
+            }
+            if (dropped) {
+                if (dropped_count++ == 0) first_dropped = &slot;
+                continue;
+            }
             if (!empty_by_quorum.contains(slot.lsn) && !data_by_lsn.contains(slot.lsn))
                 data_by_lsn.emplace(slot.lsn, &slot);
         }
+        if (dropped_count > 0)
+            LOGW("pre_resolve_slots: {} slot(s) from {} are ones a login dropped (first lsn={} at term {}) -- counted "
+                 "as lacking",
+                 dropped_count, boost::uuids::to_string(reply.member), first_dropped->lsn, first_dropped->term);
     }
     if (valid_member_count == 0) {
         // No usable reply (every one malformed or this member's own). Fail closed rather than
@@ -2933,7 +2957,8 @@ CraftReplDev::pre_resolve_slots(int64_t upto, uint64_t term,
             LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", slot->lsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        auto res = co_await journal_->write_slot(slot->lsn, term, slot->lba_off_bytes, slot->len_bytes, blkid,
+        // At the term it was written at, not this session's: a requester can still tell a slot a login dropped.
+        auto res = co_await journal_->write_slot(slot->lsn, slot->term, slot->lba_off_bytes, slot->len_bytes, blkid,
                                                  slot->all_zeros, slot->csums);
         if (!res) {
             LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
@@ -3071,10 +3096,8 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
     co_await free_slots(to_free, "apply_sync_rs_commit_lsn");
 
     std::vector< int64_t > to_fetch;
-    uint64_t term;
     {
         std::lock_guard lk{state_mu_};
-        term = state_.term; // stamps the catch-up writes
         for (int64_t lsn : missing_lsns_) {
             if (lsn > rs_commit_lsn) break; // missing_lsns_ is ordered
             to_fetch.push_back(lsn);
@@ -3097,6 +3120,8 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                  "entire batch, leaving {} lsn(s) as missing",
                  *bad_lsn, to_fetch.size());
         } else {
+            size_t dropped_count = 0;
+            JournalSlot const* first_dropped = nullptr;
             for (auto& slot : *fetched) {
                 if (slot.is_empty) {
                     std::lock_guard lk{state_mu_};
@@ -3104,11 +3129,19 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                     missing_lsns_.erase(slot.lsn);
                     continue;
                 }
-                // Leave a slot with a write in flight to that write, and skip one that landed meanwhile (H1).
-                SlotClaim claim;
+                // Leave a slot with a write in flight to that write, and skip one that landed meanwhile (H1). One a
+                // login dropped, from a peer that missed the login, stays missing for a later catch-up to fill from
+                // another peer (CraftPeerFetcher::fetch_data()).
+                bool dropped;
+                SlotClaim claim{SlotClaim::held}; // not claimed unless set below
                 {
                     std::lock_guard lk{state_mu_};
-                    claim = claim_slot_write_locked(slot.lsn);
+                    dropped = dropped_by_login_locked(slot.lsn, slot.term);
+                    if (!dropped) claim = claim_slot_write_locked(slot.lsn);
+                }
+                if (dropped) {
+                    if (dropped_count++ == 0) first_dropped = &slot;
+                    continue;
                 }
                 if (claim != SlotClaim::claimed) continue;
                 SlotWriteClaim const release{this, slot.lsn};
@@ -3130,8 +3163,8 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                 // FIXME: write_slot has no all_zeros branch -- it serializes whatever blkid it's given
                 // relying on multi_blk_id's own serialize()/serialized_size() to degrade safely for a
                 // default instance. That's an implicit, undocumented dependency on HomeStore's current
-                // behavior -- see SDSTOR-25613.
-                auto res = co_await journal_->write_slot(slot.lsn, term, slot.lba_off_bytes, slot.len_bytes, blkid,
+                // behavior -- see SDSTOR-25613. At the slot's own term, as pre-resolution's fill journals it.
+                auto res = co_await journal_->write_slot(slot.lsn, slot.term, slot.lba_off_bytes, slot.len_bytes, blkid,
                                                          slot.all_zeros, slot.csums);
                 if (!res) {
                     LOGE("apply_sync_rs_commit_lsn: write_slot failed lsn={}: {} -- leaving as missing", slot.lsn,
@@ -3165,6 +3198,10 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
                              fr.error().message());
                 }
             }
+            if (dropped_count > 0)
+                LOGW("apply_sync_rs_commit_lsn: {} fetched slot(s) are ones a login dropped (first lsn={} at term {}) "
+                     "-- leaving them missing",
+                     dropped_count, first_dropped->lsn, first_dropped->term);
         }
     }
 

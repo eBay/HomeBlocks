@@ -107,7 +107,8 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
     ASSERT_TRUE(r.has_value());
 }
 
-// read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
+// read_slot must parse back exactly what write_slot wrote: header fields (the term included), the csum array, and the
+// blkid.
 TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
@@ -124,6 +125,7 @@ TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     auto r = homeblocks::detail::sync_get(backend->read_slot(3));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->lsn, 3);
+    EXPECT_EQ(r->term, 5u);
     EXPECT_FALSE(r->all_zeros);
     EXPECT_EQ(r->lba_off_bytes, 100u);
     EXPECT_EQ(r->len_bytes, 2 * k_page_size);
@@ -149,10 +151,12 @@ TEST_F(CraftHomeStoreBackendTest, RewritingASlotReplacesItsRecord) {
 
     auto r5 = homeblocks::detail::sync_get(backend->read_slot(5));
     ASSERT_TRUE(r5.has_value());
+    EXPECT_EQ(r5->term, 2u); // the new session's record, not the dropped one
     EXPECT_EQ(r5->lba_off_bytes, 200u);
     EXPECT_TRUE(r5->blkid == (homestore::multi_blk_id{43, 1, 7}));
     auto r7 = homeblocks::detail::sync_get(backend->read_slot(7));
     ASSERT_TRUE(r7.has_value());
+    EXPECT_EQ(r7->term, 1u);
     EXPECT_EQ(r7->lba_off_bytes, 300u);
 }
 

@@ -87,14 +87,13 @@ public:
         co_return homestore::multi_blk_id{};
     }
 
-    async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len,
-                            homestore::multi_blk_id /* blkid */, bool all_zeros,
-                            std::vector< homestore::csum_t > const& csums) override {
+    async_status write_slot(int64_t lsn, uint64_t term, lba_t lba, lba_count_t len, homestore::multi_blk_id /* blkid */,
+                            bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
         if (on_write) on_write(lsn);
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        slots[lsn] =
-            JournalSlot{.lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .csums = csums};
+        slots[lsn] = JournalSlot{
+            .lsn = lsn, .term = term, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .csums = csums};
         co_return ok();
     }
 
@@ -218,6 +217,12 @@ protected:
     auto do_apply(int64_t rs_commit_lsn, uint64_t client_token, std::vector< int64_t > empty_slots = {}) {
         return homeblocks::detail::sync_get(
             dev_->apply_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(empty_slots)));
+    }
+    // Commits an InternalLogin at `term` with watermark rs_commit_lsn, as RAFT would; it applies at once.
+    void commit_login(uint64_t term, int64_t rs_commit_lsn) {
+        auto header = make_header(CraftEntryType::InternalLogin);
+        auto key = make_internal_login_key(/*client_token=*/1, term, rs_commit_lsn);
+        dev_->raft_listener().on_commit(1, as_blob(header), as_blob(key), {}, {});
     }
 
     MockCraftJournalBackend* journal_{nullptr};
@@ -654,6 +659,80 @@ TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
     EXPECT_FALSE(dev_->is_missing(1));
     EXPECT_TRUE(dev_->is_missing(2));
     EXPECT_EQ(dev_->commit_lsn(), 1); // lsn=1 resolved; stalls at lsn=2, still missing
+}
+
+// ── catch-up past a login's truncation (SDSTOR-26847) ─────────────────────────
+//
+// The peer that answers may have missed a login this member committed, and still hold a slot the login dropped.
+
+// A term-0 slot above the term-1 login's watermark is one the login dropped: it isn't journaled and stays missing, for
+// a later catch-up to fill from a member holding the live one.
+TEST_F(CraftRaftEntriesTest, CatchUpLeavesASlotALoginDroppedMissing) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/2);
+    ASSERT_EQ(dev_->term(), 1u);
+    fetcher_.response = {JournalSlot{.lsn = 3, .term = 0, .lba_off_bytes = 10, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// Slots the login kept are journaled at the term they were written at: an old-session one at or below its watermark,
+// and a current-session one above it.
+TEST_F(CraftRaftEntriesTest, CatchUpFillsSlotsNoLoginDroppedAtTheirOwnTerms) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {1});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/2);
+    fetcher_.response = {JournalSlot{.lsn = 1, .term = 0, .lba_off_bytes = 10, .len_bytes = 4},
+                         JournalSlot{.lsn = 3, .term = 1, .lba_off_bytes = 30, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(journal_->has_slot(1));
+    EXPECT_EQ(journal_->slots[1].term, 0u);
+    ASSERT_TRUE(journal_->has_slot(3));
+    EXPECT_EQ(journal_->slots[3].term, 1u);
+    EXPECT_FALSE(dev_->is_missing(1));
+    EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// A login that isn't newer than the session is ignored, so it records nothing: the term-0 slot falls under the term-2
+// login's watermark, not the lower one of the term-1 login committed after it.
+TEST_F(CraftRaftEntriesTest, ALoginThatIsntNewerDropsNothingForCatchUp) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(1, {});
+    commit_login(/*term=*/2, /*rs_commit_lsn=*/3);
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/1);
+    ASSERT_EQ(dev_->term(), 2u);
+    fetcher_.response = {JournalSlot{.lsn = 2, .term = 0, .lba_off_bytes = 20, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/3, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(journal_->has_slot(2));
+    EXPECT_FALSE(dev_->is_missing(2));
+}
+
+// A login below a committed Sync's watermark is rejected at its commit, so it records nothing either.
+TEST_F(CraftRaftEntriesTest, ARejectedLoginDropsNothingForCatchUp) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/4, /*client_token=*/0).has_value()); // nothing to fetch: 3 and 4 missing
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    ASSERT_EQ(dev_->term(), 0u);
+    fetcher_.response = {JournalSlot{.lsn = 4, .term = 0, .lba_off_bytes = 40, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/4, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(journal_->has_slot(4));
+    EXPECT_FALSE(dev_->is_missing(4));
+    EXPECT_TRUE(dev_->is_missing(3));
 }
 
 // ── checkpoint trigger (SDSTOR-22888) ─────────────────────────────────────────
