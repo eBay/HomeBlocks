@@ -385,7 +385,8 @@ public:
     // HomeStore's rollback assumes in-order appends: nothing reads past last_append_lsn, a new write to the dLSN
     // replaces the record, and recovery must skip them by term (S8). The caller fences writes first and keeps lsn at
     // or above every committed Sync's watermark. InternalLogin truncates at its commit (truncate_tail_locked()) and
-    // frees at its apply.
+    // frees at its apply, where it also re-publishes an older surviving write for an LBA whose newest entry it dropped;
+    // truncate() doesn't.
     async_status truncate(int64_t lsn);
 
     // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The proposer behind the
@@ -758,6 +759,7 @@ private:
         // Slots whose blocks the apply frees. SyncRSCommitLSN: held slots its verdicts voided. InternalLogin: journaled
         // slots its truncation dropped.
         std::vector< int64_t > to_free{};
+        bool republish{false}; // InternalLogin: its truncation dropped overlay entries
         // InternalLogin: its new term. SyncRSCommitLSN: the session it was proposed in.
         uint64_t term{0};
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
@@ -791,14 +793,21 @@ private:
     // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
+    // What truncate_tail_locked() dropped: the journaled slots, whose blocks the caller frees, and whether overlay
+    // entries went with them (an older write to one of their LBAs may then need re-publishing).
+    struct TailTruncation {
+        std::vector< int64_t > slots;
+        bool overlay_dropped{false};
+    };
     // truncate()'s state change, under state_mu_: InternalLogin's at its commit, so it lands in log order before a
-    // later Sync's install. Returns the journaled slots it dropped, whose blocks the caller frees, and marks writes in
-    // flight above lsn in truncated_in_flight_. Fails with invalid_argument, changing nothing, below a slot already
-    // indexed or being indexed.
-    result< std::vector< int64_t > > truncate_tail_locked(int64_t lsn);
+    // later Sync's install. Also marks writes in flight above lsn in truncated_in_flight_. Fails with
+    // invalid_argument, changing nothing, below a slot already indexed or being indexed.
+    result< TailTruncation > truncate_tail_locked(int64_t lsn);
     // InternalLogin's apply, run by the apply queue: waits for writes in flight, frees the slots its commit dropped
-    // (to_free), then starts the session. STALE_TERM if the entry's term isn't newer, and it was ignored.
-    async_status apply_internal_login(uint64_t client_token, uint64_t term, std::vector< int64_t > const& to_free);
+    // (to_free), re-publishes the overlay if the commit dropped entries from it (republish), then starts the session.
+    // STALE_TERM if the entry's term isn't newer, and it was ignored.
+    async_status apply_internal_login(uint64_t client_token, uint64_t term, std::vector< int64_t > const& to_free,
+                                      bool republish);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
@@ -880,8 +889,8 @@ private:
     bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
     // True if a login poll has quiesced writes at term. Caller holds state_mu_.
     bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
-    // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes every drain_writes() caller,
-    // on this thread.
+    // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes the drain_writes() callers on
+    // this thread, one at a time.
     void release_slot_write(int64_t lsn);
     // Waits until no journal write is in flight. The caller fences new writes first, or the wait may not end.
     sisl::async::task< void > drain_writes();

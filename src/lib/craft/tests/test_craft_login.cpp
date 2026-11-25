@@ -135,6 +135,19 @@ struct DropReceiver {
     void set_stopped() && noexcept {}
 };
 
+// A coroutine started and held, so a test can destroy it while it waits.
+struct HeldTask {
+    explicit HeldTask(sisl::async::task< void > task) :
+            op{stdexec::connect(
+                stdexec::write_env(std::move(task), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+                DropReceiver{})} {
+        stdexec::start(op);
+    }
+    decltype(stdexec::connect(stdexec::write_env(std::declval< sisl::async::task< void > >(),
+                                                 stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+                              DropReceiver{})) op;
+};
+
 } // namespace
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -213,11 +226,16 @@ protected:
             }(dev_, rs_commit_lsn, std::move(quiesced), outcome));
     }
     // Starts drain_writes() and destroys it while it waits, as a caller that gives up would.
-    void abandon_drain() {
-        auto op = stdexec::connect(
-            stdexec::write_env(dev_->drain_writes(), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
-            DropReceiver{});
-        stdexec::start(op);
+    void abandon_drain() { HeldTask held{dev_->drain_writes()}; }
+    // Starts drain_writes() and holds it, so a test can destroy it while it waits.
+    std::unique_ptr< HeldTask > hold_drain() { return std::make_unique< HeldTask >(dev_->drain_writes()); }
+    // Starts drain_writes() and runs `then` once it returns.
+    void start_drain_then(std::function< void() > then) {
+        homeblocks::detail::detach(
+            [](std::shared_ptr< CraftReplDev > dev, std::function< void() > then) -> sisl::async::task< void > {
+                co_await dev->drain_writes();
+                then();
+            }(dev_, std::move(then)));
     }
     size_t drain_waiters() {
         std::lock_guard lk{dev_->state_mu_};
@@ -1050,6 +1068,26 @@ TEST_F(CraftLoginTest, AFillInFlightAtOrBelowTheWatermarkIsKept) {
     EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
 }
 
+// Writes 0, 3 and 5 hit the same LBA, with 1, 2 and 4 missing, so none is indexed. A login at 4 drops 5, the LBA's
+// newest overlay entry, at commit; its apply makes 3 readable again.
+TEST_F(CraftLoginTest, ALoginRepublishesTheWriteItsTruncationUncovered) {
+    for (int64_t dlsn : {0, 3, 5}) {
+        auto w = homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
+        ASSERT_TRUE(w.has_value());
+    }
+    ASSERT_EQ(dev_->overlay_lsn_for(0), 5);
+    dev_->pause_apply();
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // dropped at commit
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 3);
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
 // ── the write drain ───────────────────────────────────────────────────────────
 
 // The leader's resolution and a login's apply both wait for the same write; when it lands, both go on. The login
@@ -1083,6 +1121,39 @@ TEST_F(CraftLoginTest, AnAbandonedDrainLeavesTheWaiterList) {
     EXPECT_EQ(drain_waiters(), 0u);
 
     dev_->release_in_flight(3); // would resume a destroyed frame if the waiter were still listed
+}
+
+// The first drain resumed destroys a second one still waiting: the second has stayed listed, so its own guard takes it
+// off the list and nothing resumes its destroyed frame.
+TEST_F(CraftLoginTest, ADrainResumedFirstCanDestroyAnotherStillWaiting) {
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+    std::unique_ptr< HeldTask > second;
+    start_drain_then([&] { second.reset(); });
+    second = hold_drain();
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    dev_->release_in_flight(3);
+
+    EXPECT_FALSE(second);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A login has already replaced this round's session, and a write is in flight (the new session's, say): resolution
+// fails STALE_TERM at once rather than wait for it.
+TEST_F(CraftLoginTest, ResolveForAReplacedSessionDoesNotWaitForWrites) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+    std::optional< result< std::vector< int64_t > > > resolved;
+    start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}, resolved); // at term 0
+
+    EXPECT_TRUE(resolved.has_value()); // didn't wait for the write
+    dev_->release_in_flight(3);
+
+    ASSERT_TRUE(resolved.has_value());
+    ASSERT_FALSE(resolved->has_value());
+    EXPECT_EQ(resolved->error(), stale_term());
 }
 
 } // namespace
