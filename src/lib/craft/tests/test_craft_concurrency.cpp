@@ -14,7 +14,7 @@
  *********************************************************************************/
 
 // Real multi-threaded tests for CraftReplDev's own internal locking (state_mu_, overlay_mu_,
-// commit_running_) -- every other CRAFT test drives calls from a single thread via sync_get(), so
+// commit_mu_) -- every other CRAFT test drives calls from a single thread via sync_get(), so
 // none of them ever exercise genuine concurrent contention on these locks.
 //
 // This stays light (no HomeStore/iomgr): MockCraftJournalBackend's coroutine bodies never suspend
@@ -349,7 +349,7 @@ TEST_F(CraftConcurrencyTest, ConcurrentWriteAndReadNoTornReads) {
 }
 
 // N real threads all call commit_with() targeting the same upto_lsn concurrently against a shared,
-// pre-seeded journal -- commit_running_ (guarded by state_mu_) must ensure the apply loop's
+// pre-seeded journal -- commit_mu_ must ensure the apply loop's
 // write_fn runs for each LBA EXACTLY ONCE across all callers combined, never zero (stall) and never
 // twice (double-apply), regardless of which thread actually "wins" the race. write_fn sleeps briefly
 // to widen the window so concurrent callers genuinely overlap with the winner's in-flight run rather
@@ -394,13 +394,91 @@ TEST_F(CraftConcurrencyTest, ConcurrentCommitWithSerializesNoDoubleApply) {
     EXPECT_EQ(applied_lbas.size(), static_cast< size_t >(kSlots)); // every LBA was applied by exactly one
 }
 
+// Syncs commit on one thread while real threads drive commits toward staggered targets (SDSTOR-26759). A Sync's
+// advance waits for whichever run holds commit_mu_ and resumes on that run's thread, so commit_lsn never moves
+// backwards, every slot reaches the index exactly once whoever applies it, and the last Sync's watermark is reached.
+TEST_F(CraftConcurrencyTest, SyncAdvancesInterleaveWithConcurrentCommits) {
+    constexpr int kSlots = 60;
+    dev_->seed_lsns(kSlots - 1, {});
+    for (int i = 0; i < kSlots; ++i)
+        journal_->add_data_slot(i, /* lba = */ static_cast< lba_t >(i), /* nlbas = */ 1,
+                                /* blk_num = */ static_cast< homestore::blk_num_t >(2000 + i), {uint16_t(i)});
+
+    std::mutex applied_mu;
+    std::set< lba_t > applied_lbas;
+    int duplicate_applies = 0;
+    auto write_fn = [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
+        std::this_thread::sleep_for(std::chrono::microseconds(200)); // keep runs overlapping
+        auto r = index_.write_to_index(s, e, info);
+        std::lock_guard lk{applied_mu};
+        for (auto l = s; l <= e; ++l) {
+            if (!applied_lbas.insert(l).second) ++duplicate_applies;
+        }
+        return r;
+    };
+    auto delete_fn = [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+        return index_.delete_lba_range(s, e, freed);
+    };
+    dev_->use_test_index(write_fn, delete_fn); // the Syncs' advances index through the same counters
+
+    std::atomic< bool > done{false};
+    std::atomic< int > regressions{0};
+    std::thread watcher([&] {
+        int64_t last = -1;
+        while (!done.load()) {
+            auto const now = dev_->commit_lsn();
+            if (now < last) ++regressions;
+            last = now;
+            std::this_thread::yield();
+        }
+    });
+
+    constexpr int kCommitters = 4;
+    std::vector< std::thread > threads;
+    for (int t = 0; t < kCommitters; ++t) {
+        threads.emplace_back([&, t] {
+            for (int target = t; target < kSlots; target += kCommitters) {
+                auto r = homeblocks::detail::sync_get(dev_->commit_with(target, write_fn, delete_fn));
+                EXPECT_TRUE(r.has_value());
+            }
+        });
+    }
+    threads.emplace_back([this] {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        int64_t raft_lsn = 1;
+        for (int64_t rs = 9; rs < kSlots; rs += 10) {
+            std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
+            serialize_sync_rs_commit_lsn(key.data(), rs, /*client_token=*/0, /*term=*/0, {});
+            cintrusive< homestore::repl_req_ctx > ctx{};
+            dev_->raft_listener().on_commit(raft_lsn++,
+                                            sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                            sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    for (auto& th : threads)
+        th.join();
+    // A Sync left waiting resumes on the thread that released commit_mu_, before that thread's commit returns, so
+    // the joins should already have drained them; the wait is only a backstop.
+    for (int i = 0; i < 500 && dev_->commit_lsn() < kSlots - 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    done = true;
+    watcher.join();
+
+    EXPECT_EQ(dev_->commit_lsn(), kSlots - 1);
+    EXPECT_EQ(regressions.load(), 0);
+    EXPECT_EQ(duplicate_applies, 0);
+    EXPECT_EQ(applied_lbas.size(), static_cast< size_t >(kSlots));
+}
+
 // ── comprehensive mixed-workload stress ───────────────────────────────────────
 //
 // A wholistic stress test combining every operation CraftReplDev allows to run concurrently in
 // production (write, commit/keep_alive-equivalent, read -- NOT truncate(), which is documented as
 // login-only/quiesced and would violate its own precondition if raced against concurrent writes) --
 // all firing simultaneously from many real threads for a sustained run, against a single shared
-// instance. Every one of state_mu_, overlay_mu_, and commit_running_ is under real contention at
+// instance. Every one of state_mu_, overlay_mu_, and commit_mu_ is under real contention at
 // once, not in isolation the way the more focused tests above exercise them one at a time.
 //
 // Correctness is checked two ways: (1) no operation anywhere in the run returns an unexpected error
@@ -453,7 +531,7 @@ TEST_F(CraftConcurrencyTest, ComprehensiveMixedWorkloadStress) {
     }
 
     // Committers: repeatedly drive commit_with() toward the final target while writers are still in
-    // flight -- commit_running_ must serialize these against each other AND against whichever
+    // flight -- commit_mu_ must serialize these against each other AND against whichever
     // writers are concurrently populating the overlay for lsns not yet applied.
     auto write_fn = [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
         return index_.write_to_index(s, e, info);
