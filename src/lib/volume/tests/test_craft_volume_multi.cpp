@@ -704,8 +704,12 @@ TEST_F(CraftVolumeMultiTest, AHandOffIsForgottenWithItsGroup) {
     auto const id = test_volume_id(12);
     auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
     HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
+    // nuraft_mesg keeps a member's leader flag for a group id once the group is gone (create_group doesn't reset it):
+    // the member that led the group would take the next one's election as won at once, and fail to form it. So the
+    // volume is created again on the member that neither led the group nor handed off.
+    bool creates = me() == 0;
     for (int created = 0; created < 2; ++created) {
-        if (me() == 0) {
+        if (creates) {
             auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(12)));
             ASSERT_TRUE(vol) << vol.error().message();
         }
@@ -737,9 +741,9 @@ TEST_F(CraftVolumeMultiTest, AHandOffIsForgottenWithItsGroup) {
         }));
         ASSERT_TRUE(sync());
 
-        if (group(id)->is_leader()) {
-            ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id)));
-        }
+        bool const leads = group(id)->is_leader();
+        if (leads) { ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id))); }
+        creates = me() != 1 && !leads;
         EXPECT_TRUE(wait_until([&id] { return group(id) == nullptr && !hb()->get_volume(id); }));
         ASSERT_TRUE(sync());
     }
