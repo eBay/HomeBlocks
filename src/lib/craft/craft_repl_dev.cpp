@@ -742,7 +742,7 @@ async_result< std::vector< int64_t > > CraftReplDev::login_resolve(int64_t rs_co
 
 async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                       std::vector< int64_t > empty_slots, uint64_t term) {
-    DEBUG_ASSERT(static_cast< bool >(lock), "login_sync without holding watermark_mu_");
+    DEBUG_ASSERT(watermark_mu_.holds(lock), "login_sync without holding watermark_mu_");
     if (faulted_.load(std::memory_order_acquire)) {
         LOGE("login_sync rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
@@ -776,8 +776,16 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     if (state_.commit_lsn < rs_commit_lsn) {
-        LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {} (first missing {}) -- login fails",
-             state_.commit_lsn, rs_commit_lsn, missing_lsns_.empty() ? -1 : *missing_lsns_.begin());
+        // Name what stopped it: a slot the advance couldn't index, or else the first slot still missing.
+        if (last_commit_stop_ && last_commit_stop_->lsn == state_.commit_lsn + 1) {
+            LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {}: slot {} can't be indexed ({}) "
+                 "-- login fails",
+                 state_.commit_lsn, rs_commit_lsn, last_commit_stop_->lsn, last_commit_stop_->error.message());
+        } else {
+            LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {} (first missing {}) -- login "
+                 "fails",
+                 state_.commit_lsn, rs_commit_lsn, missing_lsns_.empty() ? -1 : *missing_lsns_.begin());
+        }
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     co_return ok();
@@ -785,7 +793,7 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
 
 async_status CraftReplDev::login_install(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                                          uint64_t term) {
-    DEBUG_ASSERT(static_cast< bool >(lock), "login_install without holding watermark_mu_");
+    DEBUG_ASSERT(watermark_mu_.holds(lock), "login_install without holding watermark_mu_");
     if (faulted_.load(std::memory_order_acquire)) {
         LOGE("login_install rejected: partition permanently faulted");
         co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
@@ -907,6 +915,9 @@ void CraftReplDev::seed_lsns(int64_t last_append, std::initializer_list< int64_t
 void CraftReplDev::seed_commit_lsn(int64_t commit) {
     std::lock_guard lk{state_mu_};
     state_.commit_lsn = commit;
+    // Keep the seeded state reachable: a slot at or below commit_lsn is appended and not missing.
+    state_.last_append_lsn = std::max(state_.last_append_lsn, commit);
+    missing_lsns_.erase(missing_lsns_.begin(), missing_lsns_.upper_bound(commit));
 }
 
 void CraftReplDev::seed_term(uint64_t term) {
@@ -1241,7 +1252,7 @@ async_result< int64_t > CraftReplDev::commit(int64_t upto_lsn) {
         std::lock_guard lk{state_mu_};
         co_return state_.commit_lsn;
     }
-    co_return co_await commit_impl(*lock, upto_lsn, index);
+    co_return co_await run_commit(*lock, upto_lsn, index);
 }
 
 #ifdef _PRERELEASE
@@ -1253,28 +1264,58 @@ async_result< int64_t > CraftReplDev::commit_with(int64_t upto_lsn, write_index_
         co_return state_.commit_lsn;
     }
     IndexOps const index{std::move(write_fn), std::move(delete_fn)};
-    co_return co_await commit_impl(*lock, upto_lsn, &index);
+    co_return co_await run_commit(*lock, upto_lsn, &index);
 }
 
 void CraftReplDev::use_test_index(write_index_fn_t write_fn, delete_index_fn_t delete_fn) {
+    // Swapped in place, so no commit run may be using the current ops: set it up before any traffic.
+    auto const idle = commit_mu_.try_lock();
+    RELEASE_ASSERT(idle.has_value(), "use_test_index() while a commit run holds commit_mu_");
     index_ops_ = IndexOps{std::move(write_fn), std::move(delete_fn)};
 }
 #endif
+
+// Runs commit_impl() and records where it stopped on a failure: the slot just above the commit_lsn it reached. A run
+// that gets past a recorded stop clears it.
+async_result< int64_t > CraftReplDev::run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn,
+                                                 IndexOps const* index) {
+    auto r = co_await commit_impl(lock, upto_lsn, index);
+    std::lock_guard lk{state_mu_};
+    if (!r) {
+        last_commit_stop_ = CommitStop{.lsn = state_.commit_lsn + 1, .error = r.error()};
+    } else if (last_commit_stop_ && last_commit_stop_->lsn <= state_.commit_lsn) {
+        last_commit_stop_.reset();
+    }
+    co_return r;
+}
 
 // A Sync's commit advance: waits for a running commit, then runs its own, so each slot it steps over reaches the index
 // and nothing can lower commit_lsn afterwards. Best effort, like the catch-up before it: a slot that can't be indexed
 // stops the advance just below it.
 async_status CraftReplDev::advance_commit_for_sync(int64_t rs_commit_lsn) {
+    {
+        // Already indexed this far: only the commit_mu_ holder writes commit_lsn, and it never decreases. Waiting for a
+        // client's run would only park the apply queue behind it.
+        std::lock_guard lk{state_mu_};
+        if (rs_commit_lsn <= state_.commit_lsn) co_return ok();
+    }
     auto self = shared_from_this();
     auto const lock = co_await commit_mu_.lock();
-    if (auto r = co_await commit_impl(lock, rs_commit_lsn, index_ops()); !r)
-        LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped: {}", rs_commit_lsn, r.error().message());
+    if (auto r = co_await run_commit(lock, rs_commit_lsn, index_ops()); !r) {
+        int64_t stopped_at;
+        {
+            std::lock_guard lk{state_mu_};
+            stopped_at = last_commit_stop_ ? last_commit_stop_->lsn : -1; // run_commit() just recorded it
+        }
+        LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped at {}: {}", rs_commit_lsn, stopped_at,
+             r.error().message());
+    }
     co_return ok();
 }
 
 async_result< int64_t > CraftReplDev::commit_impl([[maybe_unused]] AsyncMutex::Lock const& lock, int64_t upto_lsn,
                                                   IndexOps const* index) {
-    DEBUG_ASSERT(static_cast< bool >(lock), "commit_impl without holding commit_mu_");
+    DEBUG_ASSERT(commit_mu_.holds(lock), "commit_impl without holding commit_mu_");
     int64_t commit_lsn, last_append_lsn;
     {
         std::lock_guard lk{state_mu_};
@@ -2208,7 +2249,7 @@ async_status CraftReplDev::propose_sync(AsyncMutex::Lock const& lock, int64_t rs
 
 async_status CraftReplDev::propose_entry([[maybe_unused]] AsyncMutex::Lock const& lock, CraftEntryType type,
                                          std::vector< uint8_t >& key, uint64_t term) {
-    DEBUG_ASSERT(static_cast< bool >(lock), "proposing without holding watermark_mu_");
+    DEBUG_ASSERT(watermark_mu_.holds(lock), "proposing without holding watermark_mu_");
     // The caller awaited (pre-resolution at least): re-check right before proposing.
     if (!raft_proposer_->is_leader())
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
@@ -2563,6 +2604,12 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
     if (!missing_lsns_.empty() && *missing_lsns_.rbegin() > state_.last_append_lsn)
         found.push_back(
             fmt::format("missing lsn {} above last_append {}", *missing_lsns_.rbegin(), state_.last_append_lsn));
+    // commit_lsn means indexed up to there, which takes every slot up to it appended and present.
+    if (!missing_lsns_.empty() && *missing_lsns_.begin() <= state_.commit_lsn)
+        found.push_back(
+            fmt::format("missing lsn {} at or below commit_lsn {}", *missing_lsns_.begin(), state_.commit_lsn));
+    if (state_.commit_lsn > state_.last_append_lsn)
+        found.push_back(fmt::format("commit_lsn {} above last_append {}", state_.commit_lsn, state_.last_append_lsn));
 
     std::lock_guard ol{overlay_mu_};
     std::unordered_map< int64_t, uint32_t > owned; // overlay entries per lsn

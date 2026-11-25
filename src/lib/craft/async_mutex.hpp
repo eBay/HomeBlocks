@@ -93,6 +93,9 @@ public:
         return locked_;
     }
 
+    // True if lock holds this mutex: not another mutex's lock, and not one already released.
+    bool holds(Lock const& lock) const { return lock.mu_ == this; }
+
 private:
     struct Waiter {
         sisl::async::value_awaitable< bool > turn;

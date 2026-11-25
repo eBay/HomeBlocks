@@ -268,7 +268,10 @@ any local data there), fetch the remaining missing
 slots from peers, then advance `commit_lsn` to the contiguous prefix bounded by `rs_commit_lsn` --
 skipping `Empty` slots but never past an unresolved `Missing` one, and applying each present slot it
 steps over to the LBA index, as the client's piggybacked commit does (one advance at a time, so
-`commit_lsn` always means "indexed up to here"). `client_token` is carried on the
+`commit_lsn` always means "indexed up to here"). A Sync whose watermark is already indexed doesn't wait
+for an advance that's running. An advance that stops at a slot it can't read back or index stops there,
+since stepping over it would serve wrong data; the replica records the slot and the error, and a login
+failing on it names that slot. `client_token` is carried on the
 entry but not checked against local state at apply time: `SyncRSCommitLSN` applies before the
 `InternalLogin` that would establish it, so an equality-fence here would make login itself unreachable;
 ordering plus the term fence on subsequent IO provide exclusivity instead. Replicas never declare
