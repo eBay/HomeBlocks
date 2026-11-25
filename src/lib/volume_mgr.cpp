@@ -759,6 +759,9 @@ void HomeBlocksImpl::hand_off_craft_leadership(volume_id_t const& id) {
     // replica (the group's creator) unresponsive, two members without one would nominate each other forever.
     {
         std::lock_guard lk{craft_handoff_mu_};
+        // Again under the lock on_craft_group_destroyed() forgets the record under: a group destroyed since the check
+        // above would otherwise leave a record that a group created later under the same id inherits.
+        if (is_going_away(**rd)) { return; }
         auto const [it, first] = craft_handed_off_at_.try_emplace(id, now);
         if (!first) {
             if (now - it->second < backoff) {
