@@ -57,8 +57,7 @@ public:
     // When set, the next write_slot() waits for write_gate before it lands: a journal write in flight.
     bool hold_write{false};
     sisl::async::value_awaitable< bool > write_gate;
-    std::optional< int64_t > fail_read; // read_slot() of this lsn fails with an I/O error
-
+    std::optional< int64_t > fail_on_read; // read_slot() of this lsn fails with an I/O error
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
     }
@@ -70,7 +69,8 @@ public:
         co_return ok();
     }
     async_result< JournalSlot > read_slot(int64_t lsn) override {
-        if (fail_read && *fail_read == lsn) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (fail_on_read && *fail_on_read == lsn)
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return co_await mock_read_slot(*this, lsn);
     }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
@@ -278,6 +278,15 @@ protected:
         return homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, dlsn,
                                                         /*addr=*/static_cast< uint64_t >(dlsn) * k_page_size,
                                                         k_page_size, sisl::sg_list{}));
+    }
+    // Starts login_sync() at term 0, holding the watermark as a login does, without waiting for it; `outcome` gets its
+    // result when it finishes.
+    void start_login_sync(int64_t rs_commit_lsn, std::optional< status >& outcome) {
+        homeblocks::detail::detach([](std::shared_ptr< CraftReplDev > dev, int64_t rs,
+                                      std::optional< status >& out) -> sisl::async::task< void > {
+            auto lock = co_await dev->watermark_mu_.lock();
+            out = co_await dev->login_sync(lock, rs, /*client_token=*/42, {}, /*term=*/0);
+        }(dev_, rs_commit_lsn, outcome));
     }
 
     std::vector< lba_t > unmapped_;
@@ -849,7 +858,7 @@ TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeReadBack) {
     use_counting_index();
     for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
         ASSERT_TRUE(write_zeros(dlsn).has_value());
-    journal_->fail_read = 1;
+    journal_->fail_on_read = 1;
     loop_back_proposals();
 
     auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
@@ -857,6 +866,41 @@ TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeReadBack) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), no_quorum());
     EXPECT_EQ(dev_->commit_lsn(), 0);
+    auto const stop = dev_->last_commit_stop(); // the slot login_sync()'s failure names
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 1);
+    EXPECT_EQ(stop->error, std::make_error_condition(std::errc::io_error));
+}
+
+// A commit run is still indexing past the watermark when the login's Sync applies: the Sync's own advance returns at
+// once, as commit_lsn already covers it, but login_sync() waits for that run to end and then sees commit_lsn past the
+// watermark. Not reachable through the protocol (a leader's last_append stays at or below the watermark), so this is
+// the defence the early return mustn't remove.
+TEST_F(CraftLoginTest, SyncWaitsForARunningCommitBeforeItChecks) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    auto const del_ok = [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); };
+    auto const write_ok = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(2, write_ok, del_ok)).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), 2);
+    loop_back_proposals();
+    std::optional< status > outcome;
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
+            if (s == 3 && !outcome) {
+                start_login_sync(/*rs_commit_lsn=*/2, outcome);
+                EXPECT_FALSE(outcome.has_value()); // it waits for this run
+            }
+            return ok();
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), no_quorum()); // past the watermark: a late advance
 }
 
 // ── login_install (SDSTOR-22892) ──────────────────────────────────────────────
@@ -1177,7 +1221,7 @@ TEST_F(CraftLoginTest, ALoginWhoseRepublishFailsFaultsThePartition) {
             dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
         ASSERT_TRUE(w.has_value());
     }
-    journal_->fail_read = 3;
+    journal_->fail_on_read = 3;
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
 

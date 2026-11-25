@@ -347,11 +347,10 @@ TEST_F(CraftCommitHsTest, SyncAdvanceIndexesWritesIntoTheRealIndex) {
     std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(0));
     serialize_sync_rs_commit_lsn(key.data(), /* rs_commit_lsn = */ 1, /* client_token = */ 0, dev_->term(), {});
     cintrusive< homestore::repl_req_ctx > ctx{};
+    // The apply runs inline in on_commit() and finishes there: nothing in it suspends (read_slot() blocks in
+    // read_sync(), the index ops are synchronous, and no block is freed, as both LBAs are fresh).
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
-    // Nothing in this apply should suspend, but don't rely on it: give it a moment to finish.
-    for (int i = 0; i < 200 && dev_->commit_lsn() < 1; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     EXPECT_EQ(dev_->commit_lsn(), 1);
     EXPECT_EQ(dev_->last_append_lsn(), 1);

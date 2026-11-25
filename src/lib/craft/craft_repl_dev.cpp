@@ -758,8 +758,12 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
     }
     if (!proposed) co_return std::unexpected(proposed.error());
 
-    // The entry has applied here (a proposal completes after its apply). An earlier login's timed-out InternalLogin
-    // may have committed meanwhile, replacing the session without moving commit_lsn.
+    // The entry has applied here (a proposal completes after its apply). Its advance returns at once if commit_lsn
+    // already covers rs_commit_lsn, while a commit run that's going may still move commit_lsn when it ends: wait it
+    // out, so the checks below see where it stops.
+    auto const commit_lock = co_await commit_mu_.lock();
+    // An earlier login's timed-out InternalLogin may have committed meanwhile, replacing the session without moving
+    // commit_lsn.
     std::lock_guard lk{state_mu_};
     if (!session_current_locked(term)) {
         LOGW("login_sync: term moved past the login's ({} -> {}) during SyncRSCommitLSN({})", term, state_.term,
@@ -776,8 +780,9 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     if (state_.commit_lsn < rs_commit_lsn) {
-        // Name what stopped it: a slot the advance couldn't read back or index, or else the first slot still missing.
-        if (last_commit_stop_ && last_commit_stop_->lsn == state_.commit_lsn + 1) {
+        // Name what stopped it: the next slot still missing, or else a slot the advance couldn't read back or index.
+        int64_t const next = state_.commit_lsn + 1;
+        if (!missing_lsns_.contains(next) && last_commit_stop_ && last_commit_stop_->lsn == next) {
             LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {}: slot {} can't be read back or "
                  "indexed ({}) -- login fails",
                  state_.commit_lsn, rs_commit_lsn, last_commit_stop_->lsn, last_commit_stop_->error.message());
@@ -854,6 +859,8 @@ result< CraftReplDev::TailTruncation > CraftReplDev::truncate_tail_locked(int64_
     // The Sync cadences count from the append frontier, so their baselines can't sit above the new one.
     last_periodic_sync_lsn_ = std::min(last_periodic_sync_lsn_, lsn);
     last_proposed_sync_lsn_ = std::min(last_proposed_sync_lsn_, lsn);
+    // A stop recorded at a dropped slot is about a record nothing reads any more.
+    if (last_commit_stop_ && last_commit_stop_->lsn > lsn) last_commit_stop_.reset();
     // A read must not find a dropped slot's data once its blocks are freed.
     std::lock_guard lk{overlay_mu_};
     for (auto it = overlay_.begin(); it != overlay_.end();) {
@@ -1275,15 +1282,17 @@ void CraftReplDev::use_test_index(write_index_fn_t write_fn, delete_index_fn_t d
 }
 #endif
 
-// Runs commit_impl() and records where it stopped on a failure: the slot just above the commit_lsn it reached. A run
-// that gets past a recorded stop clears it.
-async_result< int64_t > CraftReplDev::run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn,
-                                                 IndexOps const* index) {
+// Runs commit_impl() and records where it stopped on a failure: the slot just above the commit_lsn it reached, handed
+// back through `stop` too if given. A run whose target reaches a recorded stop clears it: it either got past the slot
+// or stopped there without failing, as the slot is missing now.
+async_result< int64_t > CraftReplDev::run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index,
+                                                 CommitStop* stop) {
     auto r = co_await commit_impl(lock, upto_lsn, index);
     std::lock_guard lk{state_mu_};
     if (!r) {
         last_commit_stop_ = CommitStop{.lsn = state_.commit_lsn + 1, .error = r.error()};
-    } else if (last_commit_stop_ && last_commit_stop_->lsn <= state_.commit_lsn) {
+        if (stop) *stop = *last_commit_stop_;
+    } else if (last_commit_stop_ && std::min(upto_lsn, state_.last_append_lsn) >= last_commit_stop_->lsn) {
         last_commit_stop_.reset();
     }
     co_return r;
@@ -1301,15 +1310,10 @@ async_status CraftReplDev::advance_commit_for_sync(int64_t rs_commit_lsn) {
     }
     auto self = shared_from_this();
     auto const lock = co_await commit_mu_.lock();
-    if (auto r = co_await run_commit(lock, rs_commit_lsn, index_ops()); !r) {
-        int64_t stopped_at;
-        {
-            std::lock_guard lk{state_mu_};
-            stopped_at = last_commit_stop_ ? last_commit_stop_->lsn : -1; // run_commit() just recorded it
-        }
-        LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped at {}: {}", rs_commit_lsn, stopped_at,
+    CommitStop stop;
+    if (auto r = co_await run_commit(lock, rs_commit_lsn, index_ops(), &stop); !r)
+        LOGE("apply_sync_rs_commit_lsn: commit advance toward {} stopped at {}: {}", rs_commit_lsn, stop.lsn,
              r.error().message());
-    }
     co_return ok();
 }
 

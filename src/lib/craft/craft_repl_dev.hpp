@@ -844,8 +844,10 @@ private:
     // stops it just below the failing slot, logged, and the apply still succeeds. Returns at once if commit_lsn has
     // already reached rs_commit_lsn.
     async_status advance_commit_for_sync(int64_t rs_commit_lsn);
-    // commit_impl() for every caller: records a failed run's stop in last_commit_stop_, and clears it once passed.
-    async_result< int64_t > run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index);
+    // commit_impl() for every caller: records a failed run's stop in last_commit_stop_ (and in `stop`, if given), and
+    // clears it once a run's target reaches that slot.
+    async_result< int64_t > run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index,
+                                       CommitStop* stop = nullptr);
 
     // Core apply-one-slot algorithm behind every commit_lsn advance, under commit_mu_ (`lock`); only its run writes
     // commit_lsn. `index` is the index to apply each slot to: the volume's (commit(), a Sync's advance), a test
@@ -969,8 +971,8 @@ private:
     // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
     // to commit_lsn when the run ends. Guarded by state_mu_.
     int64_t indexing_lsn_{-1};
-    // Where the last failed commit run stopped (run_commit()), until a later run passes it. Names the slot in
-    // login_sync()'s failure. Guarded by state_mu_.
+    // Where the last failed commit run stopped (run_commit()), until a later run's target reaches that slot or a
+    // truncation drops it. Names the slot in login_sync()'s failure. Guarded by state_mu_.
     std::optional< CommitStop > last_commit_stop_;
     // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
