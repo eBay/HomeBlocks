@@ -85,6 +85,7 @@ public:
     std::function< void(int64_t) > on_write; // runs inside write_slot, to apply an Empty verdict mid-write
     std::function< void() > on_free;         // runs inside free_data, to look at the durable image at that moment
     bool fail_tail{false};
+    std::optional< int64_t > fail_read; // read_slot of this lsn fails with an I/O error
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
@@ -100,7 +101,14 @@ public:
         co_return ok();
     }
 
-    async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
+    async_result< JournalSlot > read_slot(int64_t lsn) override {
+        if (fail_read && *fail_read == lsn) {
+            return []() -> async_result< JournalSlot > {
+                co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+            }();
+        }
+        return mock_read_slot(*this, lsn);
+    }
 
     async_status truncate_to(int64_t) override { co_return ok(); }
 
@@ -2745,6 +2753,21 @@ TEST_F(CraftRaftEntriesTest, RestartFreesTheVoidedSlotsOfAQueuedSync) {
         << "kept until freed";
     EXPECT_EQ(journal_->free_data_calls, 1);
     EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 10);
+}
+
+// A slot a queued Sync frees that can't be read at the restart fails the recovery: skipped, its blocks would stay free,
+// and the Sync's free, reading the slot again, would free them after the allocator may have handed them out.
+TEST_F(CraftRaftEntriesTest, RestartFaultsOnAnUnreadableSlotAQueuedSyncFrees) {
+    auto image = sample_state();
+    image.empty_lsns = {2, 4};
+    image.pending = {pending_sync(10, 3, {2})};
+    auto* store = with_store();
+    store->saved = std::move(image);
+    journal_->slots = page_slots({0, 1, 2, 3});
+    journal_->fail_read = 2;
+    dev_->trigger_on_restart();
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(store->faulted) << "the state record carries the fault";
 }
 
 // recover() is the awaitable form of the restart path: client I/O waits for it.

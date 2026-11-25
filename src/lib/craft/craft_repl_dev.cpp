@@ -2870,7 +2870,16 @@ async_status CraftReplDev::recover() {
             for (auto const& p : *pending) {
                 for (int64_t lsn : p.to_free) {
                     auto const slot = co_await journal_->read_slot(lsn);
-                    if (!slot || slot->all_zeros) continue; // nothing held: nothing to free either
+                    if (!slot) {
+                        // Never journalled here: nothing held. Any other read error fails the recovery, as in
+                        // rebuild_overlay(): skipped, the slot's blocks would stay free, and the Sync's free, reading
+                        // the slot again, would free them after the allocator may have handed them out.
+                        auto const e = slot.error();
+                        if (e == std::errc::result_out_of_range || e == std::errc::no_such_file_or_directory) continue;
+                        r = std::unexpected(e);
+                        break;
+                    }
+                    if (slot->all_zeros) continue; // nothing held: nothing to free either
                     if (r = journal_->commit_data(slot->blkid, /* recovering = */ true); !r) break;
                 }
                 if (!r) break;
