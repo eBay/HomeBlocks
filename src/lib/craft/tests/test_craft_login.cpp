@@ -875,10 +875,10 @@ TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeReadBack) {
 }
 
 // A commit run is still indexing past the watermark when the login's Sync applies: the Sync's own advance returns at
-// once, as commit_lsn already covers it, but login_sync() waits for that run to end and then sees commit_lsn past the
-// watermark. Not reachable through the protocol (a leader's last_append stays at or below the watermark), so this is
-// the defence the early return mustn't remove.
-TEST_F(CraftLoginTest, SyncWaitsForARunningCommitBeforeItChecks) {
+// once, as commit_lsn already covers it, and login_sync() fails the login as late without waiting for that run, since
+// this leader holds a slot above the watermark. Not reachable through the protocol (a leader's last_append stays at
+// or below the watermark from the poll on), so this is the defence, and it never blocks.
+TEST_F(CraftLoginTest, SyncFailsAtOnceWhenTheLeaderHoldsASlotAboveTheWatermark) {
     use_counting_index();
     for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
         ASSERT_TRUE(write_zeros(dlsn).has_value());
@@ -893,7 +893,7 @@ TEST_F(CraftLoginTest, SyncWaitsForARunningCommitBeforeItChecks) {
         dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
             if (s == 3 && !outcome) {
                 outcome = start_login_sync(/*rs_commit_lsn=*/2);
-                EXPECT_FALSE(outcome->has_value()); // it waits for this run
+                EXPECT_TRUE(outcome->has_value()); // didn't wait for this run
             }
             return ok();
         }));
@@ -902,35 +902,7 @@ TEST_F(CraftLoginTest, SyncWaitsForARunningCommitBeforeItChecks) {
     EXPECT_EQ(dev_->commit_lsn(), 3);
     ASSERT_TRUE(outcome && outcome->has_value());
     ASSERT_FALSE((*outcome)->has_value());
-    EXPECT_EQ((*outcome)->error(), no_quorum()); // past the watermark: a late advance
-}
-
-// The partition faults while login_sync() waits for that run: a Sync votes Empty the slot the run is indexing. The
-// login fails INTERNAL_ERROR, rather than with whatever commit_lsn says once the run ends.
-TEST_F(CraftLoginTest, SyncFaultedWhileWaitingForACommitFailsInternalError) {
-    use_counting_index();
-    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
-        ASSERT_TRUE(write_zeros(dlsn).has_value());
-    auto const del_ok = [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); };
-    auto const write_ok = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
-    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(2, write_ok, del_ok)).has_value());
-    loop_back_proposals();
-    std::shared_ptr< std::optional< status > > outcome;
-
-    auto r = homeblocks::detail::sync_get(
-        dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
-            if (s == 3 && !outcome) {
-                outcome = start_login_sync(/*rs_commit_lsn=*/2);
-                commit_sync(/*rs_commit_lsn=*/3, /*empty_slots=*/{3}); // slot 3 is being indexed: faults
-                EXPECT_TRUE(dev_->is_faulted());
-            }
-            return ok();
-        }));
-
-    ASSERT_TRUE(r.has_value());
-    ASSERT_TRUE(outcome && outcome->has_value());
-    ASSERT_FALSE((*outcome)->has_value());
-    EXPECT_EQ((*outcome)->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_EQ((*outcome)->error(), no_quorum()); // a slot above the watermark: a late advance
 }
 
 // ── login_install (SDSTOR-22892) ──────────────────────────────────────────────

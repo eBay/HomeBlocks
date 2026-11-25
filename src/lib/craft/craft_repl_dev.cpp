@@ -758,31 +758,23 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
     }
     if (!proposed) co_return std::unexpected(proposed.error());
 
-    // The entry has applied here (a proposal completes after its apply). Its advance returns at once if commit_lsn
-    // already covers rs_commit_lsn, while a commit run that's going may still move commit_lsn when it ends: wait it
-    // out, so the checks below see where it stops.
-    auto const commit_lock = co_await commit_mu_.lock();
-    // Rechecked after the wait: a conflicting Empty verdict may have faulted the partition meanwhile.
-    if (faulted_.load(std::memory_order_acquire)) {
-        LOGE("login_sync: partition faulted while waiting for a commit run -- abandoning rs_commit_lsn={}",
-             rs_commit_lsn);
-        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-    }
-    // An earlier login's timed-out InternalLogin may have committed meanwhile, replacing the session without moving
-    // commit_lsn.
+    // The entry has applied here (a proposal completes after its apply). An earlier login's timed-out InternalLogin
+    // may have committed meanwhile, replacing the session without moving commit_lsn.
     std::lock_guard lk{state_mu_};
     if (!session_current_locked(term)) {
         LOGW("login_sync: term moved past the login's ({} -> {}) during SyncRSCommitLSN({})", term, state_.term,
              rs_commit_lsn);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
     }
-    // InternalLogin will truncate to rs_commit_lsn, so this member must be exactly there: past it (or past an applied
-    // Sync's watermark it couldn't yet catch up to), an earlier round's timed-out Sync committed late and the watermark
-    // is stale; short of it, a slot login_resolve() settled is somehow still missing. Either way the login fails and
-    // the client retries.
-    if (state_.commit_lsn > rs_commit_lsn || applied_sync_lsn_ > rs_commit_lsn) {
-        LOGW("login_sync: commit_lsn {} / applied Sync {} past the login's watermark {} -- a late Sync; login fails",
-             state_.commit_lsn, applied_sync_lsn_, rs_commit_lsn);
+    // InternalLogin will truncate to rs_commit_lsn, so this member must be exactly there, and stay there. A commit run
+    // never moves commit_lsn past last_append_lsn, which the poll left at or below the watermark here, so no run, going
+    // or to come, can pass it: there's nothing to wait for. Holding a slot past it (or having applied a Sync past it),
+    // an earlier round's timed-out Sync committed late and the watermark is stale; short of it, a slot login_resolve()
+    // settled is somehow still missing. Either way the login fails and the client retries.
+    if (state_.last_append_lsn > rs_commit_lsn || applied_sync_lsn_ > rs_commit_lsn) {
+        LOGW("login_sync: last_append_lsn {} (commit_lsn {}) / applied Sync {} past the login's watermark {} -- a late "
+             "Sync; login fails",
+             state_.last_append_lsn, state_.commit_lsn, applied_sync_lsn_, rs_commit_lsn);
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     if (state_.commit_lsn < rs_commit_lsn) {
@@ -1252,7 +1244,8 @@ void CraftReplDev::fire_checkpoint_trigger(int64_t commit_lsn_snapshot) {
 // Advances commit_lsn toward upto_lsn by applying each committable slot to the index. At most one
 // run is ever active at a time, its caller holding commit_mu_; only that run writes commit_lsn. A
 // piggybacked caller that finds a run active is a safe no-op -- the in-flight run covers the same ground,
-// and every subsequent write()/keep_alive() retries the advance -- while a Sync's advance waits its turn.
+// and every subsequent write()/keep_alive() retries the advance -- while a Sync's advance, unless commit_lsn already
+// covers its watermark, waits its turn.
 // Never holds state_mu_ across the co_await read_slot() suspension point below (same rule fetch_data's
 // doc comment already establishes).
 
@@ -1289,8 +1282,7 @@ void CraftReplDev::use_test_index(write_index_fn_t write_fn, delete_index_fn_t d
 #endif
 
 // Runs commit_impl() and records where it stopped on a failure: the slot just above the commit_lsn it reached, handed
-// back through `stop` too if given. A run whose target reaches a recorded stop clears it: it either got past the slot
-// or stopped there without failing, as the slot is missing now.
+// back through `stop` too if given. A run that gets past a recorded stop clears it.
 async_result< int64_t > CraftReplDev::run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index,
                                                  CommitStop* stop) {
     auto r = co_await commit_impl(lock, upto_lsn, index);
@@ -1298,15 +1290,15 @@ async_result< int64_t > CraftReplDev::run_commit(AsyncMutex::Lock const& lock, i
     if (!r) {
         last_commit_stop_ = CommitStop{.lsn = state_.commit_lsn + 1, .error = r.error()};
         if (stop) *stop = *last_commit_stop_;
-    } else if (last_commit_stop_ && std::min(upto_lsn, state_.last_append_lsn) >= last_commit_stop_->lsn) {
+    } else if (last_commit_stop_ && state_.commit_lsn >= last_commit_stop_->lsn) {
         last_commit_stop_.reset();
     }
     co_return r;
 }
 
-// A Sync's commit advance: waits for a running commit, then runs its own, so each slot it steps over reaches the index
-// and nothing can lower commit_lsn afterwards. Best effort, like the catch-up before it: a slot that can't be indexed
-// stops the advance just below it.
+// A Sync's commit advance: unless commit_lsn already covers rs_commit_lsn, waits for a running commit, then runs its
+// own, so each slot it steps over reaches the index and nothing can lower commit_lsn afterwards. Best effort, like the
+// catch-up before it: a slot that can't be indexed stops the advance just below it.
 async_status CraftReplDev::advance_commit_for_sync(int64_t rs_commit_lsn) {
     {
         // Already indexed this far: only the commit_mu_ holder writes commit_lsn, and it never decreases. Waiting for a
