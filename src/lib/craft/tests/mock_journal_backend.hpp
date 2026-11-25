@@ -139,6 +139,7 @@ public:
 
     bool faulted{false}; // mark_faulted()
     int mark_calls{0};
+    std::function< void() > on_mark; // run by mark_faulted()
 
     result< std::optional< CraftDurableState > > load() override {
         if (fail_load) return std::unexpected(std::make_error_condition(std::errc::io_error));
@@ -164,6 +165,7 @@ public:
     void mark_faulted() override {
         ++mark_calls;
         faulted = true;
+        if (on_mark) on_mark();
     }
 };
 

@@ -1014,7 +1014,8 @@ private:
 
     // A SyncRSCommitLSN's state change, made at commit: the range and index checks, its Empty verdicts (their slots
     // stop being readable now), the newly spanned missing range, last_append_lsn and applied_sync_lsn_. Returns the
-    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees.
+    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees. A verdict for an indexed slot
+    // faults the partition: the caller marks the record (fault()) once it has released its locks.
     result< std::vector< int64_t > > install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
                                                                 std::vector< int64_t > const& empty_slots);
     // Its I/O, run by the apply queue: frees the voided slots' blocks, catches up the slots still missing at or below
@@ -1304,7 +1305,8 @@ private:
     // and the watchdog stop proposing. There is deliberately no self-recovery path: an operator (or a future
     // re-sync-from-peer mechanism) must intervene. Set through fault(), which also marks the state record, so a
     // restart doesn't bring the partition back from an image that lacks what it applied since; and from then on
-    // nothing is persisted.
+    // nothing is persisted. install_sync_rs_commit_lsn() sets it under its locks, and its caller calls fault() once
+    // they are released.
     std::atomic< bool > faulted_{false};
     void fault();
 

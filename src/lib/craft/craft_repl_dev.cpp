@@ -2617,6 +2617,7 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
         }
     }
     if (rejected) {
+        if (faulted_.load(std::memory_order_acquire)) fault(); // marks the record, now outside the locks
         LOGW("apply lsn={} not applied: {}", entry.lsn, rejected->message());
         complete_proposal(entry.ctx, std::unexpected(*rejected));
         return;
@@ -3178,8 +3179,8 @@ void mark_craft_state_faulted(volume_id_t vol_id, homestore::superblk< craft_sta
 }
 
 void CraftReplDev::fault() {
-    if (faulted_.exchange(true, std::memory_order_acq_rel)) return;
-    if (state_store_) state_store_->mark_faulted();
+    faulted_.store(true, std::memory_order_release);
+    if (state_store_) state_store_->mark_faulted(); // the store marks the record once
 }
 
 async_status CraftReplDev::save_state() {
@@ -3700,7 +3701,9 @@ result< std::vector< int64_t > > CraftReplDev::install_sync_rs_commit_lsn(int64_
             LOGE("apply_sync_rs_commit_lsn: Empty verdict for lsn={} at or below commit_lsn={} (indexing_lsn={}) "
                  "-- faulting the partition rather than freeing indexed blocks",
                  lsn, state_.commit_lsn, indexing_lsn_);
-            fault();
+            // Its caller marks the record (fault()) once its locks are released: the mark is a synchronous meta-blk
+            // write, which every op waiting for state_mu_ would wait for too.
+            faulted_.store(true, std::memory_order_release);
             return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
         }
     }
@@ -3917,7 +3920,10 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
     auto to_free = install_sync_rs_commit_lsn(rs_commit_lsn, empty_slots);
-    if (!to_free) co_return std::unexpected(to_free.error());
+    if (!to_free) {
+        if (faulted_.load(std::memory_order_acquire)) fault(); // marks the record, outside the lock
+        co_return std::unexpected(to_free.error());
+    }
     co_return co_await finish_sync_rs_commit_lsn(rs_commit_lsn, client_token, std::move(*to_free));
 }
 

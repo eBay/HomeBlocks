@@ -52,6 +52,7 @@
 
 #include <boost/uuid/random_generator.hpp>
 #include <gtest/gtest.h>
+#include <future>
 #include <map>
 #include <optional>
 #include <sisl/logging/logging.h>
@@ -397,6 +398,31 @@ TEST_F(CraftRaftEntriesTest, EmptySlotAtOrBelowCommitLsnFaultsInsteadOfFreeing) 
     EXPECT_EQ(journal_->free_data_calls, 0);
     EXPECT_FALSE(dev_->is_empty_slot(3));
     EXPECT_TRUE(dev_->is_faulted());
+}
+
+// The fault's mark is a synchronous meta-blk write: a Sync that faults at commit makes it once its locks are released,
+// so that ops waiting for them don't wait for the write too.
+TEST_F(CraftRaftEntriesTest, ASyncThatFaultsAtCommitMarksTheRecordOutsideItsLocks) {
+    auto* store = with_store();
+    dev_->seed_lsns(5, {});
+    dev_->seed_commit_lsn(5);
+    journal_->slots[3] = JournalSlot{.lsn = 3, .all_zeros = false, .lba_off_bytes = 0, .len_bytes = 4};
+    std::future< int64_t > other; // an op from another thread, kept until the device's locks are released
+    std::optional< bool > unlocked;
+    store->on_mark = [&] {
+        other = std::async(std::launch::async, [this] { return dev_->all_committed_lsn(); });
+        unlocked = other.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+    };
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{3});
+
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key), {}, {});
+
+    other.wait();
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_TRUE(store->faulted) << "the state record carries the fault";
+    ASSERT_TRUE(unlocked);
+    EXPECT_TRUE(*unlocked) << "marked while holding the device's state lock";
 }
 
 // A slot commit_impl() has started indexing is covered too, though commit_lsn only moves when the run ends: a
