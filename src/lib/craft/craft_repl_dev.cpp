@@ -2550,6 +2550,11 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
         std::lock_guard lk{apply_mu_};
         if (apply_stopped_) {
             rejected = std::make_error_condition(std::errc::operation_canceled);
+        } else if (faulted_.load(std::memory_order_acquire)) {
+            // A faulted partition applies nothing more (no catch-up, no journal or index writes): its record and its
+            // journal stay as the fault left them, for whoever recovers it by hand. Entries held while a recovery that
+            // failed ran end here too.
+            rejected = make_error_condition(volume_error::INTERNAL_ERROR);
         } else if (entry.lsn <= restored_raft_idx_) {
             // Applied before the restart, and its effects restored from the image: applying it again could e.g. free
             // the blocks of a slot it voided a second time.
@@ -2617,8 +2622,11 @@ void CraftReplDev::enqueue_apply(PendingApply entry, std::vector< int64_t > cons
 // Pops the next entry to apply, or marks the queue idle (waking stop_apply()) and returns nullopt.
 std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
     bool notify;
+    decltype(apply_queue_) dropped;
     {
         std::lock_guard lk{apply_mu_};
+        // Queued before a fault: dropped, as enqueue_apply() refuses the ones that commit after it.
+        if (faulted_.load(std::memory_order_acquire)) dropped.swap(apply_queue_);
         if (!apply_queue_.empty() && !apply_stopped_ && !apply_paused_) {
             auto entry = std::move(apply_queue_.front());
             apply_queue_.pop_front();
@@ -2629,6 +2637,10 @@ std::optional< CraftReplDev::PendingApply > CraftReplDev::next_apply() {
         applying_.reset();
         apply_running_ = false;
         notify = std::exchange(apply_idle_wanted_, false);
+    }
+    for (auto const& e : dropped) {
+        LOGW("apply lsn={} not applied: the partition is faulted", e.lsn);
+        complete_proposal(e.ctx, std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR)));
     }
     if (notify) apply_idle_.complete(true); // outside the lock: resumes stop_apply()'s caller
     return std::nullopt;

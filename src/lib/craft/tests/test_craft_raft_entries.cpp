@@ -1767,6 +1767,26 @@ TEST_F(CraftRaftEntriesTest, SyncsApplyInLogOrder) {
     EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{3, 4, 5, 6, 7, 8}));
 }
 
+// A faulted partition applies nothing more: an entry queued before the fault is dropped, and one that commits after it
+// is refused. Neither starts a catch-up nor records an apply.
+TEST_F(CraftRaftEntriesTest, AFaultedPartitionAppliesNothingMore) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(2, {});
+    auto hdr = make_header(CraftEntryType::SyncRSCommitLSN);
+    auto key5 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/5, /*client_token=*/0, /*empty_slots=*/{});
+    auto key8 = make_sync_rs_commit_lsn_key(/*rs_commit_lsn=*/8, /*client_token=*/0, /*empty_slots=*/{});
+    auto const applied = dev_->durable_state().last_applied_raft_idx;
+
+    dev_->pause_apply();
+    dev_->raft_listener().on_commit(1, as_blob(hdr), as_blob(key5), {}, {}); // queued
+    dev_->fault_for_test();
+    dev_->raft_listener().on_commit(2, as_blob(hdr), as_blob(key8), {}, {}); // refused
+    dev_->resume_apply();
+
+    EXPECT_TRUE(fetcher_.last_requested.empty()) << "a catch-up on a faulted partition";
+    EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, applied);
+}
+
 // A Sync waiting in the queue already fences writes: its Empty verdict takes effect at commit, so a late write to the
 // voided slot is rejected before it can be acked, not discarded once the queue reaches the verdict.
 TEST_F(CraftRaftEntriesTest, QueuedSyncVerdictFencesWritesAtCommit) {
