@@ -131,6 +131,31 @@ TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     EXPECT_TRUE(r->blkid == blkid);
 }
 
+// A truncation leaves the dropped records in the log store, so a new session's write to the same dLSN must replace
+// one: read_slot then returns the new record. Written out of order around a higher slot, as CRAFT does.
+TEST_F(CraftHomeStoreBackendTest, RewritingASlotReplacesItsRecord) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    std::vector< homestore::csum_t > const csums{7};
+    auto write = [&](int64_t lsn, uint64_t term, lba_t lba, homestore::multi_blk_id blkid) {
+        return homeblocks::detail::sync_get(
+            backend->write_slot(lsn, term, lba, k_page_size, blkid, /* all_zeros = */ false, csums));
+    };
+
+    ASSERT_TRUE(write(/* lsn = */ 5, /* term = */ 1, /* lba = */ 100, homestore::multi_blk_id{42, 1, 7}).has_value());
+    ASSERT_TRUE(write(/* lsn = */ 7, /* term = */ 1, /* lba = */ 300, homestore::multi_blk_id{44, 1, 7}).has_value());
+    ASSERT_TRUE(write(/* lsn = */ 5, /* term = */ 2, /* lba = */ 200, homestore::multi_blk_id{43, 1, 7}).has_value());
+
+    auto r5 = homeblocks::detail::sync_get(backend->read_slot(5));
+    ASSERT_TRUE(r5.has_value());
+    EXPECT_EQ(r5->lba_off_bytes, 200u);
+    EXPECT_TRUE(r5->blkid == (homestore::multi_blk_id{43, 1, 7}));
+    auto r7 = homeblocks::detail::sync_get(backend->read_slot(7));
+    ASSERT_TRUE(r7.has_value());
+    EXPECT_EQ(r7->lba_off_bytes, 300u);
+}
+
 // A never-appended lsn must fail cleanly (the log store throws std::out_of_range internally).
 TEST_F(CraftHomeStoreBackendTest, ReadSlotUnknownLsnFails) {
     auto logstore = make_logstore();

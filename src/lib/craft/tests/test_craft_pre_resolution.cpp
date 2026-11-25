@@ -614,7 +614,7 @@ TEST_F(CraftPreResolutionTest, TermChangedBeforeSlotWriteFreesBlocksAndStops) {
     EXPECT_TRUE(dev_->is_missing(4));
 }
 
-// Term bumps during slot 3's write_slot: the entry stays journalled (and its blocks referenced), but
+// Term bumps during slot 3's write_slot: the fill is dropped (its record stays, unread, and its blocks are freed),
 // missing_lsns_ is untouched and slot 4 is never written.
 TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) {
     dev_->set_peer_fetcher(&fetcher_);
@@ -632,7 +632,7 @@ TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) 
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(journal_->has_slot(4));
-    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_EQ(journal_->free_data_calls, 1);
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_TRUE(dev_->is_missing(4));
 }
@@ -1596,7 +1596,8 @@ TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
     std::vector< uint8_t > header(sizeof(CraftEntryHeader));
     reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
     std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-    serialize_internal_login(key.data(), /*client_token=*/9, /*term=*/2, /*rs_commit_lsn=*/-1);
+    // At this member's last_append, where a login's poll would settle: commit_lsn is 0, so -1 would fault.
+    serialize_internal_login(key.data(), /*client_token=*/9, /*term=*/2, /*rs_commit_lsn=*/5);
     cintrusive< homestore::repl_req_ctx > ctx{};
     dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
                                     sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
