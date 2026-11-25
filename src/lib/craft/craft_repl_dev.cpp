@@ -544,6 +544,8 @@ bool proposal_completed(cintrusive< homestore::repl_req_ctx >& ctx) {
 
 void JournalWriteDeadlines::add(shared< Wait > w, clock::time_point deadline) {
     std::lock_guard lk{mu_};
+    while (!pending_.empty() && pending_.front().first->completed.load(std::memory_order_acquire))
+        pending_.pop_front();
     pending_.emplace_back(std::move(w), deadline);
 }
 
@@ -551,12 +553,14 @@ void JournalWriteDeadlines::sweep(clock::time_point now) {
     std::vector< shared< Wait > > expired;
     {
         std::lock_guard lk{mu_};
-        std::erase_if(pending_, [&](auto const& entry) {
-            if (entry.first->completed.load(std::memory_order_acquire)) return true;
-            if (entry.second > now) return false;
-            expired.push_back(entry.first);
-            return true;
-        });
+        while (!pending_.empty()) {
+            auto const& [w, deadline] = pending_.front();
+            if (!w->completed.load(std::memory_order_acquire)) {
+                if (deadline > now) break; // the rest are due later still
+                expired.push_back(w);
+            }
+            pending_.pop_front();
+        }
     }
     // Outside the lock: failing a wait resumes its writer.
     for (auto const& w : expired)

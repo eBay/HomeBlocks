@@ -1577,6 +1577,20 @@ TEST_F(CraftRaftEntriesTest, JournalWriteDeadlinesFailTheOverdueWrites) {
     EXPECT_EQ(deadlines.pending(), 0u);
 }
 
+// Completed writes leave as new ones are added, without waiting for a sweep.
+TEST_F(CraftRaftEntriesTest, JournalWriteDeadlinesForgetCompletedWritesOnAdd) {
+    JournalWriteDeadlines deadlines;
+    auto const t0 = JournalWriteDeadlines::clock::now();
+    auto const first = std::make_shared< JournalWriteDeadlines::Wait >();
+    auto const second = std::make_shared< JournalWriteDeadlines::Wait >();
+    deadlines.add(first, t0 + std::chrono::seconds{1});
+    deadlines.add(second, t0 + std::chrono::seconds{1});
+    first->complete(true);
+    second->complete(true);
+    deadlines.add(std::make_shared< JournalWriteDeadlines::Wait >(), t0 + std::chrono::seconds{2});
+    EXPECT_EQ(deadlines.pending(), 1u);
+}
+
 // A write whose journal write timed out may still land, referencing its blocks: they stay, and the partition faults,
 // as its journal can't be trusted any more.
 TEST_F(CraftRaftEntriesTest, WriteWhoseJournalWriteTimesOutFaultsAndKeepsItsBlocks) {
