@@ -1530,9 +1530,9 @@ TEST_F(CraftRaftEntriesTest, OnCommitApplyFaultFailsProposal) {
     EXPECT_TRUE(dev_->is_faulted());
 }
 
-// An exception escaping an apply fails that entry's proposal and faults the partition (the apply stopped partway), and
-// the queue keeps applying the entries after it.
-TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
+// An exception escaping an apply fails that entry's proposal and faults the partition (the apply stopped partway). The
+// queue isn't left wedged: the entry committed after it is refused, as on any faulted partition, and the queue stops.
+TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndFaultsWithoutWedgingTheQueue) {
     dev_->set_peer_fetcher(&fetcher_);
     dev_->seed_lsns(2, {});
     fetcher_.should_throw = true; // the Sync's catch-up of slots 3..5 throws
@@ -1541,16 +1541,26 @@ TEST_F(CraftRaftEntriesTest, ApplyThatThrowsFailsProposalAndQueueContinues) {
     auto login_hdr = make_header(CraftEntryType::InternalLogin);
     auto login_key = make_internal_login_key(/*client_token=*/7, /*term=*/5, /*rs_commit_lsn=*/5);
     auto const sync_ctx = make_test_proposal_ctx();
+    auto const login_ctx = make_test_proposal_ctx();
 
     dev_->raft_listener().on_commit(1, as_blob(sync_hdr), as_blob(sync_key), {}, sync_ctx);
-    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, {});
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, login_ctx);
 
     auto const outcome = take_test_proposal_outcome(sync_ctx);
     ASSERT_TRUE(outcome.has_value());
     ASSERT_FALSE(outcome->has_value());
     EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
     EXPECT_TRUE(dev_->is_faulted());
-    EXPECT_EQ(dev_->term(), 5u); // not wedged: the login behind it applied
+    auto const login = take_test_proposal_outcome(login_ctx);
+    ASSERT_TRUE(login.has_value()) << "the login behind it never completed";
+    EXPECT_FALSE(login->has_value());
+    EXPECT_EQ(dev_->term(), 0u);
+    bool stopped = false;
+    homeblocks::detail::detach([](CraftReplDev& dev, bool& stopped) -> sisl::async::task< void > {
+        (void)co_await dev.stop_apply();
+        stopped = true;
+    }(*dev_, stopped));
+    EXPECT_TRUE(stopped) << "the apply that threw left the queue running";
 }
 
 TEST_F(CraftRaftEntriesTest, OnErrorNotLeaderFailsProposalWithNotLeader) {
@@ -1866,6 +1876,7 @@ TEST_F(CraftRaftEntriesTest, AFaultedPartitionAppliesNothingMore) {
 
     EXPECT_TRUE(fetcher_.last_requested.empty()) << "a catch-up on a faulted partition";
     EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, applied);
+    EXPECT_EQ(dev_->last_append_lsn(), 5) << "the Sync committed after the fault changed the state at its commit";
 }
 
 // A Sync waiting in the queue already fences writes: its Empty verdict takes effect at commit, so a late write to the
@@ -2680,7 +2691,8 @@ TEST_F(CraftRaftEntriesTest, RestartReplayDoesNotFreeReplacedBlocks) {
     EXPECT_EQ(journal_->free_data_calls, 1) << "only slot 4's superseded block, once the frontier covered it";
 }
 
-// End to end: what one device persisted restores the next.
+// End to end: what one device persisted restores the next. The last Sync frees nothing, so a checkpoint's save is what
+// writes it: until then a restart would get it back from the RAFT log's replay.
 TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterARestart) {
     auto* store = with_store();
     dev_->set_checkpoint_trigger(std::ref(trigger_));
@@ -2690,6 +2702,7 @@ TEST_F(CraftRaftEntriesTest, PersistedStateRestoresAfterARestart) {
     commit(1, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(2, 0, {}));
     commit(2, make_header(CraftEntryType::InternalLogin), make_internal_login_key(42, 5, /*rs_commit_lsn=*/2));
     commit(3, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(4, 0, {4}, /*term=*/5));
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->save_state()).has_value());
     ASSERT_TRUE(store->saved.has_value());
     auto const image = *store->saved;
     auto const slots = journal_->slots;
