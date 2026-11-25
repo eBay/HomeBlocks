@@ -635,6 +635,12 @@ public:
     // leader without quorum would wait out the outage: expire_overdue() completes it with timed_out instead, and the
     // caller then resumes inside it.
     async_status propose(sisl::blob header, sisl::blob key) override {
+        // HomeStore drops a proposal on a group that isn't active without telling its proposer: it checks the stage
+        // before it marks the request as the proposer's, and reports errors to proposers only. Sent, the proposal would
+        // wait out its deadline.
+        // ponytail: a stage change between this check and HomeStore's still waits out the deadline.
+        if (rd_->get_stage() != homestore::repl_dev_stage_t::ACTIVE)
+            co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
         auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
         ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
         ctx->key.assign(key.cbytes(), key.cbytes() + key.size());
@@ -2864,6 +2870,8 @@ void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, 
         ec = craft::make_error_condition(craft::craft_error::NOT_LEADER);
         break;
     // The group isn't active, starting or being destroyed: this replica doesn't serve now, as when it recovers.
+    // HomeStore checks the stage before it marks a request as the proposer's, so it doesn't report these to one
+    // today: propose() refuses such a group itself.
     case homestore::ReplServiceError::SERVER_IS_JOINING:
     case homestore::ReplServiceError::UNREADY_STATE:
     case homestore::ReplServiceError::SERVER_IS_LEAVING:

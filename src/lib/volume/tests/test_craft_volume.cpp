@@ -20,8 +20,10 @@
 
 #include <csignal>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <set>
+#include <thread>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <gtest/gtest.h>
@@ -730,6 +732,15 @@ TEST_F(CraftVolumeTest, GroupDestroyRemovesReplica) {
     // resolution resuming from an await, still asks until the volume's destroy stops it.
     EXPECT_FALSE(proposer->is_leader());
     EXPECT_TRUE(proposer->voters().empty());
+    // And a proposal on the group fails at once, as the replica not serving: HomeStore drops one on a group that isn't
+    // active without telling its proposer, which would wait out its deadline (on a thread, so the test can time it).
+    auto refusal = std::make_shared< std::promise< status > >();
+    auto refused = refusal->get_future();
+    std::thread([id, refusal] { refusal->set_value(propose_sync(id, 1, 7, 7, {})); }).detach();
+    ASSERT_EQ(refused.wait_for(std::chrono::seconds{5}), std::future_status::ready) << "the proposal waits";
+    auto const proposed = refused.get();
+    ASSERT_FALSE(proposed);
+    EXPECT_EQ(proposed.error(), make_error_condition(volume_error::OFFLINE));
 
     ASSERT_TRUE(g_helper->wait_for_volumes_removed({id}, std::chrono::seconds(60)));
     ASSERT_TRUE(wait_for_group_gone(id));
