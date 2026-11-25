@@ -1406,6 +1406,25 @@ TEST_F(CraftLoginTest, ResolveFillsFromALiveCopyOverADroppedOne) {
     EXPECT_EQ(journal_->slots[4].term, 1u);
 }
 
+// Two logins, at terms 1 (watermark 3) and 2 (watermark 5): each slot is judged by the first login after its own
+// term. 4 at term 0 is one the term-1 login dropped, though it's below the latest watermark, and 5 at term 1 is live,
+// though it's above the term-1 login's.
+TEST_F(CraftLoginTest, ResolveJudgesASlotByTheFirstLoginAfterItsTerm) {
+    dev_->seed_lsns(3, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    commit_login(/*term=*/2, /*rs_commit_lsn=*/5);
+    ASSERT_EQ(dev_->term(), 2u);
+    poller_.fetched = {holding(1, {zeros(4, /*term=*/0), zeros(5, /*term=*/1)}), holding(2)};
+
+    auto r = do_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)}, /*term=*/2);
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(*r, (std::vector< int64_t >{4}));
+    EXPECT_FALSE(journal_->slots.contains(4));
+    ASSERT_TRUE(journal_->slots.contains(5));
+    EXPECT_EQ(journal_->slots[5].term, 1u);
+}
+
 } // namespace
 } // namespace homeblocks
 

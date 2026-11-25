@@ -735,6 +735,29 @@ TEST_F(CraftRaftEntriesTest, ARejectedLoginDropsNothingForCatchUp) {
     EXPECT_TRUE(dev_->is_missing(3));
 }
 
+// Two logins, at terms 1 (watermark 3) and 2 (watermark 5): each fetched slot is judged by the first login after its
+// own term. 4 at term 0 stays missing, though it's below the latest watermark, and 5 at term 1 is filled, though it's
+// above the term-1 login's.
+TEST_F(CraftRaftEntriesTest, CatchUpJudgesASlotByTheFirstLoginAfterItsTerm) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(3, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    commit_login(/*term=*/2, /*rs_commit_lsn=*/5);
+    ASSERT_EQ(dev_->term(), 2u);
+    fetcher_.response = {JournalSlot{.lsn = 4, .term = 0, .lba_off_bytes = 40, .len_bytes = 4},
+                         JournalSlot{.lsn = 5, .term = 1, .lba_off_bytes = 50, .len_bytes = 4}};
+
+    auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(fetcher_.last_requested, (std::vector< int64_t >{4, 5}));
+    EXPECT_FALSE(journal_->has_slot(4));
+    EXPECT_TRUE(dev_->is_missing(4));
+    ASSERT_TRUE(journal_->has_slot(5));
+    EXPECT_EQ(journal_->slots[5].term, 1u);
+    EXPECT_FALSE(dev_->is_missing(5));
+}
+
 // ── checkpoint trigger (SDSTOR-22888) ─────────────────────────────────────────
 
 TEST_F(CraftRaftEntriesTest, CheckpointTriggerFiresOnceIntervalCrossed) {

@@ -62,8 +62,17 @@ static_assert(std::is_same_v< decltype(JournalSlot::len_bytes), decltype(craft::
 // are never part of the wire format. sizeof equality no longer holds; the per-field is_same_v
 // checks above are the effective wire-compat pin for the shared fields.
 
+// JournalSlot::term (the term a slot was written at) has no wire field yet: craft_client's JournalSlot and slot_desc
+// lack it (craft-client-changes.md 3.6), so no transport may carry fetched slots until they do. Fails once
+// craft_client adds it: then pin it above, carry it in to_craft_slot(), and round-trip a nonzero term below.
+template < typename Slot >
+constexpr bool has_term = requires(Slot s) { s.term; };
+static_assert(has_term< JournalSlot >); // the trait itself works
+static_assert(!has_term< craft::JournalSlot >, "craft::JournalSlot now carries term: add it to this wire pin");
+
 // ── round-trip helpers ────────────────────────────────────────────────────────
 
+// Drops s.term: the wire has no field for it yet (see has_term above).
 craft::JournalSlot to_craft_slot(JournalSlot const& s) {
     craft::JournalSlot out;
     out.lsn = s.lsn;
