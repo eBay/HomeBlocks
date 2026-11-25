@@ -2693,8 +2693,13 @@ async_status CraftReplDev::drain_apply() {
             durable_.last_applied_raft_idx = std::max(durable_.last_applied_raft_idx, entry->lsn);
             applying_.reset();
         }
-        if (auto r = co_await persist_state(); !r)
-            LOGE("persisting the last applied raft lsn={} failed: {}", entry->lsn, r.error().message());
+        // Written now only where applying the entry again would do harm, a Sync that freed blocks, and for a login,
+        // which is rare. A Sync that frees nothing, applied again, repeats its catch-up and its commit: its index rides
+        // the next persist (a checkpoint's, a login's, a free's).
+        if (entry->type != CraftEntryType::SyncRSCommitLSN || !entry->to_free.empty()) {
+            if (auto r = co_await persist_state(); !r)
+                LOGE("persisting the last applied raft lsn={} failed: {}", entry->lsn, r.error().message());
+        }
     }
     co_return ok();
 }

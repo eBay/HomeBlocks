@@ -2781,6 +2781,23 @@ TEST_F(CraftRaftEntriesTest, ImageHoldsTheFreesOfAQueuedSync) {
     EXPECT_TRUE(store->saved->pending.empty());
 }
 
+// A Sync that frees nothing writes no record once applied: applied again after a restart, it changes nothing, so its
+// index rides the next persist. One that freed blocks is recorded at once: applied again, it would free them again.
+TEST_F(CraftRaftEntriesTest, OnlyASyncThatFreedBlocksIsRecordedAsAppliedAtOnce) {
+    auto* store = with_store();
+    dev_->seed_lsns(3, {});
+    journal_->slots[2] = page_slot(2);
+    commit(5, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(1, 0, {}));
+    EXPECT_EQ(dev_->durable_state().last_applied_raft_idx, 5);
+    EXPECT_EQ(store->persist_calls, 0);
+
+    commit(6, make_header(CraftEntryType::SyncRSCommitLSN), make_sync_rs_commit_lsn_key(3, 0, {2}));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    ASSERT_TRUE(store->saved.has_value());
+    EXPECT_EQ(store->saved->last_applied_raft_idx, 6);
+    EXPECT_TRUE(store->saved->pending.empty());
+}
+
 // A restart applies again the image's pending entries above its last applied index, in log order, and the log replay
 // then skips them.
 TEST_F(CraftRaftEntriesTest, RestartAppliesThePendingEntriesAgain) {
