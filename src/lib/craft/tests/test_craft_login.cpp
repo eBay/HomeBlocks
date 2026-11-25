@@ -28,7 +28,9 @@
 
 #include <gtest/gtest.h>
 #include <functional>
+#include <latch>
 #include <map>
+#include <thread>
 #include <vector>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -52,18 +54,25 @@ static constexpr uint32_t k_page_size = 4096;
 class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
+    // When set, the next write_slot() waits for write_gate before it lands: a journal write in flight.
+    bool hold_write{false};
+    sisl::async::value_awaitable< bool > write_gate;
+    std::optional< int64_t > fail_read; // read_slot() of this lsn fails with an I/O error
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
     }
     async_status write_slot(int64_t lsn, uint64_t, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                             bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
+        if (std::exchange(hold_write, false)) co_await write_gate;
         slots[lsn] = JournalSlot{
             .lsn = lsn, .all_zeros = all_zeros, .lba_off_bytes = lba, .len_bytes = len, .blkid = blkid, .csums = csums};
         co_return ok();
     }
-    async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
-    async_status truncate_to(int64_t) override { co_return ok(); }
+    async_result< JournalSlot > read_slot(int64_t lsn) override {
+        if (fail_read && *fail_read == lsn) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        co_return co_await mock_read_slot(*this, lsn);
+    }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
     async_status free_slot(int64_t lsn) override { return mock_free_slot(*this, lsn); }
     async_status read_data(homestore::multi_blk_id, sisl::sg_list&) override {
@@ -124,6 +133,27 @@ JournalSlot zeros(int64_t lsn) {
     return JournalSlot{.lsn = lsn, .all_zeros = true, .lba_off_bytes = 0, .len_bytes = k_page_size};
 }
 
+// Receives a coroutine's completion and drops it: lets a test start one and destroy it mid-await.
+struct DropReceiver {
+    using receiver_concept = stdexec::receiver_t;
+    void set_value(auto&&...) && noexcept {}
+    void set_error(auto&&) && noexcept {}
+    void set_stopped() && noexcept {}
+};
+
+// A coroutine started and held, so a test can destroy it while it waits.
+struct HeldTask {
+    explicit HeldTask(sisl::async::task< void > task) :
+            op{stdexec::connect(
+                stdexec::write_env(std::move(task), stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+                DropReceiver{})} {
+        stdexec::start(op);
+    }
+    decltype(stdexec::connect(stdexec::write_env(std::declval< sisl::async::task< void > >(),
+                                                 stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}),
+                              DropReceiver{})) op;
+};
+
 } // namespace
 
 // ── test fixture ─────────────────────────────────────────────────────────────
@@ -171,16 +201,59 @@ protected:
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
     // At this member's last_append, where a login's poll would settle: never below a committed Sync's watermark.
-    void commit_login(uint64_t term) {
+    void commit_login(uint64_t term) { commit_login(term, dev_->last_append_lsn()); }
+    void commit_login(uint64_t term, int64_t rs_commit_lsn) {
         std::vector< uint8_t > key(sizeof(InternalLoginPayload));
-        serialize_internal_login(key.data(), /*client_token=*/7, term, dev_->last_append_lsn());
+        serialize_internal_login(key.data(), /*client_token=*/7, term, rs_commit_lsn);
         commit_entry(CraftEntryType::InternalLogin, key);
     }
-    // A Sync from this member's current session.
-    void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {}) {
+    // A Sync from this member's current session, or from `term` (a newer session's, ahead of its login's apply).
+    void commit_sync(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots = {},
+                     std::optional< uint64_t > term = std::nullopt) {
         std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(empty_slots.size()));
-        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, dev_->term(), empty_slots);
+        serialize_sync_rs_commit_lsn(key.data(), rs_commit_lsn, /*client_token=*/0, term.value_or(dev_->term()),
+                                     empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
+    }
+    // Starts a one-block all-zeros write at dlsn without waiting for it. The returned result is set when it finishes;
+    // the coroutine shares it, so one still suspended when a test returns writes live memory.
+    std::shared_ptr< std::optional< result< craft::lsn_pair > > > start_write(int64_t dlsn, uint64_t term) {
+        auto outcome = std::make_shared< std::optional< result< craft::lsn_pair > > >();
+        homeblocks::detail::detach(
+            [](std::shared_ptr< CraftReplDev > dev, int64_t dlsn, uint64_t term,
+               std::shared_ptr< std::optional< result< craft::lsn_pair > > > out) -> sisl::async::task< void > {
+                craft::client_hdr const hdr{term, -1, -1};
+                *out = co_await dev->write(hdr, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{});
+            }(dev_, dlsn, term, outcome));
+        return outcome;
+    }
+    // Starts login_resolve() at term 0 without waiting for it, sharing its result the same way.
+    std::shared_ptr< std::optional< result< std::vector< int64_t > > > >
+    start_login_resolve(int64_t rs_commit_lsn, std::vector< craft::peer_id_t > quiesced) {
+        auto outcome = std::make_shared< std::optional< result< std::vector< int64_t > > > >();
+        homeblocks::detail::detach(
+            [](std::shared_ptr< CraftReplDev > dev, int64_t rs, std::vector< craft::peer_id_t > quiesced,
+               std::shared_ptr< std::optional< result< std::vector< int64_t > > > > out) -> sisl::async::task< void > {
+                *out = co_await dev->login_resolve(rs, /*term=*/0, std::move(quiesced));
+            }(dev_, rs_commit_lsn, std::move(quiesced), outcome));
+        return outcome;
+    }
+    // Starts drain_writes() and destroys it while it waits, as a caller that gives up would.
+    void abandon_drain() { HeldTask held{dev_->drain_writes()}; }
+    // Starts drain_writes() and holds it, so a test can destroy it while it waits.
+    std::unique_ptr< HeldTask > hold_drain() { return std::make_unique< HeldTask >(dev_->drain_writes()); }
+    // Starts drain_writes() and runs `then` once it returns. `then` should capture by value (shared state, say): the
+    // drain may still be waiting when a test returns.
+    void start_drain_then(std::function< void() > then) {
+        homeblocks::detail::detach(
+            [](std::shared_ptr< CraftReplDev > dev, std::function< void() > then) -> sisl::async::task< void > {
+                co_await dev->drain_writes();
+                then();
+            }(dev_, std::move(then)));
+    }
+    size_t drain_waiters() {
+        std::lock_guard lk{dev_->state_mu_};
+        return dev_->drain_waiters_.size();
     }
     // Faults the partition: a verdict for a slot it has already committed.
     void fault_partition() {
@@ -533,16 +606,26 @@ TEST_F(CraftLoginTest, ResolveFaultedDuringTheFetchFailsInternalError) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
-// An old-session write still in flight on this leader owns its slot; until that drains, the login fails and retries.
-TEST_F(CraftLoginTest, ResolveLeavesALeadersInFlightWriteUnresolved) {
-    dev_->seed_lsns(5, {3});
-    dev_->seed_in_flight(3);
-    poller_.fetched = {holding(1), holding(2)};
+// The poll quiesced this leader's own write while it was still in flight: resolution waits for it to land, published
+// though not acked, so its slot needs no fetch and the login goes on.
+TEST_F(CraftLoginTest, ResolveWaitsForTheLeadersInFlightWrite) {
+    dev_->seed_lsns(2, {});
+    journal_->hold_write = true;
+    auto const w = start_write(/*dlsn=*/3, /*term=*/0);
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/true)).has_value());
 
-    auto r = do_login_resolve(/*rs_commit_lsn=*/5, /*quiesced=*/{test_member_id(1), test_member_id(2)});
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)});
+    EXPECT_FALSE(resolved->has_value()); // waiting for the write
 
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), no_quorum());
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(w->has_value());
+    EXPECT_FALSE((*w)->has_value()); // quiesced: kept, not acked
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_TRUE((*resolved)->has_value()) << (*resolved)->error().message();
+    EXPECT_TRUE((*resolved)->value().empty()); // no Empty verdict
+    EXPECT_FALSE(dev_->is_missing(3));
+    EXPECT_TRUE(poller_.last_fetch.empty()); // nothing left to fetch
 }
 
 // ── login_sync (SDSTOR-22891) ─────────────────────────────────────────────────
@@ -849,6 +932,299 @@ TEST_F(CraftLoginTest, InstallFaultedDuringATimedOutProposalFailsInternalError) 
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
+}
+
+// ── InternalLogin truncation (SDSTOR-22909) ───────────────────────────────────
+//
+// A login drops this member's slots above its watermark when it commits, in log order with every other entry's
+// commit-time changes. Its apply waits for writes still in flight, then starts the session.
+
+// The new session's Sync commits while the login that starts the session still waits to apply (a lagging member):
+// the login's truncation mustn't undo what the Sync installed at its commit.
+TEST_F(CraftLoginTest, ASyncCommittedBehindAQueuedLoginKeepsItsInstall) {
+    dev_->seed_lsns(5, {});
+    dev_->pause_apply();
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+    commit_sync(/*rs_commit_lsn=*/8, /*empty_slots=*/{7}, /*term=*/1);
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->last_append_lsn(), 8);
+    EXPECT_TRUE(dev_->is_missing(6)); // no peer copy to fetch: still missing, not dropped
+    EXPECT_TRUE(dev_->is_empty_slot(7));
+    EXPECT_TRUE(dev_->is_missing(8));
+}
+
+// An old-session write is still in flight when a login commits with a watermark below it: the slot is dropped, the
+// write is neither published nor acked when it lands, and the session starts only after it has landed.
+TEST_F(CraftLoginTest, AWriteInFlightAboveTheWatermarkIsDropped) {
+    dev_->seed_lsns(5, {});
+    journal_->hold_write = true;
+    auto const w = start_write(/*dlsn=*/7, /*term=*/0);
+    ASSERT_FALSE(w->has_value());
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+
+    EXPECT_EQ(dev_->term(), 0u); // the apply waits for the write
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_FALSE(dev_->is_missing(6));
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(w->has_value());
+    ASSERT_FALSE((*w)->has_value());
+    EXPECT_EQ((*w)->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_FALSE(dev_->is_missing(6));
+    EXPECT_FALSE(dev_->is_missing(7));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1);
+}
+
+// The same write at or below the watermark is the old session's copy of a slot the login settled: it's published when
+// it lands, but not acked.
+TEST_F(CraftLoginTest, AWriteInFlightAtOrBelowTheWatermarkIsKeptButNotAcked) {
+    dev_->seed_lsns(5, {4});
+    journal_->hold_write = true;
+    auto const w = start_write(/*dlsn=*/4, /*term=*/0);
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+    EXPECT_EQ(dev_->term(), 0u); // the apply waits for the write
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(w->has_value());
+    ASSERT_FALSE((*w)->has_value());
+    EXPECT_EQ((*w)->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_FALSE(dev_->is_missing(4));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
+}
+
+// A member the login's poll missed holds old-session slots above the watermark. They go when the login commits there
+// (the frontier, the gaps above it, an Empty verdict above it), and the session starts once it applies.
+TEST_F(CraftLoginTest, AMemberThatMissedTheLoginTruncatesWhenItCommits) {
+    dev_->seed_lsns(10, {7});
+    dev_->seed_empty({9});
+    dev_->pause_apply();
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+
+    EXPECT_EQ(dev_->last_append_lsn(), 5);
+    EXPECT_FALSE(dev_->is_missing(7));
+    EXPECT_FALSE(dev_->is_empty_slot(9));
+    EXPECT_EQ(dev_->term(), 0u); // not applied yet
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// A login whose term isn't newer than the session's is ignored when it applies, so it truncates nothing either.
+TEST_F(CraftLoginTest, ALoginThatIsntNewerTruncatesNothing) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(10, {7});
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+
+    EXPECT_EQ(dev_->last_append_lsn(), 10);
+    EXPECT_TRUE(dev_->is_missing(7));
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// A pre-resolution fill is in flight when another leader's login commits with a watermark below it: the fill is
+// dropped when it lands, the round stops, and the login applies once it has landed.
+TEST_F(CraftLoginTest, AFillInFlightAboveTheWatermarkIsDropped) {
+    dev_->seed_lsns(5, {4});
+    poller_.fetched = {holding(1, {zeros(4)}), holding(2)};
+    journal_->hold_write = true;
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)});
+    ASSERT_FALSE(resolved->has_value()); // the fill of 4 is in write_slot
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    EXPECT_EQ(dev_->term(), 0u); // the apply waits for the fill
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->last_append_lsn(), 3);
+    EXPECT_FALSE(dev_->is_missing(4));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1);
+}
+
+// At or below the login's watermark, the same fill is published when it lands; the round still stops.
+TEST_F(CraftLoginTest, AFillInFlightAtOrBelowTheWatermarkIsKept) {
+    dev_->seed_lsns(5, {4});
+    poller_.fetched = {holding(1, {zeros(4)}), holding(2)};
+    journal_->hold_write = true;
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)});
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+    EXPECT_EQ(dev_->term(), 0u); // the apply waits for the fill
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_FALSE(dev_->is_missing(4));
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
+}
+
+// Writes 0, 3 and 5 hit the same LBA, with 1, 2 and 4 missing, so none is indexed. A login at 4 drops 5, the LBA's
+// newest overlay entry, at commit; its apply makes 3 readable again.
+TEST_F(CraftLoginTest, ALoginRepublishesTheWriteItsTruncationUncovered) {
+    for (int64_t dlsn : {0, 3, 5}) {
+        auto w = homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
+        ASSERT_TRUE(w.has_value());
+    }
+    ASSERT_EQ(dev_->overlay_lsn_for(0), 5);
+    dev_->pause_apply();
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // dropped at commit
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 3);
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// The same login, but the journal read of slot 3 fails while it re-publishes: the overlay can't be trusted to hold an
+// LBA's surviving write, so the partition faults and the session isn't started.
+TEST_F(CraftLoginTest, ALoginWhoseRepublishFailsFaultsThePartition) {
+    for (int64_t dlsn : {0, 3, 5}) {
+        auto w = homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
+        ASSERT_TRUE(w.has_value());
+    }
+    journal_->fail_read = 3;
+
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
+
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 0u);
+}
+
+// ── the write drain ───────────────────────────────────────────────────────────
+
+// The leader's resolution and a login's apply both wait for the same write; when it lands, both go on. The login
+// fenced the resolution's session, so that round stops.
+TEST_F(CraftLoginTest, TwoDrainsWaitingOnTheSameWriteBothResume) {
+    dev_->seed_lsns(2, {});
+    journal_->hold_write = true;
+    auto const w = start_write(/*dlsn=*/3, /*term=*/0);
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
+    EXPECT_EQ(drain_waiters(), 2u);
+
+    journal_->write_gate.complete(true);
+
+    ASSERT_TRUE(w->has_value());
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A drain whose caller gives up while it waits leaves the waiter list, so the write landing later resumes nothing.
+TEST_F(CraftLoginTest, AnAbandonedDrainLeavesTheWaiterList) {
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+
+    abandon_drain();
+    EXPECT_EQ(drain_waiters(), 0u);
+
+    dev_->release_in_flight(3); // would resume a destroyed frame if the waiter were still listed
+}
+
+// The first drain resumed destroys a second one still waiting: the second has stayed listed, so its own guard takes it
+// off the list and nothing resumes its destroyed frame.
+TEST_F(CraftLoginTest, ADrainResumedFirstCanDestroyAnotherStillWaiting) {
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+    auto const second = std::make_shared< std::unique_ptr< HeldTask > >();
+    start_drain_then([second] { second->reset(); });
+    *second = hold_drain();
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    dev_->release_in_flight(3);
+
+    EXPECT_FALSE(*second);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// The drain resumed first starts another write before the second one resumes: the second keeps waiting, for that write.
+TEST_F(CraftLoginTest, ADrainWaitsForAWriteStartedByOneResumedAheadOfIt) {
+    dev_->seed_lsns(4, {3, 4});
+    dev_->seed_in_flight(3);
+    auto const second_done = std::make_shared< bool >(false);
+    start_drain_then([dev = dev_] { dev->seed_in_flight(4); });
+    start_drain_then([second_done] { *second_done = true; });
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    dev_->release_in_flight(3);
+
+    EXPECT_FALSE(*second_done);
+    EXPECT_EQ(drain_waiters(), 1u);
+
+    dev_->release_in_flight(4);
+
+    EXPECT_TRUE(*second_done);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A write lands on another thread while the drain resumed first is still running: that release leaves the rest to the
+// thread already resuming drains, so two releases can't each take a waiter off the list before either runs. The first
+// then destroys the second, whose guard takes it off the list, and nothing resumes it.
+TEST_F(CraftLoginTest, AReleaseWhileADrainIsResumingLeavesTheRestToIt) {
+    dev_->seed_lsns(4, {3, 4});
+    dev_->seed_in_flight(3);
+    auto const first_running = std::make_shared< std::latch >(1);
+    auto const first_may_go_on = std::make_shared< std::latch >(1);
+    auto const second = std::make_shared< std::unique_ptr< HeldTask > >();
+    start_drain_then([dev = dev_, first_running, first_may_go_on, second] {
+        dev->seed_in_flight(4);
+        first_running->count_down();
+        first_may_go_on->wait();
+        second->reset();
+    });
+    *second = hold_drain();
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    std::thread releaser{[dev = dev_] { dev->release_in_flight(3); }};
+    first_running->wait();
+    dev_->release_in_flight(4); // nothing in flight now, but the first drain is still resuming
+
+    EXPECT_EQ(drain_waiters(), 1u); // the second still waits
+    first_may_go_on->count_down();
+    releaser.join();
+
+    EXPECT_FALSE(*second);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A login has already replaced this round's session, and a write is in flight (the new session's, say): resolution
+// fails STALE_TERM at once rather than wait for it.
+TEST_F(CraftLoginTest, ResolveForAReplacedSessionDoesNotWaitForWrites) {
+    dev_->seed_term(1);
+    dev_->seed_lsns(3, {3});
+    dev_->seed_in_flight(3);
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}); // term 0
+
+    EXPECT_TRUE(resolved->has_value()); // didn't wait for the write
+    dev_->release_in_flight(3);
+
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
 }
 
 } // namespace

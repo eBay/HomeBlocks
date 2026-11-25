@@ -100,8 +100,6 @@ public:
 
     async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
 
-    async_status truncate_to(int64_t) override { co_return ok(); }
-
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();
@@ -1137,9 +1135,9 @@ TEST_F(CraftRaftEntriesTest, WriteRejectsStaleTermAfterInternalLogin) {
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
-// InternalLogin applies while a write's journal append is in flight: write()'s post-flight sees the new term and
-// fails STALE_TERM. The entry stays journalled and its blocks aren't freed (the journal references them; the next
-// login truncates it), and the slot stays missing.
+// InternalLogin commits while a write's journal append is in flight, with a watermark below the write: the login drops
+// the slot, so the write fails STALE_TERM when it lands and frees its own blocks (the record stays, unread). The
+// login's apply waits for it.
 TEST_F(CraftRaftEntriesTest, WriteFailsStaleTermWhenLoginLandsDuringWriteSlot) {
     auto header_buf = make_header(CraftEntryType::InternalLogin);
     auto key_buf = make_internal_login_key(/*client_token=*/1, /*term=*/1);
@@ -1159,8 +1157,10 @@ TEST_F(CraftRaftEntriesTest, WriteFailsStaleTermWhenLoginLandsDuringWriteSlot) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
     EXPECT_TRUE(journal_->has_slot(0));
-    EXPECT_EQ(journal_->free_data_calls, 0);
-    EXPECT_TRUE(dev_->is_missing(0));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    EXPECT_FALSE(dev_->is_missing(0));
+    EXPECT_EQ(dev_->last_append_lsn(), -1);
+    EXPECT_EQ(dev_->term(), 1u); // applied once the write landed
 }
 
 // InternalLogin establishing a new client_token has no bearing on SyncRSCommitLSN applies -- neither the
@@ -1178,6 +1178,46 @@ TEST_F(CraftRaftEntriesTest, SyncRSCommitLSNAppliesRegardlessOfInternalLoginToke
     auto fresh = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/7); // the token InternalLogin just set
     ASSERT_TRUE(fresh.has_value());
     EXPECT_EQ(dev_->last_append_lsn(), 5);
+}
+
+// A login's truncation is made at its commit and the dropped slots' blocks are freed at its apply.
+TEST_F(CraftRaftEntriesTest, InternalLoginFreesTheSlotsItDroppedWhenItApplies) {
+    dev_->seed_lsns(8, {7});
+    journal_->slots[6] = JournalSlot{.lsn = 6, .len_bytes = k_page_size};
+    journal_->slots[7] = JournalSlot{.lsn = 7, .len_bytes = k_page_size}; // a record, but missing here
+    journal_->slots[8] = JournalSlot{.lsn = 8, .all_zeros = true, .len_bytes = k_page_size};
+    dev_->pause_apply();
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/1, /*term=*/1, /*rs_commit_lsn=*/5);
+    dev_->raft_listener().on_commit(1, as_blob(login_hdr), as_blob(login_key), {}, {});
+
+    EXPECT_EQ(dev_->last_append_lsn(), 5); // dropped at commit
+    EXPECT_EQ(journal_->free_data_calls, 0);
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(journal_->free_data_calls, 1); // 6 only: 7 is missing here and 8 holds no blocks
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// A login whose watermark is below a slot this member has already indexed can't truncate: the member faults rather
+// than start a session below data it serves, and the login isn't applied.
+TEST_F(CraftRaftEntriesTest, InternalLoginBelowAnIndexedSlotFaultsThePartition) {
+    dev_->seed_lsns(7, {});
+    dev_->seed_commit_lsn(6);
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/1, /*term=*/1, /*rs_commit_lsn=*/5);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(1, as_blob(login_hdr), as_blob(login_key), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), make_error_condition(volume_error::INTERNAL_ERROR));
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), 7); // nothing dropped
 }
 
 // ── SyncRSCommitLSN codec (SDSTOR-26801) ──────────────────────────────────────

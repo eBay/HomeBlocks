@@ -24,6 +24,7 @@
 // craft_repl_dev.cpp directly (same pattern as test_craft_truncate.cpp).
 
 #include <condition_variable>
+#include <functional>
 #include <gtest/gtest.h>
 #include <map>
 #include <mutex>
@@ -58,8 +59,10 @@ class MockCraftJournalBackend : public CraftJournalBackend {
 public:
     std::map< int64_t, JournalSlot > slots;
     int free_data_calls{0};
+    int free_slot_calls{0};
     homestore::blk_num_t next_blk_num{1000};
     std::optional< int64_t > fail_on_read; // if set, read_slot for that lsn returns an error
+    std::function< void() > on_read_data;  // if set, runs at the start of each read_data()
     std::vector< int64_t > read_lsns;      // every lsn read_slot() was asked for, in order
     // Opt-in blocking gate for read_slot(), default open (no blocking) -- lets a test create a real,
     // observable window during rebuild_overlay()'s walk (e.g. to verify recovering_'s client-I/O gate
@@ -118,13 +121,12 @@ public:
             co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
         co_return it->second;
     }
-
-    async_status truncate_to(int64_t) override { co_return ok(); }
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();
     }
     async_status free_slot(int64_t) override {
+        ++free_slot_calls;
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
     // Same error category HomeStoreCraftJournalBackend::read_data returns for a real async_read
@@ -132,6 +134,7 @@ public:
     // filesystem-shaped condition, so this mirrors production's actual error vocabulary rather than
     // borrowing an unrelated POSIX errno.
     async_status read_data(homestore::multi_blk_id blkid, sisl::sg_list& dest) override {
+        if (on_read_data) on_read_data();
         auto* buf = static_cast< uint8_t* >(dest.iovs[0].iov_base);
         size_t offset = 0;
         auto pieces = blkid.iterate();
@@ -279,6 +282,16 @@ protected:
                                         sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
     }
 
+    // Commits an InternalLogin at term with watermark rs_commit_lsn, as RAFT would; it applies unless the queue's busy.
+    void commit_login(uint64_t term, int64_t rs_commit_lsn) {
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
+        std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+        serialize_internal_login(key.data(), /*client_token=*/7, term, rs_commit_lsn);
+        dev_->raft_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                        sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, {});
+    }
+
     auto do_read(int64_t read_lsn, lba_t lba, uint32_t nlbas) {
         dest_buf_.assign(nlbas * k_page_size, 0xFF); // non-zero filler so hole-zeroing is actually observable
         sisl::sg_list dest;
@@ -289,6 +302,22 @@ protected:
             [this](lba_t s, lba_t e, std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out) {
                 return index_.read_from_index(s, e, out);
             }));
+    }
+
+    // do_read() as a read from the session at `term`; `on_lookup` runs as the read looks up the index.
+    auto do_read_as(uint64_t term, int64_t read_lsn, lba_t lba, uint32_t nlbas,
+                    std::function< void() > on_lookup = {}) {
+        dest_buf_.assign(nlbas * k_page_size, 0xFF);
+        sisl::sg_list dest;
+        dest.size = dest_buf_.size();
+        dest.iovs.push_back(iovec{dest_buf_.data(), dest_buf_.size()});
+        return homeblocks::detail::sync_get(dev_->read_with(
+            read_lsn, lba * k_page_size, nlbas * k_page_size, std::move(dest),
+            [this, on_lookup](lba_t s, lba_t e, std::vector< std::pair< VolumeIndexKey, VolumeIndexValue > >& out) {
+                if (on_lookup) on_lookup();
+                return index_.read_from_index(s, e, out);
+            },
+            term));
     }
 
     std::vector< uint8_t > dest_buf_;
@@ -1173,6 +1202,126 @@ TEST_F(CraftCommitTest, TruncateRemovesOverlayEntriesAboveLsn) {
 
     EXPECT_EQ(dev_->overlay_lsn_for(0), 3);  // survives: 3 <= truncation point 4
     EXPECT_EQ(dev_->overlay_lsn_for(1), -1); // pruned: 5 > truncation point 4, rolled back
+}
+
+// truncate() runs the login's sequence: dropping an LBA's newest overlay entry re-publishes the older write at or below
+// the truncation point, which a read would otherwise skip for the index's value.
+TEST_F(CraftCommitTest, TruncateRepublishesTheWriteItUncovered) {
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 0, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 1, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(0), 1);
+
+    auto r = homeblocks::detail::sync_get(dev_->truncate(0));
+    ASSERT_TRUE(r.has_value());
+
+    EXPECT_EQ(dev_->last_append_lsn(), 0);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 0);
+}
+
+// A login commits while a commit run is indexing slot 1, with that slot as its watermark: the run had planned to reach
+// slot 3, but stops at the slots the login dropped rather than index them.
+TEST_F(CraftCommitTest, CommitRunStopsAtSlotsALoginDropped) {
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(do_write_data(0, dlsn, /* lba = */ dlsn, /* nlbas = */ 1).has_value());
+    bool committed = false;
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        /* upto_lsn = */
+        3,
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            if (s == 1 && !std::exchange(committed, true)) commit_login(/*term=*/1, /*rs_commit_lsn=*/1);
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_TRUE(index_.entries.contains(1));
+    EXPECT_FALSE(index_.entries.contains(2));
+    EXPECT_FALSE(index_.entries.contains(3));
+    EXPECT_EQ(dev_->term(), 1u);
+}
+
+// The same login, with the slot being indexed above its watermark: commit_lsn is still 2 while the run indexes slot 3,
+// so truncating to 2 would free blocks the index is about to point at. The member faults instead, keeping its term, its
+// tail and the slot's blocks, and the run indexes the slot.
+TEST_F(CraftCommitTest, ALoginBelowTheSlotBeingIndexedFaultsThePartition) {
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(do_write_data(0, dlsn, /* lba = */ dlsn, /* nlbas = */ 1).has_value());
+    auto const committed_to = do_commit(2);
+    ASSERT_TRUE(committed_to.has_value());
+    ASSERT_EQ(*committed_to, 2);
+    bool committed = false;
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        /* upto_lsn = */
+        3,
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            if (s == 3 && !std::exchange(committed, true)) commit_login(/*term=*/1, /*rs_commit_lsn=*/2);
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_TRUE(committed);
+    EXPECT_TRUE(dev_->is_faulted());
+    EXPECT_EQ(dev_->term(), 0u);
+    EXPECT_EQ(dev_->last_append_lsn(), 3);
+    EXPECT_EQ(journal_->free_slot_calls, 0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+    EXPECT_TRUE(index_.entries.contains(3));
+}
+
+// An old-session read looks up the index while a login commits with a watermark below the LBA's newest write: the
+// truncation drops that write from the overlay, and the older one at the watermark isn't back until the login applies,
+// so all that's left to serve is the index's value, older than both. The read fails STALE_TERM instead.
+TEST_F(CraftCommitTest, ALoginCommittingWhileAReadLooksUpTheIndexFailsTheRead) {
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 0, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_TRUE(do_commit(0).has_value());
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 1, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 2, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), 0);
+    ASSERT_EQ(dev_->overlay_lsn_for(0), 2);
+    dev_->pause_apply();
+
+    auto const r = do_read_as(/*term=*/0, /*read_lsn=*/2, /*lba=*/0, /*nlbas=*/1,
+                              [this] { commit_login(/*term=*/1, /*rs_commit_lsn=*/1); });
+
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1); // 2 is dropped, and 1 isn't back yet
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
+
+    dev_->resume_apply();
+
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 1);
+}
+
+// An old-session read has resolved the LBA's newest write, above a login's watermark, and is reading its blocks when
+// the login commits and applies: the apply frees them, and a new-session write may reuse them. The read fails
+// STALE_TERM rather than return what it read.
+TEST_F(CraftCommitTest, ALoginAppliedWhileAReadReadsItsBlocksFailsTheRead) {
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 0, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_TRUE(do_write_data(0, /* dlsn = */ 1, /* lba = */ 0, /* nlbas = */ 1).has_value());
+    ASSERT_EQ(dev_->overlay_lsn_for(0), 1);
+    bool committed = false;
+    journal_->on_read_data = [this, &committed] {
+        if (!std::exchange(committed, true)) commit_login(/*term=*/1, /*rs_commit_lsn=*/0);
+    };
+
+    auto const r = do_read_as(/*term=*/0, /*read_lsn=*/1, /*lba=*/0, /*nlbas=*/1);
+    journal_->on_read_data = nullptr;
+
+    ASSERT_TRUE(committed);
+    EXPECT_EQ(dev_->term(), 1u);             // applied during the read
+    EXPECT_EQ(journal_->free_slot_calls, 1); // slot 1, whose blocks the read was reading
+    EXPECT_EQ(dev_->overlay_lsn_for(0), 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::STALE_TERM));
 }
 
 // ── commit() resume after a gap fills ─────────────────────────────────────────
