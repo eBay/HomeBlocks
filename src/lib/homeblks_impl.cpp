@@ -545,9 +545,11 @@ void HomeBlocksImpl::on_init_complete() {
 
     homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
 
-    // A volume removes its record before its superblock, so none should be left; one that is, stays on disk.
-    for (auto const& [id, sb] : craft_state_sbs_) {
-        LOGW("CRAFT state record of volume {} has no volume here: left in place", boost::uuids::to_string(id));
+    // A volume removes its record before its superblock, so none should be left. One that is goes: a later create of
+    // the same volume would write a second record for it, and every boot after that would refuse the two.
+    for (auto& [id, sb] : craft_state_sbs_) {
+        LOGW("CRAFT state record of volume {} has no volume here: removed", boost::uuids::to_string(id));
+        sb.destroy();
     }
     craft_state_sbs_.clear();
 

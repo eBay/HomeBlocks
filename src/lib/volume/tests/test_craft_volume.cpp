@@ -644,6 +644,33 @@ TEST_F(CraftVolumeTest, AJournalThatNeverReplaysFaultsThePartitionForGood) {
     remove(id);
 }
 
+// A state record with no volume here (none should be left: a volume removes its record before its superblock) is
+// removed at boot. Left in place, a later create of the same volume would write a second record for it, and every boot
+// after that would refuse the two.
+TEST_F(CraftVolumeTest, AStateRecordWithoutItsVolumeIsRemovedAtBoot) {
+    auto info = craft_vol_info("craft_vol_orphan_record");
+    auto const id = info.id;
+    auto orphan = make_homestore_state_store(id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+    ASSERT_TRUE(homeblocks::detail::sync_get(orphan->persist(CraftDurableState{})));
+    orphan.reset();
+    ASSERT_TRUE(state_records().contains(id));
+
+    g_helper->restart();
+    EXPECT_FALSE(state_records().contains(id));
+
+    // The volume created afterwards writes a record of its own (a login persists it), which the next boot reads.
+    auto vol = create(std::move(info));
+    ASSERT_TRUE(vol);
+    auto const login = propose_login(id, 42 /* client_token */, 7 /* term */);
+    ASSERT_TRUE(login) << login.error().message();
+    ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+    g_helper->restart();
+    auto again = hb()->get_volume(id);
+    ASSERT_TRUE(again);
+    EXPECT_TRUE(state_records().contains(id));
+    remove(id);
+}
+
 // A RAFT entry a checkpoint covers is never replayed after a restart. One that hasn't applied yet survives in the
 // partition's durable state, which the checkpoint saves with it, and the restart applies it from there.
 TEST_F(CraftVolumeTest, CheckpointKeepsAnEntryThatHasNotApplied) {
