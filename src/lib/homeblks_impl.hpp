@@ -20,6 +20,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <boost/uuid/uuid_hash.hpp> // std::hash of volume ids
@@ -42,6 +43,40 @@ class volume;
 struct hs_chunk_size_cfg_t {
     uint64_t index;
     uint64_t data;
+};
+
+// The meta blk record holding a CRAFT RAFT group's last snapshot as HomeStore serializes it: this header, then ctx_len
+// bytes. One per group, removed with it.
+#pragma pack(push, 1)
+struct craft_snapshot_sb_t {
+    static constexpr uint64_t k_magic = 0x50414E53'54465243ull; // "CRFTSNAP" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    volume_id_t group_id{};
+    int64_t lsn{-1}; // the last RAFT entry it covers
+    uint32_t ctx_len{0};
+};
+#pragma pack(pop)
+inline const std::string craft_snapshot_meta_name{"CraftSnapshot"};
+
+// This node's metrics; each volume has its own (VolumeMetrics).
+class HomeBlocksMetrics : public sisl::MetricsGroup {
+public:
+    HomeBlocksMetrics() : sisl::MetricsGroup("homeblocks", "node") {
+        REGISTER_COUNTER(craft_snapshot_transfers_refused,
+                         "RAFT snapshot transfers this node refused to send: CRAFT has no snapshots yet");
+        REGISTER_GAUGE(craft_groups_without_replica,
+                       "CRAFT groups this node is a member of without a replica here, until a partition move "
+                       "replaces this member");
+        REGISTER_COUNTER(craft_leaderships_handed_off,
+                         "RAFT leaderships this node handed to another member, having no replica of the volume");
+        REGISTER_COUNTER(craft_recoveries_failed,
+                         "CRAFT partitions whose recovery at restart failed: faulted, they refuse I/O until replaced");
+        register_me_to_farm();
+    }
+    ~HomeBlocksMetrics() { deregister_me_from_farm(); }
 };
 
 class HomeBlocksImpl : public home_blocks, public std::enable_shared_from_this< HomeBlocksImpl > {
@@ -80,13 +115,29 @@ private:
     /// volume management
     mutable std::shared_mutex vol_lock_;
     std::unordered_map< volume_id_t, volume_handle > vol_map_;
-    std::unordered_set< volume_id_t > creating_vols_; // CRAFT creates in flight on this node (guarded by vol_lock_)
+    // CRAFT creates, and CreateVolume applies, in flight on this node: an entry each, so one that ends never clears
+    // another's (guarded by vol_lock_)
+    std::unordered_multiset< volume_id_t > creating_vols_;
 
     // Index tables recovered and not yet installed in a volume: volume id -> {table, its ordinal}. A volume takes its
     // table at load; one left by a create that crashed stays, holding its ordinal, until that volume's next create
     // takes it.
     mutable std::shared_mutex index_lock_;
     std::unordered_map< std::string, std::pair< shared< VolumeIndexTable >, uint64_t > > idx_tbl_map_;
+
+    // CRAFT durable state records read at boot, by volume id, until their volumes take them. Only on_init_complete()
+    // uses it, reading the records and then the volumes on one thread.
+    std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > craft_state_sbs_;
+
+    // CRAFT RAFT groups' last snapshots, by group: read at boot, kept up to date by their listeners.
+    std::mutex craft_snapshot_mu_;
+    std::unordered_map< volume_id_t, superblk< craft_snapshot_sb_t > > craft_snapshot_sbs_; // guarded by the same
+
+    // CRAFT reattaches started and not done yet, and what their waiters await: completed when the count drops to 0.
+    std::mutex craft_reattach_mu_;
+    uint32_t craft_reattaching_{0};                                             // guarded by craft_reattach_mu_
+    shared< sisl::async::shared_awaitable< bool > > craft_reattached_{nullptr}; // guarded by craft_reattach_mu_
+    std::unordered_set< volume_id_t > craft_unreplayed_; // counted, journal not replayed yet; guarded by the same
 
     bool recovery_done_{false};
     bool gracefully_shutdown_{false};
@@ -106,6 +157,12 @@ private:
     std::promise< void > shutdown_promise_;
     iomgr::timer_handle_t vol_gc_timer_hdl_{iomgr::null_timer_handle};
     iomgr::timer_handle_t shutdown_timer_hdl_{iomgr::null_timer_handle};
+    iomgr::timer_handle_t craft_sweep_timer_hdl_{iomgr::null_timer_handle}; // CRAFT: expire_overdue_craft_waits()
+    // CRAFT: when this member last handed off each group's leadership, while it leads it without a replica.
+    std::mutex craft_handoff_mu_;
+    std::unordered_map< volume_id_t, std::chrono::steady_clock::time_point > craft_handed_off_at_;
+
+    HomeBlocksMetrics metrics_;
 
 public:
     // static uint64_t _hs_chunk_size;
@@ -140,6 +197,8 @@ public:
     [[nodiscard]] result< volume_stats > get_stats(volume_id_t id) const final;
     std::vector< volume_id_t > volume_ids() const final;
 
+    [[nodiscard]] async_status replace_member(volume_id_t const& id, peer_id_t const& out, peer_id_t const& in) final;
+
     // Index
     shared< hs_index_table_t > recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
 
@@ -161,12 +220,64 @@ public:
     // CRAFT: a volume's RAFT group was destroyed (rollback of its create, or the partition's removal): removes this
     // node's replica, if it has one. Called from HomeStore's reaper reactor: the teardown runs on a worker.
     void on_craft_group_destroyed(volume_id_t const& id);
+    // CRAFT: a RAFT group's last snapshot, in its own record: nuraft takes one every snapshot_freq_distance entries and
+    // compacts the log on it, and needs it back after a restart. Empty if the group has none.
+    sisl::io_blob_safe craft_snapshot(volume_id_t const& group_id);
+    void save_craft_snapshot(volume_id_t const& group_id, homestore::snapshot_context& ctx);
+    void remove_craft_snapshot(volume_id_t const& group_id);
+    // CRAFT: this member was elected leader of a volume's RAFT group. Without a replica here that serves, it would fail
+    // every CRAFT op of the volume, so it hands leadership to another member. The hand-off runs on a worker, inline if
+    // called on one: never with a lock held.
+    void on_craft_group_leader(volume_id_t const& id);
+    // CRAFT: the groups this node is a member of without a replica of their volume here (a local create that failed
+    // leaves one), other than those of a create in flight here and those being destroyed.
+    int64_t craft_groups_without_replica() const;
+    // CRAFT: the checkpoint step. Persists every CRAFT partition's durable state, with the RAFT entries it has not
+    // applied yet; stops the process if one can't be.
+    sisl::async::task< void > save_craft_states();
+#ifdef _PRERELEASE
+    // Reads every CRAFT state record in the meta service again, as a boot does, and hands them over by volume.
+    std::unordered_map< volume_id_t, superblk< craft_state_sb_t > > read_craft_state_records() {
+        homestore::hs()->meta_service().read_sub_sb(craft_state_meta_name);
+        return std::exchange(craft_state_sbs_, {});
+    }
+#endif
     // CRAFT: HomeStore asks for a new RAFT group's listener on the thread that instantiated the group.
     static void on_craft_group_made(volume_id_t const& id) {
         if (forming_ && forming_->id == id) { forming_->made = true; }
     }
 
     void start_reaper_thread();
+    // CRAFT: a volume loaded at boot reopens its journal: its reattach is counted from now on, so a checkpoint, even
+    // one a partition recovered earlier triggers, waits for the entries held for it.
+    void expect_craft_reattach(volume_id_t const& id);
+    // CRAFT: that journal replayed: the volume's device is made and recovered on a worker (reattach_craft_volume),
+    // counted until published. HomeStore calls this from the replay, with the log device locked. `vol`: null if gone.
+    void on_craft_journal_replayed(volume_id_t const& id, volume_handle vol,
+                                   shared< homestore::home_log_store > journal);
+    // CRAFT: one counted reattach is over.
+    void end_craft_reattach();
+    // CRAFT: once no reattach is pending. A checkpoint's flush waits for this, so it never covers entries a volume
+    // holds for its device.
+    sisl::async::task< void > craft_reattaches_done();
+    // CRAFT, end of init: faults for good the partitions whose journal never replayed, then waits for every reattach.
+    void finish_craft_reattach();
+    // CRAFT, at shutdown: stops every CRAFT device (CraftReplDev::stop), keeping their queued entries.
+    void stop_craft_devices();
+    // CRAFT, at shutdown, before it waits for the requests in flight: ends every device's proposals
+    // (CraftReplDev::stop_proposing()).
+    void stop_craft_proposals();
+    // CRAFT, every second from start_reaper_thread()'s timer: fails each device's proposals and journal writes past
+    // their deadline (CraftReplDev::expire_overdue()), those of a volume being destroyed too.
+    void expire_overdue_craft_waits();
+    // CRAFT, on a worker: hands the group's RAFT leadership off if this member leads it without a replica here that
+    // serves, unless it did within craft_leadership_handoff_backoff_ms (it keeps leadership; retry_craft_handoffs()
+    // tries again).
+    void hand_off_craft_leadership(volume_id_t const& id);
+    // CRAFT, every second from the same timer: hands off again the groups whose backoff is over, and checks those whose
+    // replica here doesn't serve: it may have stopped after the election.
+    void retry_craft_handoffs();
+    std::vector< volume_handle > craft_volumes() const;
 
     void fault_containment(const volume_handle vol, const std::string& reason = "");
     bool fc_on() const;
@@ -178,6 +289,7 @@ public:
     bool is_graceful_shutdown() const { return gracefully_shutdown_; }
     bool has_pending_chunk_releases() const;
     home_blocks_config const& config() const { return config_; }
+    HomeBlocksMetrics& metrics() { return metrics_; }
     // CRAFT process mode: every volume is a CRAFT partition replicated by its own RAFT group.
     bool is_craft() const { return config_.repl_mode == replication_mode::CRAFT; }
 
@@ -222,12 +334,16 @@ private:
     // recovery apis
     void on_hb_meta_blk_found(sisl::byte_view const& buf, void* cookie);
     void on_vol_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_state_meta_blk_found(sisl::byte_view const& buf, void* cookie);
+    void on_craft_snapshot_meta_blk_found(sisl::byte_view const& buf, void* cookie);
 
     void vol_gc();
 
     // Coroutine driving the actual volume teardown (co_awaits volume::destroy); launched via detach on a
     // worker reactor by remove_volume so the reactor yields during the destroy's CP flush instead of parking.
     sisl::async::task< void > do_remove_volume(volume_id_t id);
+    // CRAFT: one volume's reattach (volume::reattach_craft_dev), counted in craft_reattaching_.
+    sisl::async::task< void > reattach_craft_volume(volume_handle vol, shared< homestore::home_log_store > journal);
     // Starts a volume's teardown (do_remove_volume) on a worker. False if the system is restricted or shutting down.
     bool start_volume_removal(volume_id_t const& id);
 

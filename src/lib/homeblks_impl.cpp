@@ -16,9 +16,12 @@
 #include <algorithm>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/nil_generator.hpp>
+#include <thread>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/drive.hpp>
+#include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore.hpp>
+#include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/replication_service.hpp>
 #include <homestore/index_service.hpp>
 #include <sisl/options/options.h>
@@ -37,7 +40,7 @@ result< shared< home_blocks > > init_homeblocks(home_blocks_config cfg) {
     // TODO: surface operational init failures (on_svc_id RPC, device open, format) as result<> errors rather than
     // aborting inside init_homestore(); precondition bugs (e.g. no devices) stay asserts.
     inst->init_homestore();
-    inst->init_cp();
+    inst->finish_craft_reattach();
     inst->start_reaper_thread();
     HomeBlocksImpl::s_instance_ = inst;
     return inst;
@@ -62,6 +65,8 @@ home_blocks_stats HomeBlocksImpl::get_stats() const {
 std::future< void > HomeBlocksImpl::shutdown_start() {
     LOGI("Setting shutdown start flag");
     shutdown_started_.test_and_set();
+    // A scrape no longer reads HomeStore, which goes down next; this waits out one in progress.
+    metrics_.detach_gather_cb();
 
     // Pending chunk releases skip write-back cache eviction from now on; can_shutdown() waits for them.
     if (volume_chunk_selector_) { volume_chunk_selector_->start_shutdown(); }
@@ -153,6 +158,9 @@ void HomeBlocksImpl::shutdown() {
     // set the shutdown flag so that no new requests are accepted;
     // start timer thread if there are still outstanding jobs;
     auto f = shutdown_start();
+    // After the flag, which refuses new CRAFT ops: a request in flight may be waiting on a proposal that only a stop
+    // would end (no deadline, no quorum), and the wait below waits for it.
+    stop_craft_proposals();
 
     f.get();
 
@@ -160,6 +168,14 @@ void HomeBlocksImpl::shutdown() {
     if (shutdown_timer_hdl_ != iomgr::null_timer_handle) {
         iomanager.cancel_timer(shutdown_timer_hdl_);
         shutdown_timer_hdl_ = iomgr::null_timer_handle;
+    }
+
+    // The sweep runs on while the devices stop: a stop waits out the apply in progress, which a journal write that
+    // never completes would hold forever without its deadline.
+    stop_craft_devices();
+    if (craft_sweep_timer_hdl_ != iomgr::null_timer_handle) {
+        iomanager.cancel_timer(craft_sweep_timer_hdl_, true /* wait: a sweep in progress finishes */);
+        craft_sweep_timer_hdl_ = iomgr::null_timer_handle;
     }
 
     // set the shutdown flag so that no new requests are accepted;
@@ -422,6 +438,12 @@ void HomeBlocksImpl::init_homestore() {
     }
 
     recovery_done_ = true;
+    // Counted at each scrape from HomeStore's groups and this node's replicas, now that both are recovered; until
+    // shutdown starts.
+    if (is_craft()) {
+        metrics_.attach_gather_cb(
+            [this] { GAUGE_UPDATE(metrics_, craft_groups_without_replica, craft_groups_without_replica()); });
+    }
     LOGI("Initialize and start HomeStore is successfully");
 }
 
@@ -479,6 +501,39 @@ void HomeBlocksImpl::on_init_complete() {
     // Add anything that needs to be done here.
     using namespace homestore;
 
+    // While HomeStore starts: the checkpoint that ends its start waits, through this consumer, for the CRAFT partitions
+    // to be reattached, so it can't cover the entries they hold meanwhile.
+    init_cp();
+
+    // CRAFT state records, ahead of the volumes that take them
+    homestore::hs()->meta_service().register_handler(
+        craft_state_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_state_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
+    homestore::hs()->meta_service().read_sub_sb(craft_state_meta_name);
+
+    // CRAFT groups' last snapshots, before the groups rejoin: nuraft reads a group's once, as it starts its server. A
+    // group HomeStore dropped at this boot without calling on_destroy (its destroy pending at a crash) leaves its
+    // record: removed, or a group created again under that id would start from its snapshot.
+    homestore::hs()->meta_service().register_handler(
+        craft_snapshot_meta_name,
+        [this](homestore::meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            on_craft_snapshot_meta_blk_found(std::move(buf), reinterpret_cast< void* >(mblk));
+        },
+        nullptr /*recovery_comp_cb*/, true /* do_crc */);
+    homestore::hs()->meta_service().read_sub_sb(craft_snapshot_meta_name);
+    {
+        std::lock_guard lk{craft_snapshot_mu_};
+        std::erase_if(craft_snapshot_sbs_, [](auto& entry) {
+            if (homestore::hs()->repl_service().get_repl_dev(entry.first)) { return false; }
+            LOGI("CRAFT snapshot record of group {}, which is gone: removed", boost::uuids::to_string(entry.first));
+            entry.second.destroy();
+            return true;
+        });
+    }
+
     // volume SB
     homestore::hs()->meta_service().register_handler(
         volume::VOL_META_NAME,
@@ -490,6 +545,14 @@ void HomeBlocksImpl::on_init_complete() {
 
     homestore::hs()->meta_service().read_sub_sb(volume::VOL_META_NAME);
 
+    // A volume removes its record before its superblock, so none should be left. One that is goes: a later create of
+    // the same volume would write a second record for it, and every boot after that would refuse the two.
+    for (auto& [id, sb] : craft_state_sbs_) {
+        LOGW("CRAFT state record of volume {} has no volume here: removed", boost::uuids::to_string(id));
+        sb.destroy();
+    }
+    craft_state_sbs_.clear();
+
     // Every index (recovered before repl devs) and volume has claimed its chunks by now, so chunks left in the free
     // pools are unowned. Clear the ones a crash during volume destroy left with allocated blks, before they are reused.
     // No CP flushes the data allocators concurrently: the data service registers for CPs only after this. The CP the
@@ -499,7 +562,58 @@ void HomeBlocksImpl::on_init_complete() {
     index_chunk_selector_->reset_dirty_free_chunks();
 }
 
-void HomeBlocksImpl::init_cp() {}
+namespace {
+// HomeStore records a checkpoint (checkpoint_lsn) in the replication service's flush, after this consumer's
+// (HS_CLIENT), and replays the RAFT log after a restart only above it. Every RAFT entry a checkpoint covers has been
+// committed to its CRAFT partition (HomeStore calls on_commit before advancing the LSN the checkpoint takes), not
+// always applied: this flush saves each partition's durable state with its entries not yet applied, which recovery
+// applies again.
+class CraftCheckpointConsumer : public homestore::CPCallbacks {
+public:
+    explicit CraftCheckpointConsumer(HomeBlocksImpl* hb) : hb_{hb} {}
+
+    std::unique_ptr< homestore::CPContext > on_switchover_cp(homestore::CP*, homestore::CP* new_cp) override {
+        return std::make_unique< homestore::CPContext >(new_cp); // non-null: flushed with every checkpoint
+    }
+    sisl::async::task< bool > cp_flush(homestore::CP*) override {
+        co_await hb_->save_craft_states();
+        co_return true;
+    }
+    void cp_cleanup(homestore::CP*) override {}
+    int cp_progress_percent() override { return 100; }
+
+private:
+    HomeBlocksImpl* hb_;
+};
+} // namespace
+
+void HomeBlocksImpl::init_cp() {
+    if (is_craft()) {
+        homestore::cp_mgr().register_consumer(homestore::cp_consumer_t::HS_CLIENT,
+                                              std::make_unique< CraftCheckpointConsumer >(this));
+    }
+}
+
+// Every CRAFT volume's state, in turn (the meta service serializes the writes anyway). A volume's store writes its
+// record only when the image changed since it last wrote it, so a checkpoint costs a write per changed partition, not
+// one per partition.
+sisl::async::task< void > HomeBlocksImpl::save_craft_states() {
+    // A volume being reattached holds the entries committed meanwhile, which this checkpoint may cover: they reach its
+    // device, whose state is saved below with them, first.
+    co_await craft_reattaches_done();
+    for (auto const& vol : craft_volumes()) {
+        // Counted in flight while saved: its destroy, which removes the state record, waits for it or is seen here.
+        vol_io_guard const guard{vol};
+        if (vol->is_destroying()) { continue; }
+        auto const dev = vol->craft_dev_ref();
+        if (!dev) { continue; } // no device yet: nothing to save
+        auto const saved = co_await dev->save_state();
+        // The replication service records the checkpoint whatever this flush returns: stop rather than let it cover
+        // entries whose state isn't durable.
+        RELEASE_ASSERT(saved, "CRAFT volume {}: saving its durable state for a checkpoint failed: {}", vol->id_str(),
+                       saved.error().message());
+    }
+}
 
 uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
     if (SISL_OPTIONS.count("gc_timer_nsecs")) {
@@ -511,12 +625,140 @@ uint64_t HomeBlocksImpl::gc_timer_nsecs() const {
     }
 }
 
+void HomeBlocksImpl::expect_craft_reattach(volume_id_t const& id) {
+    std::lock_guard lk{craft_reattach_mu_};
+    if (craft_reattaching_++ == 0) craft_reattached_ = std::make_shared< sisl::async::shared_awaitable< bool > >();
+    craft_unreplayed_.insert(id);
+}
+
+void HomeBlocksImpl::on_craft_journal_replayed(volume_id_t const& id, volume_handle vol,
+                                               shared< homestore::home_log_store > journal) {
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        if (craft_unreplayed_.erase(id) == 0) return; // given up already (finish_craft_reattach)
+    }
+    if (!vol) {
+        end_craft_reattach();
+        return;
+    }
+    // A worker, not the replay's thread: HomeStore holds the log device locked, and its start goes on meanwhile.
+    iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [this, vol = std::move(vol), journal]() mutable {
+        detail::detach(reattach_craft_volume(std::move(vol), std::move(journal)));
+    });
+}
+
+sisl::async::task< void > HomeBlocksImpl::reattach_craft_volume(volume_handle vol,
+                                                                shared< homestore::home_log_store > journal) {
+#ifdef _PRERELEASE
+    // Holds the reattach for the flip's milliseconds, for a test to commit entries meanwhile, and resumes from a
+    // message on a worker, as it started. A thread of its own waits them out, not an iomgr delay flip: each file's
+    // first use of iomgr's flips replaces their timer, leaving one still pending to fire on a destroyed object.
+    if (auto const ms = iomgr_flip::instance()->get_test_flip< long >("craft_reattach_delay_ms")) {
+        auto held = std::make_shared< sisl::async::value_awaitable< bool > >();
+        std::thread([held, ms = *ms]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds{ms});
+            iomanager.run_on_forget(iomgr::reactor_regex::random_worker, [held]() { held->complete(true); });
+        }).detach();
+        co_await *held;
+    }
+#endif
+    // A recovery that throws fails as any other, its fault durable (CraftReplDev::recover()). Anything else escaping
+    // here would leave the partition without a device and the entries held for it unsaved: the process stops rather
+    // than release the count, which would let a checkpoint cover them. Its restart recovers the partition again.
+    status r;
+    try {
+        r = co_await vol->reattach_craft_dev(std::move(journal), our_uuid());
+    } catch (std::exception const& e) {
+        RELEASE_ASSERT(false, "CRAFT volume {}: its reattach threw: {}", vol->id_str(), e.what());
+    } catch (...) { RELEASE_ASSERT(false, "CRAFT volume {}: its reattach threw", vol->id_str()); }
+    if (!r) { COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1); }
+    end_craft_reattach();
+}
+
+void HomeBlocksImpl::end_craft_reattach() {
+    shared< sisl::async::shared_awaitable< bool > > done;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        if (--craft_reattaching_ == 0) done = std::exchange(craft_reattached_, nullptr);
+    }
+    if (done) done->complete(true); // outside the lock: resumes the waiters
+}
+
+sisl::async::task< void > HomeBlocksImpl::craft_reattaches_done() {
+    shared< sisl::async::shared_awaitable< bool > > reattached;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        reattached = craft_reattached_;
+    }
+    if (reattached) co_await *reattached;
+}
+
+std::vector< volume_handle > HomeBlocksImpl::craft_volumes() const {
+    std::vector< volume_handle > vols;
+    auto lg = std::shared_lock(vol_lock_);
+    for (auto const& [id, vol] : vol_map_) {
+        if (vol->is_craft()) { vols.push_back(vol); }
+    }
+    return vols;
+}
+
+void HomeBlocksImpl::expire_overdue_craft_waits() {
+    for (auto const& vol : craft_volumes()) {
+        if (auto const dev = vol->craft_dev_ref()) { dev->expire_overdue(); }
+    }
+}
+
+void HomeBlocksImpl::stop_craft_proposals() {
+    for (auto const& vol : craft_volumes()) {
+        if (auto const dev = vol->craft_dev_ref()) { dev->stop_proposing(); }
+    }
+}
+
+// Before HomeStore shuts down: nothing a CRAFT device runs on its own may touch HomeStore after it. The entries still
+// queued stay queued, for HomeStore's last checkpoint to save with each partition's state.
+void HomeBlocksImpl::stop_craft_devices() {
+    for (auto const& vol : craft_volumes()) {
+        if (auto const dev = vol->craft_dev_ref()) { (void)detail::sync_get(dev->stop(true /* keep_queued */)); }
+    }
+}
+
+// HomeStore has started: every journal reopened at load that replays has replayed by now. One that hasn't won't (its
+// log store is missing), and the entries held for it can't be saved: its partition is faulted for good, its record
+// marked before the count lets a checkpoint cover them, so a later boot doesn't bring it back from that record.
+void HomeBlocksImpl::finish_craft_reattach() {
+    std::unordered_set< volume_id_t > unreplayed;
+    {
+        std::lock_guard lk{craft_reattach_mu_};
+        unreplayed.swap(craft_unreplayed_);
+    }
+    for (auto const& id : unreplayed) {
+        if (auto const vol = get_volume(id)) {
+            COUNTER_INCREMENT(metrics_, craft_recoveries_failed, 1);
+            (*vol)->fault_unreplayed_craft();
+        }
+        end_craft_reattach();
+    }
+    detail::sync_get(craft_reattaches_done());
+}
+
 void HomeBlocksImpl::start_reaper_thread() {
     auto const nsecs = gc_timer_nsecs();
     LOGI("Starting volume garbage collection timer with interval: {} seconds", nsecs);
     vol_gc_timer_hdl_ = iomanager.schedule_global_timer(
         nsecs * 1000 * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_user,
         [this](void*) { this->vol_gc(); }, true /* wait_to_schedule */);
+    if (is_craft()) {
+        // One timer for every partition, armed off the reactors: a recurring timer per proposer is armed and canceled
+        // on every worker, a blocking round that hangs when two workers do it at once.
+        craft_sweep_timer_hdl_ = iomanager.schedule_global_timer(
+            1'000'000'000 /* 1s: a proposal times out up to this late */, true /* recurring */, nullptr /* cookie */,
+            iomgr::reactor_regex::all_user,
+            [this](void*) {
+                expire_overdue_craft_waits();
+                retry_craft_handoffs();
+            },
+            true /* wait_to_schedule */);
+    }
 }
 
 void HomeBlocksImpl::vol_gc() {

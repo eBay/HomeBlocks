@@ -35,6 +35,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -45,6 +47,8 @@
 #include <iomgr/iomgr.hpp>
 
 #include "hb_internal.hpp"
+#include "homeblks_impl.hpp"
+#include "home_blks_config.hpp"
 #include "craft/craft_repl_dev.hpp"
 #include "coro_helpers.hpp"
 #include "test_common.hpp"
@@ -107,8 +111,39 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
     ASSERT_TRUE(r.has_value());
 }
 
+// A write HomeStore hasn't written by its deadline fails timed_out, and HomeStore writes the entry later, whole: its
+// buffer outlives the write. This log flushes only when asked, so the entry is still pending when the deadline passes.
+TEST_F(CraftHomeStoreBackendTest, AWritePastItsDeadlineIsWrittenWholeLater) {
+    auto const logdev_id = homestore::logstore_service().create_new_logdev(homestore::flush_mode_t::EXPLICIT);
+    auto logstore = homestore::logstore_service().create_new_log_store(logdev_id, /* append_mode = */ false);
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+
+    auto const timeout = HB_DYNAMIC_CONFIG(craft_journal_write_timeout_ms);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_journal_write_timeout_ms = 1; });
+    std::optional< status > written;
+    homeblocks::detail::detach([](CraftJournalBackend* b, std::optional< status >& out) -> async_status {
+        out = co_await b->write_slot(/* lsn = */ 0, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                     homestore::multi_blk_id{}, /* all_zeros = */ true, {});
+        co_return ok();
+    }(backend.get(), written));
+    HB_SETTINGS_FACTORY().modifiable_settings([timeout](auto& s) { s.craft_journal_write_timeout_ms = timeout; });
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    backend->expire_overdue();
+    ASSERT_TRUE(written.has_value());
+    ASSERT_FALSE(*written);
+    EXPECT_EQ(written->error(), std::errc::timed_out);
+
+    ASSERT_TRUE(logstore->flush());
+    auto const slot = homeblocks::detail::sync_get(backend->read_slot(0));
+    ASSERT_TRUE(slot) << slot.error().message();
+    EXPECT_EQ(slot->lsn, 0);
+    EXPECT_TRUE(slot->all_zeros);
+    EXPECT_EQ(slot->len_bytes, 4096u);
+}
+
 // truncate_to(lsn) must drop journal entries above lsn from the real logdev's tail -- verified via
-// the log_store's own tail_lsn() rather than read_slot (not yet implemented; returns not_supported).
+// the backend's tail_lsn().
 TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
     auto logstore = make_logstore();
     ASSERT_TRUE(logstore != nullptr);
@@ -120,11 +155,43 @@ TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
                                                                   std::vector< homestore::csum_t >{}));
         ASSERT_TRUE(r.has_value());
     }
-    ASSERT_EQ(logstore->tail_lsn(), 4);
+    ASSERT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 4);
 
     auto r = homeblocks::detail::sync_get(backend->truncate_to(2));
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(logstore->tail_lsn(), 2);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 2);
+}
+
+// Journal reclaim against the real log store: entries <= upto become unreadable, later ones stay, and the reclaim
+// point is reported back (a restart reads it from here). Never past the last entry: the tail stays.
+TEST_F(CraftHomeStoreBackendTest, ReclaimUptoDropsTheJournalPrefix) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    for (int64_t lsn = 0; lsn <= 4; ++lsn) {
+        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
+                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
+                                                                  std::vector< homestore::csum_t >{}));
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(backend->reclaimed_upto(), -1);
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->reclaim_upto(2)).has_value());
+    EXPECT_EQ(backend->reclaimed_upto(), 2);
+    EXPECT_FALSE(homeblocks::detail::sync_get(backend->read_slot(2)).has_value());
+    EXPECT_TRUE(homeblocks::detail::sync_get(backend->read_slot(3)).has_value());
+
+    ASSERT_TRUE(homeblocks::detail::sync_get(backend->reclaim_upto(10)).has_value());
+    EXPECT_EQ(backend->reclaimed_upto(), 4);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), 4);
+}
+
+// A journal never written to has tail -1: restart recovery takes max(tail, ...) for last_append_lsn, so any other
+// value would invent appended slots.
+TEST_F(CraftHomeStoreBackendTest, TailLsnOfANewJournalIsMinusOne) {
+    auto logstore = make_logstore();
+    ASSERT_TRUE(logstore != nullptr);
+    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
+    EXPECT_EQ(homeblocks::detail::sync_get(backend->tail_lsn()), -1);
 }
 
 // read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
@@ -401,19 +468,20 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerHonorsForceFlag) {
 
     auto r = homeblocks::detail::sync_get(trigger(/* force = */ true));
     ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(*r) << "a forced checkpoint flushes";
 }
 
 // cp_mgr()'s in-flight-flush gate (m_in_flush_phase) is a synchronous check-and-set at entry: the
 // first of several concurrent trigger_cp_flush(false) calls holds it for the duration of the real
 // flush, so every other concurrent call observes it already set and gets HomeStore's synchronous
-// false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to ok()
-// when force=false; every one of these concurrent calls must succeed, not just the one that
-// actually flushed.
+// false back -- not a failure. make_homestore_checkpoint_trigger_fn's result must map that to false
+// (coalesced) when force=false; every one of these concurrent calls must succeed. None of them has to
+// flush: HomeStore's own timer checkpoint may hold the gate for the whole batch.
 TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFails) {
     auto trigger = make_homestore_checkpoint_trigger_fn();
 
     constexpr int k_concurrent = 20;
-    std::vector< homestore::async_status > futs; // async_status is itself a sisl::async::task<result<...>>
+    std::vector< async_result< bool > > futs; // each a sisl::async::task<result<bool>>
     futs.reserve(k_concurrent);
     for (int i = 0; i < k_concurrent; ++i) {
         futs.push_back(trigger(/* force = */ false));
@@ -424,6 +492,100 @@ TEST_F(CraftHomeStoreBackendTest, CheckpointTriggerConcurrentForceFalseNeverFail
         EXPECT_TRUE(r.has_value());
     }
 }
+
+#ifdef _PRERELEASE
+// Every CRAFT state record in the meta service, by volume, read as a boot reads them.
+static auto read_state_records() {
+    return std::dynamic_pointer_cast< HomeBlocksImpl >(g_helper->inst())->read_craft_state_records();
+}
+
+// A partition's durable state in its own meta blk record: each image persisted replaces the last, whatever its size
+// (the large one spans several meta blks), and is what a boot reads back; a record belongs to one volume; destroy()
+// removes it, and nothing is persisted after it.
+TEST_F(CraftHomeStoreBackendTest, StateStoreKeepsTheImageInItsMetaBlk) {
+    auto const vol_id = boost::uuids::random_generator()();
+    auto store = make_homestore_state_store(vol_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+    auto const none = store->load();
+    ASSERT_TRUE(none);
+    EXPECT_FALSE(*none) << "nothing persisted yet";
+
+    CraftDurableState small{.term = 7,
+                            .client_token = 42,
+                            .last_applied_raft_idx = 9,
+                            .durable_commit_lsn = 3,
+                            .sync_watermark = 5,
+                            .empty_lsns = {4, 5}};
+    small.pending.push_back(CraftPendingEntry{.raft_idx = 10, .type = CraftEntryType::InternalLogin, .term = 8});
+    CraftDurableState large = small;
+    for (int64_t i = 0; i < 1000; ++i) {
+        large.pending.push_back(CraftPendingEntry{
+            .raft_idx = 11 + i, .type = CraftEntryType::SyncRSCommitLSN, .rs_commit_lsn = i, .client_token = 42});
+    }
+    // The same image twice: the second write is skipped, the record unchanged; a changed one is written again.
+    for (auto const& image : {small, small, large, small}) {
+        ASSERT_TRUE(homeblocks::detail::sync_get(store->persist(image)));
+        auto const back = store->load();
+        ASSERT_TRUE(back && *back);
+        EXPECT_EQ(**back, image);
+
+        auto records = read_state_records();
+        ASSERT_EQ(records.size(), 1u);
+        ASSERT_TRUE(records.contains(vol_id));
+        auto const reread = make_homestore_state_store(vol_id, std::move(records.at(vol_id)))->load();
+        ASSERT_TRUE(reread && *reread);
+        EXPECT_EQ(**reread, image) << "the record a boot reads";
+    }
+
+    // After a restart, a store made from the record a boot reads counts its image as written; a changed image is still
+    // written.
+    {
+        auto const boot_id = boost::uuids::random_generator()();
+        auto first =
+            make_homestore_state_store(boot_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+        ASSERT_TRUE(homeblocks::detail::sync_get(first->persist(small)));
+        first.reset(); // stopped: the record stays
+        auto booted = make_homestore_state_store(boot_id, std::move(read_state_records().at(boot_id)));
+        ASSERT_TRUE(homeblocks::detail::sync_get(booted->persist(small)));
+        ASSERT_TRUE(homeblocks::detail::sync_get(booted->persist(large)));
+        auto const reread = make_homestore_state_store(boot_id, std::move(read_state_records().at(boot_id)))->load();
+        ASSERT_TRUE(reread && *reread);
+        EXPECT_EQ(**reread, large);
+        booted->destroy();
+    }
+
+    auto records = read_state_records();
+    ASSERT_TRUE(records.contains(vol_id));
+    EXPECT_FALSE(make_homestore_state_store(boost::uuids::random_generator()(), std::move(records.at(vol_id)))->load())
+        << "another volume's record";
+
+    // Marked faulted: nothing loads or persists any more, also from the record a boot reads.
+    store->mark_faulted();
+    EXPECT_EQ(store->load().error(), std::make_error_condition(std::errc::state_not_recoverable));
+    EXPECT_FALSE(homeblocks::detail::sync_get(store->persist(small)));
+    records = read_state_records();
+    ASSERT_TRUE(records.contains(vol_id));
+    EXPECT_EQ(make_homestore_state_store(vol_id, std::move(records.at(vol_id)))->load().error(),
+              std::make_error_condition(std::errc::state_not_recoverable));
+
+    // A partition faulted before it ever persisted gets a record of its own, saying so.
+    auto const other_id = boost::uuids::random_generator()();
+    auto other = make_homestore_state_store(other_id, homestore::superblk< craft_state_sb_t >{craft_state_meta_name});
+    other->mark_faulted();
+    records = read_state_records();
+    ASSERT_TRUE(records.contains(other_id));
+    EXPECT_EQ(make_homestore_state_store(other_id, std::move(records.at(other_id)))->load().error(),
+              std::make_error_condition(std::errc::state_not_recoverable));
+    other->destroy();
+
+    store->destroy();
+    EXPECT_TRUE(read_state_records().empty());
+    auto const gone = store->load();
+    ASSERT_TRUE(gone);
+    EXPECT_FALSE(*gone);
+    EXPECT_FALSE(homeblocks::detail::sync_get(store->persist(small)));
+    EXPECT_TRUE(read_state_records().empty());
+}
+#endif
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;

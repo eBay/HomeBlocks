@@ -33,6 +33,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
+#include "craft/craft_raft_entries.hpp"
 #include "craft/craft_repl_dev.hpp"
 #include "home_blks_config.hpp"
 #include "coro_helpers.hpp"
@@ -105,7 +106,7 @@ public:
         {
             // Plain (non-coroutine) blocking wait: this mock's coroutines never suspend across a real
             // async boundary, so whatever thread calls into read_slot() (directly, or transitively via
-            // rebuild_overlay()'s detached run_recovery()) physically blocks here until released --
+            // rebuild_overlay()'s detached recover()) physically blocks here until released --
             // exactly what a test needs to create an observable in-progress-recovery window.
             std::unique_lock lk{read_gate_mu};
             read_gate_cv.wait(lk, [this] { return read_gate_open; });
@@ -373,6 +374,27 @@ TEST_F(CraftCommitTest, EmptyVerdictRetiresOverlayEvenWhenThisReplicaHadTheData)
     EXPECT_EQ(dev_->overlay_lsn_for(5), -1); // retired -- must not still be served on reads
 }
 
+// A SyncRSCommitLSN's advance applies each slot it passes to the index and retires its overlay entry. Moving commit_lsn
+// alone left the slots unapplied, and a read, which serves overlay entries only above commit_lsn, returned the index's
+// older value: here the old data instead of the new write, and the old data instead of the unmap's zeros.
+TEST_F(CraftCommitTest, SyncAdvanceAppliesSlotsToTheIndex) {
+    use_fake_index();
+    seed_index_entry(/*lba=*/0, /*blk_num=*/500, std::vector< uint8_t >(k_page_size, 0x11));
+    seed_index_entry(/*lba=*/1, /*blk_num=*/501, std::vector< uint8_t >(k_page_size, 0x22));
+    ASSERT_TRUE(do_write_data(0, /*dlsn=*/0, /*lba=*/0, /*nlbas=*/1).has_value()); // 0xAB
+    ASSERT_TRUE(do_write_zeros(0, /*dlsn=*/1, /*lba=*/1, /*nlbas=*/1).has_value());
+
+    commit_sync(/*rs_commit_lsn=*/1);
+
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    EXPECT_EQ(dev_->overlay_lsn_for(0), -1);
+    EXPECT_EQ(dev_->overlay_lsn_for(1), -1);
+    auto r = do_read(/*read_lsn=*/1, /*lba=*/0, /*nlbas=*/2);
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(dest_buf_[0], 0xAB) << "lba 0: the write's data, not the older index value";
+    EXPECT_EQ(dest_buf_[k_page_size], 0x00) << "lba 1: the unmap's zeros, not the older index value";
+}
+
 // all_zeros apply removes the index entry and reclaims its block.
 TEST_F(CraftCommitTest, AllZerosApplyRemovesEntryAndFreesBlock) {
     index_.entries[0] = BlockInfo{homestore::blk_id{500, 1, 1}, homestore::blk_id{}, 99};
@@ -528,9 +550,9 @@ TEST_F(CraftCommitTest, WriteFnErrorAbortsCommit) {
 
 struct MockCraftCheckpointTrigger {
     int call_count{0};
-    async_status operator()(bool) {
+    async_result< bool > operator()(bool) {
         ++call_count;
-        co_return ok();
+        co_return true;
     }
 };
 
@@ -1035,7 +1057,7 @@ TEST_F(CraftCommitTest, RebuildOverlayPropagatesReadSlotError) {
 
 // Per subtasks.md/SDSTOR-22905, the overlay must be fully rebuilt before the volume accepts new
 // client I/O. trigger_on_restart() drives the EXACT production path (CraftRaftListener::on_restart()
-// -> run_recovery() -> rebuild_overlay()), with the mock's read_slot() gated closed so the rebuild
+// -> recover() -> rebuild_overlay()), with the mock's read_slot() gated closed so the rebuild
 // genuinely blocks -- proving write()/read()/keep_alive() all reject with OFFLINE while recovering_
 // is set, and the gate is gone (recovering_ false, overlay actually rebuilt) once it completes.
 //
@@ -1055,7 +1077,7 @@ TEST_F(CraftCommitTest, RestartRecoveryGatesClientIoUntilOverlayRebuilt) {
     EXPECT_FALSE(dev_->is_recovering());
     std::thread restart_thread([this] { dev_->trigger_on_restart(); });
 
-    // trigger_on_restart() sets recovering_ BEFORE detaching run_recovery() (which is what then blocks
+    // trigger_on_restart() sets recovering_ BEFORE detaching recover() (which is what then blocks
     // on the closed read gate) -- so this becomes true almost immediately; a short, generous wait
     // avoids a hard poll loop without making the test slow in the common case.
     for (int i = 0; i < 1000 && !dev_->is_recovering(); ++i) {
@@ -1124,7 +1146,7 @@ TEST_F(CraftCommitTest, FailedRestartRecoveryPermanentlyFaultsThePartition) {
     journal_->fail_on_read = 1;
 
     EXPECT_FALSE(dev_->is_faulted());
-    // read_gate stays open (default) -- run_recovery() runs to completion (with a failure) synchronously
+    // read_gate stays open (default) -- recover() runs to completion (with a failure) synchronously
     // within this call, same as every other trigger_on_restart() use in this file.
     dev_->trigger_on_restart();
     EXPECT_TRUE(dev_->is_faulted());

@@ -19,8 +19,9 @@
 #include "craft_raft_entries.hpp"
 #include "../volume/index_fixed_kv.hpp" // BlockInfo -- the shape commit()'s index write callback uses
 #include <homestore/replication/repl_dev.hpp>
-#include <iomgr/timer.hpp>                // iomgr::timer_token -- RAII recurring timer used by the watchdog
-#include <sisl/async/value_awaitable.hpp> // stop_apply() waits for the apply queue to go idle
+#include <iomgr/timer.hpp>                 // iomgr::timer_token -- RAII recurring timer used by the watchdog
+#include <sisl/async/shared_awaitable.hpp> // persist_state()'s callers wait for the round that covers them
+#include <sisl/async/value_awaitable.hpp>  // stop_apply() waits for the apply queue to go idle
 
 #include <atomic>
 #include <chrono>
@@ -57,25 +58,21 @@ class VolumeIndexTable;
 // lba_count_t): neither crosses the client wire. The reference model in craft_client keeps its own copies for
 // exactly the same reason -- two independent replica implementations, one shared wire.
 
-// Per-partition CRAFT state. Authoritative in memory; recovered from the journal + superblock on restart.
+// Per-partition CRAFT state. Authoritative in memory; restored at restart from the durable image (CraftDurableState)
+// and the journal.
 struct CraftPartitionState {
     int64_t commit_lsn{-1};        // contiguous committed prefix (== Synced)
     int64_t last_append_lsn{-1};   // highest appended dLSN (may be uncommitted)
     uint64_t client_token{0};      // token from the last successful InternalLogin
     uint64_t term{0};              // current session term
-    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
-                                   // floors journal reclaim (S8: truncate below min(this, checkpointed apply
-                                   // frontier)) -- S3 only captures it, the reclaim action itself is S8's job.
-                                   // TODO(S8): this is client-controlled wire input with only a narrow
-                                   // malformed-negative check applied where it's captured (write()/read()/
-                                   // keep_alive()) -- there is NO per-call bound possible there: a lagging
-                                   // replica legitimately sees this arrive ahead of its own last_append_lsn/
-                                   // commit_lsn (that gap is the signal it needs to catch up via S6 peer
-                                   // exchange), so clamping against local state would break that. Before using
-                                   // this as a reclaim floor, S8 must validate it against real journal/
-                                   // checkpoint state (e.g. never reclaim past what's actually durable/
-                                   // replicated here), since a buggy/malicious client could otherwise poison
-                                   // it with an absurdly large value with no local signal to catch it.
+    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on every client op;
+                                   // floors journal reclaim (see reclaim_floor_locked()). Client-controlled wire
+                                   // input with only a narrow malformed-negative check where it's captured
+                                   // (write()/read()/keep_alive()) -- there is NO per-call bound possible there: a
+                                   // lagging replica legitimately sees this arrive ahead of its own
+                                   // last_append_lsn/commit_lsn (that gap is the signal it needs to catch up via
+                                   // S6 peer exchange). The reclaim floor bounds it by this member's persisted
+                                   // durable commit frontier instead.
 };
 
 // One journal slot returned by fetch_data() (server-to-server resync; never crosses the CLIENT wire). Four-way:
@@ -149,6 +146,24 @@ public:
     // blkid's byte length). Used by CraftReplDev::read() to fetch the bytes an index/overlay entry
     // only stores a block reference for. Mockable so read()'s tests stay light (no real HomeStore).
     virtual async_status read_data(homestore::multi_blk_id blkid, sisl::sg_list& dest) = 0;
+    // Highest lsn written and not rolled back, -1 for an empty journal. Restart recovery restores last_append_lsn from
+    // it. A backend that can't answer reports not_supported, which faults a recovery that needs it.
+    virtual async_result< int64_t > tail_lsn() {
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    }
+    // Journal reclaim: drops every entry with lsn <= upto (not past the journal's last entry). Their data blocks are
+    // NOT freed: the index references them by then. Default: not_supported, and the device stops asking.
+    virtual async_status reclaim_upto(int64_t /* upto */) {
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_not_supported));
+    }
+    // Highest lsn reclaimed so far, -1 for none. Read at restart.
+    virtual int64_t reclaimed_upto() const { return -1; }
+    // Commits the blocks a durable slot references: HomeStore's allocator persists an allocation only once committed,
+    // so without it a restart frees them. recovering: a restart commits again those of a live slot that no checkpoint
+    // persisted before it, the allocator holding no others, and reserves them in memory too.
+    virtual status commit_data(homestore::multi_blk_id const& /* blkid */, bool /* recovering */) { return ok(); }
+    // Fails the writes in flight past their deadline (see JournalWriteDeadlines). HomeBlocks calls it every second.
+    virtual void expire_overdue() {}
     virtual ~CraftJournalBackend() = default;
 };
 
@@ -202,9 +217,9 @@ public:
 //
 // Abstraction over this partition's RAFT group (a HomeStore repl_dev in production): leadership,
 // membership, and proposing the CRAFT control-plane entries. Injected into CraftReplDev so unit tests
-// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. Production
-// passes make_homestore_raft_proposer()'s result; wiring it to a volume's repl_dev is S8's job. Default
-// (null) leaves every leader-only path failing closed.
+// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. A CRAFT volume's
+// device gets make_homestore_raft_proposer()'s, over the volume's repl_dev. Default (null) leaves every
+// leader-only path failing closed.
 
 class CraftRaftProposer {
 public:
@@ -217,30 +232,81 @@ public:
     // Proposes a key-only RAFT entry (no data payload). Completes once the entry has committed and been
     // dispatched to this member's CraftRaftListener::on_commit, or with an error if replication fails.
     virtual async_status propose(sisl::blob header, sisl::blob key) = 0;
+    // Completes the proposals past their deadline (craft_raft_propose_timeout_ms) with timed_out: their entries may
+    // still commit. HomeBlocks calls it every second for each partition's device, on one of its own timer's reactors.
+    virtual void expire_overdue() {}
+    // Stops for good: the proposals still pending complete with timed_out (they may still commit), later ones fail
+    // with operation_canceled.
+    virtual void stop() {}
     virtual ~CraftRaftProposer() = default;
 };
+
+// A RAFT group on its way out: its destroy is proposed (DESTROYING), or committed (DESTROYED) and waiting for
+// HomeStore's reaper, which runs on_destroy repl_dev_cleanup_interval_sec (a minute by default) later, or done.
+inline bool is_going_away(homestore::repl_dev const& group) {
+    auto const stage = group.get_stage();
+    return stage == homestore::repl_dev_stage_t::DESTROYING || stage == homestore::repl_dev_stage_t::DESTROYED ||
+        stage == homestore::repl_dev_stage_t::PERMANENT_DESTROYED;
+}
 
 // Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
 // replica_id is this member's id: HomeBlocks' our_uuid(), which HomeStore gets from the repl_application.
+// Once the group is going away it answers not leader and no voters: the reaper frees the group's RAFT server
+// repl_dev_cleanup_interval_sec later, while the device (its watchdog's ticks, a resolution resuming from an await)
+// may still ask until the volume's destroy stops it, which follows the reaper.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd, craft::peer_id_t replica_id);
 
-// The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by the proposer's recurring
-// timer. Not an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its
-// own delay and nothing re-arms after a fire, so concurrent deadlines postpone or drop each other.
-class ProposalDeadlines {
+// The deadlines (craft_journal_write_timeout_ms) of a journal's writes in flight. HomeStore never completes a journal
+// write whose device write failed (SDSTOR-24993): it would wait forever, and with it what awaits it (an apply, and so
+// the device's stop()). Swept by the backend's expire_overdue(), which fails the overdue ones. Every write has the same
+// timeout, so the deadlines come in order: completed writes leave from the front, as writes are added and when swept.
+// A sweep also drops the completed writes behind one still in flight at the front, so a lost completion holds them for
+// a second at most, not for the whole timeout.
+// ponytail: a shorter timeout set at runtime can put a later deadline ahead; those writes fail only once the ones
+// before them leave. Sort by deadline if the timeout starts to change often.
+class JournalWriteDeadlines {
 public:
     using clock = std::chrono::steady_clock;
+    // One write's completion: true once written, false once timed out, whichever comes first.
+    struct Wait {
+        sisl::async::value_awaitable< bool > done;
+        std::atomic< bool > completed{false};
+        void complete(bool written) {
+            if (!completed.exchange(true, std::memory_order_acq_rel)) done.complete(written);
+        }
+    };
 
-    void add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline);
-    // Completes every pending proposal whose deadline is at or before `now` with timed_out (its outcome is unknown:
-    // the entry may still commit), and forgets the ones that already completed.
+    void add(shared< Wait > w, clock::time_point deadline);
+    // Fails every wait whose deadline is at or before `now`, and forgets the completed ones.
     void sweep(clock::time_point now);
     size_t pending() const;
 
 private:
     mutable std::mutex mu_;
+    std::deque< std::pair< shared< Wait >, clock::time_point > > pending_;
+};
+
+// The deadlines (craft_raft_propose_timeout_ms) of a proposer's in-flight proposals, swept by its expire_overdue(). Not
+// an iomgr one-shot per proposal: iomgr v13's one-shots share one timerfd that each new one re-arms to its own delay
+// and nothing re-arms after a fire, so concurrent deadlines postpone or drop each other.
+class ProposalDeadlines {
+public:
+    using clock = std::chrono::steady_clock;
+
+    // False once closed: the proposal isn't tracked.
+    bool add(intrusive< homestore::repl_req_ctx > ctx, clock::time_point deadline);
+    // Completes every pending proposal whose deadline is at or before `now` with timed_out (its outcome is unknown:
+    // the entry may still commit), and forgets the ones that already completed.
+    void sweep(clock::time_point now);
+    // Tracks nothing more, and hands back every proposal still tracked.
+    std::vector< intrusive< homestore::repl_req_ctx > > close();
+    size_t pending() const;
+
+private:
+    mutable std::mutex mu_;
     std::vector< std::pair< intrusive< homestore::repl_req_ctx >, clock::time_point > > pending_;
+    bool closed_{false};
 };
 
 #ifdef _PRERELEASE
@@ -256,13 +322,105 @@ std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_re
 // (homestore::cp_mgr().trigger_cp_flush()). Injected into CraftReplDev so unit tests can exercise
 // the trigger without touching HomeStore. Production code passes make_homestore_checkpoint_trigger_fn()'s result.
 // Default (empty) leaves the trigger stubbed -- same posture as CraftPeerFetcher.
-using checkpoint_trigger_fn_t = std::function< async_status(bool force) >;
+//
+// The result is true only when a checkpoint that started during the call has completed: everything applied to the
+// index before the call is then durable. false means the request coalesced with a flush already running (force=false),
+// which may not cover the index as of the call, or that HomeStore hasn't finished starting, so a checkpoint wouldn't
+// cover the blocks' allocations. The durable commit frontier moves only on true. Forced, a call that finds a flush
+// running waits for the one checkpoint HomeStore runs after it, shared by every forced call meanwhile.
+using checkpoint_trigger_fn_t = std::function< async_result< bool >(bool force) >;
 
 // Factory that wraps homestore::cp_mgr() (there is exactly one CPManager per HomeStore instance,
 // unlike make_homestore_journal_backend which is per-volume). Each CraftReplDev stores its own copy
 // of the returned callable by value (set_checkpoint_trigger) -- callers don't need to keep the
 // factory's result alive themselves. Tests inject a plain callable directly.
 checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn();
+
+// ─── Durable partition state (S8 / SDSTOR-22745) ─────────────────────────────
+//
+// What a partition needs after a restart that neither the journal nor the RAFT log gives back. Written AHEAD of the
+// change it protects: CraftReplDev updates its in-memory image and persists it before the change takes effect (a
+// session is admitted, a voided slot's blocks are freed), so a crash in between restarts no less safe than before.
+//
+// Not here: last_append_lsn comes back from the journal tail (raised to sync_watermark), and the missing set from a
+// walk of the journal above durable_commit_lsn. commit_lsn restarts at durable_commit_lsn, the frontier a completed
+// checkpoint covers; the slots above it are applied to the index again.
+
+// A RAFT entry committed but not yet applied when its image was taken: what applying it again needs.
+struct CraftPendingEntry {
+    int64_t raft_idx{-1};
+    CraftEntryType type{};
+    int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN; InternalLogin: the watermark the login settled
+    uint64_t client_token{0};
+    uint64_t term{0}; // InternalLogin: its new term; SyncRSCommitLSN: the session it was proposed in
+    // SyncRSCommitLSN still queued: the slots held here that its verdicts voided, which its apply frees. Empty for the
+    // entry being applied: its frees may have happened.
+    std::vector< int64_t > to_free{};
+
+    bool operator==(CraftPendingEntry const&) const = default;
+};
+
+struct CraftDurableState {
+    uint64_t term{0};                  // session term of the last InternalLogin applied
+    uint64_t client_token{0};          // and its client token
+    int64_t last_applied_raft_idx{-1}; // RAFT entries at or below were applied: a replay of one is skipped
+    int64_t durable_commit_lsn{-1};    // commit frontier covered by a completed checkpoint
+    int64_t sync_watermark{-1};        // highest SyncRSCommitLSN rs_commit_lsn applied; last_append_lsn >= this
+    std::set< int64_t > empty_lsns{};  // every Empty verdict, as empty_lsns_ (a late write or a resolution retry asks)
+    // The RAFT entries committed but not yet applied when the image was taken, in log order. The RAFT log replay after
+    // a restart starts above the last checkpoint, which may cover them: a restart applies those above
+    // last_applied_raft_idx again from here. Taken by every persist; the in-memory image leaves it empty.
+    std::vector< CraftPendingEntry > pending{};
+
+    bool operator==(CraftDurableState const&) const = default;
+};
+
+// On-disk image of CraftDurableState: a fixed header, the Empty verdicts as int64s, then the pending entries. decode
+// returns nullopt for anything malformed (bad magic or version, wrong length, verdicts negative or not strictly
+// ascending, pending entries not strictly ascending or of a type the queue doesn't apply): an image that doesn't decode
+// faults the partition, it never restarts it empty. Verdicts at or below durable_commit_lsn are normal: the image keeps
+// every one for the partition's lifetime.
+std::vector< uint8_t > encode_durable_state(CraftDurableState const& s);
+std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len);
+
+// Where a partition's CraftDurableState lives, one per partition (production: the partition's own meta blk; tests: in
+// memory). persist() returns once the image is durable; CraftReplDev never has two persist() calls outstanding.
+class CraftStateStore {
+public:
+    // The last image persisted, nullopt if none ever was, an error if what is there can't be used.
+    virtual result< std::optional< CraftDurableState > > load() = 0;
+    virtual async_status persist(CraftDurableState const& s) = 0;
+    // Removes the state for good (the partition is being destroyed). A persist() after it fails.
+    virtual void destroy() = 0;
+    // Marks the state faulted for good: persist() fails from then on, and load() too, after a restart as well. The
+    // partition can't be trusted any more, and coming back from its last image would forget what it applied since.
+    // Idempotent; a call returns once the mark is durable, also when another call made it.
+    virtual void mark_faulted() = 0;
+    virtual ~CraftStateStore() = default;
+};
+
+// The meta blk record holding one partition's durable state: this header, then the encoded CraftDurableState
+// (encode_durable_state()), image_len bytes. One per partition, removed with it.
+#pragma pack(push, 1)
+struct craft_state_sb_t {
+    static constexpr uint64_t k_magic = 0x54415453'54465243ull; // "CRFTSTAT" little-endian
+    static constexpr uint32_t k_version = 1;
+
+    uint64_t magic{k_magic};
+    uint32_t version{k_version};
+    volume_id_t vol_id{}; // the partition (volume) it belongs to
+    uint32_t image_len{0};
+    uint8_t faulted{0}; // CraftStateStore::mark_faulted(): the image (if any) is kept, but no longer loads
+};
+#pragma pack(pop)
+inline const std::string craft_state_meta_name{"CraftState"};
+
+// A CraftStateStore in the partition's own meta blk record (craft_state_sb_t). `sb` is the record loaded at boot, or an
+// empty one named craft_state_meta_name for a partition that has none yet: its first persist creates it.
+unique< CraftStateStore > make_homestore_state_store(volume_id_t vol_id, homestore::superblk< craft_state_sb_t > sb);
+// Marks a partition's state record faulted as CraftStateStore::mark_faulted() does, keeping its image if it has one, or
+// writes a header alone: for a partition whose device never came, so has no store.
+void mark_craft_state_faulted(volume_id_t vol_id, homestore::superblk< craft_state_sb_t >& sb);
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
 //
@@ -305,13 +463,22 @@ private:
     // that only exercise the write path (commit()/overlay logic must no-op safely in that case).
     // The watchdog timeout is read from HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms); 0 disables it.
     // Tests override the config key in SetUp and restore it in TearDown.
+    // state_store holds the partition's durable state (CraftDurableState). Given at construction, so it is in place
+    // before anything is applied or recovered; without one nothing is persisted and a restart restores nothing (the
+    // light unit tests).
+    // raft_proposer proposes the partition's entries through its RAFT group; the device owns it. Without one nothing
+    // is proposed: append() and request_resolution() refuse with not_supported.
     explicit CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
-                          shared< VolumeIndexTable > indx_tbl);
+                          shared< VolumeIndexTable > indx_tbl, unique< CraftStateStore > state_store,
+                          unique< CraftRaftProposer > raft_proposer);
 
 public:
     static shared< CraftReplDev > create(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
-                                         shared< VolumeIndexTable > indx_tbl) {
-        return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal), lba_size, std::move(indx_tbl)));
+                                         shared< VolumeIndexTable > indx_tbl,
+                                         unique< CraftStateStore > state_store = nullptr,
+                                         unique< CraftRaftProposer > raft_proposer = nullptr) {
+        return shared< CraftReplDev >(new CraftReplDev(vol_id, std::move(journal), lba_size, std::move(indx_tbl),
+                                                       std::move(state_store), std::move(raft_proposer)));
     }
     // Cancels the watchdog's recurring timer (iomgr::timer_token::cancel(wait=true)), blocking until
     // any in-flight tick has finished, so on_watchdog_tick() (which captures `this`) can never fire
@@ -355,8 +522,7 @@ public:
     // Advance the frontier toward hdr.commit_lsn + reset the client-liveness watchdog -- which is WHY it is
     // term-fenced: a deposed client must not be able to keep its session alive. hdr.all_committed_lsn is the
     // client-computed set-wide min commit_lsn; captured into state_ (max-monotonic, never regresses on a
-    // stale/reordered message) so a floor of min(all_committed_lsn, checkpointed apply frontier) is available
-    // for S8's journal reclaim -- the reclaim ACTION itself is S8's job, not implemented here. Returns the
+    // stale/reordered message), it can raise the journal reclaim floor, so the reclaim runs again. Returns the
     // achieved watermarks.
     async_result< craft::lsn_pair > keep_alive(craft::client_hdr hdr);
 
@@ -411,11 +577,9 @@ public:
     // Reconstructs the journal-tail overlay from the journal after a restart (a fresh instance's
     // overlay_ starts empty -- nothing else repopulates it). Walks (commit_lsn, last_append_lsn],
     // skipping missing/Empty-verdicted lsns, and applies the same highest-dLSN-wins rule write()'s
-    // own post-flight overlay population uses. Called (via run_recovery(), which also gates client I/O
-    // for the duration -- see recovering_) from CraftRaftListener::on_restart(); currently a no-op in
-    // practice since CraftPartitionState itself has no superblock-recovery path yet (state_ stays at
-    // its default -1/-1 until that separate piece of work lands) -- this is still the correct,
-    // already-usable wiring for once it does.
+    // own post-flight overlay population uses; a slot the journal doesn't hold becomes missing (catch-up fills it).
+    // Called (via recover(), which also gates client I/O for the duration -- see recovering_) from
+    // CraftRaftListener::on_restart(), after restore_state() set the range up.
     async_status rebuild_overlay();
 
     // ── observability ─────────────────────────────────────────────────────
@@ -443,6 +607,11 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.commit_lsn;
     }
+    // The durable commit frontier as last persisted (see advance_durable_commit()).
+    int64_t persisted_durable_commit() const {
+        std::lock_guard lk{state_mu_};
+        return persisted_durable_commit_;
+    }
     uint64_t client_token() const {
         std::lock_guard lk{state_mu_};
         return state_.client_token;
@@ -451,20 +620,35 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.term;
     }
-    // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim
-    // (S8's job, not read anywhere yet in this class); exposed so S8's eventual reclaim logic has
-    // something to read.
+    // The highest all_committed_lsn a client op carried -- floors journal reclaim.
     int64_t all_committed_lsn() const {
         std::lock_guard lk{state_mu_};
         return state_.all_committed_lsn;
     }
+    // True once the partition is permanently faulted (see faulted_): never false again.
+    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
 
     // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
-    // Wires this partition's RAFT group (leadership, membership, proposing). Wired by S8; tests inject a mock.
+    // Test seam: a proposer the device doesn't own (a mock the test keeps), in place of create()'s.
     void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
+    // HomeBlocks' timer, every second: the proposals (CraftRaftProposer::expire_overdue()) and the journal writes
+    // (CraftJournalBackend::expire_overdue()) past their deadline fail, and a checkpoint trigger that didn't checkpoint
+    // is tried again (retry_checkpoint()), and the journal is reclaimed up to a floor that moved (request_reclaim()).
+    void expire_overdue() {
+        if (raft_proposer_) raft_proposer_->expire_overdue();
+        journal_->expire_overdue();
+        retry_checkpoint();
+        request_reclaim(); // up to a floor writes and reads raised
+    }
+    // Ends the proposals in flight (timed_out: they may still commit) and fails every later one, as stop() does. A
+    // shutdown calls it before it waits for the requests in flight: one waiting on a proposal without a deadline
+    // (craft_raft_propose_timeout_ms = 0) and without a quorum would hold it forever.
+    void stop_proposing() {
+        if (raft_proposer_) raft_proposer_->stop();
+    }
 
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
@@ -486,9 +670,33 @@ public:
     homestore::repl_dev_listener& raft_listener() { return raft_listener_; }
 
     // Stops applying committed RAFT entries: waits out the one being applied, and fails the queued ones and any that
-    // commit later with operation_canceled, unapplied. volume::destroy() calls it (once) before tearing down the index
-    // and journal the applies use.
+    // commit later with operation_canceled, unapplied.
     async_status stop_apply();
+
+    // Stops everything the device runs on its own, before what it works on goes away: the applies (waiting out the one
+    // in progress), the journal reclaim (waiting out a running one), the checkpoint triggers (waiting out those in
+    // flight), the watchdog and the proposer (CraftRaftProposer::stop()). keep_queued, for a shutdown: the queued
+    // entries, and any that commit later, stay queued unapplied, for HomeStore's last checkpoint to save with the
+    // partition's state. Otherwise, for a destroy, they fail as in stop_apply(). Called once.
+    async_status stop(bool keep_queued);
+
+    // Restart recovery: restores the durable state (restore_state()), rebuilds the overlay, then queues again the
+    // entries the image holds as committed but not applied. Client I/O is rejected (OFFLINE) until it completes; a
+    // failure faults the partition for good. No RAFT entry may reach the device before it completes: the volume
+    // publishes the device only once recovered, its listener holding the entries meanwhile.
+    async_status recover();
+
+    // Persists the durable image, with the entries committed but not yet applied. HomeBlocks' checkpoint step calls it
+    // for every CRAFT partition before HomeStore records the checkpoint: the RAFT log replay after a restart starts
+    // above that checkpoint, so an entry it covers that isn't applied yet survives only here. A no-op without a store.
+    // A partition faulted before or during the save saves nothing, and succeeds once its record is marked faulted
+    // (see fault()): a checkpoint fails, which stops the process, only for a save that failed otherwise.
+    async_status save_state();
+
+    // The partition is being destroyed: removes its durable state from the store for good. Persists after it fail.
+    void destroy_state() {
+        if (state_store_) state_store_->destroy();
+    }
 
 #ifdef _PRERELEASE
     // Seeds partition watermarks and the missing set directly, bypassing write().
@@ -496,6 +704,8 @@ public:
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
     // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
     void seed_commit_lsn(int64_t commit);
+    // The journal's record of slot lsn.
+    async_result< JournalSlot > journal_slot_for_test(int64_t lsn) { return journal_->read_slot(lsn); }
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
     void seed_empty(std::initializer_list< int64_t > empty);
@@ -564,6 +774,18 @@ public:
     // Every CRAFT test fixture checks it in TearDown().
     std::vector< std::string > invariant_violations();
 
+    // The durable image as last handed to the state store, or about to be.
+    CraftDurableState durable_state() const {
+        std::lock_guard lk{state_mu_};
+        return durable_;
+    }
+
+    // The journal is reclaimed up to here (entries at or below it are gone).
+    int64_t reclaimed_upto() const {
+        std::lock_guard lk{state_mu_};
+        return reclaimed_upto_;
+    }
+
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
     int64_t overlay_lsn_for(lba_t lba) const {
@@ -578,13 +800,12 @@ public:
     void trigger_on_restart() { raft_listener_.on_restart(); }
 
     // Test-only observability for the SDSTOR-22905 restart-recovery gate (see recovering_'s doc
-    // comment): true from the moment on_restart() fires until run_recovery()'s rebuild_overlay() call
-    // completes successfully (see is_faulted() for the failure outcome instead).
+    // comment): true from the moment recovery starts until recover() completes successfully (see
+    // is_faulted() for the failure outcome instead).
     bool is_recovering() const { return recovering_.load(std::memory_order_acquire); }
 
-    // Test-only observability for faulted_: true once the partition is permanently faulted. Never
-    // transitions back to false.
-    bool is_faulted() const { return faulted_.load(std::memory_order_acquire); }
+    // Faults the partition, as a failure would.
+    void fault_for_test() { fault(); }
 #endif
 
 private:
@@ -625,7 +846,7 @@ private:
         void on_remove_member(const homestore::replica_id_t&, homestore::trace_id_t) override {}
         void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
                          cintrusive< homestore::repl_req_ctx >& ctx) override;
-        // Fires rebuild_overlay() fire-and-forget (defined out-of-line in the .cpp -- needs
+        // Starts restart recovery (recover()) fire-and-forget (defined out-of-line in the .cpp -- needs
         // coro_helpers.hpp's detail::detach, which this header does not include).
         void on_restart() override;
         homestore::async_status create_snapshot(std::shared_ptr< homestore::snapshot_context >) override {
@@ -760,6 +981,16 @@ private:
         // InternalLogin: its new term. SyncRSCommitLSN: the session it was proposed in.
         uint64_t term{0};
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
+
+        // As the durable image holds it (CraftDurableState::pending).
+        CraftPendingEntry as_pending() const {
+            return CraftPendingEntry{.raft_idx = lsn,
+                                     .type = type,
+                                     .rs_commit_lsn = rs_commit_lsn,
+                                     .client_token = client_token,
+                                     .term = term,
+                                     .to_free = to_free};
+        }
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
     // empty_slots, or its rejection if a committed login replaced its session; an InternalLogin's write fence, or its
@@ -774,24 +1005,34 @@ private:
     std::deque< PendingApply > apply_queue_; // guarded by apply_mu_
     bool apply_running_{false};              // guarded by apply_mu_: a drainer is active
     bool apply_stopped_{false};              // guarded by apply_mu_
-    bool apply_paused_{false};               // guarded by apply_mu_; set only by the test seam pause_apply()
+    bool apply_paused_{false};               // guarded by apply_mu_; set by stop(keep_queued) and pause_apply()
     bool apply_idle_wanted_{false};          // guarded by apply_mu_: stop_apply() is waiting on apply_idle_
     sisl::async::value_awaitable< bool > apply_idle_;
+    // RAFT entries at or below this were applied before the restart, or are queued again from the restored image: the
+    // log replay delivers some of them again, and they are skipped. Guarded by apply_mu_; -1 = nothing restored.
+    int64_t restored_raft_idx_{-1};
+    // The entry being applied, until the image records it as applied: an image taken meanwhile holds it as pending.
+    // Guarded by apply_mu_.
+    std::optional< CraftPendingEntry > applying_;
 
     // A SyncRSCommitLSN's state change, made at commit: the range and index checks, its Empty verdicts (their slots
     // stop being readable now), the newly spanned missing range, last_append_lsn and applied_sync_lsn_. Returns the
-    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees.
-    result< std::vector< int64_t > > install_sync_rs_commit_lsn(int64_t rs_commit_lsn,
-                                                                std::vector< int64_t > const& empty_slots);
+    // held slots its verdicts voided, whose blocks finish_sync_rs_commit_lsn() frees. A verdict for an indexed slot
+    // faults the partition and sets fault_pending: the caller then marks the record (fault()) once it has released its
+    // locks.
+    result< std::vector< int64_t > >
+    install_sync_rs_commit_lsn(int64_t rs_commit_lsn, std::vector< int64_t > const& empty_slots, bool& fault_pending);
     // Its I/O, run by the apply queue: frees the voided slots' blocks, catches up the slots still missing at or below
-    // rs_commit_lsn from a peer, and advances commit_lsn.
+    // rs_commit_lsn from a peer, and advances commit_lsn through commit(), which applies each slot it passes to the
+    // index.
     async_status finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                            std::vector< int64_t > to_free);
     // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
-    // InternalLogin's apply, run by the apply queue: false if the entry's term isn't newer, and it was ignored.
-    bool apply_internal_login(uint64_t client_token, uint64_t term);
+    // InternalLogin's apply, run by the apply queue: the new session is made durable, then admitted. Fails STALE_TERM
+    // if the entry's term isn't newer, and it was ignored.
+    async_status apply_internal_login(uint64_t client_token, uint64_t term);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
@@ -824,11 +1065,61 @@ private:
     // awaits (via detail::detach) and must not run with the lock held.
     bool checkpoint_interval_crossed_locked(int64_t commit_lsn_snapshot);
 
-    // Fires checkpoint_trigger_ detached (fire-and-forget), force=false so it coalesces with any flush
-    // already in flight. Call only when checkpoint_interval_crossed_locked() just returned true for the
-    // same commit_lsn_snapshot. Safe without state_mu_ held. Run at the end of every commit_impl() run,
-    // which every commit_lsn advance goes through.
-    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot);
+    // Fires checkpoint_trigger_ detached (fire-and-forget); unforced, it coalesces with any flush already in
+    // flight. Call only when checkpoint_interval_crossed_locked() just returned true for the same
+    // commit_lsn_snapshot, or from retry_checkpoint(). Safe without state_mu_ held. Run at the end of every
+    // commit_impl() run, which every commit_lsn advance goes through.
+    void fire_checkpoint_trigger(int64_t commit_lsn_snapshot, bool force = false);
+    // Fires the trigger again, forced, for the frontier of one that didn't checkpoint (checkpoint_retry_lsn_), from
+    // expire_overdue(): a partition that goes idle would otherwise pin its journal and superseded blocks. HomeBlocks'
+    // sweep retries every partition in one pass, and the forced triggers that find a flush running share the one
+    // checkpoint HomeStore runs after it: partitions whose triggers coalesced together don't take one checkpoint each,
+    // every one saving every partition's state.
+    void retry_checkpoint();
+
+    // ── durable state (S8) ──
+    // Makes the in-memory image (durable_) durable. Callers update durable_ under state_mu_, await this, then make the
+    // change it protects (write-ahead). Concurrent calls share one writer: each returns once an image taken after its
+    // call has been persisted, and fails if that write failed. A no-op without a state store.
+    async_status persist_state();
+    async_status run_persist();
+    // A checkpoint that started after every slot <= lsn was applied to the index has completed: records lsn as the
+    // durable commit frontier, then frees the blocks those slots superseded.
+    async_status advance_durable_commit(int64_t lsn);
+    // Restart recovery, before rebuild_overlay(): loads the image and restores state_ from it and the journal tail.
+    // Returns the image's pending entries, for requeue_pending() once the overlay is rebuilt.
+    async_result< std::vector< CraftPendingEntry > > restore_state();
+    // Frees blocks an index write superseded: at once without a state store, otherwise once the durable commit frontier
+    // reaches replacing_lsn (until then a restart re-applies older slots, which may still need them).
+    async_status release_superseded(int64_t replacing_lsn, std::vector< homestore::blk_id > blocks);
+    async_status free_blocks(int64_t lsn, std::vector< homestore::blk_id > blocks);
+    // Frees the blocks of a write or fill an Empty verdict voided at lsn, once the verdict is durable; leaks them if it
+    // can't be made durable (see the .cpp).
+    async_status free_voided(int64_t lsn, homestore::multi_blk_id blkid);
+
+    // ── journal reclaim (S8) ──
+    // The journal is reclaimed up to floor = min(durable commit frontier as persisted, all_committed_lsn), and below
+    // every slot a committed Sync still has to free:
+    //   - below the persisted frontier the index is durable, so a restart no longer applies those slots again;
+    //   - below all_committed_lsn every member has committed, so no member's catch-up needs them. It is the client's
+    //     word: taking the min with our own durable frontier keeps a wrong value from reclaiming anything a restart
+    //     here still needs. One that is too large can leave a lagging member unable to catch up (liveness, not
+    //     safety: a fetch of a reclaimed slot fails, it never reads as not held);
+    //   - a Sync's verdicts let the commit, and so both of the above, step over the slots they void long before its
+    //     apply frees their blocks, which it reads from the slots' journal records (awaiting_free_).
+    // Recomputed when a durable frontier is persisted, on each keep_alive, after a Sync's frees, and every second from
+    // expire_overdue(), which catches a floor writes and reads raised; one runner at a time. Never without a state
+    // store: the journal is then the only copy.
+    int64_t reclaim_floor_locked() const;
+    void request_reclaim();
+    // Raises all_committed_lsn, the reclaim floor's input, to a client's value: never lowers it, so a stale or
+    // reordered message can't. -1 means unset and any other negative value is malformed: both are ignored. Nothing
+    // bounds a value that is too large here: the floor takes the min with the persisted durable commit frontier. Under
+    // state_mu_.
+    void raise_all_committed_locked(int64_t lsn) {
+        if (lsn >= -1) state_.all_committed_lsn = std::max(state_.all_committed_lsn, lsn);
+    }
+    async_status run_reclaim();
 
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,
     // declared at the top of this class) so tests can exercise it against a fake index instead of a
@@ -898,13 +1189,10 @@ private:
     // SEGFAULT under the previous design).
     void on_watchdog_tick();
 
-    // Awaits rebuild_overlay() to completion. On SUCCESS, clears recovering_ so the volume resumes
-    // accepting client I/O against a now-complete overlay. On FAILURE, does NOT clear recovering_ --
-    // instead sets faulted_ (checked ahead of recovering_ by every client-facing entry point),
-    // permanently rejecting I/O rather than resuming against a silently incomplete overlay. This is the
-    // coroutine CraftRaftListener::on_restart() detaches, rather than detaching rebuild_overlay()
-    // directly, specifically so this outcome-dependent branching has somewhere to live.
-    async_status run_recovery();
+    // Queues again, in log order, the entries an image held as committed but not applied (those above its
+    // last_applied_raft_idx); the log replay skips them from then on. See the .cpp for what applying them again leaves
+    // out.
+    void requeue_pending(std::vector< CraftPendingEntry > pending);
 
     volume_id_t vol_id_;
     unique< CraftJournalBackend > journal_;
@@ -930,7 +1218,8 @@ private:
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, in_flight_write_dlsns_,
-                                  // last_checkpoint_lsn_, and client_commit_lsn_
+                                  // last_checkpoint_lsn_, client_commit_lsn_, and the durable-state members
+                                  // (durable_ and its bookkeeping)
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
@@ -971,12 +1260,15 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    // TODO(S8): raw pointers the device doesn't own, yet background work (append, pre-resolution, the watchdog,
-    // apply catch-up) uses them after awaits while holding only the device. Whoever wires them must make them
-    // outlive every round, e.g. by giving the device ownership (shared_ptr setters).
-    CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
-    CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
+    // TODO(S9): a raw pointer the device doesn't own, yet background work (pre-resolution, the watchdog, apply
+    // catch-up) uses it after awaits while holding only the device. Whoever wires it must make it outlive every
+    // round, e.g. by giving the device ownership, as for the proposer.
+    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};    // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    // The proposer every round uses: the one create() was given, which the device owns, or a test's
+    // (set_raft_proposer). Null: nothing is proposed.
+    unique< CraftRaftProposer > owned_raft_proposer_;
+    CraftRaftProposer* raft_proposer_{nullptr};
     // Held by whoever may propose a SyncRSCommitLSN, i.e. move the replica-set watermark: one append() round, or a
     // login from its poll through its InternalLogin. Background rounds try_lock() and skip; login and Resolve lock()
     // and wait their turn.
@@ -1000,7 +1292,7 @@ private:
     std::optional< uint64_t > quiesce_term_;
     int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
-    // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
+    // Set by CraftRaftListener::on_restart() before detaching recover(), cleared by recover()
     // ONLY on a successful rebuild_overlay() (see faulted_ below for the failure path) --
     // write()/read()/keep_alive() all reject with volume_error::OFFLINE while this is set, per
     // SDSTOR-22905: the overlay must be fully rebuilt before the volume accepts new client I/O.
@@ -1019,12 +1311,14 @@ private:
     //     is real, a concurrent login()->truncate() during recovery could destroy journal entries
     //     rebuild_overlay() is still walking. Whoever implements real login() must also gate it here.
     //
-    // A plain atomic bool suffices for the single-writer part: on_restart()/run_recovery() are the only
+    // A plain atomic bool suffices for the single-writer part: on_restart()/recover() are the only
     // writers, and HomeStore's OWN calling contract (not a runtime property of this class) is what
-    // ensures they run as one complete cycle before any next one -- see run_recovery()'s comment.
+    // ensures they run as one complete cycle before any next one -- see recover()'s comment.
     std::atomic< bool > recovering_{false};
     // Set (never cleared) when this partition can no longer serve correct data:
-    //   - run_recovery(), if rebuild_overlay() fails: overlay_ is silently INCOMPLETE (some LSNs applied,
+    //   - recover(), if restore_state() can't read the durable image or the journal tail: restarting empty would
+    //     forget the session and the verdicts;
+    //   - recover(), if rebuild_overlay() fails: overlay_ is silently INCOMPLETE (some LSNs applied,
     //     then it bailed), so resuming client I/O could serve stale pre-write data with no error at all;
     //   - apply_sync_rs_commit_lsn(), if an Empty verdict names a slot already applied to the index, or one
     //     commit_impl() is indexing: freeing it would leave the index pointing at free blocks.
@@ -1032,8 +1326,12 @@ private:
     // with volume_error::INTERNAL_ERROR permanently -- an honest, fail-closed fault rather than fail-open
     // data corruption. fetch_data()/get_rs_commit_lsn() reject too, so peers treat it as down, and append()
     // and the watchdog stop proposing. There is deliberately no self-recovery path: an operator (or a future
-    // re-sync-from-peer mechanism) must intervene.
+    // re-sync-from-peer mechanism) must intervene. Set through fault(), which also marks the state record, so a
+    // restart doesn't bring the partition back from an image that lacks what it applied since; and from then on
+    // nothing is persisted. install_sync_rs_commit_lsn() sets it under its locks and tells its caller, which calls
+    // fault() once they are released.
     std::atomic< bool > faulted_{false};
+    void fault();
 
     uint64_t watchdog_timeout_ns_{0}; // ns; 0 = disabled; set from craft_watchdog_timeout_ms config at construction
     // Updated (relaxed store) on every touch_watchdog() call; read (relaxed load) by on_watchdog_tick()
@@ -1059,12 +1357,44 @@ private:
     checkpoint_trigger_fn_t checkpoint_trigger_{}; // empty until production wiring; unit tests inject a mock
     int64_t checkpoint_lsn_interval_{128};         // commit_lsn delta between checkpoint triggers; see
                                                    // set_checkpoint_lsn_interval()
-    int64_t last_checkpoint_lsn_{-1}; // commit_lsn as of the last triggered checkpoint (guarded by state_mu_)
-                                      // FIXME(S8/SDSTOR-22745): defaults to -1 in lockstep with state_.commit_lsn
-                                      // When S8 wires recovering commit_lsn from the journal/superblock on restart,
-                                      // seed this to the recovered commit_lsn too (not -1), or the first post-
-                                      // restart apply_sync_rs_commit_lsn will unconditionally fire a checkpoint
-                                      // regardless of how recently one actually happened before the crash.
+    int64_t last_checkpoint_lsn_{-1};  // commit_lsn as of the last triggered checkpoint (guarded by state_mu_);
+                                       // restore_state() seeds it with the restored commit_lsn
+    int64_t checkpoint_retry_lsn_{-1}; // a trigger's frontier that didn't checkpoint, for retry_checkpoint() (guarded
+                                       // by state_mu_)
+
+    // ── durable state (S8) ──
+    unique< CraftStateStore > state_store_; // null: nothing persisted, nothing restored
+    CraftDurableState durable_;             // the image persist_state() writes (guarded by state_mu_)
+    // persist_state()'s next round: the callers that joined it share the image the writer takes when it starts it, and
+    // the round completes with whether that image was written. Null until a caller joins. Guarded by state_mu_.
+    shared< sisl::async::shared_awaitable< bool > > persist_next_;
+    bool persist_running_{false}; // a writer (run_persist) is active (guarded by state_mu_)
+    // Slots at or below this were journalled before the restart and may already be in the durable index: a checkpoint
+    // can run between our triggers, so the index can be ahead of durable_commit_lsn. Applying one again must not free
+    // the block it replaces, which may belong to a NEWER slot the index already holds (the replay applies it next).
+    // Leaking those blocks is bounded by the replay window; freeing them would corrupt. Guarded by state_mu_.
+    int64_t replay_upto_{-1};
+    // Blocks an index write superseded, each with the slot that replaced it, until the durable commit frontier reaches
+    // that slot. Lost on a crash: a bounded leak. Guarded by state_mu_.
+    std::vector< std::pair< int64_t, homestore::blk_id > > deferred_frees_;
+
+    // ── journal reclaim (S8), all guarded by state_mu_ ──
+    int64_t reclaimed_upto_{-1};           // journal entries at or below this are gone
+    int64_t persisted_durable_commit_{-1}; // durable_commit_lsn as last persisted: the floor's input
+    bool reclaim_running_{false};          // a run_reclaim() is active
+    bool reclaim_unsupported_{false};      // the backend said not_supported: stop asking
+    bool reclaim_stopped_{false};          // stop(): no reclaim runs anymore
+    // The slots committed Syncs void and free when they apply (from the commit, or the re-queue at a restart, until the
+    // frees are done): the reclaim stays below them.
+    std::multiset< int64_t > awaiting_free_;
+    // fire_checkpoint_trigger()'s detached rounds still running: after its flush, one persists the frontier and frees
+    // blocks, so stop() waits for them. Guarded by state_mu_.
+    int checkpoints_running_{0};
+    bool checkpoints_stopped_{false}; // stop(): none starts anymore
+    shared< sisl::async::value_awaitable< bool > > checkpoints_idle_;
+    void checkpoint_done();
+    // Completed when the running reclaim ends, for a stop() waiting for it.
+    shared< sisl::async::value_awaitable< bool > > reclaim_idle_;
 };
 
 } // namespace homeblocks

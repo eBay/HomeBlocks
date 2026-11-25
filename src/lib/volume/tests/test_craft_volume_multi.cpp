@@ -17,9 +17,11 @@
 // others (re-executing this binary with --replica_num) and receives every create; the processes share nothing but a
 // shared-memory barrier, and each one checks its own HomeBlocks. Every member must end up with the volume, keep it
 // across a restart of the whole group, and lose it again when a create fails after the followers applied it; a member
-// left without a replica must not take the group down. Each test creates its own volume.
+// left without a replica must not take the group down, and one behind the RAFT log compaction gets no snapshot. Each
+// test creates its own volume.
 
 #include <filesystem>
+#include <thread>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
@@ -36,6 +38,9 @@
 #include <homestore/replication_service.hpp>
 #include "hb_internal.hpp"
 #include "test_common.hpp"
+#include "craft/craft_raft_entries.hpp"
+#include "craft/craft_repl_dev.hpp"
+#include "home_blks_config.hpp"
 #include <volume/volume.hpp>
 
 extern char** environ;
@@ -136,6 +141,17 @@ static peer_id_t member_id(uint32_t i) {
 static std::string test_volume_name(uint32_t n) { return fmt::format("craft_multi_{}", n); }
 static volume_id_t test_volume_id(uint32_t n) { return craft_volume_id(test_volume_name(n)); }
 
+// An InternalLogin's key: a new session with this token and term, on a volume no Sync has committed to (an empty
+// watermark).
+static std::vector< uint8_t > login_key(uint64_t client_token, uint64_t term) {
+    std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+    serialize_internal_login(key.data(), client_token, term, /*rs_commit_lsn=*/-1);
+    return key;
+}
+static sisl::blob as_blob(std::vector< uint8_t >& bytes) {
+    return sisl::blob{bytes.data(), static_cast< uint32_t >(bytes.size())};
+}
+
 class CraftVolumeMultiTest : public ::testing::Test {
 protected:
     static bool sync() { return g_barrier->sync(num_members(), wait_timeout_sec()); }
@@ -184,6 +200,15 @@ TEST_F(CraftVolumeMultiTest, CreateReachesEveryMember) {
     auto rd = group(id);
     ASSERT_NE(rd, nullptr);
     EXPECT_EQ(rd->get_replication_quorum().size(), num_members());
+    // A follower's apply is in flight, as a create is, only until it has published the replica: a create retried
+    // there then hands that replica back.
+    if (me() != 0) {
+        EXPECT_TRUE(wait_until([&id] {
+            auto const again = homeblocks::detail::sync_get(hb()->create_volume(vol_info(1)));
+            auto const vol = hb()->get_volume(id);
+            return again && vol && *again == *vol;
+        }));
+    }
     ASSERT_TRUE(sync());
 }
 
@@ -233,10 +258,12 @@ TEST_F(CraftVolumeMultiTest, FailedCreateLeavesNoReplica) {
 }
 
 // A follower's own apply fails, so the group lives on without a replica there. A create sent to that follower leaves
-// the group alone: it neither proposes into nor destroys it, and the other members keep their replicas.
+// the group alone: it neither proposes into nor destroys it, and the other members keep their replicas. The follower
+// reports the group, also after it restarts, and when elected leader it hands leadership to another member.
 TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     ASSERT_TRUE(sync());
     auto const id = test_volume_id(3);
+    auto const without_replica = g_helper->groups_without_replica();
     if (me() == 1) { g_helper->set_flip_point("craft_create_volume_apply_error", 1); }
     ASSERT_TRUE(sync());
     if (me() == 0) {
@@ -270,9 +297,458 @@ TEST_F(CraftVolumeMultiTest, CreateOnMemberWithoutReplicaKeepsTheGroup) {
     EXPECT_NE(group(id), nullptr);
     if (me() != 1) { EXPECT_TRUE(hb()->get_volume(id)); }
     if (me() == 1) { g_helper->remove_flip("craft_create_volume_apply_error"); }
+    EXPECT_EQ(g_helper->groups_without_replica(), without_replica + (me() == 1 ? 1 : 0));
+    ASSERT_TRUE(sync());
+
+    // Member 1 restarts, after a checkpoint: a CreateVolume committed after the last one would be committed again
+    // after the restart, rather than replayed, and create the replica.
+    if (me() == 1) {
+        ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->cp_mgr().trigger_cp_flush(true /* force */)));
+        g_helper->restart();
+        EXPECT_FALSE(hb()->get_volume(id));
+        EXPECT_NE(group(id), nullptr);
+        EXPECT_EQ(g_helper->groups_without_replica(), without_replica + 1);
+    }
+    ASSERT_TRUE(sync());
+
+    // Made leader, member 1 hands leadership off at once, so become_leader() may well time out. It also fails until
+    // member 1, just restarted, knows the leader: asked again until the hand-off shows.
+    if (me() == 1) {
+        auto const handed_off = g_helper->leaderships_handed_off();
+        EXPECT_TRUE(wait_until([&id, handed_off] {
+            if (g_helper->leaderships_handed_off() > handed_off) { return true; }
+            if (auto const rd = group(id); rd && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return g_helper->leaderships_handed_off() > handed_off;
+        }));
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+
+    // Made leader again within its hand-off backoff, member 1 keeps leadership: two members without a replica would
+    // otherwise hand it to each other forever. Once the backoff is over, HomeBlocks' timer hands it off again.
+    if (me() == 1) {
+        auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
+        auto const handed_off = g_helper->leaderships_handed_off();
+        // A hand-off queued earlier (a retry's, an earlier election's) that runs while member 1 follows keeps the
+        // backoff going.
+        std::dynamic_pointer_cast< HomeBlocksImpl >(hb())->on_craft_group_leader(id);
+        std::this_thread::sleep_for(std::chrono::seconds{1});
+        EXPECT_TRUE(wait_until([&id] {
+            auto const rd = group(id);
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        std::this_thread::sleep_for(std::chrono::seconds{2});
+        EXPECT_TRUE(group(id)->is_leader()) << "kept within the backoff";
+        EXPECT_EQ(g_helper->leaderships_handed_off(), handed_off);
+
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 1000; });
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [backoff](auto& s) { s.craft_leadership_handoff_backoff_ms = backoff; });
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
     ASSERT_TRUE(sync());
 }
 #endif
+
+// HomeStore compacts a group's RAFT log. A member that falls behind the compaction needs a RAFT snapshot, which CRAFT
+// can't serve yet: the leader refuses to send it, and the member stays behind, its replica untouched. So does a leader
+// that restarted since the compaction.
+TEST_F(CraftVolumeMultiTest, MemberBehindTheCompactionIsRefusedASnapshot) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(5);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(5)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    // While member 2 is down, the leader commits entries it misses, then compacts its log past them.
+    if (me() == 0) {
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
+        for (uint64_t i = 1; i <= 10; ++i) {
+            CraftEntryHeader hdr{CraftEntryType::InternalLogin};
+            auto login = login_key(i /* client_token */, i /* term */);
+            auto const st = homeblocks::detail::sync_get(
+                proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)}, as_blob(login)));
+            ASSERT_TRUE(st) << st.error().message();
+        }
+        rd->trigger_snapshot_creation(rd->get_last_commit_lsn(), true /* wait_for_commit */);
+        g_barrier->publish(rd->get_last_commit_lsn());
+    }
+    ASSERT_TRUE(sync());
+
+    // The leader restarts and takes leadership back: nuraft may elect member 1 meanwhile, as it weighs priorities only
+    // to start an election. The snapshot its log was compacted on comes back with it: without it, its nuraft would stop
+    // the process as member 2 asks for what the compaction dropped. Asked until it leads: become_leader() fails when
+    // nuraft elects this member while it asks, which then asks in vain until its deadline.
+    if (me() == 0) {
+        g_helper->restart();
+        auto const rd = group(id);
+        ASSERT_NE(rd, nullptr);
+        ASSERT_TRUE(wait_until([&rd] {
+            return rd->is_leader() || (homeblocks::detail::sync_get(rd->become_leader()) && rd->is_leader());
+        }));
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) { g_helper->start(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+        EXPECT_TRUE(wait_until([&impl] {
+            using namespace sisl; // the metric's name literal
+            return COUNTER_VALUE(impl->metrics(), craft_snapshot_transfers_refused) > 0;
+        }));
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 2) {
+        EXPECT_TRUE(hb()->get_volume(id));
+        EXPECT_LT(group(id)->get_last_commit_lsn(), g_barrier->published());
+    }
+    ASSERT_TRUE(sync());
+}
+
+// Every member's device proposes through its own RAFT group: a follower refuses a resolution as not the leader, and the
+// leader takes it on (refusing it only for its invalid upper bound).
+TEST_F(CraftVolumeMultiTest, OnlyTheLeaderRunsAResolution) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(7);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(7)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(wait_until([&id] {
+        auto rd = group(id);
+        return rd && !rd->get_leader_id().is_nil();
+    }));
+    ASSERT_TRUE(sync());
+
+    auto vol = hb()->get_volume(id);
+    ASSERT_TRUE(vol);
+    auto const r = homeblocks::detail::sync_get(
+        homeblocks::request_resolution(*vol, craft::client_hdr{0 /* term */, -1, -1}, -1 /* upto */));
+    ASSERT_FALSE(r);
+    if (group(id)->is_leader()) {
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::invalid_argument)) << r.error().message();
+    } else {
+        EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+}
+
+// A leader cut off from its group doesn't wait out the outage: its proposal times out, outcome unknown.
+TEST_F(CraftVolumeMultiTest, ProposalWithoutQuorumTimesOut) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(8);
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(8)));
+        ASSERT_TRUE(vol) << vol.error().message();
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
+        auto const st = homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(rd, member_id(0))
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)}, as_blob(login)));
+        ASSERT_TRUE(st) << st.error().message();
+        ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
+        sisl::io_blob_safe data(page, 512);
+        std::memset(data.bytes(), 'a', page);
+        auto const w = homeblocks::detail::sync_get(homeblocks::async_write(
+            *vol, hdr, 0 /* dlsn */, 0, page, sisl::sg_list{.size = page, .iovs = {iovec{data.bytes(), page}}}));
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const timeout_ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_raft_propose_timeout_ms = 1000; });
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        auto const r = homeblocks::detail::sync_get(homeblocks::request_resolution(*vol, hdr, 0 /* upto */));
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [timeout_ms](auto& s) { s.craft_raft_propose_timeout_ms = timeout_ms; });
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->start(); }
+    ASSERT_TRUE(sync());
+}
+
+// A shutdown ends the CRAFT proposals in flight before it waits for the requests in flight: a resolution whose
+// proposal has neither a deadline nor a quorum would otherwise hold it forever.
+TEST_F(CraftVolumeMultiTest, ShutdownEndsAProposalWithoutADeadline) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(10);
+    craft::client_hdr const hdr{7 /* term */, -1 /* commit_lsn */, -1 /* all_committed_lsn */};
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(10)));
+        ASSERT_TRUE(vol) << vol.error().message();
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        CraftEntryHeader login_hdr{CraftEntryType::InternalLogin};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
+        auto const st = homeblocks::detail::sync_get(
+            make_homestore_raft_proposer(rd, member_id(0))
+                ->propose(sisl::blob{reinterpret_cast< uint8_t* >(&login_hdr), sizeof(login_hdr)}, as_blob(login)));
+        ASSERT_TRUE(st) << st.error().message();
+        ASSERT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        auto const page = static_cast< uint32_t >((*vol)->info()->page_size);
+        sisl::io_blob_safe data(page, 512);
+        std::memset(data.bytes(), 'a', page);
+        auto const w = homeblocks::detail::sync_get(homeblocks::async_write(
+            *vol, hdr, 0 /* dlsn */, 0, page, sisl::sg_list{.size = page, .iovs = {iovec{data.bytes(), page}}}));
+        ASSERT_TRUE(w) << w.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const timeout_ms = HB_DYNAMIC_CONFIG(craft_raft_propose_timeout_ms);
+        HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_raft_propose_timeout_ms = 0; });
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        // Not held: the device must not outlive the shutdown, which may free it. Only the fallback below uses it.
+        std::weak_ptr< CraftReplDev > const dev = (*vol)->craft_dev_ref();
+        std::weak_ptr< volume > const watched = *vol;
+        // The request holds the volume until it ends, which is before the shutdown ends: no handle outlives that.
+        auto resolved = std::async(std::launch::async, [vol = std::move(*vol), hdr]() mutable {
+            auto r = homeblocks::detail::sync_get(homeblocks::request_resolution(vol, hdr, 0 /* upto */));
+            vol.reset();
+            return r;
+        });
+        EXPECT_TRUE(wait_until([&watched] {
+            auto const v = watched.lock();
+            return v && v->num_outstanding_reqs() > 0;
+        }));
+        std::this_thread::sleep_for(std::chrono::seconds{1}); // it waits on its proposal by now
+        auto stopped = std::async(std::launch::async, [] { g_helper->stop(); });
+        bool const in_time = stopped.wait_for(std::chrono::seconds{30}) == std::future_status::ready;
+        EXPECT_TRUE(in_time) << "the shutdown waited on a proposal without a deadline";
+        if (!in_time) { // what the shutdown should have done: it ends now
+            if (auto const d = dev.lock()) { d->stop_proposing(); }
+        }
+        stopped.wait();
+        auto const r = resolved.get();
+        HB_SETTINGS_FACTORY().modifiable_settings(
+            [timeout_ms](auto& s) { s.craft_raft_propose_timeout_ms = timeout_ms; });
+        g_helper->start(); // first: the cases after this one need it
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error(), std::make_error_condition(std::errc::timed_out)) << r.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() != 0) { g_helper->start(); }
+    ASSERT_TRUE(sync());
+}
+
+#ifdef _PRERELEASE
+// A restarting member holds what its group commits until its device has recovered, then applies it in log order: here
+// a login committed while it was down, which it gets when it rejoins, during a reattach held for 10 seconds.
+TEST_F(CraftVolumeMultiTest, EntriesCommittedBeforeTheReattachAreHeld) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(6);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(6)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) { g_helper->stop(); }
+    ASSERT_TRUE(sync());
+
+    if (me() == 0) {
+        auto const rd = group(id);
+        ASSERT_TRUE(rd->is_leader());
+        auto const proposer = make_homestore_raft_proposer(rd, member_id(0));
+        CraftEntryHeader hdr{CraftEntryType::InternalLogin};
+        auto login = login_key(42 /* client_token */, 7 /* term */);
+        auto const st = homeblocks::detail::sync_get(
+            proposer->propose(sisl::blob{reinterpret_cast< uint8_t* >(&hdr), sizeof(hdr)}, as_blob(login)));
+        ASSERT_TRUE(st) << st.error().message();
+    }
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        g_helper->set_retval_flip("craft_reattach_delay_ms", 10000 /* ms */, 1000 /* every volume */);
+        g_helper->start();
+        g_helper->remove_flip("craft_reattach_delay_ms");
+        auto vol = hb()->get_volume(id);
+        ASSERT_TRUE(vol);
+        ASSERT_NE((*vol)->craft_dev(), nullptr) << "init returned before the reattach";
+        EXPECT_TRUE(wait_until([&vol] { return (*vol)->craft_dev()->term() == 7; }));
+        EXPECT_EQ((*vol)->craft_dev()->client_token(), 42u);
+    }
+    ASSERT_TRUE(sync());
+}
+
+// A faulted replica can't serve its partition: leading, it would fail every resolution while the other members refuse
+// them as not the leader. Its member hands leadership to one that can. Last: a member restarted after it would find
+// the partition faulted for good.
+TEST_F(CraftVolumeMultiTest, AMemberWhoseReplicaFaultsHandsLeadershipOff) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(9);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(9)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        auto const rd = group(id);
+        EXPECT_TRUE(wait_until([&rd] {
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        auto const handed_off = g_helper->leaderships_handed_off();
+        (*hb()->get_volume(id))->craft_dev()->fault_for_test();
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+}
+#endif
+
+// So does one whose volume fault containment took offline, though its device is healthy: the CRAFT API refuses the
+// volume's every op. Back online, the volume serves again.
+TEST_F(CraftVolumeMultiTest, AMemberWhoseVolumeGoesOfflineHandsLeadershipOff) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(11);
+    if (me() == 0) {
+        auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(11)));
+        ASSERT_TRUE(vol) << vol.error().message();
+    }
+    ASSERT_TRUE(wait_until([&id] {
+        auto vol = hb()->get_volume(id);
+        return vol && (*vol)->craft_dev() != nullptr;
+    }));
+    ASSERT_TRUE(sync());
+
+    if (me() == 1) {
+        auto const rd = group(id);
+        EXPECT_TRUE(wait_until([&rd] {
+            if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                (void)homeblocks::detail::sync_get(rd->become_leader());
+            }
+            return rd->is_leader();
+        }));
+        auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+        auto vol = *hb()->get_volume(id);
+        auto const handed_off = g_helper->leaderships_handed_off();
+        impl->fault_containment(vol, "test");
+        EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }));
+        impl->exit_fc(vol);
+        EXPECT_TRUE(vol->serves_craft());
+    }
+    EXPECT_TRUE(wait_until([&id] {
+        auto const leader = group(id)->get_leader_id();
+        return !leader.is_nil() && leader != member_id(1);
+    }));
+    ASSERT_TRUE(sync());
+}
+
+// A hand-off is forgotten with its group: the volume, created again within the backoff, gets a new group, whose leader
+// hands off at once if it can't serve.
+TEST_F(CraftVolumeMultiTest, AHandOffIsForgottenWithItsGroup) {
+    ASSERT_TRUE(sync());
+    auto const id = test_volume_id(12);
+    auto const backoff = HB_DYNAMIC_CONFIG(craft_leadership_handoff_backoff_ms);
+    HB_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.craft_leadership_handoff_backoff_ms = 600'000; });
+    // nuraft_mesg keeps a member's leader flag for a group id once the group is gone (create_group doesn't reset it):
+    // the member that led the group would take the next one's election as won at once, and fail to form it. So the
+    // volume is created again on the member that neither led the group nor handed off.
+    bool creates = me() == 0;
+    for (int created = 0; created < 2; ++created) {
+        if (creates) {
+            auto vol = homeblocks::detail::sync_get(hb()->create_volume(vol_info(12)));
+            ASSERT_TRUE(vol) << vol.error().message();
+        }
+        ASSERT_TRUE(wait_until([&id] {
+            auto vol = hb()->get_volume(id);
+            return vol && (*vol)->craft_dev() != nullptr;
+        }));
+        ASSERT_TRUE(sync());
+
+        if (me() == 1) {
+            auto const rd = group(id);
+            EXPECT_TRUE(wait_until([&rd] {
+                if (!rd->is_leader() && !rd->get_leader_id().is_nil()) {
+                    (void)homeblocks::detail::sync_get(rd->become_leader());
+                }
+                return rd->is_leader();
+            }));
+            auto const impl = std::dynamic_pointer_cast< HomeBlocksImpl >(hb());
+            auto vol = *hb()->get_volume(id);
+            auto const handed_off = g_helper->leaderships_handed_off();
+            impl->fault_containment(vol, "test");
+            EXPECT_TRUE(wait_until([handed_off] { return g_helper->leaderships_handed_off() > handed_off; }))
+                << "created " << created + 1 << " times";
+            impl->exit_fc(vol);
+        }
+        EXPECT_TRUE(wait_until([&id] {
+            auto const leader = group(id)->get_leader_id();
+            return !leader.is_nil() && leader != member_id(1);
+        }));
+        ASSERT_TRUE(sync());
+
+        bool const leads = group(id)->is_leader();
+        if (leads) { ASSERT_TRUE(homeblocks::detail::sync_get(homestore::hs()->repl_service().remove_repl_dev(id))); }
+        creates = me() != 1 && !leads;
+        EXPECT_TRUE(wait_until([&id] { return group(id) == nullptr && !hb()->get_volume(id); }));
+        ASSERT_TRUE(sync());
+    }
+    HB_SETTINGS_FACTORY().modifiable_settings([backoff](auto& s) { s.craft_leadership_handoff_backoff_ms = backoff; });
+}
 
 // Replica 0 starts the other members: this binary again, with their own --replica_num, the shared memory, and a
 // settings directory each (they rewrite their settings files at startup).
