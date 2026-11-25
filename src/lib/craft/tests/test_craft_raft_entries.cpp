@@ -2957,8 +2957,9 @@ TEST_F(CraftRaftEntriesTest, ReclaimFollowsTheLowerOfTheDurableCommitAndAllCommi
     EXPECT_EQ(dev_->reclaimed_upto(), 10) << "past the durable commit frontier";
 }
 
-// A write or a read that carries a higher set-wide committed prefix reclaims as well: a partition that only does I/O,
-// with no keep_alive, still frees its journal.
+// A write or a read that carries a higher set-wide committed prefix reclaims as well, from HomeBlocks' 1 s sweep rather
+// than on its own path: a partition that only does I/O, with no keep_alive, still frees its journal. So does a write
+// retried after its reply was lost, which returns before it journals anything.
 TEST_F(CraftRaftEntriesTest, AWriteOrAReadAloneAdvancesTheReclaim) {
     with_store();
     dev_->set_checkpoint_trigger(std::ref(trigger_));
@@ -2966,17 +2967,26 @@ TEST_F(CraftRaftEntriesTest, AWriteOrAReadAloneAdvancesTheReclaim) {
     journal_->slots = page_slots({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, /*zeros=*/true);
     dev_->seed_lsns(10, {});
     ASSERT_TRUE(do_apply(/*rs_commit_lsn=*/10, /*client_token=*/0).has_value());
+    auto const write = [this](int64_t all_committed) {
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = all_committed},
+                        /*dlsn=*/11, /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}));
+    };
 
-    ASSERT_TRUE(homeblocks::detail::sync_get(
-                    dev_->write(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = 6}, /*dlsn=*/11,
-                                /*addr=*/0, /*len=*/k_page_size, sisl::sg_list{}))
-                    .has_value());
+    ASSERT_TRUE(write(6).has_value());
+    EXPECT_EQ(dev_->reclaimed_upto(), -1) << "reclaimed on the write's own path";
+    dev_->expire_overdue();
     EXPECT_EQ(dev_->reclaimed_upto(), 6);
+
+    ASSERT_TRUE(write(7).has_value()); // the same slot again: idempotent
+    dev_->expire_overdue();
+    EXPECT_EQ(dev_->reclaimed_upto(), 7);
 
     // The read itself needs an index this fixture doesn't have; its header is taken before that.
     (void)homeblocks::detail::sync_get(
         dev_->read(craft::client_hdr{.term = 0, .commit_lsn = -1, .all_committed_lsn = 8},
                    /*read_lsn=*/0, /*addr=*/0, k_page_size, sisl::sg_list{}));
+    dev_->expire_overdue();
     EXPECT_EQ(dev_->reclaimed_upto(), 8);
 }
 

@@ -65,7 +65,7 @@ struct CraftPartitionState {
     int64_t last_append_lsn{-1};   // highest appended dLSN (may be uncommitted)
     uint64_t client_token{0};      // token from the last successful InternalLogin
     uint64_t term{0};              // current session term
-    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on keep_alive/write;
+    int64_t all_committed_lsn{-1}; // client-computed set-wide min commit_lsn, piggybacked on every client op;
                                    // floors journal reclaim (see reclaim_floor_locked()). Client-controlled wire
                                    // input with only a narrow malformed-negative check where it's captured
                                    // (write()/read()/keep_alive()) -- there is NO per-call bound possible there: a
@@ -620,7 +620,7 @@ public:
         std::lock_guard lk{state_mu_};
         return state_.term;
     }
-    // The last all_committed_lsn captured from a client's keep_alive/write -- floors journal reclaim.
+    // The highest all_committed_lsn a client op carried -- floors journal reclaim.
     int64_t all_committed_lsn() const {
         std::lock_guard lk{state_mu_};
         return state_.all_committed_lsn;
@@ -636,11 +636,12 @@ public:
     void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
     // HomeBlocks' timer, every second: the proposals (CraftRaftProposer::expire_overdue()) and the journal writes
     // (CraftJournalBackend::expire_overdue()) past their deadline fail, and a checkpoint trigger that didn't checkpoint
-    // is tried again (retry_checkpoint()).
+    // is tried again (retry_checkpoint()), and the journal is reclaimed up to a floor that moved (request_reclaim()).
     void expire_overdue() {
         if (raft_proposer_) raft_proposer_->expire_overdue();
         journal_->expire_overdue();
         retry_checkpoint();
+        request_reclaim(); // up to a floor writes and reads raised
     }
     // Ends the proposals in flight (timed_out: they may still commit) and fails every later one, as stop() does. A
     // shutdown calls it before it waits for the requests in flight: one waiting on a proposal without a deadline
@@ -1105,10 +1106,18 @@ private:
     //     safety: a fetch of a reclaimed slot fails, it never reads as not held);
     //   - a Sync's verdicts let the commit, and so both of the above, step over the slots they void long before its
     //     apply frees their blocks, which it reads from the slots' journal records (awaiting_free_).
-    // Recomputed when a durable frontier is persisted and on each keep_alive; one runner at a time. Never without a
-    // state store: the journal is then the only copy.
+    // Recomputed when a durable frontier is persisted, on each keep_alive, after a Sync's frees, and every second from
+    // expire_overdue(), which catches a floor writes and reads raised; one runner at a time. Never without a state
+    // store: the journal is then the only copy.
     int64_t reclaim_floor_locked() const;
     void request_reclaim();
+    // Raises all_committed_lsn, the reclaim floor's input, to a client's value: never lowers it, so a stale or
+    // reordered message can't. -1 means unset and any other negative value is malformed: both are ignored. Nothing
+    // bounds a value that is too large here: the floor takes the min with the persisted durable commit frontier. Under
+    // state_mu_.
+    void raise_all_committed_locked(int64_t lsn) {
+        if (lsn >= -1) state_.all_committed_lsn = std::max(state_.all_committed_lsn, lsn);
+    }
     async_status run_reclaim();
 
     // Core algorithm behind read(), parameterized by the index read operation (read_index_fn_t,

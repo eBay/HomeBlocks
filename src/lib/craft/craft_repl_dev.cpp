@@ -1104,7 +1104,6 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         co_return std::unexpected(make_error_condition(std::errc::invalid_argument));
     }
 
-    bool all_committed_raised = false;
     {
         std::lock_guard lock{state_mu_};
         // state_.term is guarded by state_mu_ like the rest of state_ -- read it under the same lock
@@ -1123,16 +1122,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
             LOGW("write rejected: term={} quiesced by a login poll (term {}) dlsn={}", hdr.term, *quiesce_term_, dlsn);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
-        // Without this, all_committed_lsn only moves via keep_alive() messages, so quiet partitions
-        // (write-only, no explicit keep_alive) never advance the reclaim floor at all.
-        // hdr.all_committed_lsn is client-controlled wire input: -1 is the "unset" sentinel (skip),
-        // any other negative value is malformed (ignore rather than corrupt this long-lived floor).
-        // There is no other per-call bound to validate against here -- see keep_alive()'s doc comment.
-        if (hdr.all_committed_lsn >= -1 && hdr.all_committed_lsn > state_.all_committed_lsn) {
-            state_.all_committed_lsn = hdr.all_committed_lsn;
-            all_committed_raised = true;
-        }
+        // I/O raises the reclaim floor too: a partition without keep_alives still reclaims (expire_overdue()).
+        raise_all_committed_locked(hdr.all_committed_lsn);
         // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
         if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
         if (empty_lsns_.contains(dlsn)) {
@@ -1190,7 +1181,6 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
         in_flight_write_dlsns_.insert(dlsn);
     }
-    if (all_committed_raised) request_reclaim(); // it may have raised the reclaim floor
     // Erased on every exit from here on (success or failure) -- see the in_flight_write_dlsns_ check
     // above for why this exists. A coroutine's local objects are destroyed on any co_return exactly
     // like a normal function's, so this RAII guard is safe across every path below, including ones
@@ -1790,23 +1780,16 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         LOGW("read rejected: overlay rebuild in progress after restart");
         co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
     }
-    bool all_committed_raised = false;
     {
         std::lock_guard lock{state_mu_};
         if (hdr.term != state_.term) {
             LOGW("read rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        // Advance the reclaim floor from ordinary IO -- same max-monotonic pattern as keep_alive().
-        // Reject malformed negative values -- see write()'s doc comment.
-        if (hdr.all_committed_lsn >= -1 && hdr.all_committed_lsn > state_.all_committed_lsn) {
-            state_.all_committed_lsn = hdr.all_committed_lsn;
-            all_committed_raised = true;
-        }
+        raise_all_committed_locked(hdr.all_committed_lsn); // as write() does
         // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
         if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
-    if (all_committed_raised) request_reclaim(); // it may have raised the reclaim floor
     // Best-effort piggyback, same reasoning as write()'s: read()'s own success does not depend on
     // whether commit() advances further, so a genuine commit() fault here is swallowed rather than
     // failing an otherwise-servable read.
@@ -2040,16 +2023,7 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
             LOGW("keep_alive rejected: stale term want={} got={}", state_.term, hdr.term);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        // Max-monotonic: never let a stale/reordered message regress the floor journal reclaim reads.
-        // hdr.all_committed_lsn is client-controlled wire input with no per-call bound to validate
-        // against (it legitimately advances independently of this call's own commit_lsn/
-        // last_append_lsn -- confirmed by existing tests). -1 is the "unset" sentinel (skip); any
-        // OTHER negative value is unambiguously malformed and is ignored rather than corrupting this
-        // long-lived floor. Does not catch an absurdly-large-but-positive value (no bound exists for
-        // that here): the reclaim floor bounds it by the persisted durable commit frontier
-        // (reclaim_floor_locked()).
-        if (hdr.all_committed_lsn >= -1)
-            state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        raise_all_committed_locked(hdr.all_committed_lsn);
         // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
         if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
