@@ -418,6 +418,12 @@ public:
 
     // ── observability ─────────────────────────────────────────────────────
 
+    // Where a commit run last stopped on a failure: the slot it couldn't read back or index, and why.
+    struct CommitStop {
+        int64_t lsn{-1};
+        std::error_condition error{};
+    };
+
     size_t missing_count() const {
         std::lock_guard lk{state_mu_};
         return missing_lsns_.size();
@@ -492,7 +498,8 @@ public:
     // Seeds partition watermarks and the missing set directly, bypassing write().
     // Only compiled when _PRERELEASE is defined; never present in production binaries.
     void seed_lsns(int64_t last_append, std::initializer_list< int64_t > missing = {});
-    // Seeds commit_lsn independently of seed_lsns (which only touches last_append + missing).
+    // Seeds commit_lsn, raising last_append_lsn to it and dropping missing slots at or below it, so the state stays
+    // reachable (seed_lsns only touches last_append and missing).
     void seed_commit_lsn(int64_t commit);
     // Seeds the Empty-verdict set and removes those LSNs from missing_lsns_ (resolving any gap they
     // represented). Replaces any prior seeded empties. apply_sync_rs_commit_lsn (S5) must do the same.
@@ -549,6 +556,11 @@ public:
     int64_t client_commit_lsn() const {
         std::lock_guard lk{state_mu_};
         return client_commit_lsn_;
+    }
+
+    std::optional< CommitStop > last_commit_stop() const {
+        std::lock_guard lk{state_mu_};
+        return last_commit_stop_;
     }
 
     bool overlay_has_extent(int64_t lsn) const {
@@ -709,10 +721,10 @@ private:
 
     // Login step 3, leader-only, under watermark_mu_ (`lock` is the proof): proposes SyncRSCommitLSN{rs_commit_lsn,
     // the new client's token, the step-2 verdicts} and waits for the leader to apply it, then checks the leader is
-    // exactly at rs_commit_lsn. Always proposes, even if rs_commit_lsn is already covered. Fails NO_QUORUM if
-    // commit_lsn isn't rs_commit_lsn afterwards (a late Sync past it, or a slot still missing), STALE_TERM if a login
-    // replaced the session meanwhile, INTERNAL_ERROR if the partition is or becomes faulted, and otherwise with
-    // propose_entry()'s error (NOT_LEADER, timed_out, ...).
+    // exactly at rs_commit_lsn. Always proposes, even if rs_commit_lsn is already covered. Never waits for a commit
+    // run. Fails NO_QUORUM if the leader isn't exactly at rs_commit_lsn afterwards (it holds a slot past it after a
+    // late Sync, or a slot is still missing), STALE_TERM if a login replaced the session meanwhile, INTERNAL_ERROR if
+    // the partition is or becomes faulted, and otherwise with propose_entry()'s error (NOT_LEADER, timed_out, ...).
     async_status login_sync(AsyncMutex::Lock const& lock, int64_t rs_commit_lsn, uint64_t client_token,
                             std::vector< int64_t > empty_slots, uint64_t term);
 
@@ -829,8 +841,13 @@ private:
 
     // A SyncRSCommitLSN apply's commit advance up to rs_commit_lsn: waits for a running commit (commit_mu_), then runs
     // its own through commit_impl(), so each slot it steps over reaches the index. Best effort: an indexing failure
-    // stops it just below the failing slot, logged, and the apply still succeeds.
+    // stops it just below the failing slot, logged, and the apply still succeeds. Returns at once if commit_lsn has
+    // already reached rs_commit_lsn.
     async_status advance_commit_for_sync(int64_t rs_commit_lsn);
+    // commit_impl() for every caller: records a failed run's stop in last_commit_stop_ (and in `stop`, if given), and
+    // clears it once a run gets past that slot.
+    async_result< int64_t > run_commit(AsyncMutex::Lock const& lock, int64_t upto_lsn, IndexOps const* index,
+                                       CommitStop* stop = nullptr);
 
     // Core apply-one-slot algorithm behind every commit_lsn advance, under commit_mu_ (`lock`); only its run writes
     // commit_lsn. `index` is the index to apply each slot to: the volume's (commit(), a Sync's advance), a test
@@ -946,7 +963,8 @@ private:
     size_t max_missing_lsns_{2'000'000}; // see missing_at_capacity_locked(); overridden only by tests
     std::set< int64_t > empty_lsns_;     // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     // Held by the one commit_impl() run allowed at a time, the only writer of commit_lsn: a piggybacked commit
-    // try_lock()s and skips, a Sync's advance lock()s and waits its turn.
+    // try_lock()s and skips, a Sync's advance (unless commit_lsn already covers its watermark) lock()s and waits its
+    // turn.
     AsyncMutex commit_mu_;
     // indx_tbl_'s operations, built once in the constructor; or the test double use_test_index() set; or none
     // (write-path-only tests).
@@ -954,6 +972,9 @@ private:
     // Highest slot commit_impl() has started indexing, so apply's Empty guard sees it before commit_lsn moves. Reset
     // to commit_lsn when the run ends. Guarded by state_mu_.
     int64_t indexing_lsn_{-1};
+    // Where the last failed commit run stopped (run_commit()), until a later run gets past that slot or a truncation
+    // drops it. Names the slot in login_sync()'s failure. Guarded by state_mu_.
+    std::optional< CommitStop > last_commit_stop_;
     // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;

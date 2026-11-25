@@ -60,6 +60,7 @@ public:
     std::map< int64_t, JournalSlot > slots;
     int free_data_calls{0};
     int free_slot_calls{0};
+    std::vector< homestore::multi_blk_id > freed_blkids; // every free_data() call, in order
     homestore::blk_num_t next_blk_num{1000};
     std::optional< int64_t > fail_on_read; // if set, read_slot for that lsn returns an error
     std::function< void() > on_read_data;  // if set, runs at the start of each read_data()
@@ -121,8 +122,9 @@ public:
             co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
         co_return it->second;
     }
-    async_status free_data(homestore::multi_blk_id) override {
+    async_status free_data(homestore::multi_blk_id blkid) override {
         ++free_data_calls;
+        freed_blkids.push_back(blkid);
         co_return ok();
     }
     async_status free_slot(int64_t) override {
@@ -1659,11 +1661,15 @@ TEST_F(CraftCommitTest, SyncAdvanceWaitsOutARunningCommit) {
 }
 
 // An index failure stops a Sync's advance just below the failing slot, as it does a piggybacked commit's. The apply
-// itself still succeeds: the advance is best effort, and a login sees commit_lsn short of its watermark.
-TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAnIndexFailure) {
+// itself still succeeds: the advance is best effort, and a login sees commit_lsn short of its watermark. Once the
+// failure clears, the next advance resumes at that slot and indexes each remaining slot exactly once.
+TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAnIndexFailureAndResumesOnceItClears) {
+    bool failing = true;
+    std::map< lba_t, int > writes;
     dev_->use_test_index(
-        [this](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
-            if (s == 3) return std::unexpected(volume_error::INDEX_ERROR);
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
+            if (s == 3 && failing) return std::unexpected(volume_error::INDEX_ERROR);
+            ++writes[s];
             return index_.write_to_index(s, e, info);
         },
         [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
@@ -1684,11 +1690,30 @@ TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAnIndexFailure) {
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_TRUE(index_.entries.count(2));
     EXPECT_FALSE(index_.entries.count(3));
+    auto const stop = dev_->last_commit_stop(); // what login_sync() names
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 3);
+    EXPECT_EQ(stop->error, make_error_condition(volume_error::INDEX_ERROR));
+
+    failing = false;
+    commit_sync(/*rs_commit_lsn=*/5);
+
+    EXPECT_FALSE(dev_->last_commit_stop().has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_EQ(writes, (std::map< lba_t, int >{{0, 1}, {1, 1}, {2, 1}, {3, 1}, {4, 1}, {5, 1}}));
 }
 
 // Same for a slot that can't be read back from the journal.
-TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAJournalReadFailure) {
-    use_fake_index();
+TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAJournalReadFailureAndResumesOnceItClears) {
+    std::map< lba_t, int > writes;
+    dev_->use_test_index(
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            ++writes[s];
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        });
     dev_->seed_lsns(5, {});
     for (int64_t lsn = 0; lsn <= 5; ++lsn)
         journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
@@ -1705,6 +1730,111 @@ TEST_F(CraftCommitTest, SyncAdvanceStopsBelowAJournalReadFailure) {
     EXPECT_EQ(dev_->commit_lsn(), 2);
     EXPECT_TRUE(index_.entries.count(2));
     EXPECT_FALSE(index_.entries.count(3));
+    auto const stop = dev_->last_commit_stop();
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 3);
+    EXPECT_EQ(stop->error, std::make_error_condition(std::errc::io_error));
+
+    journal_->fail_on_read.reset();
+    commit_sync(/*rs_commit_lsn=*/5);
+
+    EXPECT_FALSE(dev_->last_commit_stop().has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_EQ(writes, (std::map< lba_t, int >{{0, 1}, {1, 1}, {2, 1}, {3, 1}, {4, 1}, {5, 1}}));
+}
+
+// A client's piggybacked commit (keep_alive() here) records the stop the same way, and a later run that gets past the
+// slot clears it.
+TEST_F(CraftCommitTest, PiggybackedCommitRecordsAndClearsTheStop) {
+    bool failing = true;
+    dev_->use_test_index(
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) -> status {
+            if (s == 1 && failing) return std::unexpected(volume_error::INDEX_ERROR);
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        });
+    dev_->seed_lsns(2, {});
+    for (int64_t lsn = 0; lsn <= 2; ++lsn)
+        journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
+                                /*blk_num=*/static_cast< homestore::blk_num_t >(100 + lsn),
+                                {static_cast< homestore::csum_t >(lsn)});
+
+    auto const failed =
+        homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{0, /*commit_lsn=*/2, /*all_committed=*/-1}));
+
+    EXPECT_FALSE(failed.has_value()); // keep_alive() surfaces its commit's failure
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    auto const stop = dev_->last_commit_stop();
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 1);
+
+    failing = false;
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{0, 2, -1})).has_value());
+
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_FALSE(dev_->last_commit_stop().has_value());
+}
+
+// A Sync's advance over an index that already maps the LBAs: a write and an unmap acked with no piggybacked commit
+// read back as the new data and as zeros once a Sync passes them, and the blocks they supersede are freed.
+TEST_F(CraftCommitTest, SyncAdvanceOverAMappedIndexServesNewDataAndFreesOldBlocks) {
+    use_fake_index();
+    seed_index_entry(/*lba=*/0, /*blk_num=*/500, std::vector< uint8_t >(k_page_size, 0x11));
+    seed_index_entry(/*lba=*/1, /*blk_num=*/501, std::vector< uint8_t >(k_page_size, 0x22));
+    ASSERT_TRUE(do_write_data(0, /*dlsn=*/0, /*lba=*/0, /*nlbas=*/1).has_value());
+    ASSERT_TRUE(do_write_zeros(0, /*dlsn=*/1, /*lba=*/1, /*nlbas=*/1).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), -1);
+
+    commit_sync(/*rs_commit_lsn=*/1);
+
+    EXPECT_EQ(dev_->commit_lsn(), 1);
+    std::vector< homestore::blk_num_t > freed;
+    for (auto const& blkid : journal_->freed_blkids)
+        freed.push_back(blkid.blk_num());
+    EXPECT_EQ(freed, (std::vector< homestore::blk_num_t >{500, 501})); // the superseded blocks, not the new one
+    auto r = do_read(/*read_lsn=*/1, /*lba=*/0, /*nlbas=*/2);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->extents.size(), 2u);
+    EXPECT_FALSE(r->extents[0].hole);
+    EXPECT_TRUE(r->extents[1].hole);
+    std::vector< uint8_t > expected(k_page_size, 0xAB); // do_write_data's fill
+    expected.insert(expected.end(), k_page_size, 0);
+    EXPECT_EQ(dest_buf_, expected);
+}
+
+// A Sync whose watermark commit_lsn has already reached has nothing to index, so it doesn't wait for a commit run
+// that's going: it applies at once, rather than parking the apply queue behind a client's commit.
+TEST_F(CraftCommitTest, SyncAlreadyCoveredDoesNotWaitForARunningCommit) {
+    dev_->seed_lsns(3, {});
+    for (int64_t lsn = 0; lsn <= 3; ++lsn)
+        journal_->add_data_slot(lsn, /*lba=*/static_cast< lba_t >(lsn), /*nlbas=*/1,
+                                /*blk_num=*/static_cast< homestore::blk_num_t >(100 + lsn),
+                                {static_cast< homestore::csum_t >(lsn)});
+    ASSERT_TRUE(do_commit(1).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), 1);
+    bool synced = false;
+    std::optional< status > during_run;
+
+    auto r = homeblocks::detail::sync_get(dev_->commit_with(
+        3,
+        [&](lba_t s, lba_t e, std::unordered_map< lba_t, BlockInfo >& info) {
+            if (s == 2 && !std::exchange(synced, true)) {
+                auto const ctx = make_test_proposal_ctx();
+                commit_sync(/*rs_commit_lsn=*/1, ctx);
+                during_run = take_test_proposal_outcome(ctx);
+            }
+            return index_.write_to_index(s, e, info);
+        },
+        [this](lba_t s, lba_t e, std::vector< homestore::blk_id >& freed) {
+            return index_.delete_lba_range(s, e, freed);
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(during_run.has_value()); // applied inside the run, not once it ended
+    EXPECT_TRUE(during_run->has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
 }
 
 } // namespace

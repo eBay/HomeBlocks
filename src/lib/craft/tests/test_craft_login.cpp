@@ -57,8 +57,7 @@ public:
     // When set, the next write_slot() waits for write_gate before it lands: a journal write in flight.
     bool hold_write{false};
     sisl::async::value_awaitable< bool > write_gate;
-    std::optional< int64_t > fail_read; // read_slot() of this lsn fails with an I/O error
-
+    std::optional< int64_t > fail_on_read; // read_slot() of this lsn fails with an I/O error
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
         co_return homestore::multi_blk_id{};
     }
@@ -70,7 +69,8 @@ public:
         co_return ok();
     }
     async_result< JournalSlot > read_slot(int64_t lsn) override {
-        if (fail_read && *fail_read == lsn) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        if (fail_on_read && *fail_on_read == lsn)
+            co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return co_await mock_read_slot(*this, lsn);
     }
     async_status free_data(homestore::multi_blk_id) override { co_return ok(); }
@@ -261,7 +261,37 @@ protected:
         dev_->seed_commit_lsn(5);
         commit_sync(/*rs_commit_lsn=*/5, /*empty_slots=*/{3});
     }
+    // Backs the device's own commits with a test index that records each LBA it unmaps (every write here is
+    // all-zeros), and fails at fail_at.
+    void use_counting_index(std::optional< lba_t > fail_at = std::nullopt) {
+        dev_->use_test_index([](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); },
+                             [this, fail_at](lba_t s, lba_t e, std::vector< homestore::blk_id >&) -> status {
+                                 if (fail_at && s <= *fail_at && *fail_at <= e)
+                                     return std::unexpected(volume_error::INDEX_ERROR);
+                                 for (lba_t lba = s; lba <= e; ++lba)
+                                     unmapped_.push_back(lba);
+                                 return ok();
+                             });
+    }
+    // A one-block all-zeros write at dlsn, to LBA dlsn, with no piggybacked commit.
+    auto write_zeros(int64_t dlsn) {
+        return homeblocks::detail::sync_get(dev_->write(craft::client_hdr{0, -1, -1}, dlsn,
+                                                        /*addr=*/static_cast< uint64_t >(dlsn) * k_page_size,
+                                                        k_page_size, sisl::sg_list{}));
+    }
+    // Starts login_sync() at term 0, holding the watermark as a login does, without waiting for it. The returned result
+    // is set when it finishes; the coroutine shares it, so one still suspended when a test returns writes live memory.
+    std::shared_ptr< std::optional< status > > start_login_sync(int64_t rs_commit_lsn) {
+        auto outcome = std::make_shared< std::optional< status > >();
+        homeblocks::detail::detach([](std::shared_ptr< CraftReplDev > dev, int64_t rs,
+                                      std::shared_ptr< std::optional< status > > out) -> sisl::async::task< void > {
+            auto lock = co_await dev->watermark_mu_.lock();
+            *out = co_await dev->login_sync(lock, rs, /*client_token=*/42, {}, /*term=*/0);
+        }(dev_, rs_commit_lsn, outcome));
+        return outcome;
+    }
 
+    std::vector< lba_t > unmapped_;
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftLsnPoller poller_;
     MockCraftRaftProposer proposer_;
@@ -786,6 +816,95 @@ TEST_F(CraftLoginTest, SyncFaultedDuringATimedOutProposalFailsInternalError) {
     EXPECT_EQ(r.error(), make_error_condition(volume_error::INTERNAL_ERROR));
 }
 
+// ── login_sync over an index (SDSTOR-26853) ───────────────────────────────────
+//
+// The tests above run with no index, so the Sync's advance only steps over slots. These back it with one, as a
+// volume's would.
+
+// Writes acked with no piggybacked commit: the login's Sync indexes every slot up to its watermark before
+// login_sync() returns.
+TEST_F(CraftLoginTest, SyncIndexesEverySlotUpToTheWatermark) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), -1);
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_EQ(unmapped_, (std::vector< lba_t >{0, 1, 2}));
+}
+
+// A slot at or below the watermark that can't be indexed stops the advance below it: the login fails NO_QUORUM, with
+// commit_lsn just below that slot.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeIndexed) {
+    use_counting_index(/*fail_at=*/1);
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    auto const stop = dev_->last_commit_stop(); // the slot login_sync()'s failure names
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 1);
+}
+
+// The same for a slot that can't be read back from the journal.
+TEST_F(CraftLoginTest, SyncFailsNoQuorumWhenASlotCantBeReadBack) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    journal_->fail_on_read = 1;
+    loop_back_proposals();
+
+    auto r = do_login_sync(/*rs_commit_lsn=*/2, /*client_token=*/42, /*empty_slots=*/{});
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), no_quorum());
+    EXPECT_EQ(dev_->commit_lsn(), 0);
+    auto const stop = dev_->last_commit_stop(); // the slot login_sync()'s failure names
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_EQ(stop->lsn, 1);
+    EXPECT_EQ(stop->error, std::make_error_condition(std::errc::io_error));
+}
+
+// A commit run is still indexing past the watermark when the login's Sync applies: the Sync's own advance returns at
+// once, as commit_lsn already covers it, and login_sync() fails the login as late without waiting for that run, since
+// this leader holds a slot above the watermark. Not reachable through the protocol (a leader's last_append stays at
+// or below the watermark from the poll on), so this is the defence, and it never blocks.
+TEST_F(CraftLoginTest, SyncFailsAtOnceWhenTheLeaderHoldsASlotAboveTheWatermark) {
+    use_counting_index();
+    for (int64_t dlsn = 0; dlsn <= 3; ++dlsn)
+        ASSERT_TRUE(write_zeros(dlsn).has_value());
+    auto const del_ok = [](lba_t, lba_t, std::vector< homestore::blk_id >&) -> status { return ok(); };
+    auto const write_ok = [](lba_t, lba_t, std::unordered_map< lba_t, BlockInfo >&) -> status { return ok(); };
+    ASSERT_TRUE(homeblocks::detail::sync_get(dev_->commit_with(2, write_ok, del_ok)).has_value());
+    ASSERT_EQ(dev_->commit_lsn(), 2);
+    loop_back_proposals();
+    std::shared_ptr< std::optional< status > > outcome;
+
+    auto r = homeblocks::detail::sync_get(
+        dev_->commit_with(3, write_ok, [&](lba_t s, lba_t, std::vector< homestore::blk_id >&) -> status {
+            if (s == 3 && !outcome) {
+                outcome = start_login_sync(/*rs_commit_lsn=*/2);
+                EXPECT_TRUE(outcome->has_value()); // didn't wait for this run
+            }
+            return ok();
+        }));
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+    ASSERT_TRUE(outcome && outcome->has_value());
+    ASSERT_FALSE((*outcome)->has_value());
+    EXPECT_EQ((*outcome)->error(), no_quorum()); // a slot above the watermark: a late advance
+}
+
 // ── login_install (SDSTOR-22892) ──────────────────────────────────────────────
 
 // The entry carries the new client's token, the next term and the watermark, and once it applies the session is
@@ -1104,7 +1223,7 @@ TEST_F(CraftLoginTest, ALoginWhoseRepublishFailsFaultsThePartition) {
             dev_->write(craft::client_hdr{0, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{}));
         ASSERT_TRUE(w.has_value());
     }
-    journal_->fail_read = 3;
+    journal_->fail_on_read = 3;
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/4);
 
