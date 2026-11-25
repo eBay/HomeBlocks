@@ -3756,6 +3756,10 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
             }
         }
         {
+            // Released whether their free worked or not: a slot whose free failed is leaked on purpose. Most failures
+            // are records a retry can't read either (corrupt, truncated, or a failing device), and holding the slot
+            // would stop the reclaim for good.
+            // ponytail: a leak is only logged; keep the failed lsns in the image and retry them if leaks ever matter.
             std::lock_guard lk{state_mu_};
             for (int64_t lsn : to_free) {
                 if (auto it = awaiting_free_.find(lsn); it != awaiting_free_.end()) awaiting_free_.erase(it);
