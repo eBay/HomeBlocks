@@ -1668,6 +1668,24 @@ TEST_F(CraftRaftEntriesTest, JournalWriteDeadlinesForgetCompletedWritesOnAdd) {
     EXPECT_EQ(deadlines.pending(), 1u);
 }
 
+// A sweep drops the completed writes behind one still in flight at the front: one whose completion is lost would
+// otherwise hold them all until its own deadline.
+TEST_F(CraftRaftEntriesTest, JournalWriteDeadlinesDropCompletedWritesBehindAStuckOne) {
+    JournalWriteDeadlines deadlines;
+    auto const t0 = JournalWriteDeadlines::clock::now();
+    auto const stuck = std::make_shared< JournalWriteDeadlines::Wait >();
+    deadlines.add(stuck, t0 + std::chrono::seconds{30});
+    for (int i = 0; i < 3; ++i) {
+        auto const w = std::make_shared< JournalWriteDeadlines::Wait >();
+        deadlines.add(w, t0 + std::chrono::seconds{30});
+        w->complete(true);
+    }
+    ASSERT_EQ(deadlines.pending(), 4u);
+    deadlines.sweep(t0 + std::chrono::seconds{1});
+    EXPECT_EQ(deadlines.pending(), 1u) << "completed writes held behind the stuck one";
+    EXPECT_FALSE(stuck->completed.load()) << "expired before its deadline";
+}
+
 // A write whose journal write timed out may still land, referencing its blocks: they stay, and the partition faults,
 // as its journal can't be trusted any more.
 TEST_F(CraftRaftEntriesTest, WriteWhoseJournalWriteTimesOutFaultsAndKeepsItsBlocks) {

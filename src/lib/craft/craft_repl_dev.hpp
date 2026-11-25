@@ -260,8 +260,9 @@ unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl
 // The deadlines (craft_journal_write_timeout_ms) of a journal's writes in flight. HomeStore never completes a journal
 // write whose device write failed (SDSTOR-24993): it would wait forever, and with it what awaits it (an apply, and so
 // the device's stop()). Swept by the backend's expire_overdue(), which fails the overdue ones. Every write has the same
-// timeout, so the deadlines come in order: completed writes leave from the front, as writes are added and when swept,
-// and neither walks the writes still in flight.
+// timeout, so the deadlines come in order: completed writes leave from the front, as writes are added and when swept.
+// A sweep also drops the completed writes behind one still in flight at the front, so a lost completion holds them for
+// a second at most, not for the whole timeout.
 // ponytail: a shorter timeout set at runtime can put a later deadline ahead; those writes fail only once the ones
 // before them leave. Sort by deadline if the timeout starts to change often.
 class JournalWriteDeadlines {

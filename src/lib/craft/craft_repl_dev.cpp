@@ -561,6 +561,9 @@ void JournalWriteDeadlines::sweep(clock::time_point now) {
             }
             pending_.pop_front();
         }
+        // A write still in flight at the front, a slow one or one whose completion was lost, would hold every completed
+        // write behind it until its own deadline: they go now.
+        std::erase_if(pending_, [](auto const& e) { return e.first->completed.load(std::memory_order_acquire); });
     }
     // Outside the lock: failing a wait resumes its writer.
     for (auto const& w : expired)
