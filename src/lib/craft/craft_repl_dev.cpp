@@ -776,10 +776,10 @@ async_status CraftReplDev::login_sync(AsyncMutex::Lock const& lock, int64_t rs_c
         co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
     }
     if (state_.commit_lsn < rs_commit_lsn) {
-        // Name what stopped it: a slot the advance couldn't index, or else the first slot still missing.
+        // Name what stopped it: a slot the advance couldn't read back or index, or else the first slot still missing.
         if (last_commit_stop_ && last_commit_stop_->lsn == state_.commit_lsn + 1) {
-            LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {}: slot {} can't be indexed ({}) "
-                 "-- login fails",
+            LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {}: slot {} can't be read back or "
+                 "indexed ({}) -- login fails",
                  state_.commit_lsn, rs_commit_lsn, last_commit_stop_->lsn, last_commit_stop_->error.message());
         } else {
             LOGE("login_sync: commit_lsn {} stopped short of the login's watermark {} (first missing {}) -- login "
