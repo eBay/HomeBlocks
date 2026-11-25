@@ -375,9 +375,10 @@ struct CraftDurableState {
 };
 
 // On-disk image of CraftDurableState: a fixed header, the Empty verdicts as int64s, then the pending entries. decode
-// returns nullopt for anything malformed (bad magic or version, wrong length, verdicts not strictly ascending or at or
-// below durable_commit_lsn, pending entries not strictly ascending or of a type the queue doesn't apply): an image that
-// doesn't decode faults the partition, it never restarts it empty.
+// returns nullopt for anything malformed (bad magic or version, wrong length, verdicts negative or not strictly
+// ascending, pending entries not strictly ascending or of a type the queue doesn't apply): an image that doesn't decode
+// faults the partition, it never restarts it empty. Verdicts at or below durable_commit_lsn are normal: the image keeps
+// every one for the partition's lifetime.
 std::vector< uint8_t > encode_durable_state(CraftDurableState const& s);
 std::optional< CraftDurableState > decode_durable_state(uint8_t const* buf, size_t len);
 
