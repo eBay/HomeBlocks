@@ -73,11 +73,6 @@ public:
         co_return it->second;
     }
 
-    async_status truncate_to(int64_t lsn) override {
-        truncated_to = lsn;
-        if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
-        co_return ok();
-    }
     async_status free_data(homestore::multi_blk_id blkid) override {
         freed_blkids.push_back(blkid);
         co_return ok();

@@ -100,8 +100,6 @@ public:
 
     async_result< JournalSlot > read_slot(int64_t lsn) override { return mock_read_slot(*this, lsn); }
 
-    async_status truncate_to(int64_t) override { co_return ok(); }
-
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();

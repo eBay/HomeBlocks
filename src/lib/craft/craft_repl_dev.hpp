@@ -133,8 +133,6 @@ public:
                                     homestore::multi_blk_id blkid, bool all_zeros,
                                     std::vector< homestore::csum_t > const& csums) = 0;
     virtual async_result< JournalSlot > read_slot(int64_t lsn) = 0;
-    // Drop all entries with seq_num > lsn; lsn becomes the new journal tail.
-    virtual async_status truncate_to(int64_t lsn) = 0;
     // Release blocks previously allocated by alloc_write_data. Called when write_slot fails or
     // when the write is discarded post-flight (stale term). Free errors are logged but non-fatal.
     virtual async_status free_data(homestore::multi_blk_id blkid) = 0;
@@ -381,15 +379,13 @@ public:
     // pass is_login=false and never quiesce.
     async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t term, bool is_login);
 
-    // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn and
-    // the periodic-sync baseline; prune any overlay entry whose recorded lsn > lsn (it referenced a now-rolled-back
-    // write -- leaving it would let a later read serve stale data from a write that no longer exists in the
-    // journal). Called only during login (quiesced -- no concurrent writes). commit_lsn is NOT changed.
-    // FIXME(S4/S7): before dropping entries here, force a completed checkpoint --
-    // co_await checkpoint_trigger_(true). Once entries above/below lsn are gone, the journal is
-    // no longer a durable record of them; if HomeStore's checkpoint has only been requested and not yet
-    // completed, a crash in between loses that data. HomeStore's own IndexTable::destroy() hits the
-    // identical problem and force-flushes before removing its superblock for exactly this reason.
+    // Drops every slot above lsn: clamps last_append_lsn and the Sync baselines, clears the missing and Empty marks
+    // above lsn, prunes the overlay above it, then frees the dropped slots' blocks. commit_lsn is not changed, and an
+    // lsn below a slot already indexed fails with invalid_argument, changing nothing. The journal records stay, as
+    // HomeStore's rollback assumes in-order appends: nothing reads past last_append_lsn, a new write to the dLSN
+    // replaces the record, and recovery must skip them by term (S8). The caller fences writes first and keeps lsn at
+    // or above every committed Sync's watermark. InternalLogin truncates at its commit (truncate_tail_locked()) and
+    // frees at its apply.
     async_status truncate(int64_t lsn);
 
     // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The proposer behind the
@@ -504,6 +500,8 @@ public:
     void seed_term(uint64_t term);
     // Marks lsn as having a journal write in flight, as write() does while its write is outstanding.
     void seed_in_flight(int64_t lsn);
+    // Lands a seeded in-flight write: releases its claim as the write would, waking any drain.
+    void release_in_flight(int64_t lsn) { release_slot_write(lsn); }
 
     // Test seam for commit(): runs the same apply-one-slot algorithm, but the index write/delete
     // operations are injected rather than routed through indx_tbl_, so tests can exercise commit()'s
@@ -698,7 +696,8 @@ private:
     };
     async_result< LoginPoll > login_poll(uint64_t term);
 
-    // Login step 2, leader-only: resolves every slot this member lacks up to rs_commit_lsn, holes below its own
+    // Login step 2, leader-only: waits for this member's writes still in flight (the poll quiesced them, so each lands
+    // published), then resolves every slot this member lacks up to rs_commit_lsn, holes below its own
     // last_append_lsn included, counting only the quiesced members' lacks. All or nothing: the watermark is fixed by
     // the poll, so any slot left unresolved fails NO_QUORUM before anything is proposed; a partition that is or becomes
     // faulted fails INTERNAL_ERROR. Returns the Empty verdicts the login's SyncRSCommitLSN carries.
@@ -756,15 +755,17 @@ private:
         CraftEntryType type{};
         int64_t rs_commit_lsn{-1}; // SyncRSCommitLSN, InternalLogin
         uint64_t client_token{0};
-        std::vector< int64_t > to_free{}; // SyncRSCommitLSN: held slots its verdicts voided
+        // Slots whose blocks the apply frees. SyncRSCommitLSN: held slots its verdicts voided. InternalLogin: journaled
+        // slots its truncation dropped.
+        std::vector< int64_t > to_free{};
         // InternalLogin: its new term. SyncRSCommitLSN: the session it was proposed in.
         uint64_t term{0};
         intrusive< homestore::repl_req_ctx > ctx{}; // this member's own proposal, if any; completed once applied
     };
     // Admits a committed entry: unless the queue is stopped, makes its commit-time effects (a Sync's state change from
-    // empty_slots, or its rejection if a committed login replaced its session; an InternalLogin's write fence, or its
-    // rejection if a committed Sync is past its watermark) and queues the rest. Under apply_mu_, so once stop_apply()
-    // has run, nothing changes.
+    // empty_slots, or its rejection if a committed login replaced its session; a newer InternalLogin's write fence and
+    // truncation, or its rejection if a committed Sync is past its watermark) and queues the rest. Under apply_mu_, so
+    // once stop_apply() has run, nothing changes.
     void enqueue_apply(PendingApply entry, std::vector< int64_t > const& empty_slots = {});
     std::optional< PendingApply > next_apply();
     async_status drain_apply();
@@ -790,8 +791,14 @@ private:
     // Both halves back to back, for tests that apply a Sync without the queue.
     async_status apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                           std::vector< int64_t > empty_slots);
-    // InternalLogin's apply, run by the apply queue: false if the entry's term isn't newer, and it was ignored.
-    bool apply_internal_login(uint64_t client_token, uint64_t term);
+    // truncate()'s state change, under state_mu_: InternalLogin's at its commit, so it lands in log order before a
+    // later Sync's install. Returns the journaled slots it dropped, whose blocks the caller frees, and marks writes in
+    // flight above lsn in truncated_in_flight_. Fails with invalid_argument, changing nothing, below a slot already
+    // indexed or being indexed.
+    result< std::vector< int64_t > > truncate_tail_locked(int64_t lsn);
+    // InternalLogin's apply, run by the apply queue: waits for writes in flight, frees the slots its commit dropped
+    // (to_free), then starts the session. STALE_TERM if the entry's term isn't newer, and it was ignored.
+    async_status apply_internal_login(uint64_t client_token, uint64_t term, std::vector< int64_t > const& to_free);
 
     // Advance commit_lsn toward upto_lsn by applying each committable slot to the index (internal
     // helper; never a wire op -- there is no standalone commit verb on the CRAFT wire). Stalls
@@ -873,13 +880,15 @@ private:
     bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
     // True if a login poll has quiesced writes at term. Caller holds state_mu_.
     bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
+    // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes every drain_writes() caller,
+    // on this thread.
+    void release_slot_write(int64_t lsn);
+    // Waits until no journal write is in flight. The caller fences new writes first, or the wait may not end.
+    sisl::async::task< void > drain_writes();
     struct SlotWriteClaim {
         CraftReplDev* dev;
         int64_t lsn;
-        ~SlotWriteClaim() {
-            std::lock_guard lk{dev->state_mu_};
-            dev->in_flight_write_dlsns_.erase(lsn);
-        }
+        ~SlotWriteClaim() { dev->release_slot_write(lsn); }
     };
 
     // Records write()/keep_alive() activity and, on the first call after login, arms the watchdog's
@@ -929,8 +938,12 @@ private:
     // dlsns with a journal write outstanding, from write(), pre-resolution or apply catch-up -- see
     // write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
+    // In-flight writes above a committed login's watermark: the login dropped their slots, so each discards itself
+    // when it lands. Erased with the claim.
+    std::set< int64_t > truncated_in_flight_;
+    std::vector< std::shared_ptr< sisl::async::value_awaitable< bool > > > drain_waiters_; // drain_writes() callers
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, in_flight_write_dlsns_,
-                                  // last_checkpoint_lsn_, and client_commit_lsn_
+                                  // truncated_in_flight_, drain_waiters_, last_checkpoint_lsn_, and client_commit_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
@@ -1015,9 +1028,10 @@ private:
     //     call can be in flight when it fires. Held to be an acceptable, explicitly documented limitation
     //     rather than adding suspension-point-granularity re-checks for a window that cannot occur under
     //     that contract; revisit if HomeStore's on_restart() timing guarantee ever changes.
-    //   - login() (still a stub -- see the "stubs" section) is NOT gated by this flag either. Once login()
-    //     is real, a concurrent login()->truncate() during recovery could destroy journal entries
-    //     rebuild_overlay() is still walking. Whoever implements real login() must also gate it here.
+    //   - login() (still a stub -- see the "stubs" section) is NOT gated by this flag either; whoever implements it
+    //     must gate it here. Nor is an InternalLogin committing during recovery: its truncation can race
+    //     rebuild_overlay(), which may then republish a slot it dropped. S8, which makes recovery real, must order
+    //     the two.
     //
     // A plain atomic bool suffices for the single-writer part: on_restart()/run_recovery() are the only
     // writers, and HomeStore's OWN calling contract (not a runtime property of this class) is what

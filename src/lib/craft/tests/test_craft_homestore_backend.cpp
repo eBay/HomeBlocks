@@ -107,26 +107,6 @@ TEST_F(CraftHomeStoreBackendTest, WriteSlotCompletesInlineWithoutHanging) {
     ASSERT_TRUE(r.has_value());
 }
 
-// truncate_to(lsn) must drop journal entries above lsn from the real logdev's tail -- verified via
-// the log_store's own tail_lsn() rather than read_slot (not yet implemented; returns not_supported).
-TEST_F(CraftHomeStoreBackendTest, TruncateToRollsBackRealLogStore) {
-    auto logstore = make_logstore();
-    ASSERT_TRUE(logstore != nullptr);
-    auto backend = make_homestore_journal_backend(logstore, /* vol_ordinal = */ 0, k_page_size);
-
-    for (int64_t lsn = 0; lsn <= 4; ++lsn) {
-        auto r = homeblocks::detail::sync_get(backend->write_slot(lsn, /* term = */ 1, /* lba = */ 0, /* len = */ 4096,
-                                                                  homestore::multi_blk_id{}, /* all_zeros = */ true,
-                                                                  std::vector< homestore::csum_t >{}));
-        ASSERT_TRUE(r.has_value());
-    }
-    ASSERT_EQ(logstore->tail_lsn(), 4);
-
-    auto r = homeblocks::detail::sync_get(backend->truncate_to(2));
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(logstore->tail_lsn(), 2);
-}
-
 // read_slot must parse back exactly what write_slot wrote: header fields, the csum array, and the blkid.
 TEST_F(CraftHomeStoreBackendTest, ReadSlotReturnsCorrectData) {
     auto logstore = make_logstore();

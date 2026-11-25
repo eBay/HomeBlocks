@@ -118,8 +118,6 @@ public:
             co_return std::unexpected(std::make_error_condition(std::errc::no_such_file_or_directory));
         co_return it->second;
     }
-
-    async_status truncate_to(int64_t) override { co_return ok(); }
     async_status free_data(homestore::multi_blk_id) override {
         ++free_data_calls;
         co_return ok();

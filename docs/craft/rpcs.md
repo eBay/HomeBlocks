@@ -289,11 +289,20 @@ every replica rejects the same ones.
 RAFT entry payload: { version: uint8, client_token: uint64, term: uint64, rs_commit_lsn: int64 }
 ```
 
-Proposed immediately after the login's `SyncRSCommitLSN` commits. On apply each replica first fences
-prior-session writes and waits for any already in flight to finish (a replica the login poll missed was
-never quiesced), then truncates its journal to `rs_commit_lsn` if its `last_append_lsn` is above it, then
-stores `client_token` and `term`, rejecting any subsequent IO from a different term. Until a replica has applied the entry, it
-rejects IO and HELO at the new term, so no new-session write can land before its truncation.
+Proposed immediately after the login's `SyncRSCommitLSN` commits. When a newer entry commits, each replica
+fences prior-session writes (a replica the login poll missed was never quiesced) and drops its slots above
+`rs_commit_lsn`: `last_append_lsn` comes down to it, and the missing and `Empty` marks above it go. This
+happens at commit, in log order, so a later `SyncRSCommitLSN` committing before this entry applies (on a
+lagging replica) installs on top of the truncated tail rather than being undone by it. A replica that has
+already indexed past `rs_commit_lsn` can't truncate; it faults, and the proposer gets `INTERNAL_ERROR`. An
+old-session write still in flight then lands without an ack: dropped if its slot is above `rs_commit_lsn`,
+kept otherwise. On apply the replica waits for those writes to land, frees the dropped slots' blocks, then
+stores `client_token` and `term`, rejecting any subsequent IO from a different term. Until a replica has
+applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its
+truncation.
+
+The truncation is logical: the journal records above `rs_commit_lsn` stay, unread, until a new-session write
+to the same dLSN replaces one; recovery skips them by term (S8).
 
 Two entries are turned away, each decided in log order so every replica agrees:
 - **Not newer.** An entry whose `term` isn't newer than the session's is ignored when it applies, token

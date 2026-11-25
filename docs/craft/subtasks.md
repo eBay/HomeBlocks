@@ -110,10 +110,13 @@ given LSN, so that replicas can clean up stale writes from a previous term when 
 starts.
 
 **Acceptance criteria:**
-- `truncate(lsn)` removes all data journal entries with dLSN > `lsn`
+- `truncate(lsn)` drops every slot with dLSN > `lsn` from the replica's state and frees its blocks. It is
+  logical: HomeStore's log-store rollback assumes in-order appends, so the journal records stay, unread,
+  until a write to the same dLSN replaces one; recovery skips them by term (S8)
 - Updates `last_append_lsn = min(last_append_lsn, lsn)`
-- Clears any Missing-set entries above `lsn`
-- Does not affect entries ≤ `lsn`
+- Clears any Missing-set and `Empty` entries above `lsn`, and prunes the journal-tail overlay above it
+- Does not affect entries ≤ `lsn`; fails (`invalid_argument`, nothing changed) if `lsn` is below a slot
+  already indexed
 - Safe to call concurrently with in-flight reads at committed LSNs ≤ `lsn`
 - Unit tests cover: truncate with committed entries below, truncate with missing entries, idempotency
 
@@ -139,7 +142,7 @@ and enforce single-writer exclusivity without data flowing through the RAFT log.
 
 **InternalLogin:**
 - RAFT entry carries `{version, client_token, term, rs_commit_lsn}` (`rs_commit_lsn` added by S7)
-- On apply, if `term` is newer than `state.term`: `state.client_token = client_token`, `state.term = term`; S7 has the replica first fence and drain prior-session writes, then truncate its journal to `rs_commit_lsn` if `last_append_lsn` is above it (S7 step 5). An entry whose `term` isn't newer (a replay, or a login that lost its term to an earlier one) is ignored outright, and its proposer gets `STALE_TERM`. A newer entry whose `rs_commit_lsn` is below the watermark of a `SyncRSCommitLSN` committed ahead of it (another leader's, after a leadership change mid-login) is rejected at commit, in log order, without fencing the old session; its proposer gets `NO_QUORUM`
+- On apply, if `term` is newer than `state.term`: `state.client_token = client_token`, `state.term = term`; S7 has the replica fence prior-session writes and truncate its slots above `rs_commit_lsn` when the entry commits, then drain the writes still in flight and free the dropped slots' blocks before it adopts the term (S7 step 5). An entry whose `term` isn't newer (a replay, or a login that lost its term to an earlier one) is ignored outright, and its proposer gets `STALE_TERM`. A newer entry whose `rs_commit_lsn` is below the watermark of a `SyncRSCommitLSN` committed ahead of it (another leader's, after a leadership change mid-login) is rejected at commit, in log order, without fencing the old session; its proposer gets `NO_QUORUM`
 - All subsequent IO with a different `term` is rejected
 - Proposed immediately after `SyncRSCommitLSN` commits during login
 
@@ -180,7 +183,7 @@ term across the replica set.
   2. Compute `rs_commit_lsn` = max `last_append_lsn` over the leader and every member that replied before the poll timeout (not just the first quorum to reply), counting each member once; if the leader plus responders are not a majority, fail with `NO_QUORUM` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
   3. Pre-resolve every unresolved slot ≤ `rs_commit_lsn`, including holes below the leader's own `last_append_lsn`: fetch each from any peer holding it, or record an `Empty` verdict when a quorum (leader included) lacks it, counting only members the poll quiesced: one it didn't could still ack an old-session write to the slot after reporting it lacks it. If any slot stays unresolved, the login fails (`NO_QUORUM`) before anything is proposed and the client retries
   4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, term, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts and the session `term` the login replaces; wait for it to apply on the leader, which brings the leader's `commit_lsn` to `rs_commit_lsn`. The entry is proposed even if `rs_commit_lsn` is already covered; if the leader isn't exactly at `rs_commit_lsn` afterwards (an earlier round's timed-out Sync committing late), the login fails (`NO_QUORUM`) and the client retries
-  5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for it to apply on the leader. Each replica with `last_append > rs_commit_lsn` truncates to `rs_commit_lsn` when it applies the entry, before adopting the new term (no truncate RPC; a replica that missed the login truncates when it applies the entry later). Before truncating, the replica fences prior-session writes the way the login poll does and waits for any already in flight to finish, so none can journal a slot above `rs_commit_lsn` afterwards; the fence holds until it adopts the new term. Until a replica has applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its truncation
+  5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for it to apply on the leader. Each replica drops its slots above `rs_commit_lsn` when the entry commits, in log order, so a later `SyncRSCommitLSN` committing before the entry applies installs on top of the truncated tail (no truncate RPC; a replica that missed the login truncates when the entry commits there later). The commit also fences prior-session writes the way the login poll does; one already in flight lands unacked, dropped above `rs_commit_lsn` and kept at or below it. On apply the replica waits for those writes, frees the dropped slots' blocks, then adopts the new term. Until a replica has applied the entry, it rejects IO and HELO at the new term, so no new-session write can land before its truncation
   6. Return `{members, dLSN=rs_commit_lsn, term=term+1}` plus the volume geometry `{lba_size, capacity, max_tx}`
 - **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner. The leader aborts the login once it passes a deadline shorter than the quiesce timeout
 - Returns `ENOTLEADER` if called on a follower
