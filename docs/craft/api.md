@@ -252,12 +252,12 @@ is already past T.
 async_status truncate(int64_t lsn);
 ```
 
-Drop every slot with `dLSN > lsn` (a stale prior-session tail) and free its blocks; `commit_lsn` is
-unchanged, and an `lsn` below a slot already indexed fails with `invalid_argument`. Logical: the journal
-records stay, unread, until a write to the same dLSN replaces one; recovery tells a dropped record from a kept
-one by the login history (see [rpcs.md](rpcs.md) #10). A login doesn't call it: `InternalLogin`
-makes the same state change when it commits and frees the blocks when it applies (see
-[rpcs.md](rpcs.md) #10).
+Drop every slot with `dLSN > lsn` (a stale prior-session tail), wait for writes in flight, free the dropped
+slots' blocks, and re-publish any older write whose LBA lost its newest entry; `commit_lsn` is unchanged, and an
+`lsn` below a slot already indexed fails with `invalid_argument`. Logical: the journal records stay, unread,
+until a write to the same dLSN replaces one; recovery tells a dropped record from a kept one by the login
+history (see [rpcs.md](rpcs.md) #10). A login doesn't call it, but runs the same steps: `InternalLogin` makes
+the state change when it commits and the rest when it applies (see [rpcs.md](rpcs.md) #10).
 
 ### `fetch_data` (peer)
 

@@ -28,7 +28,9 @@
 
 #include <gtest/gtest.h>
 #include <functional>
+#include <latch>
 #include <map>
+#include <thread>
 #include <vector>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -213,27 +215,35 @@ protected:
                                      empty_slots);
         commit_entry(CraftEntryType::SyncRSCommitLSN, key);
     }
-    // Starts a one-block all-zeros write at dlsn without waiting for it; `outcome` gets its result when it finishes.
-    void start_write(int64_t dlsn, uint64_t term, std::optional< result< craft::lsn_pair > >& outcome) {
-        homeblocks::detail::detach([](std::shared_ptr< CraftReplDev > dev, int64_t dlsn, uint64_t term,
-                                      std::optional< result< craft::lsn_pair > >& out) -> sisl::async::task< void > {
-            out = co_await dev->write(craft::client_hdr{term, -1, -1}, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{});
-        }(dev_, dlsn, term, outcome));
+    // Starts a one-block all-zeros write at dlsn without waiting for it. The returned result is set when it finishes;
+    // the coroutine shares it, so one still suspended when a test returns writes live memory.
+    std::shared_ptr< std::optional< result< craft::lsn_pair > > > start_write(int64_t dlsn, uint64_t term) {
+        auto outcome = std::make_shared< std::optional< result< craft::lsn_pair > > >();
+        homeblocks::detail::detach(
+            [](std::shared_ptr< CraftReplDev > dev, int64_t dlsn, uint64_t term,
+               std::shared_ptr< std::optional< result< craft::lsn_pair > > > out) -> sisl::async::task< void > {
+                craft::client_hdr const hdr{term, -1, -1};
+                *out = co_await dev->write(hdr, dlsn, /*addr=*/0, k_page_size, sisl::sg_list{});
+            }(dev_, dlsn, term, outcome));
+        return outcome;
     }
-    // Starts login_resolve() at term 0 without waiting for it; `outcome` gets its result when it finishes.
-    void start_login_resolve(int64_t rs_commit_lsn, std::vector< craft::peer_id_t > quiesced,
-                             std::optional< result< std::vector< int64_t > > >& outcome) {
+    // Starts login_resolve() at term 0 without waiting for it, sharing its result the same way.
+    std::shared_ptr< std::optional< result< std::vector< int64_t > > > >
+    start_login_resolve(int64_t rs_commit_lsn, std::vector< craft::peer_id_t > quiesced) {
+        auto outcome = std::make_shared< std::optional< result< std::vector< int64_t > > > >();
         homeblocks::detail::detach(
             [](std::shared_ptr< CraftReplDev > dev, int64_t rs, std::vector< craft::peer_id_t > quiesced,
-               std::optional< result< std::vector< int64_t > > >& out) -> sisl::async::task< void > {
-                out = co_await dev->login_resolve(rs, /*term=*/0, std::move(quiesced));
+               std::shared_ptr< std::optional< result< std::vector< int64_t > > > > out) -> sisl::async::task< void > {
+                *out = co_await dev->login_resolve(rs, /*term=*/0, std::move(quiesced));
             }(dev_, rs_commit_lsn, std::move(quiesced), outcome));
+        return outcome;
     }
     // Starts drain_writes() and destroys it while it waits, as a caller that gives up would.
     void abandon_drain() { HeldTask held{dev_->drain_writes()}; }
     // Starts drain_writes() and holds it, so a test can destroy it while it waits.
     std::unique_ptr< HeldTask > hold_drain() { return std::make_unique< HeldTask >(dev_->drain_writes()); }
-    // Starts drain_writes() and runs `then` once it returns.
+    // Starts drain_writes() and runs `then` once it returns. `then` should capture by value (shared state, say): the
+    // drain may still be waiting when a test returns.
     void start_drain_then(std::function< void() > then) {
         homeblocks::detail::detach(
             [](std::shared_ptr< CraftReplDev > dev, std::function< void() > then) -> sisl::async::task< void > {
@@ -601,21 +611,19 @@ TEST_F(CraftLoginTest, ResolveFaultedDuringTheFetchFailsInternalError) {
 TEST_F(CraftLoginTest, ResolveWaitsForTheLeadersInFlightWrite) {
     dev_->seed_lsns(2, {});
     journal_->hold_write = true;
-    std::optional< result< craft::lsn_pair > > w;
-    start_write(/*dlsn=*/3, /*term=*/0, w);
+    auto const w = start_write(/*dlsn=*/3, /*term=*/0);
     ASSERT_TRUE(homeblocks::detail::sync_get(dev_->get_rs_commit_lsn(/*term=*/0, /*is_login=*/true)).has_value());
 
-    std::optional< result< std::vector< int64_t > > > resolved;
-    start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}, resolved);
-    EXPECT_FALSE(resolved.has_value()); // waiting for the write
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)});
+    EXPECT_FALSE(resolved->has_value()); // waiting for the write
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(w.has_value());
-    EXPECT_FALSE(w->has_value()); // quiesced: kept, not acked
-    ASSERT_TRUE(resolved.has_value());
-    ASSERT_TRUE(resolved->has_value()) << resolved->error().message();
-    EXPECT_TRUE((*resolved)->empty()); // no Empty verdict
+    ASSERT_TRUE(w->has_value());
+    EXPECT_FALSE((*w)->has_value()); // quiesced: kept, not acked
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_TRUE((*resolved)->has_value()) << (*resolved)->error().message();
+    EXPECT_TRUE((*resolved)->value().empty()); // no Empty verdict
     EXPECT_FALSE(dev_->is_missing(3));
     EXPECT_TRUE(poller_.last_fetch.empty()); // nothing left to fetch
 }
@@ -953,9 +961,8 @@ TEST_F(CraftLoginTest, ASyncCommittedBehindAQueuedLoginKeepsItsInstall) {
 TEST_F(CraftLoginTest, AWriteInFlightAboveTheWatermarkIsDropped) {
     dev_->seed_lsns(5, {});
     journal_->hold_write = true;
-    std::optional< result< craft::lsn_pair > > w;
-    start_write(/*dlsn=*/7, /*term=*/0, w);
-    ASSERT_FALSE(w.has_value());
+    auto const w = start_write(/*dlsn=*/7, /*term=*/0);
+    ASSERT_FALSE(w->has_value());
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
 
@@ -965,9 +972,9 @@ TEST_F(CraftLoginTest, AWriteInFlightAboveTheWatermarkIsDropped) {
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(w.has_value());
-    ASSERT_FALSE(w->has_value());
-    EXPECT_EQ(w->error(), stale_term());
+    ASSERT_TRUE(w->has_value());
+    ASSERT_FALSE((*w)->has_value());
+    EXPECT_EQ((*w)->error(), stale_term());
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_EQ(dev_->last_append_lsn(), 5);
     EXPECT_FALSE(dev_->is_missing(6));
@@ -980,17 +987,16 @@ TEST_F(CraftLoginTest, AWriteInFlightAboveTheWatermarkIsDropped) {
 TEST_F(CraftLoginTest, AWriteInFlightAtOrBelowTheWatermarkIsKeptButNotAcked) {
     dev_->seed_lsns(5, {4});
     journal_->hold_write = true;
-    std::optional< result< craft::lsn_pair > > w;
-    start_write(/*dlsn=*/4, /*term=*/0, w);
+    auto const w = start_write(/*dlsn=*/4, /*term=*/0);
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
     EXPECT_EQ(dev_->term(), 0u); // the apply waits for the write
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(w.has_value());
-    ASSERT_FALSE(w->has_value());
-    EXPECT_EQ(w->error(), stale_term());
+    ASSERT_TRUE(w->has_value());
+    ASSERT_FALSE((*w)->has_value());
+    EXPECT_EQ((*w)->error(), stale_term());
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_FALSE(dev_->is_missing(4));
     EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
@@ -1033,18 +1039,17 @@ TEST_F(CraftLoginTest, AFillInFlightAboveTheWatermarkIsDropped) {
     dev_->seed_lsns(5, {4});
     poller_.fetched = {holding(1, {zeros(4)}), holding(2)};
     journal_->hold_write = true;
-    std::optional< result< std::vector< int64_t > > > resolved;
-    start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)}, resolved);
-    ASSERT_FALSE(resolved.has_value()); // the fill of 4 is in write_slot
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)});
+    ASSERT_FALSE(resolved->has_value()); // the fill of 4 is in write_slot
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
     EXPECT_EQ(dev_->term(), 0u); // the apply waits for the fill
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(resolved.has_value());
-    ASSERT_FALSE(resolved->has_value());
-    EXPECT_EQ(resolved->error(), stale_term());
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_EQ(dev_->last_append_lsn(), 3);
     EXPECT_FALSE(dev_->is_missing(4));
@@ -1056,17 +1061,16 @@ TEST_F(CraftLoginTest, AFillInFlightAtOrBelowTheWatermarkIsKept) {
     dev_->seed_lsns(5, {4});
     poller_.fetched = {holding(1, {zeros(4)}), holding(2)};
     journal_->hold_write = true;
-    std::optional< result< std::vector< int64_t > > > resolved;
-    start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)}, resolved);
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/5, {test_member_id(1), test_member_id(2)});
 
     commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
     EXPECT_EQ(dev_->term(), 0u); // the apply waits for the fill
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(resolved.has_value());
-    ASSERT_FALSE(resolved->has_value());
-    EXPECT_EQ(resolved->error(), stale_term());
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_FALSE(dev_->is_missing(4));
     EXPECT_EQ(dev_->overlay_lsn_for(0), 4);
@@ -1115,19 +1119,17 @@ TEST_F(CraftLoginTest, ALoginWhoseRepublishFailsFaultsThePartition) {
 TEST_F(CraftLoginTest, TwoDrainsWaitingOnTheSameWriteBothResume) {
     dev_->seed_lsns(2, {});
     journal_->hold_write = true;
-    std::optional< result< craft::lsn_pair > > w;
-    start_write(/*dlsn=*/3, /*term=*/0, w);
-    std::optional< result< std::vector< int64_t > > > resolved;
-    start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}, resolved);
+    auto const w = start_write(/*dlsn=*/3, /*term=*/0);
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)});
     commit_login(/*term=*/1, /*rs_commit_lsn=*/3);
     EXPECT_EQ(drain_waiters(), 2u);
 
     journal_->write_gate.complete(true);
 
-    ASSERT_TRUE(w.has_value());
-    ASSERT_TRUE(resolved.has_value());
-    ASSERT_FALSE(resolved->has_value());
-    EXPECT_EQ(resolved->error(), stale_term());
+    ASSERT_TRUE(w->has_value());
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
     EXPECT_EQ(dev_->term(), 1u);
     EXPECT_EQ(drain_waiters(), 0u);
 }
@@ -1148,14 +1150,14 @@ TEST_F(CraftLoginTest, AnAbandonedDrainLeavesTheWaiterList) {
 TEST_F(CraftLoginTest, ADrainResumedFirstCanDestroyAnotherStillWaiting) {
     dev_->seed_lsns(3, {3});
     dev_->seed_in_flight(3);
-    std::unique_ptr< HeldTask > second;
-    start_drain_then([&] { second.reset(); });
-    second = hold_drain();
+    auto const second = std::make_shared< std::unique_ptr< HeldTask > >();
+    start_drain_then([second] { second->reset(); });
+    *second = hold_drain();
     ASSERT_EQ(drain_waiters(), 2u);
 
     dev_->release_in_flight(3);
 
-    EXPECT_FALSE(second);
+    EXPECT_FALSE(*second);
     EXPECT_EQ(drain_waiters(), 0u);
 }
 
@@ -1163,19 +1165,49 @@ TEST_F(CraftLoginTest, ADrainResumedFirstCanDestroyAnotherStillWaiting) {
 TEST_F(CraftLoginTest, ADrainWaitsForAWriteStartedByOneResumedAheadOfIt) {
     dev_->seed_lsns(4, {3, 4});
     dev_->seed_in_flight(3);
-    bool second_done = false;
-    start_drain_then([this] { dev_->seed_in_flight(4); });
-    start_drain_then([&] { second_done = true; });
+    auto const second_done = std::make_shared< bool >(false);
+    start_drain_then([dev = dev_] { dev->seed_in_flight(4); });
+    start_drain_then([second_done] { *second_done = true; });
     ASSERT_EQ(drain_waiters(), 2u);
 
     dev_->release_in_flight(3);
 
-    EXPECT_FALSE(second_done);
+    EXPECT_FALSE(*second_done);
     EXPECT_EQ(drain_waiters(), 1u);
 
     dev_->release_in_flight(4);
 
-    EXPECT_TRUE(second_done);
+    EXPECT_TRUE(*second_done);
+    EXPECT_EQ(drain_waiters(), 0u);
+}
+
+// A write lands on another thread while the drain resumed first is still running: that release leaves the rest to the
+// thread already resuming drains, so two releases can't each take a waiter off the list before either runs. The first
+// then destroys the second, whose guard takes it off the list, and nothing resumes it.
+TEST_F(CraftLoginTest, AReleaseWhileADrainIsResumingLeavesTheRestToIt) {
+    dev_->seed_lsns(4, {3, 4});
+    dev_->seed_in_flight(3);
+    auto const first_running = std::make_shared< std::latch >(1);
+    auto const first_may_go_on = std::make_shared< std::latch >(1);
+    auto const second = std::make_shared< std::unique_ptr< HeldTask > >();
+    start_drain_then([dev = dev_, first_running, first_may_go_on, second] {
+        dev->seed_in_flight(4);
+        first_running->count_down();
+        first_may_go_on->wait();
+        second->reset();
+    });
+    *second = hold_drain();
+    ASSERT_EQ(drain_waiters(), 2u);
+
+    std::thread releaser{[dev = dev_] { dev->release_in_flight(3); }};
+    first_running->wait();
+    dev_->release_in_flight(4); // nothing in flight now, but the first drain is still resuming
+
+    EXPECT_EQ(drain_waiters(), 1u); // the second still waits
+    first_may_go_on->count_down();
+    releaser.join();
+
+    EXPECT_FALSE(*second);
     EXPECT_EQ(drain_waiters(), 0u);
 }
 
@@ -1185,15 +1217,14 @@ TEST_F(CraftLoginTest, ResolveForAReplacedSessionDoesNotWaitForWrites) {
     dev_->seed_term(1);
     dev_->seed_lsns(3, {3});
     dev_->seed_in_flight(3);
-    std::optional< result< std::vector< int64_t > > > resolved;
-    start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}, resolved); // at term 0
+    auto const resolved = start_login_resolve(/*rs_commit_lsn=*/3, {test_member_id(1), test_member_id(2)}); // term 0
 
-    EXPECT_TRUE(resolved.has_value()); // didn't wait for the write
+    EXPECT_TRUE(resolved->has_value()); // didn't wait for the write
     dev_->release_in_flight(3);
 
-    ASSERT_TRUE(resolved.has_value());
-    ASSERT_FALSE(resolved->has_value());
-    EXPECT_EQ(resolved->error(), stale_term());
+    ASSERT_TRUE(resolved->has_value());
+    ASSERT_FALSE((*resolved)->has_value());
+    EXPECT_EQ((*resolved)->error(), stale_term());
 }
 
 } // namespace

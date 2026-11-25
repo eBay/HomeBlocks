@@ -306,9 +306,12 @@ can land before its truncation.
 The truncation is logical: the journal records above `rs_commit_lsn` stay, unread, until a new-session write
 to the same dLSN replaces one. A kept record and a dropped one can carry the same term, so recovery (S8) needs
 every login's `(term, rs_commit_lsn)`: a record written at term s is dead if the first login after s has
-`rs_commit_lsn` below it. The InternalLogin entries are the only durable copy of that history, so S8 must
-persist it outside the RAFT log before compacting the log, and must not re-commit a dead record's blocks on
-replay: they were freed and may have been reused.
+`rs_commit_lsn` below it. A voided record is dead too, whatever the logins: a slot a committed
+`SyncRSCommitLSN` voted `Empty` keeps its record, but its blocks were freed when it was voided (a held slot's
+when the Sync applied, a late write's when it landed), so recovery also needs the committed `Empty`
+verdicts. The InternalLogin and `SyncRSCommitLSN` entries are the only durable copy of that history, so S8
+must persist it outside the RAFT log before compacting the log, and must not re-commit a dead record's blocks
+on replay: they were freed and may have been reused.
 
 Two entries are turned away, each decided in log order so every replica agrees:
 - **Not newer.** An entry whose `term` isn't newer than the session's is ignored when it applies, token

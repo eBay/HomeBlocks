@@ -825,7 +825,7 @@ async_status CraftReplDev::login_install(AsyncMutex::Lock const& lock, int64_t r
 // commit_lsn isn't touched: every slot at or below it is already indexed.
 //
 // InternalLogin runs it on the RAFT commit thread under apply_mu_ and state_mu_, so IO waits for it: it costs the
-// dropped range, plus a scan of empty_lsns_ and the overlay. A member with a long, sparse stale tail stalls that long.
+// dropped range, plus a scan of the overlay. A member with a long, sparse stale tail stalls that long.
 
 result< CraftReplDev::TailTruncation > CraftReplDev::truncate_tail_locked(int64_t lsn) {
     // Dropping an indexed slot, or one a running commit_impl() has started indexing, would leave the index pointing at
@@ -842,7 +842,7 @@ result< CraftReplDev::TailTruncation > CraftReplDev::truncate_tail_locked(int64_
     truncated_in_flight_.insert(in_flight_write_dlsns_.upper_bound(lsn), in_flight_write_dlsns_.end());
     state_.last_append_lsn = std::min(state_.last_append_lsn, lsn);
     missing_lsns_.erase(missing_lsns_.upper_bound(lsn), missing_lsns_.end());
-    std::erase_if(empty_lsns_, [lsn](int64_t l) { return l > lsn; });
+    empty_lsns_.erase(empty_lsns_.upper_bound(lsn), empty_lsns_.end());
     // The Sync cadences count from the append frontier, so their baselines can't sit above the new one.
     last_periodic_sync_lsn_ = std::min(last_periodic_sync_lsn_, lsn);
     last_proposed_sync_lsn_ = std::min(last_proposed_sync_lsn_, lsn);
@@ -860,18 +860,40 @@ result< CraftReplDev::TailTruncation > CraftReplDev::truncate_tail_locked(int64_
 }
 
 async_status CraftReplDev::truncate(int64_t lsn) {
-    std::vector< int64_t > dropped;
+    TailTruncation dropped;
     {
         std::lock_guard lk{state_mu_};
         auto r = truncate_tail_locked(lsn);
         if (!r) co_return std::unexpected(r.error());
-        dropped = std::move(r->slots);
+        dropped = std::move(*r);
     }
-    for (int64_t l : dropped) {
-        if (auto fr = co_await journal_->free_slot(l); !fr)
-            LOGE("truncate: free_slot failed lsn={}: {} -- blocks may leak", l, fr.error().message());
+    auto r = co_await finish_tail_truncation(dropped.slots, dropped.overlay_dropped, "truncate");
+    co_return r;
+}
+
+async_status CraftReplDev::finish_tail_truncation(std::vector< int64_t > const& to_free, bool republish,
+                                                  std::string_view who) {
+    // A write caught in flight above the truncation point discards itself as it lands.
+    co_await drain_writes();
+    co_await free_slots(to_free, who);
+    if (republish) {
+        // The truncation dropped the newest overlay entry of each LBA it touched; an older write to one, at or below
+        // the truncation point and not yet indexed, must be readable again. No commit run may retire entries meanwhile.
+        auto const commit_lock = co_await commit_mu_.lock();
+        if (auto r = co_await rebuild_overlay(); !r) {
+            LOGE("{}: re-publishing the overlay failed: {} -- faulting the partition", who, r.error().message());
+            faulted_.store(true, std::memory_order_release);
+            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+        }
     }
     co_return ok();
+}
+
+sisl::async::task< void > CraftReplDev::free_slots(std::vector< int64_t > const& lsns, std::string_view who) {
+    for (int64_t lsn : lsns) {
+        if (auto r = co_await journal_->free_slot(lsn); !r)
+            LOGE("{}: free_slot failed lsn={}: {} -- blocks may leak", who, lsn, r.error().message());
+    }
 }
 
 #ifdef _PRERELEASE
@@ -1447,6 +1469,10 @@ void CraftReplDev::release_slot_write(int64_t lsn) {
         std::lock_guard lk{state_mu_};
         in_flight_write_dlsns_.erase(lsn);
         truncated_in_flight_.erase(lsn);
+        // Only one release resumes waiters at a time; the one doing so rechecks after each. Two could each take a
+        // waiter off the list before either ran, and the first resumed could then destroy the other's caller.
+        if (resuming_drains_ || !in_flight_write_dlsns_.empty() || drain_waiters_.empty()) return;
+        resuming_drains_ = true;
     }
     // Waiters come off the list one at a time, each just before it resumes: one resumed ahead of it may have started a
     // write (the rest then wait for that one), or destroyed another waiter, whose guard has taken it off the list.
@@ -1454,7 +1480,10 @@ void CraftReplDev::release_slot_write(int64_t lsn) {
         std::shared_ptr< sisl::async::value_awaitable< bool > > next;
         {
             std::lock_guard lk{state_mu_};
-            if (!in_flight_write_dlsns_.empty() || drain_waiters_.empty()) return;
+            if (!in_flight_write_dlsns_.empty() || drain_waiters_.empty()) {
+                resuming_drains_ = false;
+                return;
+            }
             next = std::move(drain_waiters_.front());
             drain_waiters_.erase(drain_waiters_.begin());
         }
@@ -1571,7 +1600,7 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
         // A committed login has replaced this session: its truncation may have dropped an LBA's newest version, and
-        // the older one isn't readable again until the login applies.
+        // the older one isn't readable again until the login applies. Checked again once the read is done.
         if (hdr.term < login_fence_term_) {
             LOGW("read rejected: term={} fenced by a committed login (term {})", hdr.term, login_fence_term_);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
@@ -1595,13 +1624,32 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
     read_index_fn_t read_fn = [this](lba_t s, lba_t e, index_kv_list_t& kvs) {
         return indx_tbl_->read_from_index(s, e, kvs);
     };
+    auto r = co_await read_in_session(hdr.term, read_lsn, addr, len, std::move(dest), read_fn);
+    co_return r;
+}
+
+// A login that committed while the read ran may have dropped the version it served, or once applied, freed the blocks
+// it read, so the read fails whatever it found. The fence goes up at the login's commit, ahead of both.
+async_result< craft::read_result > CraftReplDev::read_in_session(uint64_t term, int64_t read_lsn, uint64_t addr,
+                                                                 uint64_t len, sisl::sg_list dest,
+                                                                 read_index_fn_t const& read_fn) {
     auto r = co_await read_impl(read_lsn, addr, len, std::move(dest), read_fn);
+    std::lock_guard lk{state_mu_};
+    if (term < login_fence_term_) {
+        LOGW("read rejected: a login at term {} committed while this read from term {} ran", login_fence_term_, term);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+    }
     co_return r;
 }
 
 #ifdef _PRERELEASE
 async_result< craft::read_result > CraftReplDev::read_with(int64_t read_lsn, uint64_t addr, uint64_t len,
-                                                           sisl::sg_list dest, read_index_fn_t read_fn) {
+                                                           sisl::sg_list dest, read_index_fn_t read_fn,
+                                                           std::optional< uint64_t > term) {
+    if (term) {
+        auto r = co_await read_in_session(*term, read_lsn, addr, len, std::move(dest), read_fn);
+        co_return r;
+    }
     auto r = co_await read_impl(read_lsn, addr, len, std::move(dest), read_fn);
     co_return r;
 }
@@ -2124,8 +2172,6 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
     }
 
     // Every Empty verdict <= target, earlier rounds' included, so a client that lost a reply still learns them.
-    // TODO: make empty_lsns_ a std::set (like missing_lsns_) so this is begin()..upper_bound(target), already
-    // sorted and unique, instead of a full scan plus sort/unique.
     craft::resolution_result result{.resolved_upto = target, .empty_slots = {}};
     {
         std::lock_guard lk{state_mu_};
@@ -2135,8 +2181,7 @@ async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, u
             LOGW("append: term moved past the caller's ({} -> {}) after resolving to {}", term, state_.term, target);
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
-        for (int64_t lsn : empty_lsns_)
-            if (lsn <= target) result.empty_slots.push_back(lsn);
+        result.empty_slots.assign(empty_lsns_.begin(), empty_lsns_.upper_bound(target));
     }
     result.empty_slots.insert(result.empty_slots.end(), verdicts.begin(), verdicts.end());
     std::sort(result.empty_slots.begin(), result.empty_slots.end());
@@ -2514,6 +2559,7 @@ std::vector< std::string > CraftReplDev::invariant_violations() {
             found.push_back(fmt::format("lsn {} marked dropped in flight, but no write is in flight", lsn));
     if (!drain_waiters_.empty() && in_flight_write_dlsns_.empty())
         found.push_back(fmt::format("{} drain waiter(s) with no write in flight", drain_waiters_.size()));
+    if (resuming_drains_) found.push_back("a release still marked as resuming drains");
     if (!missing_lsns_.empty() && *missing_lsns_.rbegin() > state_.last_append_lsn)
         found.push_back(
             fmt::format("missing lsn {} above last_append {}", *missing_lsns_.rbegin(), state_.last_append_lsn));
@@ -2973,11 +3019,7 @@ async_status CraftReplDev::finish_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint
     // external owner drops it mid-apply (drain_apply() holds one too). Requires a shared_ptr-owned CraftReplDev.
     auto self = shared_from_this();
 
-    for (int64_t lsn : to_free) {
-        if (auto fr = co_await journal_->free_slot(lsn); !fr) {
-            LOGE("apply_sync_rs_commit_lsn: free_slot failed lsn={}: {} -- blocks may leak", lsn, fr.error().message());
-        }
-    }
+    co_await free_slots(to_free, "apply_sync_rs_commit_lsn");
 
     std::vector< int64_t > to_fetch;
     uint64_t term;
@@ -3115,23 +3157,10 @@ async_status CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t 
             co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
         }
     }
-    // Each lands under the old session: one above the watermark discards itself, one at or below it is kept unacked.
-    co_await drain_writes();
-    for (int64_t lsn : to_free) {
-        if (auto fr = co_await journal_->free_slot(lsn); !fr)
-            LOGE("apply_internal_login: free_slot failed lsn={}: {} -- blocks may leak", lsn, fr.error().message());
-    }
-    if (republish) {
-        // The truncation dropped the newest overlay entry of each LBA it touched; an older write to one, at or below
-        // the watermark and not yet indexed, must be readable again. No commit run may retire entries meanwhile.
-        auto const commit_lock = co_await commit_mu_.lock();
-        if (auto r = co_await rebuild_overlay(); !r) {
-            LOGE("apply_internal_login: re-publishing the overlay failed: {} -- faulting the partition",
-                 r.error().message());
-            faulted_.store(true, std::memory_order_release);
-            co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
-        }
-    }
+    // The old session's writes still in flight land first: one above the watermark discards itself, one at or below it
+    // is kept unacked.
+    if (auto r = co_await finish_tail_truncation(to_free, republish, "apply_internal_login"); !r)
+        co_return std::unexpected(r.error());
     std::lock_guard lk{state_mu_};
     state_.client_token = client_token;
     state_.term = term;

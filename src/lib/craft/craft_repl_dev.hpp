@@ -32,8 +32,8 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace homestore {
@@ -380,14 +380,14 @@ public:
     async_result< RsCommitLsnReply > get_rs_commit_lsn(uint64_t term, bool is_login);
 
     // Drops every slot above lsn: clamps last_append_lsn and the Sync baselines, clears the missing and Empty marks
-    // above lsn, prunes the overlay above it, then frees the dropped slots' blocks. commit_lsn is not changed, and an
+    // above lsn and prunes the overlay above it, then waits for writes in flight, frees the dropped slots' blocks and
+    // re-publishes an older surviving write for an LBA whose newest entry it dropped. commit_lsn is not changed, and an
     // lsn below a slot already indexed fails with invalid_argument, changing nothing. The journal records stay, as
     // HomeStore's rollback assumes in-order appends: nothing reads past last_append_lsn, and a new write to the dLSN
     // replaces the record. Recovery (S8) must skip them using every login's (term, rs_commit_lsn), as rpcs.md #10
     // describes, and must not re-commit their freed blocks. The caller fences writes first and keeps lsn at
-    // or above every committed Sync's watermark. InternalLogin truncates at its commit (truncate_tail_locked()) and
-    // frees at its apply, where it also re-publishes an older surviving write for an LBA whose newest entry it dropped;
-    // truncate() doesn't.
+    // or above every committed Sync's watermark. InternalLogin runs the same two halves: truncate_tail_locked() at its
+    // commit, finish_tail_truncation() at its apply.
     async_status truncate(int64_t lsn);
 
     // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The proposer behind the
@@ -517,9 +517,10 @@ public:
     // Test seam for read(): runs the same read algorithm, but the index read operation is injected
     // rather than routed through indx_tbl_, so tests can exercise read()'s logic (index/overlay merge,
     // horizon clamp, checksum verification, read-time all-zero collapse) against a fake index instead
-    // of a real VolumeIndexTable.
+    // of a real VolumeIndexTable. With a term, it reads as that session's read() does.
     async_result< craft::read_result > read_with(int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest,
-                                                 read_index_fn_t read_fn);
+                                                 read_index_fn_t read_fn,
+                                                 std::optional< uint64_t > term = std::nullopt);
 
     // Test-only observability for the watchdog: counts ticks that found the session stale, on any member
     // (counted before the leader check, so it's independent of whether a CraftRaftProposer is wired).
@@ -804,9 +805,14 @@ private:
     // later Sync's install. Also marks writes in flight above lsn in truncated_in_flight_. Fails with
     // invalid_argument, changing nothing, below a slot already indexed or being indexed.
     result< TailTruncation > truncate_tail_locked(int64_t lsn);
-    // InternalLogin's apply, run by the apply queue: waits for writes in flight, frees the slots its commit dropped
-    // (to_free), re-publishes the overlay if the commit dropped entries from it (republish), then starts the session.
-    // STALE_TERM if the entry's term isn't newer, and it was ignored.
+    // truncate()'s I/O, after truncate_tail_locked(): waits for writes in flight, frees the dropped slots (to_free),
+    // and re-publishes the overlay if entries were dropped from it (republish). If that fails it faults the partition
+    // and returns INTERNAL_ERROR. `who` prefixes its logs.
+    async_status finish_tail_truncation(std::vector< int64_t > const& to_free, bool republish, std::string_view who);
+    // Frees each slot's blocks; a failure is logged, and the blocks leak.
+    sisl::async::task< void > free_slots(std::vector< int64_t > const& lsns, std::string_view who);
+    // InternalLogin's apply, run by the apply queue: finish_tail_truncation() for what its commit dropped (to_free,
+    // republish), then starts the session. STALE_TERM if the entry's term isn't newer, and it was ignored.
     async_status apply_internal_login(uint64_t client_token, uint64_t term, std::vector< int64_t > const& to_free,
                                       bool republish);
 
@@ -856,6 +862,9 @@ private:
     // a hole extent at read time (never at write time).
     async_result< craft::read_result > read_impl(int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest,
                                                  read_index_fn_t const& read_fn);
+    // read_impl() for a read from the session at `term`: STALE_TERM if a login committed while it ran.
+    async_result< craft::read_result > read_in_session(uint64_t term, int64_t read_lsn, uint64_t addr, uint64_t len,
+                                                       sisl::sg_list dest, read_index_fn_t const& read_fn);
 
     // Core overlay-population rule shared by write()'s post-flight update and rebuild_overlay():
     // highest-dLSN-wins per LBA -- an entry only replaces whatever's already at that LBA if dlsn is
@@ -891,7 +900,7 @@ private:
     // True if a login poll has quiesced writes at term. Caller holds state_mu_.
     bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
     // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes the drain_writes() callers on
-    // this thread, one at a time.
+    // this thread, one at a time; a release made while it does leaves them to it.
     void release_slot_write(int64_t lsn);
     // Waits until no journal write is in flight. The caller fences new writes first, or the wait may not end.
     sisl::async::task< void > drain_writes();
@@ -933,9 +942,9 @@ private:
     // TODO: Can this be replaced with boost::icl::interval_set? Particularly helpful when a write
     // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
     // insert one LSN at a time under state_mu_, which is O(gap width) instead of O(log ranges).
-    std::set< int64_t > missing_lsns_;         // gaps between commit_lsn and last_append_lsn
-    size_t max_missing_lsns_{2'000'000};       // see missing_at_capacity_locked(); overridden only by tests
-    std::unordered_set< int64_t > empty_lsns_; // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
+    std::set< int64_t > missing_lsns_;   // gaps between commit_lsn and last_append_lsn
+    size_t max_missing_lsns_{2'000'000}; // see missing_at_capacity_locked(); overridden only by tests
+    std::set< int64_t > empty_lsns_;     // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     // Held by the one commit_impl() run allowed at a time, the only writer of commit_lsn: a piggybacked commit
     // try_lock()s and skips, a Sync's advance lock()s and waits its turn.
     AsyncMutex commit_mu_;
@@ -952,8 +961,10 @@ private:
     // when it lands. Erased with the claim.
     std::set< int64_t > truncated_in_flight_;
     std::vector< std::shared_ptr< sisl::async::value_awaitable< bool > > > drain_waiters_; // drain_writes() callers
+    bool resuming_drains_{false}; // a release_slot_write() is resuming drain_waiters_
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, in_flight_write_dlsns_,
-                                  // truncated_in_flight_, drain_waiters_, last_checkpoint_lsn_, and client_commit_lsn_
+                                  // truncated_in_flight_, drain_waiters_, resuming_drains_, last_checkpoint_lsn_, and
+                                  // client_commit_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
