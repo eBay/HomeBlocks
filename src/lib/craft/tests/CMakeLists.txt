@@ -202,6 +202,24 @@ add_dependencies(test_craft_login ${PROJECT_NAME}_core)
 
 add_test(NAME CraftLoginTest COMMAND test_craft_login)
 
+# Seeded randomized interleaving test (S7: SDSTOR-26679): random client writes, Sync and InternalLogin commits, apply
+# pauses, held writes, rounds, Resolves and reads against one member, with safety checks after every step. Same
+# pattern: compile craft_repl_dev.cpp directly. --seed=N replays one seed; --seeds and --steps size the run.
+add_executable(test_craft_interleave)
+target_sources(test_craft_interleave PRIVATE
+    test_craft_interleave.cpp
+    ../craft_repl_dev.cpp
+)
+target_compile_definitions(test_craft_interleave PRIVATE _PRERELEASE)
+target_sources(test_craft_interleave PRIVATE ${HB_CONFIG_BINDUMP})
+target_link_libraries(test_craft_interleave
+    ${COMMON_TEST_DEPS}
+    -rdynamic
+)
+add_dependencies(test_craft_interleave ${PROJECT_NAME}_core)
+
+add_test(NAME CraftInterleaveTest COMMAND test_craft_interleave)
+
 # Heavy integration test for CraftReplDev::commit()/read() against a REAL VolumeIndexTable and real
 # data blocks (via a real, ordinarily-created volume) -- same pattern as
 # test_craft_homestore_backend.cpp (links the full library, real HomeStore bring-up).

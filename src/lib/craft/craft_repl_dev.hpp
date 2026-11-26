@@ -558,6 +558,12 @@ public:
         return last_proposed_sync_lsn_;
     }
 
+    // Highest watermark of a SyncRSCommitLSN committed here, or -1.
+    int64_t applied_sync_lsn() const {
+        std::lock_guard lk{state_mu_};
+        return applied_sync_lsn_;
+    }
+
     // Highest commit_lsn the current session has piggybacked, or -1.
     int64_t client_commit_lsn() const {
         std::lock_guard lk{state_mu_};
