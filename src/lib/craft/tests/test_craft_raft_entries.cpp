@@ -1322,6 +1322,30 @@ TEST_F(CraftRaftEntriesTest, InternalLoginBelowAnIndexedSlotFaultsThePartition) 
     EXPECT_EQ(dev_->last_append_lsn(), 7); // nothing dropped
 }
 
+// A newer login below the previous login's watermark, with no Sync committed between them, is rejected at commit like
+// one below a committed Sync: committed logins' watermarks never decrease, which the stale-slot filter relies on. It
+// doesn't fence or truncate.
+TEST_F(CraftRaftEntriesTest, ALoginBelowThePreviousLoginsWatermarkIsRejected) {
+    dev_->seed_lsns(5, {});
+    commit_login(/*term=*/1, /*rs_commit_lsn=*/5);
+    ASSERT_EQ(dev_->term(), 1u);
+    auto login_hdr = make_header(CraftEntryType::InternalLogin);
+    auto login_key = make_internal_login_key(/*client_token=*/2, /*term=*/2, /*rs_commit_lsn=*/3);
+    auto const ctx = make_test_proposal_ctx();
+
+    dev_->raft_listener().on_commit(2, as_blob(login_hdr), as_blob(login_key), {}, ctx);
+
+    auto const outcome = take_test_proposal_outcome(ctx);
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_FALSE(outcome->has_value());
+    EXPECT_EQ(outcome->error(), craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    EXPECT_EQ(dev_->term(), 1u);
+    EXPECT_EQ(dev_->last_append_lsn(), 5); // nothing dropped
+    auto const write = homeblocks::detail::sync_get(dev_->write(
+        craft::client_hdr{.term = 1, .commit_lsn = -1, .all_committed_lsn = -1}, /*dlsn=*/6, 0, k_page_size, {}));
+    EXPECT_TRUE(write.has_value()) << "the session at term 1 isn't fenced";
+}
+
 // ── SyncRSCommitLSN codec (SDSTOR-26801) ──────────────────────────────────────
 
 TEST(SyncRSCommitLSNCodecTest, RoundTrip) {

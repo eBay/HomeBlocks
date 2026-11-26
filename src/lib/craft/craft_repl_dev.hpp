@@ -921,12 +921,15 @@ private:
     // True if term is the current session and no newer login has committed. Caller holds state_mu_.
     bool session_current_locked(uint64_t term) const { return term == state_.term && term >= login_fence_term_; }
     // True if a committed login dropped slot lsn as written at term: the first one after term has a watermark below
-    // lsn. That one is enough, as committed logins' watermarks never decrease (a login below a committed Sync is
-    // rejected). Caller holds state_mu_.
+    // lsn. That one is enough, as committed logins' watermarks never decrease (a login below a committed Sync's or an
+    // earlier login's is rejected at commit). Caller holds state_mu_.
     bool dropped_by_login_locked(int64_t lsn, uint64_t term) const {
         auto const first_after = login_rs_.upper_bound(term);
         return first_after != login_rs_.end() && lsn > first_after->second;
     }
+    // Erases the fetched slots a committed login dropped (dropped_by_login_locked()), which a peer that missed the
+    // login still holds, and logs them under `who`. Takes state_mu_.
+    void erase_login_dropped(std::vector< JournalSlot >& slots, std::string_view who);
     // True if a login poll has quiesced writes at term. Caller holds state_mu_.
     bool write_quiesced_locked(uint64_t term) const { return quiesce_term_ && term <= *quiesce_term_; }
     // Releases lsn's write claim. The release that empties in_flight_write_dlsns_ resumes the drain_writes() callers on
