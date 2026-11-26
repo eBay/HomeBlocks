@@ -233,7 +233,8 @@ Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
 
 ```
 Request:  { lsns: [int64] }
-Response: { slots: [{ lsn: int64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32, data: bytes }] }
+Response: { slots: [{ lsn: int64, term: uint64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32,
+                      data: bytes }] }
 ```
 
 Called by the leader during pre-resolution (before proposing a `SyncRSCommitLSN`), and by a replica that is
@@ -242,6 +243,16 @@ missing slots while applying one.
 (no data, applied as a range unmap); `is_empty=true` means the peer **positively** marked that slot
 `Empty` (leader-only verdict); a requested `lsn` **omitted** means *not-present-here*. A peer never
 returns `is_empty=true` for a slot it merely lacks.
+
+**A slot a login dropped.** `term` is the session term the slot was written at. A peer that missed a login
+still holds the old session's slots above that login's `rs_commit_lsn` (#10), so the requester checks each
+slot against the logins it has committed: a slot written at term s is dropped if the first login after s has
+`rs_commit_lsn` below it. That first login is enough, because committed logins' watermarks never decrease
+(a login below a committed `SyncRSCommitLSN`'s or an earlier login's is rejected, #10). Pre-resolution counts
+the peer as lacking such a slot, so a slot only stale tails hold resolves `Empty`; catch-up leaves it missing
+for a later fetch from a peer holding the live one. Each replica records a login's `(term, rs_commit_lsn)` when
+its `InternalLogin` commits, unless it's rejected or isn't newer (#10). A fill journals a
+slot at its original term, not the current session's, so a dropped slot can't come back looking current.
 
 HomeBlocks handler: `CraftReplDev::fetch_data()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
@@ -308,7 +319,7 @@ can land before its truncation.
 
 The truncation is logical: the journal records above `rs_commit_lsn` stay, unread, until a new-session write
 to the same dLSN replaces one. A kept record and a dropped one can carry the same term, so recovery (S8) needs
-every login's `(term, rs_commit_lsn)`: a record written at term s is dead if the first login after s has
+the `(term, rs_commit_lsn)` of every login that took effect: a record written at term s is dead if the first login after s has
 `rs_commit_lsn` below it. A voided record is dead too, whatever the logins: a slot a committed
 `SyncRSCommitLSN` voted `Empty` keeps its record, but its blocks were freed when it was voided (a held slot's
 when the Sync applied, a late write's when it landed), so recovery also needs the committed `Empty`
@@ -321,9 +332,10 @@ Two entries are turned away, each decided in log order so every replica agrees:
   included: a replay, or a second login that proposed the same term after the first one took it. Its
   proposer gets `STALE_TERM`.
 - **Below a committed watermark.** A newer entry whose `rs_commit_lsn` is below the watermark of a
-  `SyncRSCommitLSN` committed ahead of it is rejected when it commits: only another leader can have moved
-  the watermark (a leadership change mid-login), and the session would start below committed slots. It
-  doesn't fence the old session it no longer replaces, and its proposer gets `NO_QUORUM`.
+  `SyncRSCommitLSN` or an `InternalLogin` committed ahead of it is rejected when it commits: only another
+  leader can have moved the watermark (a leadership change mid-login), the session would start below
+  committed slots, and logins' watermarks must never decrease (#8 relies on it). It doesn't fence the old
+  session it no longer replaces, and its proposer gets `NO_QUORUM`.
 
 ---
 

@@ -252,15 +252,18 @@ TEST_F(CraftPeerExchangeTest, FetchDataEmptyRequest) {
     EXPECT_TRUE(r->empty());
 }
 
-// A slot present in the journal (not missing, within last_append) returns with its data fields.
+// A slot present in the journal (not missing, within last_append) returns with its data fields, and the term it was
+// written at, so the requester can tell a slot a later login dropped.
 TEST_F(CraftPeerExchangeTest, FetchDataPresentData) {
     add_slot(5, /*lba=*/10, /*len=*/4);
+    journal_->slots[5].term = 3;
     dev_->seed_lsns(5, {});
 
     auto r = do_fetch_data({5});
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(r->size(), 1u);
     EXPECT_EQ((*r)[0].lsn, 5);
+    EXPECT_EQ((*r)[0].term, 3u);
     EXPECT_FALSE((*r)[0].is_empty);
     EXPECT_FALSE((*r)[0].all_zeros);
     EXPECT_EQ((*r)[0].lba_off_bytes, 10u);

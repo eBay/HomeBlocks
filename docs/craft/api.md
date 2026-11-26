@@ -269,7 +269,8 @@ Server-to-server raw journal read: the leader's pre-resolution fetches unresolve
 before it proposes a `SyncRSCommitLSN`, and a lagging replica fetches its missing slots while applying one.
 Each `JournalSlot` is one of: a data
 slot, a zero write (`all_zeros=true`, no data), or `Empty` (`is_empty=true`); a requested LSN absent
-from the result means not-present-here.
+from the result means not-present-here. Each slot carries the `term` it was written at, so the requester can
+reject one a login it has committed dropped (see [rpcs.md](rpcs.md) #8).
 
 ### RAFT state machine entries
 
